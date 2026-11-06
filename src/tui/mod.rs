@@ -1204,6 +1204,9 @@ struct App {
     /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
     /// right-click target map.
     account_row_chrome: Vec<ui::AccountRowHit>,
+    /// Models-strip entry rects from the LAST rendered frame — left-click
+    /// opens the model in the Stats tab.
+    strip_chrome: Vec<twolab_tui::packed_grid::GridHit>,
     /// The rendered context menu's hit layout (UI-3 U11), when open.
     menu_chrome: Option<twolab_tui::menu::MenuLayout>,
     /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
@@ -1400,6 +1403,7 @@ impl App {
             perf_cursor: 0,
             perf_day_off: None,
             account_row_chrome: Vec::new(),
+            strip_chrome: Vec::new(),
             menu_chrome: None,
             menu_anchor: None,
             menu_account: None,
@@ -2294,6 +2298,14 @@ impl App {
                         ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
                         ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
                     }
+                    return true;
+                }
+                // A models-strip entry opens the Stats tab with that model
+                // under the cursor, its drill-down beside the table.
+                if let Some(model) =
+                    twolab_tui::packed_grid::hit_test(&self.strip_chrome, mouse.column, mouse.row)
+                {
+                    self.open_model(model, view);
                     return true;
                 }
                 match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
@@ -4428,6 +4440,16 @@ impl App {
         }
     }
 
+    /// The Stats tab with model `index` (strip order, which is the table's)
+    /// under the cursor — a click on a models-strip entry.
+    fn open_model(&mut self, index: usize, view: Option<&DashboardView>) {
+        self.open_stats(view);
+        if self.overlay == Overlay::Stats {
+            let len = view.map_or(0, |v| v.model_usage.len());
+            self.model_cursor = index.min(len.saturating_sub(1));
+        }
+    }
+
     /// The live codex settings, or `None` when no codex account exists.
     fn current_codex(&self, view: Option<&DashboardView>) -> Option<CodexSettingsDoc> {
         view.and_then(|v| v.codex.available.then(|| v.codex.clone()))
@@ -6466,6 +6488,7 @@ async fn event_loop(
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
             app.account_row_chrome = main.account_rows;
+            app.strip_chrome = main.models_strip;
             app.menu_chrome = main.menu;
             app.setting_chrome = main.settings;
             // The Logs pager clamps a held offset itself; one at (or past)
@@ -7836,6 +7859,38 @@ mod tests {
             assert_eq!(app.mode, Mode::Normal, "{overlay:?}: no row cursor moved");
             assert_eq!(app.menu_account, None, "{overlay:?}: no context menu");
         }
+    }
+
+    /// A left-click on a models-strip entry (its rect from the last frame,
+    /// one per entry of twolab-tui's packed grid) opens the Stats tab with
+    /// that model under the cursor; a click beside every entry does not.
+    #[test]
+    fn strip_click_opens_the_model_in_stats() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut view = stats_view();
+        let mut second = view.model_usage[0].clone();
+        second.model = "gpt-5.6-sol".into();
+        view.model_usage.push(second);
+        let click = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        };
+        let entry = |x, index| twolab_tui::packed_grid::GridHit {
+            rect: ratatui::layout::Rect::new(x, 30, 70, 1),
+            index,
+        };
+        let mut app = remote_app();
+        app.strip_chrome = vec![entry(1, 0), entry(74, 1)];
+        assert!(
+            !app.on_mouse(click(72), Some(&view)),
+            "the gap between entries"
+        );
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.on_mouse(click(80), Some(&view)));
+        assert_eq!(app.overlay, Overlay::Stats);
+        assert_eq!(app.model_cursor, 1, "the clicked model");
     }
 
     /// Review of #234: the mouse wiring of the twolab-tui modal — a click on

@@ -48,29 +48,6 @@ pub(crate) fn countdown(remaining: Duration) -> String {
     }
 }
 
-/// [`countdown`] split into its two styled parts for the in-bar quota
-/// countdown: `("7d", Some("10h"))`, `("10h", Some("15m"))`,
-/// `("17m", Some("35s"))`, `("42s", None)`. The FIRST (larger) unit is the
-/// one the renderer emphasizes — it carries most of the signal.
-pub(crate) fn countdown_units(remaining: Duration) -> (String, Option<String>) {
-    let total = remaining.as_secs();
-    let (days, hours, mins, secs) = (
-        total / 86_400,
-        (total % 86_400) / 3_600,
-        (total % 3_600) / 60,
-        total % 60,
-    );
-    if days > 0 {
-        (format!("{days}d"), Some(format!("{hours}h")))
-    } else if hours > 0 {
-        (format!("{hours}h"), Some(format!("{mins:02}m")))
-    } else if mins > 0 {
-        (format!("{mins}m"), Some(format!("{secs:02}s")))
-    } else {
-        (format!("{secs}s"), None)
-    }
-}
-
 /// Whole-number percentage label: "42%", clamped to 0–100. A non-finite
 /// utilization (a share of nothing) reads `—`, never `NaN%`. twolab-tui's
 /// [`twolab_tui::format::percent`].
@@ -110,35 +87,6 @@ pub(crate) fn refreshed_marker(last_refresh_ms: Option<u64>, now: SystemTime) ->
     let at = SystemTime::UNIX_EPOCH + Duration::from_millis(last_refresh_ms?);
     let ago = now.duration_since(at).unwrap_or_default();
     Some(format!("\u{21bb}{}", age_unit(ago)))
-}
-
-/// Fixed-width `MM/DD HH:MM` in UTC (11 chars) for the quota bars' absolute
-/// reset-time display (the `t` toggle). UTC by the same reasoning as
-/// [`clock_hms_utc`]; the in-bar width budget has no room for a zone suffix,
-/// so the toggle's footer hint carries the "UTC" fact. Civil-date math is the
-/// standard days-from-epoch algorithm (Howard Hinnant) — no chrono needed.
-pub(crate) fn absolute_utc_label(at: SystemTime) -> String {
-    let secs = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let day_secs = secs % 86_400;
-    // Civil from days (valid for the unix era we care about).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let _y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{m:02}/{d:02} {:02}:{:02}",
-        day_secs / 3_600,
-        (day_secs % 3_600) / 60
-    )
 }
 
 /// Wall-clock HH:MM:SS in UTC for activity-log timestamps. UTC (not local)
@@ -373,8 +321,12 @@ mod tests {
         );
     }
 
+    /// The quota meters' in-bar countdown is twolab-tui's
+    /// `format::countdown_units` (it was a copy here): split on the same
+    /// bands as [`countdown`], the first unit the one the meter makes bold.
     #[test]
     fn countdown_units_split_matches_countdown_banding() {
+        use twolab_tui::format::countdown_units;
         let d = Duration::from_secs;
         assert_eq!(
             countdown_units(d(7 * 86_400 + 10 * 3_600)),
