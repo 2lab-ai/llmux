@@ -33,7 +33,7 @@ use super::event::TokenCounts;
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
+use super::{AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState, StatusMsg};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -342,6 +342,9 @@ pub(crate) fn draw(
     // stands on the footer, over whichever surface opened it.
     draw_gate(frame, view, &ctx, chrome);
     draw_login_picker(frame, chrome);
+    // Status messages with several facts float over everything but the
+    // footer, in the corner under the tab row.
+    draw_toasts(frame, overlay_area, chrome, ctx.mask);
 
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
@@ -354,7 +357,10 @@ pub(crate) fn draw(
     frame.render_widget(Clear, footer_area);
     draw_footer(frame, footer_area, chrome, ctx.mask);
     // Usage context uses only the spare status row; flashes and modal chrome win.
-    if chrome.status_line.as_deref().is_none_or(str::is_empty)
+    if chrome
+        .status_line
+        .as_ref()
+        .is_none_or(|m| m.text.is_empty())
         && matches!(chrome.mode, Mode::Normal)
         && chrome.input_modal.is_none()
         && chrome.raw_modal.is_none()
@@ -4881,11 +4887,16 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     // The bottom hint doubles as the action-feedback line: a fresh flash
     // ("copied 4132 bytes → pbcopy", "saved → ~/Downloads/…") replaces the key
     // legend until it expires.
+    // The chrome carries a flash only while it is live (the app drops it at
+    // its TTL), so nothing here reads a clock.
     let hint = match &modal.flash {
-        Some((msg, at)) if at.elapsed() < std::time::Duration::from_secs(3) => Line::from(
-            Span::styled(format!(" {msg} "), Style::new().fg(Color::Yellow)),
-        )
-        .centered(),
+        Some((msg, _)) => {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(outcome_spans(msg.outcome, &msg.text));
+            spans.push(Span::raw(" "));
+            cells::truncate_line(Line::from(spans), usize::from(area.width.saturating_sub(4)))
+                .centered()
+        }
         // The key legend fitted to the border it sits on: whole hints drop
         // (`… +N more`) instead of the line being cut on both sides.
         _ => {
@@ -11267,16 +11278,76 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
-    // Status messages quote account names ("switched to a@x.com") — mask any
-    // embedded email under the email-anonymous setting.
-    let status = Line::from(Span::styled(
-        format!(
-            " {}",
-            masked_text(chrome.status_line.as_deref().unwrap_or(""), mask)
+/// A message led by its outcome as a glyph and a word — `✓ ok   switched to
+/// …`, `! warn reset cancelled …`, `✗ fail refresh failed: …` (twolab-tui
+/// `Flash`, with the toast kind's glyph in front) — so ok, warn and fail
+/// read apart without colour; under `NO_COLOR` a failure is bold too.
+fn outcome_spans(outcome: twolab_tui::banner::Outcome, text: &str) -> Vec<Span<'static>> {
+    use twolab_tui::banner::Flash;
+    use twolab_tui::toast::ToastKind;
+    let kind = ToastKind::from(outcome);
+    let mut spans = vec![
+        Span::styled(
+            kind.glyph(),
+            kind.style(&KEYBAR_THEME).add_modifier(Modifier::BOLD),
         ),
-        Style::new().fg(Color::Yellow),
-    ));
+        Span::raw(" "),
+    ];
+    if let Some(line) = Flash::new(outcome, text).theme(KEYBAR_THEME).line() {
+        spans.extend(line.spans);
+    }
+    spans
+}
+
+/// The footer's status row: the live message with its outcome, cut with `…`
+/// at the width (it used to run off the right edge). Status messages quote
+/// account names ("switched to a@x.com") — any embedded email is masked
+/// under the email-anonymous setting.
+fn status_row(msg: Option<&StatusMsg>, mask: bool, width: u16) -> Line<'static> {
+    let Some(msg) = msg.filter(|m| !m.text.is_empty()) else {
+        return Line::default();
+    };
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(outcome_spans(msg.outcome, &masked_text(&msg.text, mask)));
+    cells::truncate_line(Line::from(spans), usize::from(width))
+}
+
+/// Status messages with several facts — a multi-account refresh with
+/// failures — as twolab-tui toast cards stacked in the top-right corner of
+/// `area` (under the tab row, above the footer): the outcome's word in the
+/// border, its glyph and the summary, then one line per fact and `+N more`
+/// past four. Each stays for its kind's time (8 s for a failure) on the
+/// dashboard's clock, so a burst is read one card after another. Up to two
+/// thirds of the width, so long errors are not cut early on a wide terminal;
+/// at 64 columns or fewer a card becomes a one-row banner. Account names
+/// are masked like the status row.
+fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+    use twolab_tui::toast::{Anchor, Toast, ToastStack, DEFAULT_MAX_WIDTH};
+    let cap = (area.width.saturating_mul(2) / 3).max(DEFAULT_MAX_WIDTH);
+    let shown: Vec<Toast> = chrome
+        .toasts
+        .visible(chrome.clock)
+        .into_iter()
+        .map(|t| {
+            Toast::new(t.kind_of(), masked_text(t.title(), mask))
+                .lines(t.body_lines().iter().map(|l| masked_text(l, mask)))
+                .ttl(t.ttl_of())
+                .max_width(cap)
+        })
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    ToastStack::new(&shown)
+        .anchor(Anchor::TopRight)
+        .queued(chrome.toasts.waiting())
+        .dropped(chrome.toasts.dropped())
+        .theme(KEYBAR_THEME)
+        .render(area, frame.buffer_mut());
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+    let status = status_row(chrome.status_line.as_ref(), mask, area.width);
     let keybar = match chrome.mode {
         // Config-editor prompts render their own inline hint line inside the
         // overlay; the keybar mirrors the essentials.
@@ -12374,11 +12445,11 @@ mod tests {
             .expect("codex row");
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::ConfirmReset { idx: codex_pos };
-        chrome.status_line = Some(super::super::reset_confirm_status(
+        chrome.status_line = Some(StatusMsg::warn(super::super::reset_confirm_status(
             "codex:me@example.com",
             Some(3),
             Some(0),
-        ));
+        )));
         let rows = render_rows(&view, &chrome, 160, 30);
         let frame = rows.join("\n");
         assert!(frame.contains("codex:me@example.com"), "{frame}");
@@ -12476,6 +12547,53 @@ mod tests {
             legend.contains("esc close"),
             "the close key stays: {legend}"
         );
+    }
+
+    /// Every status message leads with its outcome as a glyph and a word
+    /// (all of them were yellow, `refresh failed` included): ok, warn and
+    /// fail read apart at 80 and 179 columns, also once `NO_COLOR` has
+    /// stripped the colour — the failure is bold then — and a long message
+    /// ends in `…` at the edge instead of running off it.
+    #[test]
+    fn status_row_says_ok_warn_or_fail_also_without_colour() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for (msg, lead) in [
+                (StatusMsg::ok("fold on"), " ✓ ok   fold on"),
+                (
+                    StatusMsg::warn("reset cancelled — nothing was spent"),
+                    " ! warn reset cancelled",
+                ),
+                (
+                    StatusMsg::fail("refresh failed: upstream 502"),
+                    " ✗ fail refresh failed",
+                ),
+            ] {
+                chrome.status_line = Some(msg.clone());
+                let mut buf = render_buffer(&view, &chrome, w, h);
+                twolab_tui::theme::decolor(&mut buf);
+                let y = h - 2;
+                let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+                assert!(row.starts_with(lead), "{w}x{h}: {row:?}");
+                // The message text starts in one column for every outcome.
+                let text_col = 8;
+                let bold = buf[(text_col, y)].modifier.contains(Modifier::BOLD);
+                assert_eq!(
+                    bold,
+                    msg.outcome == twolab_tui::banner::Outcome::Fail,
+                    "only a failure is bold without colour: {row:?}"
+                );
+            }
+        }
+        chrome.status_line = Some(StatusMsg::fail(format!(
+            "refresh failed: error sending request for url ({})",
+            "http://localhost:3456/llmux/refresh-usage".repeat(3)
+        )));
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let row = rows[22].trim_end();
+        assert!(row.ends_with('…'), "{row:?}");
+        assert!(cells::width(row) <= 80, "{row:?}");
     }
 
     /// Under `NO_COLOR` the frame loop strips every colour; the gate's marked
@@ -12865,6 +12983,8 @@ mod tests {
             mode: Mode::Normal,
             overlay,
             status_line: None,
+            toasts: Default::default(),
+            clock: Duration::ZERO,
             activity_scroll: 0,
             expanded_activity: None,
             expanded_run: None,
@@ -13627,7 +13747,7 @@ mod tests {
         let view = c5_long_totals_view();
         let mut chrome = chrome_overlay(Overlay::Usage);
         for status in [Some("refresh failed: retry later"), None] {
-            chrome.status_line = status.map(str::to_string);
+            chrome.status_line = status.map(StatusMsg::fail);
             let rows = render_rows(&view, &chrome, 100, 50);
             if let Some(status) = status {
                 assert!(
@@ -13667,7 +13787,7 @@ mod tests {
     fn c5_usage_title_fits_legacy_width_with_long_totals() {
         let view = c5_long_totals_view();
         let mut chrome = chrome_overlay(Overlay::Usage);
-        chrome.status_line = Some("refresh failed: retry later".into());
+        chrome.status_line = Some(StatusMsg::fail("refresh failed: retry later"));
         for width in [80, 74] {
             let rows = render_rows(&view, &chrome, width, 50);
             assert!(
@@ -13746,7 +13866,7 @@ mod tests {
             },
         ];
         let mut chrome = chrome_overlay(Overlay::Usage);
-        chrome.status_line = Some("refresh failed: retry later".into());
+        chrome.status_line = Some(StatusMsg::fail("refresh failed: retry later"));
         let rows = render_rows(&view, &chrome, 80, 50);
         assert!(rows[48].contains("refresh failed: retry later"));
         assert!(
@@ -13840,11 +13960,12 @@ mod tests {
         ] {
             let mut chrome = chrome_overlay(overlay);
             for status in [None, Some("switched to codex@example.com")] {
-                chrome.status_line = status.map(str::to_string);
+                chrome.status_line = status.map(StatusMsg::ok);
                 let rows = render_rows(&view, &chrome, 160, 50);
+                // The status row leads with its outcome (glyph and word).
                 assert_eq!(
                     rows[48].trim_end(),
-                    status.map_or(String::new(), |status| format!(" {status}")),
+                    status.map_or(String::new(), |status| format!(" ✓ ok   {status}")),
                     "non-Usage status line is unchanged"
                 );
                 assert_eq!(rows[49].trim_end(), keybar, "non-Usage keybar is unchanged");
@@ -18712,7 +18833,7 @@ mod tests {
 
     fn email_everywhere_chrome(overlay: Overlay) -> Chrome {
         let mut chrome = chrome_overlay(overlay);
-        chrome.status_line = Some(format!("switched to {LEAK} (manual)"));
+        chrome.status_line = Some(StatusMsg::ok(format!("switched to {LEAK} (manual)")));
         chrome.sessions = vec![crate::session::Session {
             user_id: Some("acct_x".into()),
             requests: 1,
@@ -20718,7 +20839,12 @@ mod tests {
     /// each entry two cells wider), dollars in the default colour over dim
     /// cents and a dim `$` instead of all green; every other cell unchanged
     /// (previous digest 7_483_902_083_238_678_069).
-    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
+    /// Re-pinned the same day for status messages with an outcome (twolab-tui
+    /// `Flash`): the fixture has no status, and the empty status row (row 41)
+    /// no longer starts with a space in the old all-yellow status colour —
+    /// `Yellow×1 Reset×178` reads `Reset×179`; every other cell, text and
+    /// style, unchanged (previous digest 11_040_274_043_730_846_167).
+    const FOLD_OFF_179X43_DIGEST: u64 = 11_178_084_734_170_114_220;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
