@@ -529,8 +529,10 @@ pub(crate) fn draw(
     // Status messages with several facts float over MAIN and any overlay,
     // in the corner under the tab row — and under every modal, gate and
     // picker drawn after them, so a toast never covers a question that is
-    // still waiting for its answer (a short terminal stacks them).
-    draw_toasts(frame, overlay_area, chrome, ctx.mask);
+    // still waiting for its answer (a short terminal stacks them). Each
+    // toast drawn is a click target over what lies beneath it.
+    let toasts = draw_toasts(frame, overlay_area, chrome, ctx.mask);
+    main.hits.extend(toasts);
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
     // centered, scrollable full-text box. Its max-scroll (or a close signal
@@ -571,8 +573,8 @@ pub(crate) fn draw(
 
     // A confirm gate (remove / reset / config) or the new-login picker
     // stands on the footer, over whichever surface opened it.
-    draw_gate(frame, view, &ctx, chrome);
-    draw_login_picker(frame, chrome);
+    draw_gate(frame, view, &ctx, chrome, &mut main.hits);
+    draw_login_picker(frame, chrome, &mut main.hits);
 
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
@@ -9005,6 +9007,9 @@ pub(crate) enum ClickTarget {
     /// The raw viewer's body scrollbar track ([`RawModalChrome::bar`] has
     /// the maths the drag after a press uses).
     RawScrollbar,
+    /// A toast card (or banner) as drawn, by its id in the queue: a left
+    /// click takes it down, and no press on it reaches what lies beneath.
+    Toast(twolab_tui::toast::ToastId),
 }
 
 /// A surface drawn over what came before it.
@@ -9018,6 +9023,9 @@ pub(crate) enum Surface {
     /// A modal, which holds the whole screen while it is open: a click off
     /// its parts is swallowed.
     Modal,
+    /// A card standing on the footer (a confirm gate, the login picker),
+    /// over any toast or row beneath it.
+    Card,
 }
 
 /// A text modal (input, account) as drawn: it holds the whole `screen`,
@@ -11624,7 +11632,13 @@ const GATE_MAX_WIDTH: u16 = 100;
 /// as tall as its question needs, over whatever surface summoned it (the
 /// accounts table, MAIN, the config editor) — the layout underneath does not
 /// move while the gate is open.
-fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
+fn draw_gate(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    hits: &mut Hits,
+) {
     use twolab_tui::choice_form::{ChoiceForm, ChoiceOption, ChoiceState};
     let Some(gate) = gate_card(view, ctx, chrome) else {
         return;
@@ -11646,7 +11660,7 @@ fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &C
     // A gate taller than the room windows its options (`⋯ N more`) instead
     // of cutting them.
     let body = form.height(&state, width.saturating_sub(2));
-    if let Some(inner) = footer_card(frame, body, gate.title, gate.color) {
+    if let Some(inner) = footer_card(frame, hits, body, gate.title, gate.color) {
         frame.render_stateful_widget(&form, inner, &mut state);
     }
 }
@@ -11659,9 +11673,16 @@ fn card_width(full: Rect) -> u16 {
 
 /// Clear and frame a card of `body` rows (plus its border) standing on the
 /// two footer rows, [`card_width`] wide, titled in `color`; the header and
-/// tab rows always stay uncovered. Returns the rect inside the border, or
-/// `None` when not even one row fits.
-fn footer_card(frame: &mut Frame, body: u16, title: &str, color: Color) -> Option<Rect> {
+/// tab rows always stay uncovered. The card is a surface in `hits`, over
+/// what lies beneath it (a toast, a row). Returns the rect inside the
+/// border, or `None` when not even one row fits.
+fn footer_card(
+    frame: &mut Frame,
+    hits: &mut Hits,
+    body: u16,
+    title: &str,
+    color: Color,
+) -> Option<Rect> {
     let full = frame.area();
     let height = body.saturating_add(2).min(full.height.saturating_sub(4));
     if height < 3 {
@@ -11681,6 +11702,7 @@ fn footer_card(frame: &mut Frame, body: u16, title: &str, color: Color) -> Optio
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
+    hits.push(area, ClickTarget::Surface(Surface::Card));
     Some(inner)
 }
 
@@ -11731,14 +11753,14 @@ pub(crate) fn login_list(idx: usize) -> twolab_tui::select_list::SelectList {
 /// Draw the new-login picker as a card standing on the footer (the footer
 /// row lists its keys). It used to be one footer line that lost OpenRouter,
 /// Gemini and its own Enter/Esc off the right edge at 80 columns.
-fn draw_login_picker(frame: &mut Frame, chrome: &Chrome) {
+fn draw_login_picker(frame: &mut Frame, chrome: &Chrome, hits: &mut Hits) {
     use twolab_tui::render::Renderable;
     let Mode::NewLogin { idx } = chrome.mode else {
         return;
     };
     let list = login_list(idx);
     let body = list.desired_height(card_width(frame.area()).saturating_sub(2));
-    if let Some(inner) = footer_card(frame, body, "new login", THEME.accent) {
+    if let Some(inner) = footer_card(frame, hits, body, "new login", THEME.accent) {
         frame.render_widget(&list, inner);
     }
 }
@@ -12031,30 +12053,42 @@ fn status_row(msg: Option<&StatusMsg>, mask: bool, width: u16) -> Line<'static> 
 /// dashboard's clock, so a burst is read one card after another. Up to two
 /// thirds of the width, so long errors are not cut early on a wide terminal;
 /// at 64 columns or fewer a card becomes a one-row banner. Account names
-/// are masked like the status row.
-fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+/// are masked like the status row. Returns each drawn toast's rect as its
+/// click target ([`ClickTarget::Toast`]), first drawn first.
+fn draw_toasts(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: &Chrome,
+    mask: bool,
+) -> Vec<(Rect, ClickTarget)> {
     use twolab_tui::toast::{Anchor, Toast, ToastStack, DEFAULT_MAX_WIDTH};
     let cap = (area.width.saturating_mul(2) / 3).max(DEFAULT_MAX_WIDTH);
-    let shown: Vec<Toast> = chrome
+    let (ids, shown): (Vec<_>, Vec<Toast>) = chrome
         .toasts
-        .visible(chrome.clock)
-        .into_iter()
-        .map(|t| {
-            Toast::new(t.kind_of(), masked_text(t.title(), mask))
+        .entries(chrome.clock)
+        .map(|(id, t, _)| {
+            let toast = Toast::new(t.kind_of(), masked_text(t.title(), mask))
                 .lines(t.body_lines().iter().map(|l| masked_text(l, mask)))
                 .ttl(t.ttl_of())
-                .max_width(cap)
+                .max_width(cap);
+            (id, toast)
         })
-        .collect();
+        .unzip();
     if shown.is_empty() {
-        return;
+        return Vec::new();
     }
-    ToastStack::new(&shown)
+    let layout = ToastStack::new(&shown)
         .anchor(Anchor::TopRight)
         .queued(chrome.toasts.waiting())
         .dropped(chrome.toasts.dropped())
         .theme(THEME)
         .render(area, frame.buffer_mut());
+    // The layout's index is into `shown`, which runs in the queue's order.
+    layout
+        .toasts
+        .into_iter()
+        .filter_map(|(i, rect)| Some((rect, ClickTarget::Toast(*ids.get(i)?))))
+        .collect()
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) -> Option<u16> {
@@ -13639,6 +13673,7 @@ mod tests {
             let frame = render(&view, &chrome(Mode::Normal, true), w, h);
             assert!(frame.contains("5 FAILED"), "{w}x{h}: {frame}");
         }
+        let mut covered = 0;
         for (mode, title) in [
             (Mode::ConfirmRemove { idx: 0 }, "┌ remove account "),
             (Mode::ConfirmReset { idx: 0 }, "┌ "),
@@ -13656,8 +13691,26 @@ mod tests {
                 for y in top..bare.len() {
                     assert_eq!(cut(&both[y]), cut(&bare[y]), "{mode:?} {w}x{h} row {y}");
                 }
+                // And a click there lands on the card, not the toast under it.
+                let (_, hits) = render_with_hits(&view, &chrome(mode, true), w, h);
+                let toast = hits
+                    .hits
+                    .iter()
+                    .find(|(_, t)| matches!(t, ClickTarget::Toast(_)))
+                    .map(|(rect, _)| rect)
+                    .expect("the toast is recorded");
+                let y = u16::try_from(top).expect("row").max(toast.y);
+                if y < toast.bottom() {
+                    assert_eq!(
+                        hits.hits.hit_test(toast.x, y),
+                        Some(&ClickTarget::Surface(Surface::Card)),
+                        "{mode:?} {w}x{h}"
+                    );
+                    covered += 1;
+                }
             }
         }
+        assert!(covered >= 3, "each card covered the toast somewhere");
     }
 
     #[test]

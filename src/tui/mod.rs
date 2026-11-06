@@ -2047,6 +2047,18 @@ impl App {
             }
             return true;
         }
+        // A toast lies over the rows, tabs and menu items beneath it: a left
+        // click on it takes it down (the next one waiting moves up), and no
+        // press on it reaches what it covers. The wheel and a held drag pass.
+        if let Some(&ui::ClickTarget::Toast(id)) = target {
+            if let MouseEventKind::Down(button) = mouse.kind {
+                if button == MouseButton::Left {
+                    let clock = self.clock_at(Instant::now());
+                    self.toasts.dismiss(id, clock);
+                }
+                return true;
+            }
+        }
         // Tab-bar clicks (UI-3 U6) work from ANY overlay while no text-entry
         // interaction is pending — the tab bar is how the mouse navigates.
         if self.mode == Mode::Normal
@@ -11923,6 +11935,57 @@ mod tests {
             .expect("draw");
         let text = format!("{:?}", terminal.backend().buffer());
         assert!(!text.contains("FAILED"), "{text}");
+    }
+
+    /// A toast lies over the accounts table: a left click on it takes it
+    /// down instead of opening the account modal of the row beneath (it
+    /// used to pass through), and any other press on it is swallowed too.
+    /// With the toast gone, the same cell is the row again.
+    #[test]
+    fn a_click_on_a_toast_takes_it_down_and_never_reaches_the_row_beneath() {
+        let view = control_view();
+        let mut app = remote_app();
+        let lines = (2..=6)
+            .map(|n| format!("claude:a{n}@x.com: upstream 50{n}"))
+            .collect();
+        app.set_status(StatusMsg::fail("refresh: 1 ok, 5 FAILED").with_lines(lines));
+        let rows = draw_and_adopt(&mut app, &view, 179, 43);
+        let toast = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, ui::ClickTarget::Toast(_)))
+            .map(|(rect, _)| rect)
+            .expect("the toast is a click target");
+        let (x, y) = app
+            .hits
+            .iter()
+            .filter(|(_, t)| matches!(t, ui::ClickTarget::AccountRow(_)))
+            .find_map(|(row, _)| {
+                let both = row.intersection(toast);
+                (!both.is_empty()).then_some((both.x, both.y))
+            })
+            .unwrap_or_else(|| panic!("the toast lies over a row:\n{}", rows.join("\n")));
+        assert!(rows.iter().any(|r| r.contains("5 FAILED")), "{rows:#?}");
+        // A right click on it neither opens the row's menu nor takes it down.
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), x, y),
+            Some(&view)
+        ));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.toasts.is_empty(), "a right click keeps the toast");
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            Some(&view)
+        ));
+        assert!(app.account_modal.is_none(), "the row beneath stays shut");
+        assert!(app.toasts.is_empty(), "the click took the toast down");
+        let rows = draw_and_adopt(&mut app, &view, 179, 43);
+        assert!(!rows.iter().any(|r| r.contains("5 FAILED")), "{rows:#?}");
+        app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            Some(&view),
+        );
+        assert!(app.account_modal.is_some(), "the row is clickable again");
     }
 
     /// The connecting screen counts how long the attach has been retrying
