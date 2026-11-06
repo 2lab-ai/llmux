@@ -462,7 +462,7 @@ the in-memory activity fold, so they survive restarts and can be narrowed:
 | Key | Effect |
 |---|---|
 | `w` | Cycle the window: `all` → `1h` → `24h` → `7d` → `14d` → `30d` → `90d` → `all`. Each window is the exact closed interval `[now − duration, now]`; future-stamped rows are never counted. |
-| `f` | Multi-select the models observed in the current window — `↑/↓` move, `Space` toggles, `a` selects all, `c` clears, `Enter` applies, `Esc` cancels. No selection = every model. The offered list is the window's models, never narrowed by the filter already applied, so a selection can be changed and not just narrowed. |
+| `f` | Multi-select the models observed in the current window — `↑/↓` (or `j`/`k`) move, `Space` toggles, `a` selects all, `c` clears, `/` starts a type-to-filter (fuzzy, matched letters highlighted; letters are picker keys until then — while it is open they type, `Esc` or `Backspace` on an empty filter closes it), `Enter` applies, `Esc` cancels. `k of n selected` counts every model and says how many the filter hides. No selection = every model. The offered list is the window's models, never narrowed by the filter already applied, so a selection can be changed and not just narrowed; opened while the query is still loading, it fills in when the answer lands (checks and the cursor row kept). The popup is sized to its rows, and the footer bar lists the picker's keys while it is open. |
 | `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. |
 | `r` | Re-run the query. |
 
