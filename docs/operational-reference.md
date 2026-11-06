@@ -25,7 +25,9 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `v` releases the mouse for the terminal's own selection ([Copy mode](#copy-mode)), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `V` (accounts overlay) switches between the table and the compact account list (see **Compact account list** under [Dashboard layout](#dashboard-layout-main)), and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. The context menu (right-click an accounts row on the dashboard) is titled with that account and opens on the row below the click — above it when there is no room below, so it never covers the row — with each item's switcher key: `switch now` (`⏎`), `pause`/`resume` (`p`), `set limit` (`L`) and `delete` (`r`, drawn destructive, behind the same confirmation card). `↑↓` move, `Enter` or a click runs the highlighted item, typing an item's key runs it, and any other key closes the menu. Items that cannot run are dim and skipped: `switch now` on a paused account (the scheduler refuses a paused target — resume it first), and every item once the account has left the pool. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+
+**Text fields.** The add-account key prompt (`a`), the per-account limits prompt (`L` in the switcher) and a config value edit are one-line text fields after a `❯`: `←`/`→` and `Home`/`End` (`Ctrl+A`/`Ctrl+E`) move the caret, `Ctrl+←`/`Ctrl+→` by word; typing, `Backspace` and `Delete` edit at the caret; `Ctrl+U`, `Ctrl+K` and `Ctrl+W` cut to the start, to the end and the word before the caret, and `Ctrl+Y` puts the cut back. A paste lands whole at the caret (bracketed paste — a line break in it never submits; outside a text field a paste types nothing — a pasted `y` never confirms a removal and a pasted `q` never quits — except into the keys picker's open filter, where its characters land as typed). A value wider than the field scrolls with the caret, `‹` or `›` marking the side with more. The key field draws one `∙` per character and never the key itself, in any frame; the limits field takes only digits, `,`, `.` and spaces, keeps its text when Enter finds an error, and Enter on an empty field returns the account to the global ceilings. The keys are listed in the `?` help under *text fields*.
 
 ### Tab shortcut hints
 
@@ -57,7 +59,46 @@ terminal cutting a hint in half.
 With `NO_COLOR` set to any non-empty value (<https://no-color.org>), the
 dashboard draws no colour at all: every cell keeps your terminal's default
 colours, bold, dim, reversed and underline stay, and text that would be red
-(errors, failures, a nearly spent window) is bold instead.
+(errors, failures, a nearly spent window) is bold instead. The two trend
+charts (tokens per day in `stats`, tokens/sec in `perf`) then mark every
+sample with its series' glyph — `*`, `+`, `x`, `o`, the same glyph in the
+legend — so four lines stay apart without colour.
+
+The status line (the row above the key bar) shows the last message for
+5 seconds, led by how it went: `✓ ok` (it worked, or it was accepted and is
+under way — `switching to …`), `! warn` (nothing happened or only part of it:
+cancelled, refused before trying, saved but live only after a restart, a
+stale read riding on a success) or `✗ fail`. The glyph and the word say it
+without colour too; under `NO_COLOR` a failure is also bold. A message wider
+than the terminal ends in `…`. A refresh of several accounts with failures
+(`f` in the accounts tab) is not squeezed into that row: it opens a card in
+the top-right corner, under the tab row — `fail` in its border,
+`✗ refresh: 1 ok, 5 FAILED`, then one line per failed account with its error
+and `+N more` past four lines. The card stays for 8 seconds (5 for a
+warning); a newer card replaces it, and at 64 columns or fewer it is a
+one-row banner instead.
+
+A label that waits on a load — `loading sessions…` and then the title's
+`loading… N%` in the sessions tab, `· loading…` in the keys title,
+`loading raw record…` in the raw viewer — is still for 0.6 seconds after the
+load starts (a quicker load never moves), then a band of light passes across
+it every 4 seconds. The band is weight only — dim at rest, bold at its crest —
+so it also shows under `NO_COLOR`; the words never change. With
+`LLMUX_REDUCED_MOTION` set to any non-empty value the label is plain bold and
+its spinner holds still.
+
+Each pane and overlay section opens with a rule: two cells of `─`, its
+title, then `─` to the right edge (`── accounts · sort name · … ────`). A
+title too long for its row ends in `…`. The scheduler and detail band's top
+border opens the same way. Some terminals draw East-Asian Ambiguous glyphs
+two cells wide (a common setting with Korean, Japanese and Chinese locales).
+There `─` takes two cells, so a rule would run past the right edge. Start
+the dashboard with `LLMUX_AMBIGUOUS_WIDE=1` and the rules draw ASCII `-`
+instead (`-- accounts · sort name · … ----`). Each rule also stops a few
+cells short, by the extra cells its own `·` and `—` take there, so it ends
+at the right edge. Any other value, or none, keeps `─`. The dashboard reads
+the variable once when it starts, like `NO_COLOR`. It changes only the
+rules: table rows, gauges and the popups' box borders draw as before.
 
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
@@ -128,17 +169,42 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   grouped (`$112,293.04`; the old 9-cell column cut it to `$112293.0`), the
   decimal point in one column, cents dimmer, and `—` for a model no rate
   prices (it read `$0.0000`). Narrower terminals keep the one-model-per-row
-  table. The
-  packing choice reserves room for the widest `last` value (`N in-flight`),
-  so a model starting or finishing a request does not change the strip's
-  height.
+  table. In the `stats` tab, the model detail beside the table (110 columns
+  and wider) gives the cursored model's counts as a fact table: requests,
+  ok, errors and cost on the left, tokens in, tokens out, cache read and
+  cache write on the right, every figure right-aligned on its last digit,
+  and `—` for a cache class the upstream never reported or a cost no rate
+  prices. Every
+  packed entry reserves room for the widest `last` value (`N in-flight`),
+  so a model starting or finishing a request changes neither the strip's
+  height nor where its columns start (the second column used to slide
+  sideways with the first column's `last` text). Clicking a model in the
+  strip, packed or as a table row, opens the `stats` tab with that model
+  under the cursor.
 - **Header tail.** When the header does not fit its row, its last part —
   `cfg <config path>` and the attach marker — moves to the right end of the
   tab row. There your home directory is shown as `~`, and the marker reads
   just `attached` when it names the same pid the header already shows
   (`attached → pid N` for another pid; `pid ?` and `reconnecting` are shown
-  as before). If the tab row has no room either, the tail is left out (the
-  header used to cut it off). When the whole header fits, nothing moves.
+  as before). If the tab row has no room either, the tail stays in the
+  header and competes for the row like everything else (next item). When
+  the whole header fits, nothing moves.
+- **Narrow header.** The header starts with the health verdict
+  (`[OK]`/`[WARN]`/`[FAIL]` and what it is about) and always keeps it
+  whole. On a row too narrow for the rest, whole items drop, least
+  important first: `cfg <path>`, the account count `·N`, the build tag
+  (`(preview …)`), the upstream, `pid`, the uptime, the port, the version;
+  the attach marker is kept longest. An item that does not fit whole gives
+  way to the next one that does, so nothing is cut in the middle — at 80
+  columns the header reads `[FAIL] … +2  llmux 0.2.26` and ends there,
+  where the terminal used to cut it off mid-item.
+- **Settings line.** One group per backend:
+  `sched <mode>  │  claude N acc  │  codex <model> effort:<e> fast:<f>  │  grok effort:<e>  │  gemini N acc`.
+  On a row too narrow for all of them, whole groups drop — the account
+  counts first, then grok, then codex; the scheduler mode stays — and `+N`
+  at the end says how many groups are not shown. A click on an underlined
+  value rotates the value drawn under the pointer (positions are measured
+  in terminal cells, so a wide model name does not shift them).
 - **Folding spent accounts (`z`).** Off by default. `z` on the dashboard
   turns it on or off for this session, the same way `u` works, and while
   it is on the key bar ends with `z fold`. It folds only the accounts the
@@ -164,8 +230,9 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   cursor still moves through every account in table order, a folded
   account under the cursor is highlighted like a table row, and clicking
   a folded account works like clicking its row. When the terminal is too
-  short, `+N more` counts the table rows that do not fit plus the folded
-  accounts on the lines that do not fit. The columns keep room for the
+  short, the block's last line reads `+N more` for the folded accounts it
+  cannot show (the lines used to stop at the pane's edge), and the title's
+  `+N more` counts the table rows that do not fit plus those accounts. The columns keep room for the
   widest form of every value the clock changes (a reset countdown with
   its `◑` mark, a Fable window resetting), so the block does not move as
   time passes. The fold never makes the accounts pane taller.
@@ -176,6 +243,31 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   folded lines would not take fewer rows than the accounts they fold
   (always the case with one or two spent accounts). Pressing `z` only says
   `fold on` or `fold off`.
+- **Compact account list (`V`).** One row per account: a focus mark, a
+  glyph for what the account is doing, its name and, when the column has
+  room for every name, the state's word — `✗ error 401` (auth failed),
+  `◌ 7d spent` / `5h spent` (over a ceiling until the window resets),
+  `◉ cooling 45m10s` (parked by a cooldown), `⠋ active` (the scheduler's
+  current account; the glyph turns), `◦ ok` (eligible), `ǁ paused` and
+  `? stale` (usage too old to trust). Every glyph is one cell wide, CJK
+  terminals included, so states differ by shape under `NO_COLOR` too. The
+  rows keep the table's order and run down, then across in as many
+  columns as fit (at least 14 cells each). The title keeps the sort and
+  the account count (and the group counts when they fit), adds a one-line
+  tally of the states with their glyphs (`✗ 1 error · ◌ 10 spent · ⠋ 2
+  active …`; a slot two states share reads `spent+cooling` or
+  `paused+stale`, and the tally drops whole counts with `…` when the width
+  runs out) and ends with `+N more` for the accounts that do not fit. The
+  account under the cursor (the switcher, a remove/reset card, the
+  context menu) is marked `›` and reversed, and the list moves to keep it
+  in view. A left click on an entry opens that account's detail modal and
+  a right click (dashboard) its context menu, exactly like its table row.
+  `V` on the accounts tab switches between the table and the list for this
+  session (the footer says `V compact` or `V table`); the dashboard uses the
+  list by itself whenever its table would show fewer than 5 account rows
+  and still hide some (at 80×24 the table showed 2 rows and `+19 more` of
+  21 accounts; the list shows 10). `z` folding does not apply while the
+  list is shown.
 
 ### Reading account quota columns
 
@@ -188,7 +280,12 @@ is no `5h` column: no provider reports a 5h window any more (the scheduler's
 
 The time inside a weekly gauge is its reset countdown, shown bare and
 centered (`7d 10h`, or the absolute stamp under `t`); the header's `RESET`
-names it. Cold or unavailable cells show no reset time. The `rst` column
+names it. A value that is not fresh carries its state glyph (`○` cold, `◑`
+stale, `!` poll-degraded) in the bar's last cell; in the narrowest bar the
+absolute stamp then shows its date only (`07/07`) rather than a time with
+its last digit cut. On the cursor row the bar's empty part is drawn
+without the row highlight, so the fill stays visible. Cold or unavailable
+cells show no reset time. The `rst` column
 described below counts **reset credits/grants owned**; it is not a
 countdown.
 
@@ -212,7 +309,7 @@ Claude grants are gated upstream on the client **surface and version**: the endp
 
 ### Usage tab (calendar usage + cost)
 
-The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
+The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; when the rows overflow, a scrollbar in the table's last column shows where you are (it counts rows: a bucket row plus one per model) — click the track to jump, drag the thumb to scroll, and the table lands on the first bucket at or after that row; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
 
 ### Logs tab
 
@@ -227,11 +324,34 @@ Lines that leave the 500-line ring while you read move the text up by as
 much. Before the first line arrives it says `no log lines yet` — locally and
 attached — instead of showing an empty pane. `l`/`Esc` goes back, `q` quits.
 
+Drag across the lines with the left button to select them (drawn reversed;
+dragging past the top or bottom edge scrolls). Releasing copies the
+selection — exactly the cells shown, one line per row — through the same
+clipboard path as the raw viewer's copy buttons (`pbcopy`/`wl-copy`/`xclip`/
+`xsel`, else OSC 52, wrapped for tmux or GNU screen), and the status line
+confirms it (`copied 2 lines → pbcopy`). While a selection is shown the
+pager holds still instead of following (`held for the selection — End
+follows`); a plain click clears it, and `End` follows again.
+
+### Copy mode
+
+The dashboard captures the mouse for its clicks, drags and wheel, so the
+terminal's own text selection does not work over it. `v` — on the dashboard,
+in any tab, or over a modal, whenever no prompt is open and nothing is being
+typed — releases the mouse to the terminal: select and copy with it as you
+would anywhere else (an account email, an error on the status line, an
+activity row). The footer's key bar becomes the banner `copy mode — mouse
+released for selecting; press v/Esc to return`; the status line above it
+keeps its message. While copy mode is on the screen holds still (it redraws
+only on a resize) and every key but `v`/`Esc` is ignored, so nothing moves
+under the selection; `v` or `Esc` takes the mouse back and the dashboard
+carries on where it was. `Ctrl-C` still quits.
+
 ### Perf tab (observed performance)
 
 The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: passive telemetry from real proxied requests — deliberately not an active healthcheck. Three panes over a selectable trailing span (`d` cycles 7/14/30/90 days):
 
-- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series, y = end-to-end output tokens/sec (`Σoutput / Σduration` per day).
+- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series (the top four; the legend counts the rest as `+N more`), y = end-to-end output tokens/sec (`Σoutput / Σduration` per day). A day with fewer than 5 throughput samples is drawn dim and the legend says `(dim = n<5)`; a day without samples is a gap. The `stats` tab's tokens-per-day chart is the same chart over token totals, its legend giving each model's share of every token in the span; a day with no recorded request at all — before the history starts, for example — is a gap there too, while a recorded day on which a model served nothing reads 0.
 - **Provider health matrix** — one row per day, one column per provider: request count, error %, average TTFB (time to first upstream body byte), and e2e t/s. A day with no traffic renders `—`, never a fabricated `0`.
 - **Series table** — per `(provider, model, fast)` over the span (`j`/`k` scroll): requests, error %, output tokens, `e2e t/s`, `est t/s`, average TTFB, and measured coverage (`measured/throughput` samples).
 
@@ -246,7 +366,7 @@ Metric semantics (v1, deliberately conservative):
 
 The activity feed gains the same per-request view: a `t/s` column (e2e) on every completed row, and the click-expanded detail shows `e2e` / `est … post-delta` / `ttfb` / `first output` when recorded. Attach clients receive the same rows on `GET /llmux/dashboard` (`daily_perf`).
 
-In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
+In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. When the sessions overflow, a scrollbar in the list's last column shows where you are; clicking its track or dragging its thumb scrolls the list by moving the cursor, as the wheel does. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
 
 ### Config tab (the config editor)
 
@@ -257,9 +377,9 @@ The `config` tab (`c`, or click the tab bar) is a mouse-driven config editor cov
 - `session` — this TUI only (reset display).
 - `ro` — managed elsewhere, with the note saying where (accounts → Accounts tab, per-account limits → `L`, events → `POST /llmux/events`, pricing/gradient colors/domain abbreviations → config file, `remote.api_key` → secret).
 
-Rows show a section column, the label, then the value in a column measured on the widest label (so a label never runs into its value), the apply state and a note cut with `…` where the screen ends. Read-only rows are dim and marked `(disabled: <where it is managed>)`. When the rows do not all fit, `▾`/`▴` and `N of M` say so. `j`/`k`, the arrows, `PgUp`/`PgDn`, `Home`/`End` (or the wheel) move the cursor over the editable rows — read-only rows are skipped — and stop at the ends; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0, a retention decrease — open a confirmation card above the footer that states the setting and its current → new value (`Set routing.enabled: off → on?`) and what applying it does, with two numbered choices: `1`/`y` applies, `2`/`n`/`Esc` cancels, `↑↓` move the mark and `Enter` answers the marked choice (Apply until you move it). The raw-io `retention` row is read-only ("never deletes"); the settings API rejects `raw_io_retention_days`. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
+Rows show a section column, the label, then the value in a column measured on the widest label (so a label never runs into its value), the apply state and a note cut with `…` where the screen ends. Read-only rows are dim and marked `(disabled: <where it is managed>)`. When the rows do not all fit, `▾`/`▴` and `N of M` say so. `j`/`k`, the arrows, `PgUp`/`PgDn`, `Home`/`End` (or the wheel) move the cursor over the editable rows — read-only rows are skipped — and stop at the ends; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt, a text field (see **Text fields** above) with the caret at the end of the current value (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0, a retention decrease — open a confirmation card above the footer that states the setting and its current → new value (`Set routing.enabled: off → on?`) and what applying it does, with two numbered choices: `1`/`y` applies, `2`/`n`/`Esc` cancels, `↑↓` move the mark and `Enter` answers the marked choice (Apply until you move it). The raw-io `retention` row is read-only ("never deletes"); the settings API rejects `raw_io_retention_days`. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
 
-The `misc` tab (`?`) carries the keybinding reference plus daemon facts. The reference is built from the same key tables the footers use — one group per surface (dashboard, accounts, stats, usage, keys, perf, sessions, logs, config), the account switcher, the raw viewer, the surface keys and the mouse — in up to three columns; in attach mode it shows `R disabled (attached)` exactly as the footer does, and when the groups do not fit it ends in `… +N more` instead of dropping rows silently. Every footer bar, the limits and add-key prompts and the raw viewer's legend drop whole hints and count them (`… +N more`) when the terminal is too narrow. The facts: config path, account count, raw-io capture state and store size (partitions, archives, spool, legacy), and the activity-log size (sizes refresh at most every 30s).
+The `misc` tab (`?`) carries the keybinding reference plus daemon facts. The reference is built from the same key tables the footers use — one group per surface (dashboard, accounts, stats, usage, keys, perf, sessions, logs, config), the account switcher, the raw viewer, the surface keys and the mouse — in up to three columns; in attach mode it shows `R disabled (attached)` exactly as the footer does, and when the groups do not fit it ends in `… +N more` instead of dropping rows silently. Every footer bar, the limits and add-key prompts and the raw viewer's legend drop whole hints and count them (`… +N more`) when the terminal is too narrow. The facts, under the key grid: the build (version, daemon pid, port, uptime) on the left and the daemon (account count, raw-io capture state and store size — partitions, archives, spool, legacy — and the activity-log size) on the right, figures right-aligned on their last digit and `—` for a size not measured yet (sizes refresh at most every 30s); one column under the other on a narrow pane; the config path on its own row below.
 
 ## Install and launch details
 
@@ -358,6 +478,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 | Gemini backend group (`llmux login --gemini`, the dashboard picker's Gemini row, `gemini` / `argon` models, Islands Gemini tiles) | no | yes | yes |
 | Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | yes | yes |
 | `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | yes | yes |
+| Compact account list (`V` on the accounts tab; automatic on a dashboard whose table would show fewer than 5 rows) ([Dashboard layout](#dashboard-layout-main)) | no | no | yes |
 | Explicit Haiku 4.5 ids served by Haiku 5.5 on Claude Code / Agent SDK–shaped requests with default sampling and the bare `quota` probe (bare, custom-system or non-default-sampling requests still reach Haiku 4.5; row retired), Claude Code system block on the bare `quota` probe ([models](models.md#alias-semantics)) | no | yes | yes |
 | Subscription plan per account: `plan` / `rate_limit_tier` / `plan_type` in `/llmux/status`, `llmux status` lines (`max20 · 7d 66% left`), TUI detail pane ([Usage controls](#usage-controls-refresh--resets)) | no | yes | yes |
 
@@ -493,7 +614,7 @@ the in-memory activity fold, so they survive restarts and can be narrowed:
 |---|---|
 | `w` | Cycle the window: `all` → `1h` → `24h` → `7d` → `14d` → `30d` → `90d` → `all`. Each window is the exact closed interval `[now − duration, now]`; future-stamped rows are never counted. |
 | `f` | Multi-select the models observed in the current window — `↑/↓` (or `j`/`k`) move, `Space` toggles, `a` selects all, `c` clears, `/` starts a type-to-filter (fuzzy, matched letters highlighted; letters are picker keys until then — while it is open they type, `Esc` or `Backspace` on an empty filter closes it), `Enter` applies, `Esc` cancels. `k of n selected` counts every model and says how many the filter hides. No selection = every model. The offered list is the window's models, never narrowed by the filter already applied, so a selection can be changed and not just narrowed; opened while the query is still loading, it fills in when the answer lands (checks and the cursor row kept). The popup is sized to its rows, and the footer bar lists the picker's keys while it is open. |
-| `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. |
+| `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. The mouse wheel scrolls too, and when the rows overflow a scrollbar on the panel's right border shows where you are: click the track to jump, drag the thumb to scroll. |
 | `r` | Re-run the query. |
 
 On a narrow terminal the table sheds its widest, lowest-value columns (the
@@ -501,8 +622,9 @@ On a narrow terminal the table sheds its widest, lowest-value columns (the
 `└ group/model` labels stay readable down to 80 columns.
 
 The title always states the active question (`window 24h · 2 model(s) · N
-requests`). A pending query says `loading…` and a failed one says why — a
-filtered or failed view is never redrawn as unfiltered data or as zeros.
+requests`). A pending query says `loading…`, with a band of light passing
+across it, and a failed one says why — a filtered or failed view is never
+redrawn as unfiltered data or as zeros.
 With explicit models selected, requests that failed before routing (no model
 attributed) drop out; under `all models` they stay, so the admin view still
 accounts for every observed completion.
@@ -547,7 +669,7 @@ accounts for every observed completion.
 
 Only one process can own port 3456 — normally the background daemon created by `llmux run`. To inspect it:
 
-- `llmux dashboard` polls `GET /llmux/dashboard` once a second and renders the same view model the in-process TUI uses. Dropped connections show a reconnecting banner and keep retrying.
+- `llmux dashboard` polls `GET /llmux/dashboard` once a second and renders the same view model the in-process TUI uses. Dropped connections show a reconnecting banner and keep retrying. Until the first document arrives the screen shows a spinner and how long it has been trying — `⠋ connecting to daemon — retrying… (42s) - q quit`; `q` quits. With `LLMUX_REDUCED_MOTION` set to any non-empty value that spinner holds still and its label is plain bold (the count still runs).
 - `llmux server`, when a llmux daemon already owns the port, prints `daemon already running (pid N) — attaching…` and enters attach mode instead of failing with `Address already in use`.
 - A foreign process on the port remains a clean error and is never overwritten.
 
@@ -721,17 +843,26 @@ from a day that is already archived answers "in the DAY archive — run
   for gemini) → `Upstream Resp` (the provider's
   verbatim reply before conversion) → `Response` (what the client
   received). A byte-identity Anthropic passthrough shows the classic 2 tabs
-  (client and upstream exchange are the same bytes). Click a tab or walk
-  with `←`/`→`/`Tab`/`h`/`l`.
+  (client and upstream exchange are the same bytes). The tabs sit on the
+  same strip as the dashboard's tab row (`Request │ Response`, the active
+  one bold); click a tab or walk with `←`/`→`/`Tab`/`h`/`l`.
 For Claude-through-Codex, the `claude-agent-sdk` upstream legs record the Messages
 bridge transport, not the SDK’s private HTTP bytes; only the original client
 request is a replayable HTTP request. Raw capture is enabled by default and follows
 the configured size/redaction limits.
 
-- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, and the
-  wheel scroll vertically; `H`/`L` (or a horizontal wheel) pan sideways.
-  Proportional scrollbars render on the right and bottom edges when the
-  content overflows.
+- **Body.** The general and header sections come first as plain lines,
+  then the body — one JSON document pretty-printed and coloured, an SSE
+  stream line by line. Long lines (a base64 image, a minified stream) wrap
+  at the modal's width with continuation rows under their indent, so
+  nothing runs off the right edge and nothing pans sideways; the bottom
+  row says `lines 12–40 of 213` (or `17 lines` when it all fits), counted
+  in the body's own lines. An 8 MiB line is wrapped once per width, so
+  scrolling through it stays fast.
+- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn` (the view's height),
+  `Home`/`End`, and the wheel scroll. When the lines overflow, a scrollbar
+  on the right edge shows where you are: click its track to jump, drag
+  its thumb to scroll.
 - **Action buttons** (top-right, click or key): `copy` (`c`) puts the
   active tab's raw body on the system clipboard; `copy as curl` (`C`)
   reconstructs a replayable curl for that tab's side of the exchange
@@ -740,7 +871,8 @@ the configured size/redaction limits.
   `save all` (`S`) write the body / the whole record JSON to `~/Downloads`
   (timestamped). Clipboard uses `pbcopy`/`wl-copy`/`xclip`/`xsel` when
   available, falling back to the OSC 52 terminal escape; the outcome
-  flashes on the modal's hint line. Inside tmux or GNU screen the OSC 52
+  flashes on the modal's hint line for 5 seconds (it was 3), led by
+  `✓ ok`, `! warn` or `✗ fail` like the status line. Inside tmux or GNU screen the OSC 52
   escape is wrapped in the multiplexer's passthrough so it reaches your
   terminal (tmux 3.3 or later also needs `set -g allow-passthrough on`).
 - `Esc`/`q`/`Enter` closes. Records written by a daemon predating a field

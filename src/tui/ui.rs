@@ -9,15 +9,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+use twolab_tui::fact_table::{Fact, FactTable};
+use twolab_tui::meter::{Fill, Meter};
+use twolab_tui::packed_grid::{self, GridPlan, PackedGrid};
 use twolab_tui::spinner::SpinnerKind;
 use twolab_tui::text as cells;
+use twolab_tui::trend_chart::{Series, TrendChart};
+use twolab_tui::Level;
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -33,7 +34,7 @@ use super::event::TokenCounts;
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
+use super::{AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState, StatusMsg};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -100,6 +101,111 @@ const HEATMAP_BAR_WIDTH: usize = 12;
 
 fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
+}
+
+thread_local! {
+    /// This frame's [`Chrome::ambiguous_wide`], set by [`draw`] before it
+    /// draws anything, so every section rule reads it without the flag
+    /// riding through each pane's signature. Thread-local rather than a
+    /// global: a test frame drawn with it on never leaks into a frame drawn
+    /// beside it.
+    static AMBIGUOUS_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The cells of rule twolab-tui `Rule` draws before a title (`── accounts`).
+const RULE_LEAD: usize = 2;
+
+/// The cells a section rule's title takes beyond its text: the
+/// [`RULE_LEAD`] and a space each side (`── accounts ─`).
+const RULE_TITLE_PAD: usize = RULE_LEAD + 2;
+
+/// Draw a section heading on `area`'s first row — a twolab-tui `Rule` with
+/// `title` at its left in the default foreground, `─` switched to its ASCII
+/// fallback `-` where the terminal draws Ambiguous glyphs wide — and
+/// return the rows under it — what `Block::new().borders(Borders::TOP)`
+/// gave the section's body. On a terminal that draws Ambiguous glyphs wide
+/// the rule also stops short by the extra cells its title's own Ambiguous
+/// characters (`—`, `·`) take there, so the row ends at the right edge
+/// instead of wrapping.
+fn section(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    section_line(frame, area, Line::from(title.trim().to_string()))
+}
+
+/// [`section`] with a styled title — the sessions title carries the
+/// loading label's shimmer spans. Leading and trailing spaces of the title
+/// are trimmed, as [`section`] trims a plain one.
+fn section_line(frame: &mut Frame, area: Rect, title: Line<'static>) -> Rect {
+    if area.height == 0 {
+        return area;
+    }
+    let mut title = title;
+    if let Some(first) = title.spans.first_mut() {
+        first.content = first.content.trim_start().to_string().into();
+    }
+    if let Some(last) = title.spans.last_mut() {
+        last.content = last.content.trim_end().to_string().into();
+    }
+    let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+    let wide = AMBIGUOUS_WIDE.with(std::cell::Cell::get);
+    let width = if wide {
+        area.width.saturating_sub(ambiguous_extra(&text) as u16)
+    } else {
+        area.width
+    };
+    frame.render_widget(
+        twolab_tui::rule::Rule::new()
+            .label(title)
+            .ambiguous_wide(wide),
+        Rect {
+            width,
+            height: 1,
+            ..area
+        },
+    );
+    Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    }
+}
+
+/// Where Ambiguous glyphs draw two cells wide, blank the last cells of the
+/// rule `row` that `text` — everything on the row, its title included —
+/// pushes past the right edge: for a legend laid on a rule after
+/// [`section`] drew it (which stopped short by the title's alone).
+fn rule_stop_short(frame: &mut Frame, row: Rect, text: &str) {
+    if !AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        return;
+    }
+    let extra = (ambiguous_extra(text) as u16).min(row.width);
+    let buf = frame.buffer_mut();
+    for x in row.right() - extra..row.right() {
+        buf[(x, row.y)].reset();
+    }
+}
+
+/// The cells `text` takes beyond its width when Ambiguous glyphs are drawn
+/// two cells wide.
+fn ambiguous_extra(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width_cjk().saturating_sub(text.width())
+}
+
+/// Cells a section title takes on its rule: its text plus
+/// [`RULE_TITLE_PAD`] — what a legend drawn after the title starts past.
+fn section_title_width(title: &str) -> usize {
+    cells::width(title.trim()) + RULE_TITLE_PAD
+}
+
+/// `n` cells of the rule glyph for a hand-drawn rule (the band's top
+/// border): `─`, or `-` when Ambiguous glyphs are drawn wide.
+fn rule_fill(n: usize) -> String {
+    let glyph = if AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        twolab_tui::rule::ASCII
+    } else {
+        twolab_tui::rule::SOLID
+    };
+    std::iter::repeat_n(glyph, n).collect()
 }
 
 /// `value`'s share of `max` as a twolab-tui mini bar (`▰▰▰▱▱▱`, empty cells
@@ -251,6 +357,7 @@ pub(crate) fn draw(
     // No activity panel hit-targets until MAIN draws one this frame (cleared so
     // a stale layout from a previous frame can never mis-map a click).
     *hits = None;
+    AMBIGUOUS_WIDE.with(|wide| wide.set(chrome.ambiguous_wide));
     let Some(view) = view else {
         draw_connecting(frame, chrome);
         return;
@@ -292,18 +399,30 @@ pub(crate) fn draw(
             }
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
-        Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
+        Overlay::Usage => {
+            let bar;
+            (usage_scope, bar) = draw_usage_overlay(frame, overlay_area, view, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.table_scroll = bar;
+            }
+        }
         Overlay::Logs => {
             let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
             if let Some(hits) = hits.as_mut() {
                 hits.logs = Some(pos);
+                hits.logs_area = Some(overlay_area);
             }
         }
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
-        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view, chrome),
+        Overlay::Keys => {
+            let bar = draw_keys_overlay(frame, overlay_area, view, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.table_scroll = bar;
+            }
+        }
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -321,7 +440,7 @@ pub(crate) fn draw(
     // footer — same layering contract as the input modal (the two are never
     // open at once: each swallows the clicks that could open the other).
     if let Some(modal) = &chrome.raw_modal {
-        let raw_chrome = draw_raw_modal(frame, modal);
+        let raw_chrome = draw_raw_modal(frame, modal, chrome.clock, chrome.motion);
         if let Some(hits) = hits.as_mut() {
             hits.raw_modal = Some(raw_chrome);
         }
@@ -342,6 +461,9 @@ pub(crate) fn draw(
     // stands on the footer, over whichever surface opened it.
     draw_gate(frame, view, &ctx, chrome);
     draw_login_picker(frame, chrome);
+    // Status messages with several facts float over everything but the
+    // footer, in the corner under the tab row.
+    draw_toasts(frame, overlay_area, chrome, ctx.mask);
 
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
@@ -352,9 +474,15 @@ pub(crate) fn draw(
         height: 2,
     };
     frame.render_widget(Clear, footer_area);
-    draw_footer(frame, footer_area, chrome, ctx.mask);
+    let footer_field = draw_footer(frame, footer_area, chrome, ctx.mask);
+    if let Some(hits) = hits.as_mut() {
+        hits.field_width = hits.field_width.or(footer_field);
+    }
     // Usage context uses only the spare status row; flashes and modal chrome win.
-    if chrome.status_line.as_deref().is_none_or(str::is_empty)
+    if chrome
+        .status_line
+        .as_ref()
+        .is_none_or(|m| m.text.is_empty())
         && matches!(chrome.mode, Mode::Normal)
         && chrome.input_modal.is_none()
         && chrome.raw_modal.is_none()
@@ -502,11 +630,19 @@ fn draw_main(
     let (tabs, tabs_room) = draw_tabs(frame, tabs_area, chrome.overlay);
     let header_tail = draw_header(frame, header_area, view, chrome, now, tabs_room);
     draw_tabs_tail(frame, tabs_area, header_tail);
-    let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
+    // A table that would show fewer than COMPACT_BELOW rows and hide the
+    // rest gives way to the compact list, which shows more of them.
+    let account_rows = if table_crowded(snapshot.accounts.len(), fold.plan(), table_height) {
+        draw_accounts_compact(frame, table_area, view, ctx, chrome)
+    } else {
+        draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout)
+    };
     draw_middle(frame, middle_area, view, &middle);
-    if strip_height > 0 {
-        draw_models_strip(frame, strip_area, view, ctx, now, strip);
-    }
+    let models_strip = if strip_height > 0 {
+        draw_models_strip(frame, strip_area, view, ctx, now, strip)
+    } else {
+        Vec::new()
+    };
     let activity = draw_activity(frame, activity_area, view, chrome, now);
     // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
     // pane above it. With no model strip the activity border resizes the
@@ -536,15 +672,21 @@ fn draw_main(
     }
     let settings = draw_group_settings(frame, groups_area, view);
     // The context menu (UI-3 U11) draws last so it floats over every pane.
+    // Its bounds stop above the footer, which `draw` paints over everything.
+    let menu_bounds = Rect {
+        height: footer_area.y.saturating_sub(area.y),
+        ..area
+    };
     let menu = chrome
         .menu_anchor
         .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
-        .map(|anchor| draw_context_menu(frame, view, ctx, chrome, anchor));
+        .map(|anchor| draw_context_menu(frame, menu_bounds, view, ctx, chrome, anchor));
     *hits = Some(MainChrome {
         activity,
         tabs,
         separators,
         account_rows,
+        models_strip,
         menu,
         sessions_table: None,
         config_rows: Vec::new(),
@@ -553,11 +695,13 @@ fn draw_main(
         input_modal: None,
         account_modal: None,
         logs: None,
+        logs_area: None,
+        table_scroll: None,
         raw_modal: None,
+        field_width: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
-    let _ = footer_area;
 }
 
 /// The group-settings bar (UI-3 U9/U10): one bottom row showing each backend
@@ -565,53 +709,84 @@ fn draw_main(
 /// setting (scheduler mode, codex model / effort / fast, grok effort).
 /// Effort `bypass` = the client's own value rides through (UI-3 U12).
 /// Claude and gemini have no live settings, so they show an account count.
+///
+/// Laid out by twolab-tui's `StatusBar`, one segment per group joined by
+/// `  │  `: on a row too narrow for all of them whole groups drop — the
+/// account counts first, then grok, then codex; the scheduler mode stays —
+/// and `+N` says how many went. The click rects come from
+/// `StatusBar::hits`, so a click lands on the value that is drawn there,
+/// measured in cells (a wide model name included).
 fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+    use twolab_tui::status_bar::{Segment, StatusBar};
     if area.height == 0 {
         return Vec::new();
     }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut hits: Vec<SettingHit> = Vec::new();
-    let mut x = area.x;
-    let push_plain = |spans: &mut Vec<Span<'static>>, x: &mut u16, text: String, style| {
-        let w = text.chars().count() as u16;
-        spans.push(Span::styled(text, style));
-        *x += w;
-    };
+    let groups = settings_groups(view);
+    let bar = StatusBar::new(KEYBAR_THEME)
+        .style(dim())
+        .separator("  │  ")
+        .count_dropped(true)
+        .segments(groups.iter().map(|g| {
+            let text: String = g
+                .parts
+                .iter()
+                .map(|(span, _)| span.content.as_ref())
+                .collect();
+            Segment::new(text).priority(g.priority)
+        }));
+    let row = Rect { height: 1, ..area };
+    frame.render_widget(&bar, row);
+    let mut hits = Vec::new();
+    for (i, rect) in bar.hits(row) {
+        // The bar drew the group's text in one style; paint its own styles
+        // over exactly those cells, then map each value to where it is.
+        let parts = &groups[i].parts;
+        let spans: Vec<Span<'static>> = parts.iter().map(|(span, _)| span.clone()).collect();
+        let line = cells::truncate_line(Line::from(spans), usize::from(rect.width));
+        frame
+            .buffer_mut()
+            .set_line(rect.x, rect.y, &line, rect.width);
+        let mut x = rect.x;
+        for (span, action) in parts {
+            let right = x
+                .saturating_add(cells::width(&span.content) as u16)
+                .min(rect.right());
+            if let Some(action) = *action {
+                if right > x {
+                    hits.push(SettingHit {
+                        area: Rect::new(x, rect.y, right - x, 1),
+                        action,
+                    });
+                }
+            }
+            x = right;
+        }
+    }
+    hits
+}
+
+/// One group on the group-settings bar: its parts in their styles, each
+/// with the setting a click on it rotates, and how long it stays when the
+/// row is narrow (higher stays longer; equals drop from the right).
+struct SettingsGroup {
+    parts: Vec<(Span<'static>, Option<SettingAction>)>,
+    priority: u8,
+}
+
+/// The groups of the settings bar, left to right: the scheduler mode, then
+/// each backend group that is present.
+fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
     let clickable = Style::new()
         .fg(Color::Cyan)
         .add_modifier(Modifier::UNDERLINED);
-    let push_click = |spans: &mut Vec<Span<'static>>,
-                      hits: &mut Vec<SettingHit>,
-                      x: &mut u16,
-                      text: String,
-                      action: SettingAction| {
-        let w = text.chars().count() as u16;
-        hits.push(SettingHit {
-            area: Rect {
-                x: *x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-            action,
-        });
-        spans.push(Span::styled(text, clickable));
-        *x += w;
+    let plain = |text: String, style: Style| (Span::styled(text, style), None);
+    let click = |text: String, action: SettingAction| (Span::styled(text, clickable), Some(action));
+    let name = |group: &'static str| {
+        plain(
+            format!("{group} "),
+            group_color(Some(group)).add_modifier(Modifier::BOLD),
+        )
     };
-    let sep = |spans: &mut Vec<Span<'static>>, x: &mut u16| {
-        spans.push(Span::styled("  │  ", dim()));
-        *x += 5;
-    };
-
-    push_plain(&mut spans, &mut x, " sched ".into(), dim());
-    push_click(
-        &mut spans,
-        &mut hits,
-        &mut x,
-        view.select_params.mode.label().to_string(),
-        SettingAction::SchedMode,
-    );
-
     let count = |g: BackendGroup| {
         view.snapshot
             .accounts
@@ -619,79 +794,63 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
             .filter(|a| a.group == g)
             .count()
     };
+    let mut groups = vec![SettingsGroup {
+        parts: vec![
+            plain(" sched ".into(), dim()),
+            click(
+                view.select_params.mode.label().to_string(),
+                SettingAction::SchedMode,
+            ),
+        ],
+        priority: 3,
+    }];
     let claude_n = count(BackendGroup::Claude);
     if claude_n > 0 {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "claude ".into(),
-            group_color(Some("claude")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, format!("{claude_n} acc"), dim());
+        groups.push(SettingsGroup {
+            parts: vec![name("claude"), plain(format!("{claude_n} acc"), dim())],
+            priority: 1,
+        });
     }
     if view.codex.available {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "codex ".into(),
-            group_color(Some("codex")).add_modifier(Modifier::BOLD),
-        );
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.codex.model.clone(),
-            SettingAction::CodexModel,
-        );
-        push_plain(&mut spans, &mut x, " effort:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
-            SettingAction::CodexEffort,
-        );
-        push_plain(&mut spans, &mut x, " fast:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            if view.codex.fast { "on" } else { "off" }.into(),
-            SettingAction::CodexFast,
-        );
+        groups.push(SettingsGroup {
+            parts: vec![
+                name("codex"),
+                click(view.codex.model.clone(), SettingAction::CodexModel),
+                plain(" effort:".into(), dim()),
+                click(
+                    view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
+                    SettingAction::CodexEffort,
+                ),
+                plain(" fast:".into(), dim()),
+                click(
+                    if view.codex.fast { "on" } else { "off" }.into(),
+                    SettingAction::CodexFast,
+                ),
+            ],
+            priority: 2,
+        });
     }
     if view.grok.available {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "grok ".into(),
-            group_color(Some("grok")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, "effort:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
-            SettingAction::GrokEffort,
-        );
+        groups.push(SettingsGroup {
+            parts: vec![
+                name("grok"),
+                plain("effort:".into(), dim()),
+                click(
+                    view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
+                    SettingAction::GrokEffort,
+                ),
+            ],
+            priority: 2,
+        });
     }
     let gemini_n = count(BackendGroup::Gemini);
     if gemini_n > 0 {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "gemini ".into(),
-            group_color(Some("gemini")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, format!("{gemini_n} acc"), dim());
+        groups.push(SettingsGroup {
+            parts: vec![name("gemini"), plain(format!("{gemini_n} acc"), dim())],
+            priority: 1,
+        });
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    hits
+    groups
 }
 
 /// The tab strip (UI-3 U6): one row of clickable surface names right under
@@ -761,17 +920,24 @@ fn draw_accounts_overlay(
 ) -> Vec<AccountRowHit> {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
-    let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
+    // `v`: the compact list — a title row and a row per account.
+    let compact = chrome.compact_accounts && !snapshot.accounts.is_empty();
+    let table_height =
+        (snapshot.accounts.len().max(1) as u16).saturating_add(if compact { 1 } else { 2 });
     let [table_area, detail_area] =
         Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
-    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
+    let account_rows = if compact {
+        draw_accounts_compact(frame, table_area, view, ctx, chrome)
+    } else {
+        draw_accounts(frame, table_area, view, ctx, chrome)
+    };
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" detail "));
-        frame.render_widget(empty, detail_area);
+        )));
+        let body = section(frame, detail_area, " detail ");
+        frame.render_widget(empty, body);
     } else {
         draw_detail(frame, detail_area, view, ctx, chrome);
     }
@@ -810,7 +976,14 @@ fn draw_stats_overlay(
     ])
     .areas(area);
     if chart_height > 0 {
-        draw_daily_chart(frame, chart_area, view, ctx, chrome.chart_days);
+        draw_daily_chart(
+            frame,
+            chart_area,
+            view,
+            ctx,
+            chrome.chart_days,
+            chart_theme(),
+        );
     }
     let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
@@ -833,139 +1006,116 @@ fn draw_stats_overlay(
 }
 
 /// Height of the Tokens-per-Day chart slice in the Stats overlay (UI-3
-/// U14): border/title + plot rows + x-axis labels + legend line.
+/// U14): title rule + plot rows + x axis + x-axis labels + legend line.
 const DAILY_CHART_HEIGHT: u16 = 13;
 /// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
 /// overlay — UI-3 U14 period selection).
 pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
-/// Max model lines plotted at once (top by window tokens); more would turn
-/// minimal into noise.
-const DAILY_CHART_SERIES: usize = 4;
-/// Line colors by rank — chosen to stay distinct on dark terminals and to
-/// echo the group hues used elsewhere.
-const DAILY_CHART_COLORS: [Color; DAILY_CHART_SERIES] =
-    [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
 
-/// Tokens-per-Day line chart (UI-3 U14): one braille line per top model over
-/// the selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]),
-/// modern-minimal — no grid, dim axes,
-/// a single legend line with colored dots. Data = the daily fold carried on
-/// the document (history filled by the persisted-request replay).
+/// The theme both trend charts draw with (tokens per day, perf t/s). The
+/// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank, so
+/// this carries the hues the charts always had — magenta, cyan, yellow,
+/// green, distinct on dark terminals. Under `NO_COLOR` the charts draw with
+/// [`twolab_tui::Theme::mono`] instead ([`chart_theme`]), where a glyph at
+/// every sample (`* + x o`, also in the legend) tells the series apart.
+const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
+    accent: Color::Magenta,
+    wait: Color::Cyan,
+    done: Color::Yellow,
+    fail: Color::Green,
+    ..KEYBAR_THEME
+};
+
+/// [`CHART_THEME`], or mono under `NO_COLOR` — the frame loop's `decolor`
+/// pass alone would leave four identical lines.
+fn chart_theme() -> twolab_tui::Theme {
+    if super::no_color() {
+        twolab_tui::Theme::mono()
+    } else {
+        CHART_THEME
+    }
+}
+
+/// The one renderer of both trend charts (tokens per day, perf t/s): a top
+/// rule carrying `title`, then the twolab-tui trend chart — braille lines for
+/// the top four series, dim axes with three labels each, gaps where a day has
+/// no data, and a legend that counts the series it leaves out (`+N more`).
+fn draw_trend_chart(frame: &mut Frame, area: Rect, title: &str, chart: &TrendChart) {
+    let inner = section(frame, area, title);
+    frame.render_widget(chart, inner);
+}
+
+/// Tokens-per-Day line chart (UI-3 U14): one line per top model over the
+/// selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]), legend
+/// `model share%` with each model's share of every token in the span. Data =
+/// the daily fold carried on the document (history filled by the
+/// persisted-request replay). A day with no record at all — before history
+/// starts, or while nothing was recorded — is a gap; on a recorded day a
+/// model that served nothing reads 0.
 fn draw_daily_chart(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     chart_days: u64,
+    theme: twolab_tui::Theme,
 ) {
     let chart_days = chart_days.clamp(2, 366);
-    let today = ctx
-        .now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0);
-    let start = today.saturating_sub(chart_days.saturating_sub(1));
-    // Rank models by window total, then build one (x=day-offset, y=tokens)
-    // series per top model, zero-filled across the whole span so a quiet day
-    // reads as a drop to zero, not a gap.
+    let (start, today) = perf_window(ctx.now, chart_days);
     // Bounded on BOTH ends: a future-dated replay row (clock skew) must not
     // index past the series (review R1 MUST-FIX 2).
     let in_span = |r: &&crate::dashboard::DailyUsageDoc| r.day >= start && r.day <= today;
+    let tokens = |r: &crate::dashboard::DailyUsageDoc| {
+        r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation
+    };
+    let days = chart_days as usize;
+    let mut recorded = vec![false; days];
     let mut totals: std::collections::HashMap<(&str, &str), u64> = Default::default();
     for r in view.daily_usage.iter().filter(&in_span) {
+        recorded[(r.day - start) as usize] = true;
         *totals
             .entry((r.group.as_str(), r.model.as_str()))
-            .or_default() += r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation;
+            .or_default() += tokens(r);
     }
+    // Rank models by span total; the chart draws the top four and counts
+    // the rest in its legend.
     let mut ranked: Vec<((&str, &str), u64)> = totals.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(DAILY_CHART_SERIES);
-    if ranked.is_empty() {
-        return;
-    }
     let grand: u64 = ranked.iter().map(|(_, t)| *t).sum::<u64>().max(1);
-    let days = chart_days as usize;
-    let mut series: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); days]; ranked.len()];
-    for (s, serie) in series.iter_mut().enumerate() {
-        for (i, point) in serie.iter_mut().enumerate() {
-            point.0 = i as f64;
-        }
-        let _ = s;
-    }
-    let mut y_max = 0f64;
-    for r in view.daily_usage.iter().filter(&in_span) {
-        if let Some(idx) = ranked
-            .iter()
-            .position(|((g, m), _)| *g == r.group && *m == r.model)
-        {
-            let x = (r.day - start) as usize;
-            let y = (r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation) as f64;
-            series[idx][x].1 += y;
-            y_max = y_max.max(series[idx][x].1);
-        }
-    }
-    let y_max = y_max.max(1.0);
-
-    let datasets: Vec<Dataset> = series
+    let rank: std::collections::HashMap<(&str, &str), usize> = ranked
         .iter()
         .enumerate()
-        .map(|(i, data)| {
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(DAILY_CHART_COLORS[i]))
-                .data(data)
-        })
+        .map(|(i, (key, _))| (*key, i))
         .collect();
-    let day_label = |d: u64| {
-        let at = UNIX_EPOCH + Duration::from_secs(d * 86_400);
-        let full = format::month_day_hm(at, 0);
-        full.split(' ').next().unwrap_or("").to_string()
-    };
-    let x_axis = Axis::default()
-        .bounds([0.0, (days - 1) as f64])
-        .labels(vec![
-            Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + chart_days / 2), dim()),
-            Span::styled(day_label(today), dim()),
-        ])
-        .style(dim());
-    let y_axis = Axis::default()
-        .bounds([0.0, y_max])
-        .labels(vec![
-            Span::styled("0", dim()),
-            Span::styled(format::human_count((y_max / 2.0) as u64), dim()),
-            Span::styled(format::human_count(y_max as u64), dim()),
-        ])
-        .style(dim());
-    let [plot_area, legend_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(
-            Block::new()
-                .borders(Borders::TOP)
-                .title(format!(" tokens per day — last {chart_days}d · d cycles ")),
-        )
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
-    // Legend: ● model (share%) — one line, dim separators.
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, ((group, model), total)) in ranked.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
+    let blank: Vec<Option<f64>> = recorded.iter().map(|r| r.then_some(0.0)).collect();
+    let mut points = vec![blank; ranked.len()];
+    for r in view.daily_usage.iter().filter(&in_span) {
+        let i = rank[&(r.group.as_str(), r.model.as_str())];
+        if let Some(y) = points[i][(r.day - start) as usize].as_mut() {
+            *y += tokens(r) as f64;
         }
-        spans.push(Span::styled(
-            "● ".to_string(),
-            Style::new().fg(DAILY_CHART_COLORS[i]),
-        ));
-        spans.push(Span::raw(format!("{} ", abbrev_model(Some(group), model))));
-        spans.push(Span::styled(
-            format!("({:.1}%)", *total as f64 * 100.0 / grand as f64),
-            dim(),
-        ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+    let series = ranked
+        .iter()
+        .zip(points)
+        .map(|(((group, model), total), points)| {
+            Series::new(abbrev_model(Some(group), model), points)
+                .note(format!("{:.1}%", *total as f64 * 100.0 / grand as f64))
+        });
+    let chart = TrendChart::new(series)
+        .x_labels([
+            day_label(start),
+            day_label(start + chart_days / 2),
+            day_label(today),
+        ])
+        .empty("no tokens in this span")
+        .theme(theme);
+    draw_trend_chart(
+        frame,
+        area,
+        &format!(" tokens per day — last {chart_days}d · d cycles "),
+        &chart,
+    );
 }
 
 /// Compact per-client request-attribution table (issue #32): top
@@ -1011,9 +1161,9 @@ fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
     let shown = total.min(CLIENT_PANEL_ROWS);
     let title = format!(" clients — top {shown} of {total} by requests (metadata.user_id) ");
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Rows the windowed heatmap panel needs: a title/header pair + one row per
@@ -1045,7 +1195,7 @@ fn draw_usage_overlay(
     area: Rect,
     view: &DashboardView,
     chrome: &Chrome,
-) -> Option<String> {
+) -> (Option<String>, Option<TableScroll>) {
     frame.render_widget(Clear, area);
     let gran = chrome.usage_gran;
     // Keep the daemon's cost wording verbatim on wide screens. The compact
@@ -1074,13 +1224,17 @@ fn draw_usage_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             hint,
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(format!(
-            " usage — {} · {cost_warning} · ALL 0 buckets ",
-            gran.label()
         )));
-        frame.render_widget(empty, area);
-        return None;
+        let body = section(
+            frame,
+            area,
+            &format!(
+                " usage — {} · {cost_warning} · ALL 0 buckets ",
+                gran.label()
+            ),
+        );
+        frame.render_widget(empty, body);
+        return (None, None);
     }
 
     // Group consecutive rows by bucket — the document orders each granularity
@@ -1114,19 +1268,32 @@ fn draw_usage_overlay(
         .map(usage_row_tokens)
         .fold(0, u64::saturating_add);
     let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
+    // The scrollbar counts table rows (a bucket row plus one per model), so
+    // its thumb is the share of rows in view; `scroll` stays in buckets.
+    let rows_total: usize = buckets.iter().map(|(_, _, g)| 1 + g.len()).sum();
+    let rows_above: usize = buckets
+        .iter()
+        .take(scroll)
+        .map(|(_, _, g)| 1 + g.len())
+        .sum();
+    let body_h = usize::from(area.height.saturating_sub(2)); // rule + header
+    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(rows_total, body_h, rows_above);
     let (label, n) = (gran.label(), buckets.len());
     let (tok, cost) = (format::human_count(total_tokens), format_cost(total_cost));
     let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
     // Widest first. The last form is exactly as wide as the pre-scope title,
     // so any width that fit it still shows the warning, ALL and qualifier.
+    // Each is measured as its section rule draws it (lead included), and
+    // the short form joins tokens and cost with a space like the tight one,
+    // so an 80-column overlay keeps `N buckets` under the rule's lead.
     let full = format!(
         " usage — {label} · {cost_warning} · ALL {n} buckets · Σ {tok} tok · Σ {cost}{unpriced} "
     );
     let short = format!(
-        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok · {cost}{unpriced} "
+        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok {cost}{unpriced} "
     );
     let tight = format!(" ≈API est/NOT BILL · ALL {n} {label} · {tok} tok {cost}{unpriced} ");
-    let fits = |t: &str| cells::width(t) <= usize::from(area.width);
+    let fits = |t: &str| section_title_width(t) <= usize::from(area.width);
     let title = if fits(&full) {
         full
     } else if fits(&short) {
@@ -1223,16 +1390,19 @@ fn draw_usage_overlay(
         Constraint::Length(8),
         Constraint::Length(USAGE_COST_COL_WIDTH),
     ];
+    let body = section(frame, area, &title);
+    let (table_area, track) = table_scroll_split(body, bar_pos);
     let table = Table::new(trows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
-    buckets.get(scroll).map(|(_, label, _)| {
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, table_area);
+    let bar = track.and_then(|track| draw_table_scrollbar(frame, bar_pos, track));
+    let scope = buckets.get(scroll).map(|(_, label, _)| {
         format!(
             "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
             gran.label()
         )
-    })
+    });
+    (scope, bar)
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -1354,22 +1524,84 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
+/// A table's scrollbar as one frame drew it (keys, sessions, usage): where
+/// the rows are and the one-column track a press or drag acts on. Only
+/// reported while the rows overflow, so `None` means there is nothing to drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableScroll {
+    pub pos: twolab_tui::scrollbar::ScrollPos,
+    pub track: Rect,
+}
+
+/// A borderless-sided table's body split for its scrollbar: when `pos`
+/// overflows, the rightmost column becomes the track (beside the data rows,
+/// under the header row) and the table gets the rest.
+fn table_scroll_split(inner: Rect, pos: twolab_tui::scrollbar::ScrollPos) -> (Rect, Option<Rect>) {
+    let (table, track) = twolab_tui::scrollbar::split(inner, pos);
+    let track = track.map(|t| Rect {
+        y: t.y.saturating_add(1),
+        height: t.height.saturating_sub(1),
+        ..t
+    });
+    (table, track)
+}
+
+/// Draw a table's scrollbar (twolab-tui, herdr's glyphs: track `╎`, thumb
+/// `▐`) on `track` and report it for the mouse — `None` when nothing
+/// overflows or the track has no rows.
+fn draw_table_scrollbar(
+    frame: &mut Frame,
+    pos: twolab_tui::scrollbar::ScrollPos,
+    track: Rect,
+) -> Option<TableScroll> {
+    twolab_tui::scrollbar::thumb(pos, track)?;
+    frame.render_widget(
+        twolab_tui::scrollbar::Scrollbar::new(pos).theme(KEYBAR_THEME),
+        track,
+    );
+    Some(TableScroll { pos, track })
+}
+
 /// Logs overlay (`l`): the whole log ring in a twolab-tui
 /// [`Pager`](twolab_tui::pager::Pager) — long lines wrap, `~` past the end,
 /// the bottom rule says how far down the view is (`NN%`). It follows new
 /// lines while `chrome.logs_scroll` is `None` (the bottom) and holds still
-/// once scrolled back. Returns where it drew, so the runtime can turn the
-/// next key or wheel step into a row offset.
+/// once scrolled back; a drag-selected stretch is drawn reversed. Returns
+/// where it drew, so the runtime can turn the next key or wheel step into a
+/// row offset.
 fn draw_logs_overlay(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     chrome: &Chrome,
 ) -> twolab_tui::scrollbar::ScrollPos {
-    use twolab_tui::pager::Pager;
     use twolab_tui::scrollbar::ScrollPos;
 
     frame.render_widget(Clear, area);
+    let pager = logs_pager(view, chrome.logs_scroll, chrome.logs_selection);
+    frame.render_widget(&pager, area);
+    // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
+    let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
+    let view_h = area.height.saturating_sub(chrome_rows) as usize;
+    ScrollPos::of(
+        pager.content_height(area.width),
+        view_h,
+        pager.scroll_offset(),
+    )
+}
+
+/// The Logs overlay's pager over this frame's log ring — the one build the
+/// draw and the mouse share, so a drag lands on the cells the person saw.
+/// `scroll` is `chrome.logs_scroll` (`None` follows the tail); `selection`
+/// is the drag-selected stretch, drawn reversed (it shows under `NO_COLOR`
+/// too). A pager held for a selection says so in its title.
+pub(crate) fn logs_pager(
+    view: &DashboardView,
+    scroll: Option<usize>,
+    selection: Option<twolab_tui::pager::Selection>,
+) -> twolab_tui::pager::Pager {
+    use twolab_tui::pager::Pager;
+
     let lines: Vec<Line<'static>> = if view.logs.is_empty() {
         // Say so instead of a blank pane (the same in attach mode, where the
         // lines come from the daemon's document).
@@ -1392,24 +1624,19 @@ fn draw_logs_overlay(
     } else {
         format!("{n} lines")
     };
-    let title = match chrome.logs_scroll {
+    let selecting = selection.is_some_and(|s| s.is_visible());
+    let title = match scroll {
         _ if n == 0 => "logs".to_string(),
         None => format!("logs · {count} · following"),
+        Some(_) if selecting => format!("logs · {count} · held for the selection — End follows"),
         Some(_) => format!("logs · {count} · scrolled back — End follows"),
     };
-    let pager = Pager::new(title, lines)
+    let mut pager = Pager::new(title, lines)
         .hints(false)
         .theme(KEYBAR_THEME)
-        .scroll_to(chrome.logs_scroll.unwrap_or(usize::MAX));
-    frame.render_widget(&pager, area);
-    // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
-    let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
-    let view_h = area.height.saturating_sub(chrome_rows) as usize;
-    ScrollPos::of(
-        pager.content_height(area.width),
-        view_h,
-        pager.scroll_offset(),
-    )
+        .scroll_to(scroll.unwrap_or(usize::MAX));
+    pager.set_selection(selection);
+    pager
 }
 
 /// Sessions overlay (`s`, issue #34): the persisted raw-io log folded by
@@ -1433,25 +1660,29 @@ fn draw_sessions_overlay(
     // in rather than staring at a spinner. On reopen, a prior open's `sessions`
     // stay visible (with the loading title) until the first fresh partial lands.
     if chrome.sessions_loading && chrome.sessions.is_empty() {
-        let glyph = SpinnerKind::Braille.glyph(chrome.frame);
-        let loading = Paragraph::new(Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::new().fg(Color::Cyan)),
-            Span::styled("loading sessions…", dim()),
-        ]))
-        .block(Block::new().borders(Borders::TOP).title(" sessions "));
-        frame.render_widget(loading, area);
+        let glyph = SpinnerKind::Braille.glyph(loading_spin(chrome.frame, chrome.motion));
+        let mut spans = vec![Span::styled(format!("{glyph} "), KEYBAR_THEME.accent())];
+        spans.extend(loading_label(
+            "loading sessions…",
+            Style::new(),
+            chrome.clock.saturating_sub(chrome.sessions_since),
+            chrome.motion,
+        ));
+        let loading = Paragraph::new(Line::from(spans));
+        let body = section(frame, area, " sessions ");
+        frame.render_widget(loading, body);
         return;
     }
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no sessions yet — enable raw-io capture and send requests through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" sessions "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " sessions ");
+        frame.render_widget(empty, body);
         return;
     }
-    let table_chrome = if area.width >= SIDE_BY_SIDE_AT {
+    let (table_chrome, bar) = if area.width >= SIDE_BY_SIDE_AT {
         let [list_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
         let tc = draw_sessions_table(frame, list_area, ctx, chrome);
@@ -1462,6 +1693,7 @@ fn draw_sessions_overlay(
     };
     if let Some(hits) = hits.as_mut() {
         hits.sessions_table = table_chrome;
+        hits.table_scroll = bar;
     }
 }
 
@@ -1474,7 +1706,7 @@ fn draw_sessions_table(
     area: Rect,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Option<SessionsChrome> {
+) -> (Option<SessionsChrome>, Option<TableScroll>) {
     let total = chrome.sessions.len();
     let cursor = chrome.session_cursor.min(total.saturating_sub(1));
     let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
@@ -1484,6 +1716,7 @@ fn draw_sessions_table(
         0
     };
     let end = (start + capacity).min(total);
+    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(total, capacity, start);
 
     let rows = chrome.sessions[start..end]
         .iter()
@@ -1546,30 +1779,44 @@ fn draw_sessions_table(
     // the growing table reads as "filling in", not stalled.
     let sort = chrome.session_sort.label();
     let title = if chrome.sessions_loading {
-        format!(
-            " sessions — {} of {total} — sort {sort} (o) — loading… {}% ",
-            cursor + 1,
-            chrome.sessions_pct
-        )
+        let mut spans = vec![Span::raw(format!(
+            " sessions — {} of {total} — sort {sort} (o) — ",
+            cursor + 1
+        ))];
+        spans.extend(loading_label(
+            "loading…",
+            Style::new(),
+            chrome.clock.saturating_sub(chrome.sessions_since),
+            chrome.motion,
+        ));
+        spans.push(Span::raw(format!(" {}% ", chrome.sessions_pct)));
+        Line::from(spans)
     } else {
-        format!(" sessions — {} of {total} — sort {sort} (o) ", cursor + 1)
+        Line::from(format!(
+            " sessions — {} of {total} — sort {sort} (o) ",
+            cursor + 1
+        ))
     };
+    let body = section_line(frame, area, title);
+    let (table_area, track) = table_scroll_split(body, bar_pos);
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
-    // Data rows start under the top border + header row.
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, table_area);
+    let bar = track.and_then(|track| draw_table_scrollbar(frame, bar_pos, track));
+    // Data rows start under the top border + header row; the scrollbar's
+    // column is not a row click.
     let rows_rect = Rect {
         x: area.x,
         y: area.y.saturating_add(2),
-        width: area.width,
+        width: table_area.width,
         height: area.height.saturating_sub(2),
     };
     let _ = ctx;
-    (rows_rect.height > 0).then_some(SessionsChrome {
+    let table_chrome = (rows_rect.height > 0).then_some(SessionsChrome {
         rows: rows_rect,
         start,
-    })
+    });
+    (table_chrome, bar)
 }
 
 /// Drill-down pane for the cursored session: the grouping confidence, the full
@@ -1643,8 +1890,8 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
             Span::raw(session_span_label(s)),
         ]),
     ];
-    let detail = Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(" session "));
-    frame.render_widget(detail, area);
+    let body = section(frame, area, " session ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Display label for a session's grouping key: the user_id, or `(ungrouped)` for
@@ -1837,9 +2084,6 @@ fn perf_series_for_day(view: &DashboardView, off: u64, now: SystemTime) -> Vec<P
     rows
 }
 
-/// Colors for the perf chart series (rank order, distinct on dark terminals).
-const PERF_CHART_COLORS: [Color; 4] = [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
-
 /// Perf overlay (`p`, perf telemetry v1 — "observed performance"): a daily
 /// e2e tokens/sec chart for the top series, a date × provider health matrix,
 /// and the per-(model, fast) series table. Passive telemetry from real
@@ -1859,9 +2103,9 @@ fn draw_perf_overlay(
             "no perf data yet — collecting starts with this daemon version (metric v1); \
              send requests through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" perf "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " perf ");
+        frame.render_widget(empty, body);
         return;
     }
     let series = match chrome.perf_day_off {
@@ -1894,7 +2138,7 @@ fn draw_perf_overlay(
     ])
     .areas(area);
     if chart_h > 0 {
-        draw_perf_chart(frame, chart_area, view, ctx, days, &title);
+        draw_perf_chart(frame, chart_area, view, ctx, days, &title, chart_theme());
         draw_perf_health(frame, health_area, view, ctx, days, None);
     } else {
         draw_perf_health(frame, health_area, view, ctx, days, Some(&title));
@@ -1920,9 +2164,11 @@ fn day_label(d: u64) -> String {
     full.split(' ').next().unwrap_or("").to_string()
 }
 
-/// Daily e2e tokens/sec line chart: one braille line per top series over the
-/// span. A day without throughput samples plots 0 (trend view; the tables
-/// stay the honest `—` surface).
+/// Daily e2e tokens/sec line chart: one line per top series over the span,
+/// on the same renderer as the tokens chart ([`draw_trend_chart`]). A day
+/// without throughput samples is a GAP, never a fabricated 0 (contract C5);
+/// a day with fewer than five samples is drawn dim — low traffic is itself a
+/// signal, but must not read as a confident trend point.
 fn draw_perf_chart(
     frame: &mut Frame,
     area: Rect,
@@ -1930,13 +2176,15 @@ fn draw_perf_chart(
     ctx: &FrameCtx,
     days: u64,
     title: &str,
+    theme: twolab_tui::Theme,
 ) {
     let (start, today) = perf_window(ctx.now, days);
     let in_span = |r: &&crate::dashboard::DailyPerfDoc| r.day >= start && r.day <= today;
-    // Rank series by window output; plot the top 4.
-    let ranked = {
-        let mut totals: std::collections::BTreeMap<(&str, &str, Option<bool>), u64> =
-            Default::default();
+    // Rank series by window output; the chart draws the top four and counts
+    // the rest in its legend.
+    type Key<'a> = (&'a str, &'a str, Option<bool>);
+    let ranked: Vec<(Key, u64)> = {
+        let mut totals: std::collections::BTreeMap<Key, u64> = Default::default();
         for r in view.daily_perf.iter().filter(&in_span) {
             *totals
                 .entry((r.group.as_str(), r.model.as_str(), r.fast))
@@ -1944,126 +2192,52 @@ fn draw_perf_chart(
         }
         let mut ranked: Vec<_> = totals.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(PERF_CHART_COLORS.len());
         ranked
     };
-    if ranked.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())))
-            .block(Block::new().borders(Borders::TOP).title(title.to_string()));
-        frame.render_widget(empty, area);
-        return;
-    }
-    let span_days = days as usize;
-    // Per-day per-series raw sums → tps points. A day WITHOUT throughput
-    // samples is a GAP, never a fabricated 0 (contract C5): each series is
-    // split into contiguous sampled segments and each segment becomes its
-    // own same-colored dataset, so the line breaks over quiet days.
-    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; span_days]; ranked.len()];
+    // Per-day per-series raw sums (output tokens, e2e ms, samples) → t/s.
+    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; days as usize]; ranked.len()];
     for r in view.daily_perf.iter().filter(&in_span) {
+        if r.tps_n == 0 {
+            continue;
+        }
         if let Some(idx) = ranked
             .iter()
             .position(|((g, m, f), _)| *g == r.group && *m == r.model && *f == r.fast)
         {
-            let x = (r.day - start) as usize;
-            if r.tps_n > 0 {
-                let slot = sums[idx][x].get_or_insert((0, 0, 0));
-                slot.0 += r.output_tokens;
-                slot.1 += r.e2e_ms;
-                slot.2 += r.tps_n;
-            }
+            let slot = sums[idx][(r.day - start) as usize].get_or_insert((0, 0, 0));
+            slot.0 += r.output_tokens;
+            slot.1 += r.e2e_ms;
+            slot.2 += r.tps_n;
         }
     }
-    // Segments split on BOTH gaps and confidence flips: low-sample (n<5)
-    // stretches render dim so a thin day can't read as a confident trend
-    // point; quiet days stay gaps (never a fabricated 0).
-    let mut y_max = 1f64;
-    // (series rank, low-confidence?, points)
-    type Segment = (usize, bool, Vec<(f64, f64)>);
-    let mut segments: Vec<Segment> = Vec::new();
-    for (idx, day_sums) in sums.iter().enumerate() {
-        let mut current: Vec<(f64, f64)> = Vec::new();
-        let mut current_low = false;
-        for (x, slot) in day_sums.iter().enumerate() {
-            match slot {
-                Some((out, ms, n)) if *ms > 0 => {
-                    let y = *out as f64 * 1000.0 / *ms as f64;
-                    y_max = y_max.max(y);
-                    let low = *n < 5;
-                    if low != current_low && !current.is_empty() {
-                        let last = *current.last().expect("non-empty");
-                        segments.push((idx, current_low, std::mem::take(&mut current)));
-                        // Connect across the flip only INTO the dim segment
-                        // — a low-confidence point must never be repainted
-                        // at full brightness (review MUST-FIX: dim = n<5).
-                        if low {
-                            current.push(last);
-                        }
-                    }
-                    current_low = low;
-                    current.push((x as f64, y));
-                }
-                _ => {
-                    if !current.is_empty() {
-                        segments.push((idx, current_low, std::mem::take(&mut current)));
-                    }
-                }
-            }
-        }
-        if !current.is_empty() {
-            segments.push((idx, current_low, current));
-        }
-    }
-    let datasets: Vec<Dataset> = segments
+    let series = ranked
         .iter()
-        .map(|(idx, low, data)| {
-            let style = if *low {
-                dim()
-            } else {
-                Style::new().fg(PERF_CHART_COLORS[*idx])
-            };
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(style)
-                .data(data)
+        .zip(&sums)
+        .map(|(((group, model, fast), _), day_sums)| {
+            let tps = day_sums.iter().map(|slot| match slot {
+                Some((out, ms, _)) if *ms > 0 => Some(*out as f64 * 1000.0 / *ms as f64),
+                _ => None,
+            });
+            let low = day_sums
+                .iter()
+                .map(|slot| slot.is_some_and(|(_, _, n)| n < 5));
+            Series::new(perf_series_label(group, model, *fast), tps).low(low)
+        });
+    let chart = TrendChart::new(series)
+        .x_labels([
+            day_label(start),
+            day_label(start + days / 2),
+            day_label(today),
+        ])
+        .y_unit("e2e t/s")
+        .low_note("dim = n<5")
+        .empty(if ranked.is_empty() {
+            "no requests in this span"
+        } else {
+            "no throughput samples in this span"
         })
-        .collect();
-    let x_axis = Axis::default()
-        .bounds([0.0, (span_days.saturating_sub(1)) as f64])
-        .labels(vec![
-            Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + days / 2), dim()),
-            Span::styled(day_label(today), dim()),
-        ])
-        .style(dim());
-    let y_axis = Axis::default()
-        .bounds([0.0, y_max])
-        .labels(vec![
-            Span::styled("0", dim()),
-            Span::styled(format!("{:.0}", y_max / 2.0), dim()),
-            Span::styled(format!("{y_max:.0} t/s"), dim()),
-        ])
-        .style(dim());
-    let [plot_area, legend_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(Block::new().borders(Borders::TOP).title(title.to_string()))
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, ((group, model, fast), _)) in ranked.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
-        }
-        spans.push(Span::styled("● ", Style::new().fg(PERF_CHART_COLORS[i])));
-        spans.push(Span::raw(perf_series_label(group, model, *fast)));
-    }
-    spans.push(Span::styled(
-        "   (e2e t/s · dim = n<5 — estimated post-delta rates in the table below)",
-        dim(),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+        .theme(theme);
+    draw_trend_chart(frame, area, title, &chart);
 }
 
 /// Date × provider health matrix: per day and backend group — sample count,
@@ -2152,14 +2326,10 @@ fn draw_perf_health(
     }
     let mut constraints = vec![Constraint::Length(7)];
     constraints.extend(groups.iter().map(|_| Constraint::Fill(1)));
-    let block = Block::new().borders(Borders::TOP).title(match title {
-        Some(t) => t.to_string(),
-        None => " provider health (observed) ".to_string(),
-    });
+    let body = section(frame, area, title.unwrap_or(" provider health (observed) "));
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(block);
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, body);
 }
 
 /// Per-(group, model, fast) series table over the span: samples, error %,
@@ -2228,12 +2398,16 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
         Constraint::Length(8),
     ];
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(format!(
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(
+        frame,
+        area,
+        &format!(
             " series ({scope}) — {} of {total} · est = post-first-delta (measured only) ",
             cursor.saturating_add(1).min(total.max(1))
-        )));
-    frame.render_widget(table, area);
+        ),
+    );
+    frame.render_widget(table, body);
 }
 
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
@@ -2530,7 +2704,12 @@ pub(crate) fn keys_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
 /// The table is scrolled by the panel's own offset (rows are sliced here, not
 /// clipped by the widget), so the final rows are reachable on any terminal
 /// height. Read-only: mutations stay in the CLI/API (admin-gated).
-fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+fn draw_keys_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Option<TableScroll> {
     frame.render_widget(Clear, area);
     let panel = &chrome.keys;
     let rows = keys_rows(view, chrome);
@@ -2549,11 +2728,21 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         .filter(|d| d.health.importing)
         .map(|d| format!(" · importing history {}%", d.health.import_pct))
         .unwrap_or_default();
-    let title = format!(
-        " keys — {issued} issued · window {} · {filter} · {matched} requests{}{importing} ",
+    // The title's `loading…` is the panel's live label (twolab-tui shimmer).
+    let mut title = vec![Span::raw(format!(
+        " keys — {issued} issued · window {} · {filter} · {matched} requests",
         panel.window.as_str(),
-        if panel.loading { " · loading…" } else { "" }
-    );
+    ))];
+    if panel.loading {
+        title.push(Span::raw(" · "));
+        title.extend(loading_label(
+            "loading…",
+            Style::new(),
+            chrome.clock.saturating_sub(panel.loading_since),
+            chrome.motion,
+        ));
+    }
+    title.push(Span::raw(format!("{importing} ")));
 
     // A failed or missing query NEVER renders as zeros: the panel says what it
     // could not answer (keys-history K-5).
@@ -2566,10 +2755,10 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
             )),
             Line::from("  press r to retry · w to change the window · K/Esc to go back"),
         ])
-        .block(Block::bordered().title(title));
+        .block(Block::bordered().title(Line::from(title)));
         frame.render_widget(body, area);
         draw_keys_picker(frame, area, panel);
-        return;
+        return None;
     }
     if rows.is_empty() {
         let body = if panel.doc.is_none() {
@@ -2589,10 +2778,10 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
                 ),
             ])
         }
-        .block(Block::bordered().title(title));
+        .block(Block::bordered().title(Line::from(title)));
         frame.render_widget(body, area);
         draw_keys_picker(frame, area, panel);
-        return;
+        return None;
     }
 
     // Only the columns this frame can hold — the name is never one of the
@@ -2656,11 +2845,27 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
     } else {
         String::new()
     };
+    title.push(Span::raw(scrolled));
     let table = Table::new(table_rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::bordered().title(format!("{title}{scrolled}")));
+        .block(Block::bordered().title(Line::from(title)));
     frame.render_widget(table, area);
+    // The scrollbar stands on the right border beside the data rows (under
+    // the header row, above the bottom border), so it costs no column.
+    let track = Rect {
+        x: area.right().saturating_sub(1),
+        y: area.y.saturating_add(2),
+        width: area.width.min(1),
+        height: area.height.saturating_sub(3),
+    };
+    let bar = draw_table_scrollbar(
+        frame,
+        twolab_tui::scrollbar::ScrollPos::of(rows.len(), visible, scroll),
+        track,
+    );
     draw_keys_picker(frame, area, panel);
+    // An open picker owns the panel: its table cannot be dragged then.
+    bar.filter(|_| panel.picker.is_none())
 }
 
 /// The `f` model picker's keys (its footer and the `?` help): `/` starts
@@ -2760,42 +2965,28 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
     use twolab_tui::key_hints::KeyHelp;
     frame.render_widget(Clear, area);
-    let bytes = |b: Option<u64>| match b {
-        Some(b) => format!("{}B", format::human_count(b)),
-        None => "—".into(),
-    };
+    let bytes = |b: Option<u64>| b.map(|b| format!("{}B", format::human_count(b)));
     let f = &view.config_facts;
-    let facts = vec![
-        Line::default(),
-        Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "   llmux {} · daemon pid {} · port {} · up {}",
-            view.display_version(),
-            view.pid,
-            view.port,
-            format::countdown(view.uptime)
-        ))),
-        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "   config {}",
-            view.config_path.clone().unwrap_or_else(|| "—".into())
-        ))),
-        Line::from(Span::raw(format!(
-            "   accounts {} · raw-io {} ({}) · activity log {}",
-            view.snapshot.accounts.len(),
-            if f.raw_io_enabled { "on" } else { "off" },
-            bytes(f.raw_io_bytes),
-            bytes(f.activity_log_bytes),
-        ))),
-    ];
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" misc — keys · build · daemon ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    // The facts keep their rows at the bottom; the key grid takes the rest
-    // and, when it does not fit, ends in `… +N more` — never cut silently.
-    let facts_h = (facts.len() as u16).min(inner.height.saturating_sub(2));
+    // The build and daemon facts on a fact table: two columns when the pane
+    // holds them — the build on the left, the daemon on the right — figures
+    // right-aligned on their last digit, `—` for a size not measured yet.
+    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+        Fact::new("llmux", view.display_version()),
+        Fact::new("daemon pid", view.pid.to_string()),
+        Fact::new("port", view.port.to_string()),
+        Fact::new("up", format::countdown(view.uptime)),
+        Fact::new("accounts", view.snapshot.accounts.len().to_string()),
+        Fact::new("raw-io", if f.raw_io_enabled { "on" } else { "off" }),
+        Fact::maybe("raw-io store", bytes(f.raw_io_bytes)),
+        Fact::maybe("activity log", bytes(f.activity_log_bytes)),
+    ]);
+    // A path, not a figure: its own row under the table.
+    let config = FactTable::new(KEYBAR_THEME).fact(Fact::maybe("config", view.config_path.clone()));
+    let inner = section(frame, area, " misc — keys · build · daemon ");
+    // The facts keep their rows at the bottom (a blank row, the table, the
+    // config path); the key grid takes the rest and, when it does not fit,
+    // ends in `… +N more` — never cut silently.
+    let facts_h = (facts.height(inner.width) + 2).min(inner.height.saturating_sub(2));
     let help_area = Rect {
         x: inner.x + 1,
         width: inner.width.saturating_sub(1),
@@ -2806,14 +2997,18 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         KeyHelp::new(help_groups(chrome)).theme(KEYBAR_THEME),
         help_area,
     );
-    frame.render_widget(
-        Paragraph::new(facts),
-        Rect {
-            y: help_area.bottom(),
-            height: facts_h,
-            ..inner
-        },
-    );
+    let [_, table_area, config_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(Rect {
+        y: help_area.bottom(),
+        height: facts_h,
+        ..inner
+    });
+    frame.render_widget(&facts, table_area);
+    frame.render_widget(&config, config_area);
 }
 
 /// One editable (or honestly-labeled read-only) config row's action
@@ -3531,11 +3726,11 @@ fn draw_config_overlay(
 ) {
     frame.render_widget(Clear, area);
     let rows = config_rows(view, chrome);
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" config — Enter/click value edits · read-only rows are skipped ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = section(
+        frame,
+        area,
+        " config — Enter/click value edits · read-only rows are skipped ",
+    );
     // The edit prompt takes the last two rows while a value is being typed.
     let editing = match chrome.mode {
         Mode::ConfigEdit { action } => Some(action),
@@ -3578,125 +3773,129 @@ fn draw_config_overlay(
             }
         }
     }
-    // Edit prompt line (config-editor v1). The confirm gate is the card
+    // Edit prompt line (config-editor v1): the value in a twolab-tui
+    // composer field, the format hint after it. The confirm gate is the card
     // above the footer (`draw_gate`).
+    let mut field_width = None;
     if let Some(action) = editing {
-        let hint = action.input_hint().unwrap_or("");
-        let prompt = Line::from(vec![
-            Span::styled(" edit ", Style::new().fg(Color::Cyan)),
-            Span::raw(format!("{}▏", chrome.config_input)),
-            Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
-        ]);
+        let lead = " edit ";
+        let hint = format!("   ({})", action.input_hint().unwrap_or(""));
+        let room = inner.width.saturating_sub(cells::width(lead) as u16);
+        let width = room
+            .saturating_sub(cells::width(&hint) as u16)
+            .max(FIELD_MIN.min(room));
+        let mut spans = vec![Span::styled(lead, Style::new().fg(Color::Cyan))];
+        spans.extend(field_line(&chrome.field, "", width).spans);
+        spans.push(Span::styled(hint, dim()));
         frame.render_widget(
-            Paragraph::new(prompt),
+            Paragraph::new(cells::truncate_line(
+                Line::from(spans),
+                usize::from(inner.width),
+            )),
             Rect {
                 y: list_area.bottom() + 1,
                 height: 1,
                 ..inner
             },
         );
+        field_width = Some(width);
     }
     if let Some(hits) = hits.as_mut() {
         hits.config_rows = hit_rows;
+        hits.field_width = field_width;
     }
 }
 
-/// The right-click account context menu (UI-3 U11): a small floating list
-/// anchored at the click cell, clamped to the frame. Items mirror the key
-/// flows exactly: switch now (`Enter` in the switcher), pause/resume (`p`),
-/// set limit (`L`), delete (`r` + confirm). Returns the hit layout.
+/// What the open context menu acts on (UI-3 U11): the PINNED account id
+/// governs both what the menu says and what it runs (review R2/R3) — the
+/// account, or `Err(id)` when that account has left the pool. A vanished pin
+/// never falls back to whoever now occupies the row (execution would cancel
+/// while the menu named someone else). With no pin (keyboard-driven or test
+/// states) the display row `idx` of `order` is the target.
+pub(crate) fn menu_target<'a>(
+    view: &'a DashboardView,
+    pinned: Option<&'a str>,
+    order: &[usize],
+    idx: usize,
+) -> Result<Option<&'a AccountSnapshot>, &'a str> {
+    match pinned {
+        Some(name) => view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == name)
+            .map(Some)
+            .ok_or(name),
+        None => Ok(order.get(idx).and_then(|&i| view.snapshot.accounts.get(i))),
+    }
+}
+
+/// The context menu's entries, in the order `App::run_menu_item` runs
+/// them: switch now, pause/resume, set limit, delete — each with the key
+/// that runs the same flow in the account switcher (typed while the menu is
+/// open, it runs the item too). What cannot run is shown dim and skipped:
+/// everything when there is no account to act on, and `switch now` on a
+/// paused account (the scheduler refuses a paused target — resume it
+/// first). Delete keeps its confirm gate; here it is only marked
+/// destructive.
+pub(crate) fn account_menu_items(
+    target: Option<&AccountSnapshot>,
+) -> Vec<twolab_tui::menu::MenuItem<'static>> {
+    use twolab_tui::menu::MenuItem;
+    let none = target.is_none();
+    let paused = target.is_some_and(|a| a.paused);
+    vec![
+        MenuItem::new("switch now")
+            .key("⏎")
+            .disabled(none || paused),
+        MenuItem::new(if paused { "resume" } else { "pause" })
+            .key("p")
+            .disabled(none),
+        MenuItem::new("set limit").key("L").disabled(none),
+        MenuItem::new("delete")
+            .key("r")
+            .destructive(true)
+            .disabled(none),
+    ]
+}
+
+/// The right-click account context menu (UI-3 U11), drawn by the library's
+/// `Menu`: anchored at the click cell, it opens on the row below — or above
+/// when there is no room below, so it never covers the clicked row — inside
+/// `bounds` (MAIN above the footer, which draws over everything). Titled
+/// with the pinned account; items mirror the key flows exactly (see
+/// [`account_menu_items`]). Returns where each runnable item was drawn.
 fn draw_context_menu(
     frame: &mut Frame,
+    bounds: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
     anchor: (u16, u16),
-) -> MenuChrome {
+) -> twolab_tui::menu::MenuLayout {
+    use twolab_tui::menu::{Menu, MenuState};
     let Mode::ContextMenu { idx, item } = chrome.mode else {
-        return MenuChrome::default();
+        return twolab_tui::menu::MenuLayout::default();
     };
-    // The PINNED account id governs what the menu says — the same identity
-    // execution acts on (review R2/R3). The explicit match keeps "no pin"
-    // (index fallback — keyboard-driven/test states) distinct from "pinned
-    // account VANISHED": a vanished pin must never fall back to whoever now
-    // occupies the row (execution would cancel while the menu named someone
-    // else) — it renders as gone instead.
-    let (target, gone) = match chrome.menu_account.as_deref() {
-        Some(name) => {
-            let found = view.snapshot.accounts.iter().find(|a| a.id.0 == name);
-            (found, found.is_none().then(|| name.to_string()))
-        }
-        None => (
-            ctx.order
-                .get(idx)
-                .and_then(|&i| view.snapshot.accounts.get(i)),
-            None,
-        ),
-    };
-    let paused = target.is_some_and(|a| a.paused);
-    let name = match (&gone, target) {
-        (Some(pinned), _) => format!(
+    let target = menu_target(view, chrome.menu_account.as_deref(), &ctx.order, idx);
+    let name = match target {
+        Err(pinned) => format!(
             "{} — gone",
             row_account_name(pinned, ctx.mask, &view.domain_abbrev)
         ),
-        (None, Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
-        (None, None) => "?".into(),
+        Ok(Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
+        Ok(None) => "?".into(),
     };
-    let items: [&str; 4] = [
-        "switch now",
-        if paused { "resume" } else { "pause" },
-        "set limit",
-        "delete",
-    ];
-    let width = (items
-        .iter()
-        .map(|i| i.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(name.chars().count() + 1) as u16
-        + 4)
-    .min(frame.area().width);
-    let height = items.len() as u16 + 1; // + title border row
-    let frame_area = frame.area();
-    let x = anchor
-        .0
-        .min(frame_area.right().saturating_sub(width))
-        .max(frame_area.x);
-    let y = anchor
-        .1
-        .saturating_add(1)
-        .min(frame_area.bottom().saturating_sub(height))
-        .max(frame_area.y);
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
+    let menu = Menu::new(account_menu_items(target.ok().flatten()))
+        .title(name)
+        .anchor(anchor.0, anchor.1)
+        .theme(KEYBAR_THEME);
+    let mut state = MenuState {
+        selected: item,
+        ..MenuState::default()
     };
-    frame.render_widget(Clear, area);
-    let mut lines: Vec<Line> = Vec::with_capacity(items.len());
-    let mut rects: Vec<Rect> = Vec::with_capacity(items.len());
-    for (i, label) in items.iter().enumerate() {
-        let style = if i == item {
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::new()
-        };
-        lines.push(Line::from(Span::styled(format!(" {label} "), style)));
-        rects.push(Rect {
-            x: area.x,
-            y: area.y + 1 + i as u16,
-            width: area.width,
-            height: 1,
-        });
-    }
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(format!(" {name} "));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    MenuChrome { area, items: rects }
+    frame.render_stateful_widget(&menu, bounds, &mut state);
+    state.layout
 }
 
 /// The rect an overlay draws into. Rows left visible at the top: header + tab
@@ -4464,8 +4663,9 @@ pub(crate) struct RawContent {
 pub(crate) struct RawTabContent {
     pub label: &'static str,
     pub lines: Vec<Line<'static>>,
-    /// Widest line in display cells — the horizontal scroll bound.
-    pub width: u16,
+    /// Whether a line is longer than [`RAW_LONG_LINE`] bytes: those are
+    /// wrapped once per width by the viewer itself, not every frame.
+    pub long_lines: bool,
     /// The raw body verbatim — the `copy` / `save` payload.
     pub body_text: String,
     /// `copy as curl` for this tab's SIDE of the exchange: client tabs carry
@@ -4520,28 +4720,33 @@ fn curl_command(
     out
 }
 
-/// Assemble one [`RawTabContent`], measuring the widest line for the
-/// horizontal scroll bound.
+/// Assemble one [`RawTabContent`], noting whether any line is too long to
+/// wrap on every frame.
 fn raw_tab(
     label: &'static str,
     lines: Vec<Line<'static>>,
     body_text: String,
     curl: String,
 ) -> RawTabContent {
-    let width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let long_lines = lines.iter().any(|l| line_bytes(l) > RAW_LONG_LINE);
     RawTabContent {
         label,
         lines,
-        width: u16::try_from(width).unwrap_or(u16::MAX),
+        long_lines,
         body_text,
         curl,
     }
 }
 
-/// Hard wrap applied to raw body lines at build time (cells are clipped by the
-/// Paragraph anyway; the wrap bounds the cost of cloning the VISIBLE slice per
-/// frame — a truncated non-JSON stream body can be one single 8 MiB line).
-const RAW_LINE_WRAP: usize = 2048;
+/// A raw-viewer line longer than this many bytes is wrapped once per width
+/// by the viewer ([`raw_long_lines`]), not by `JsonView` on every frame: the
+/// widget wraps a whole line to draw any of its rows, and a truncated stream
+/// body or a base64 image can be one 8 MiB line (≈ 230 ms a frame).
+const RAW_LONG_LINE: usize = 16 * 1024;
+
+fn line_bytes(line: &Line) -> usize {
+    line.spans.iter().map(|s| s.content.len()).sum()
+}
 
 /// Section header line (`── request headers ──` style) for the raw viewer.
 fn raw_section(title: &str) -> Line<'static> {
@@ -4595,68 +4800,151 @@ const RAW_JSON_STYLES: twolab_tui::json_view::JsonStyles = twolab_tui::json_view
     punct: Style::new().fg(Color::DarkGray),
 };
 
-/// Hard-wrap a single logical line into `RAW_LINE_WRAP`-char chunks on char
-/// boundaries (continuation chunks lose highlighting context by design — they
-/// only occur on machine-generated monster lines).
-fn wrap_raw_line(line: &str) -> Vec<&str> {
-    if line.len() <= RAW_LINE_WRAP {
-        return vec![line];
-    }
-    let mut chunks = Vec::new();
-    let mut rest = line;
-    while rest.len() > RAW_LINE_WRAP {
-        let mut end = RAW_LINE_WRAP;
-        while end > 0 && !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == 0 {
-            break; // pathological; emit whole remainder below
-        }
-        chunks.push(&rest[..end]);
-        rest = &rest[end..];
-    }
-    chunks.push(rest);
-    chunks
-}
-
-/// Render a captured body as styled lines. A body that parses as ONE JSON
-/// document is pretty-printed and highlighted (the CDT "preview" view). An
-/// SSE / plain-text body keeps its own lines; `data: {json}` SSE lines get
-/// their payload highlighted inline. Anything else renders plain.
+/// Render a captured body as styled lines, one per source line (the viewer
+/// wraps them at its width). A body that parses as ONE JSON document is
+/// pretty-printed and highlighted (the CDT "preview" view). An SSE /
+/// plain-text body keeps its own lines; `data: {json}` SSE lines get their
+/// payload highlighted inline. Anything else renders plain.
 pub(crate) fn raw_body_lines(body: &str) -> Vec<Line<'static>> {
     if body.is_empty() {
         return vec![Line::from(Span::styled("(empty body)", dim()))];
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-            return pretty
-                .lines()
-                .flat_map(|l| {
-                    wrap_raw_line(l)
-                        .into_iter()
-                        .map(highlight_json_line)
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            return pretty.lines().map(highlight_json_line).collect();
         }
     }
     body.lines()
-        .flat_map(|line| {
-            wrap_raw_line(line)
-                .into_iter()
-                .map(|chunk| {
-                    if let Some(rest) = chunk.strip_prefix("data: ") {
-                        if serde_json::from_str::<serde_json::Value>(rest).is_ok() {
-                            let mut spans = vec![Span::styled("data: ".to_string(), dim())];
-                            spans.extend(highlight_json_line(rest).spans);
-                            return Line::from(spans);
-                        }
-                    }
-                    Line::from(Span::raw(chunk.to_string()))
-                })
-                .collect::<Vec<_>>()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("data: ") {
+                if serde_json::from_str::<serde_json::Value>(rest).is_ok() {
+                    let mut spans = vec![Span::styled("data: ".to_string(), dim())];
+                    spans.extend(highlight_json_line(rest).spans);
+                    return Line::from(spans);
+                }
+            }
+            Line::from(Span::raw(line.to_string()))
         })
         .collect()
+}
+
+/// The raw viewer's body cache, kept across frames for the opened modal:
+/// `JsonView`'s measured rows and, on a tab with [`RAW_LONG_LINE`]s, those
+/// lines wrapped once at the width. `Chrome` is cloned every frame, so the
+/// cache sits behind a shared lock that the frame drawing the modal fills;
+/// a new modal starts a new one. Two handles always compare equal: what a
+/// cache has measured is not part of the modal's state.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RawBodyView(std::sync::Arc<std::sync::Mutex<RawBodyCache>>);
+
+impl PartialEq for RawBodyView {
+    fn eq(&self, _: &RawBodyView) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RawBodyCache {
+    state: twolab_tui::json_view::JsonViewState,
+    long: Option<RawLongLines>,
+}
+
+/// A tab's lines with every [`RAW_LONG_LINE`] wrapped at one width.
+#[derive(Debug)]
+struct RawLongLines {
+    /// (body generation, width) the rows were wrapped for.
+    key: (u64, usize),
+    lines: Vec<Line<'static>>,
+    /// Per wrapped source line: its first display line, its rows, and the
+    /// rows added by the wrapped lines before it.
+    splits: Vec<(usize, usize, usize)>,
+}
+
+impl RawLongLines {
+    /// The source line a display line belongs to (0-based).
+    fn source(&self, display: usize) -> usize {
+        let k = self
+            .splits
+            .partition_point(|&(start, _, _)| start <= display);
+        match k.checked_sub(1).map(|i| self.splits[i]) {
+            None => display,
+            Some((start, rows, before)) if display < start + rows => start - before,
+            Some((_, rows, before)) => display - before - (rows - 1),
+        }
+    }
+
+    /// Rows added by wrapping: display lines minus source lines.
+    fn added(&self) -> usize {
+        self.splits
+            .last()
+            .map_or(0, |&(_, rows, before)| before + rows - 1)
+    }
+}
+
+/// `lines` with every line over [`RAW_LONG_LINE`] bytes wrapped at `width`
+/// — the rows `JsonView` would draw for it (continuation rows hang under the
+/// line's indent), so only their count differs from the source.
+fn raw_long_lines(lines: &[Line<'static>], width: usize, key: (u64, usize)) -> RawLongLines {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut splits = Vec::new();
+    let mut added = 0;
+    for line in lines {
+        if line_bytes(line) <= RAW_LONG_LINE {
+            out.push(line.clone());
+            continue;
+        }
+        let rows = wrap_ascii(line, width)
+            .unwrap_or_else(|| twolab_tui::json_view::wrap_line(line, width));
+        splits.push((out.len(), rows.len(), added));
+        added += rows.len().saturating_sub(1);
+        out.extend(rows);
+    }
+    RawLongLines {
+        key,
+        lines: out,
+        splits,
+    }
+}
+
+/// [`twolab_tui::json_view::wrap_line`] for a line of printable ASCII (one
+/// cell per byte), by slicing instead of walking graphemes — an 8 MiB base64
+/// string wraps in milliseconds. `None` for any other line.
+fn wrap_ascii(line: &Line<'static>, width: usize) -> Option<Vec<Line<'static>>> {
+    let printable = |s: &Span| s.content.bytes().all(|b| (0x20..0x7f).contains(&b));
+    if !line.spans.iter().all(printable) {
+        return None;
+    }
+    let width = width.max(1);
+    let lead = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.bytes())
+        .take_while(|&b| b == b' ')
+        .count();
+    let hang = lead.min(width / 2);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+    for span in &line.spans {
+        let mut rest = span.content.as_ref();
+        while !rest.is_empty() {
+            if col == width {
+                rows.push(Line::from(std::mem::take(&mut row)));
+                if hang > 0 {
+                    row.push(Span::raw(" ".repeat(hang)));
+                }
+                col = hang;
+            }
+            let take = rest.len().min(width - col);
+            row.push(Span::styled(rest[..take].to_string(), span.style));
+            rest = &rest[take..];
+            col += take;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(Line::from(row));
+    }
+    Some(rows)
 }
 
 /// General-metadata lines for the raw viewer's Request tab, built at OPEN time
@@ -4846,17 +5134,10 @@ pub(crate) fn raw_content_from_record(
     }
 }
 
-/// Draw the raw request/response viewer (UI-7/UI-8): a near-full-screen modal
-/// with a payload tab bar (2 or 4 tabs), top-right action buttons, the
-/// prebuilt content scrolled by whole lines both ways, and proportional
-/// scrollbars on the right + bottom edges. Returns the frame's
-/// [`RawModalChrome`] (scroll clamps + click rects) so the runtime can clamp
-/// offsets and route clicks.
 /// The raw viewer's keys (its bottom-border legend; the `?` help lists them).
-const RAW_KEYS: [(&str, &str); 9] = [
+const RAW_KEYS: [(&str, &str); 8] = [
     ("←→/tab", "switch"),
     ("↑↓", "scroll"),
-    ("H/L", "pan"),
     ("c", "copy"),
     ("C", "curl"),
     ("a", "copy all"),
@@ -4865,7 +5146,22 @@ const RAW_KEYS: [(&str, &str); 9] = [
     ("esc", "close"),
 ];
 
-fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
+/// Draw the raw request/response viewer (UI-7/UI-8): a near-full-screen modal
+/// with a payload tab strip (2 or 4 tabs, the library `Tabs` the main row
+/// uses), top-right action buttons, and the active tab's lines — the general
+/// and header sections as plain lines, then the body — in a twolab-tui
+/// `JsonView`: wrapped at the width, `lines a–b of n` below, a scrollbar that
+/// can be dragged when it overflows. Returns the frame's [`RawModalChrome`]
+/// (scroll clamp, page, scrollbar and click rects) so the runtime can clamp
+/// the offset and route keys and clicks.
+/// `clock` and `motion` are the frame's [`Chrome`] values; they drive the
+/// Loading label's shimmer.
+fn draw_raw_modal(
+    frame: &mut Frame,
+    modal: &RawModal,
+    clock: Duration,
+    motion: twolab_tui::Motion,
+) -> RawModalChrome {
     let mut area = centered_rect(frame.area(), 94, 92);
     // Its bottom border carries the key legend: keep it above the two footer
     // rows (at 24 rows the footer used to cover it).
@@ -4881,11 +5177,16 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     // The bottom hint doubles as the action-feedback line: a fresh flash
     // ("copied 4132 bytes → pbcopy", "saved → ~/Downloads/…") replaces the key
     // legend until it expires.
+    // The chrome carries a flash only while it is live (the app drops it at
+    // its TTL), so nothing here reads a clock.
     let hint = match &modal.flash {
-        Some((msg, at)) if at.elapsed() < std::time::Duration::from_secs(3) => Line::from(
-            Span::styled(format!(" {msg} "), Style::new().fg(Color::Yellow)),
-        )
-        .centered(),
+        Some((msg, _)) => {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(outcome_spans(msg.outcome, &msg.text));
+            spans.push(Span::raw(" "));
+            cells::truncate_line(Line::from(spans), usize::from(area.width.saturating_sub(4)))
+                .centered()
+        }
         // The key legend fitted to the border it sits on: whole hints drop
         // (`… +N more`) instead of the line being cut on both sides.
         _ => {
@@ -4970,26 +5271,27 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
         frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
     }
 
-    // Content viewport: tab bar (row 0) + spacer, right column + bottom row
-    // reserved for the scrollbars.
+    // Content viewport: under the tab strip (row 0) and a spacer; the
+    // JsonView keeps its last row for `lines a–b of n` and its right column
+    // for the scrollbar when the lines overflow.
     let viewport = Rect {
         x: inner.x,
         y: inner.y + 2,
-        width: inner.width.saturating_sub(1),
-        height: inner.height.saturating_sub(3),
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
     };
     let content = match &modal.state {
         RawModalState::Loading => {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(
-                        " {} loading raw record…",
-                        SpinnerKind::Braille.glyph(modal.spin)
-                    ),
-                    Style::new().fg(Color::Yellow),
-                ))),
-                viewport,
-            );
+            let wait = Style::new().fg(KEYBAR_THEME.wait);
+            let glyph = SpinnerKind::Braille.glyph(loading_spin(modal.spin, motion));
+            let mut spans = vec![Span::styled(format!(" {glyph} "), wait)];
+            spans.extend(loading_label(
+                "loading raw record…",
+                wait,
+                clock.saturating_sub(modal.since),
+                motion,
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), viewport);
             return chrome;
         }
         RawModalState::Failed(msg) => {
@@ -5006,99 +5308,125 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
         RawModalState::Ready(content) => content,
     };
 
-    // Tab bar: one hit rect per label, active tab inverted.
+    // Tab strip: the library `Tabs` with the main row's look; one hit rect
+    // per label as drawn, measured in cells.
     let active = modal.tab.min(content.tabs.len().saturating_sub(1));
-    let mut tab_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    let mut x = inner.x + 1;
-    for (i, t) in content.tabs.iter().enumerate() {
-        let w = t.label.len() as u16 + 2;
-        chrome.tabs.push((
-            i,
-            Rect {
-                x,
-                y: inner.y,
-                width: w,
-                height: 1,
-            },
-        ));
-        tab_spans.push(if i == active {
-            Span::styled(
-                format!(" {} ", t.label),
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!(" {} ", t.label), dim())
-        });
-        tab_spans.push(Span::raw(" "));
-        x += w + 1;
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(tab_spans)),
-        Rect { height: 1, ..inner },
-    );
+    let strip = twolab_tui::tabs::Tabs::new(
+        content
+            .tabs
+            .iter()
+            .map(|t| twolab_tui::tabs::Tab::new(t.label)),
+    )
+    .active(active)
+    .theme(twolab_tui::Theme::ansi())
+    .hints(twolab_tui::tabs::Hints::Off);
+    let layout = strip.render_layout(Rect { height: 1, ..inner }, frame.buffer_mut());
+    chrome.tabs = layout.hits.iter().map(|h| (h.index, h.rect)).collect();
 
     if viewport.height == 0 || viewport.width == 0 {
         return chrome;
     }
-    let tab = &content.tabs[active];
-    let lines = &tab.lines;
-    let max_v = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_sub(viewport.height);
-    let max_h = tab.width.saturating_sub(viewport.width);
-    chrome.max_scroll = (max_v, max_h);
-    let scroll = usize::from(modal.scroll.min(max_v));
-    let hscroll = modal.hscroll.min(max_h);
-    let visible: Vec<Line<'static>> = lines
-        .iter()
-        .skip(scroll)
-        .take(usize::from(viewport.height))
-        .cloned()
-        .collect();
-    frame.render_widget(Paragraph::new(visible).scroll((0, hscroll)), viewport);
-
-    // Proportional scrollbars (UI-8): right edge = vertical, bottom =
-    // horizontal. Rendered only when the content overflows that axis.
-    if max_v > 0 {
-        let mut state =
-            ScrollbarState::new(usize::from(max_v)).position(usize::from(modal.scroll.min(max_v)));
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(dim())
-                .thumb_style(Style::new().fg(Color::Cyan)),
-            Rect {
-                x: inner.right().saturating_sub(1),
-                y: viewport.y,
-                width: 1,
-                height: viewport.height,
-            },
-            &mut state,
-        );
-    }
-    if max_h > 0 {
-        let mut state = ScrollbarState::new(usize::from(max_h)).position(usize::from(hscroll));
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-                .style(dim())
-                .thumb_style(Style::new().fg(Color::Cyan)),
-            Rect {
-                x: viewport.x,
-                y: inner.bottom().saturating_sub(1),
-                width: viewport.width,
-                height: 1,
-            },
-            &mut state,
-        );
-    }
+    let Some(tab) = content.tabs.get(active) else {
+        return chrome;
+    };
+    draw_raw_body(frame, viewport, modal, active, tab, &mut chrome);
     chrome
 }
 
-/// Attach-mode pre-first-document screen: identity + a "connecting…" /
-/// reconnect line, plus the footer so `q` is discoverable.
+/// The active tab's lines in a `JsonView` over `viewport`, with its cache
+/// (row starts, long lines wrapped at this width) kept on the modal. The
+/// widget's ratatui scrollbar is drawn over with the library scrollbar the
+/// tables use, so the thumb drawn is the thumb a press or drag acts on.
+fn draw_raw_body(
+    frame: &mut Frame,
+    viewport: Rect,
+    modal: &RawModal,
+    active: usize,
+    tab: &RawTabContent,
+    chrome: &mut RawModalChrome,
+) {
+    use ratatui::widgets::StatefulWidget;
+    use twolab_tui::json_view::JsonView;
+    use twolab_tui::scrollbar::{ScrollPos, Scrollbar};
+
+    let mut cache = modal.view.0.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = &mut *cache;
+    // Long lines are wrapped here at the width the view draws them at once
+    // it scrolls (one column for the scrollbar) — they always overflow.
+    let wrap_w = usize::from(viewport.width.saturating_sub(1)).max(1);
+    let body = modal.generation.wrapping_mul(8).wrapping_add(active as u64);
+    let long = if tab.long_lines {
+        let key = (body, wrap_w);
+        if cache.long.as_ref().is_none_or(|l| l.key != key) {
+            cache.long = Some(raw_long_lines(&tab.lines, wrap_w, key));
+        }
+        cache.long.as_ref()
+    } else {
+        None
+    };
+    // One generation per body (and per wrap width when long lines are
+    // wrapped here): a tab switch or a new record re-measures.
+    let generation = body
+        .wrapping_mul(1 << 16)
+        .wrapping_add(long.map_or(0, |_| wrap_w as u64));
+    cache.state.set_generation(generation);
+    cache.state.scroll = modal.scroll;
+    let lines = long.map_or(tab.lines.as_slice(), |l| l.lines.as_slice());
+    let view = JsonView::new(lines).hints(false).theme(KEYBAR_THEME);
+    (&view).render(viewport, frame.buffer_mut(), &mut cache.state);
+
+    let max = cache.state.max_scroll().unwrap_or(0);
+    let view_h = usize::from(viewport.height.saturating_sub(1)).max(1);
+    chrome.max_scroll = max;
+    chrome.page = view_h.saturating_sub(1).max(1);
+    if max > 0 && viewport.width >= 2 && viewport.height >= 2 {
+        let pos = ScrollPos::new(cache.state.scroll, max, view_h);
+        let track = Rect {
+            x: viewport.right() - 1,
+            width: 1,
+            height: viewport.height - 1,
+            ..viewport
+        };
+        frame.render_widget(Scrollbar::new(pos).theme(KEYBAR_THEME), track);
+        chrome.bar = Some(TableScroll { pos, track });
+    }
+    // With long lines wrapped here the widget counted display lines; say the
+    // position in the body's own lines instead.
+    if let (Some(long), Some((first, last, n))) = (long, cache.state.shown()) {
+        if viewport.height >= 2 {
+            let n = n - long.added();
+            let at = if max == 0 {
+                format!("{n} lines")
+            } else {
+                format!(
+                    "lines {}–{} of {n}",
+                    long.source(first - 1) + 1,
+                    long.source(last - 1) + 1
+                )
+            };
+            let row = Rect {
+                y: viewport.bottom() - 1,
+                height: 1,
+                ..viewport
+            };
+            frame.render_widget(Clear, row);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(at, KEYBAR_THEME.secondary())))
+                    .right_aligned(),
+                row,
+            );
+        }
+    }
+}
+
+/// Attach-mode pre-first-document screen: identity, then a twolab-tui
+/// `Working` row — a spinner, the connecting / retrying label, how long it
+/// has been at it and the quit key (`⠋ connecting to daemon — retrying…
+/// (42s) - q quit`; it was static yellow text) — plus the footer. Under
+/// reduced motion the spinner holds its first glyph and the label is plain
+/// bold; the clock still counts.
 fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
+    use twolab_tui::working::Working;
     let [header_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -5120,12 +5448,20 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
         Some(attach) if attach.connected => "connecting — waiting for the first document…",
         _ => "connecting to daemon — retrying…",
     };
+    // The label's sweep restarts when the state (and so the label) changes.
+    let working = Working::new(connecting)
+        .elapsed(chrome.attach_wait)
+        .header_age(chrome.attach_wait)
+        .no_interrupt()
+        .inline("q quit");
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {connecting}"),
-            Style::new().fg(Color::Yellow),
-        ))),
-        body_area,
+        working.at(chrome.clock, KEYBAR_THEME.with_motion(chrome.motion)),
+        Rect {
+            x: body_area.x.saturating_add(1),
+            width: body_area.width.saturating_sub(1),
+            height: body_area.height.min(1),
+            ..body_area
+        },
     );
     // No document yet → no live setting to honor; nothing here shows emails.
     draw_footer(frame, footer_area, chrome, false);
@@ -5207,9 +5543,11 @@ fn header_tail_spans(
 /// review 2026-10-22), knowing the room the tab labels leave (`tabs_room`):
 /// the whole header fits → today's header; else the tabs-row form of the
 /// tail ([`header_tail_spans`]) fits that room → the header drops its tail
-/// and the tail is returned for [`draw_tabs_tail`]; else today's whole
-/// header, clipped by its row as before (cfg is never lost to a tail that
-/// had nowhere to go).
+/// and the tail is returned for [`draw_tabs_tail`]; else the whole header
+/// with its tail. Whatever the header keeps is laid out by
+/// [`draw_header_row`]: the verdict always, then whole identity segments by
+/// importance — never a segment cut mid-word (cfg is never lost to a tail
+/// that had nowhere to go: it competes for the row like the rest).
 fn draw_header(
     frame: &mut Frame,
     area: Rect,
@@ -5218,21 +5556,84 @@ fn draw_header(
     now: SystemTime,
     tabs_room: usize,
 ) -> Vec<Span<'static>> {
-    let lead = header_lead_spans(view, now);
-    let mut full = lead.clone();
-    if let Some(path) = &view.config_path {
-        full.push(Span::styled(format!(" cfg {path} "), dim()));
-    }
-    full.extend(attach_spans(chrome));
-    if Line::from(full.clone()).width() > usize::from(area.width) {
+    let verdict = header_verdict_spans(view, now);
+    let identity = header_identity_segments(view);
+    let mut full = identity.clone();
+    full.extend(header_tail_segments(view, chrome));
+    if header_width(&verdict, &full) > usize::from(area.width) {
         let tail = header_tail_spans(view, chrome, dirs::home_dir().as_deref());
         if !tail.is_empty() && Line::from(tail.clone()).width() <= tabs_room {
-            frame.render_widget(Paragraph::new(Line::from(lead)), area);
+            draw_header_row(frame, area, verdict, identity);
             return tail;
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(full)), area);
+    draw_header_row(frame, area, verdict, full);
     Vec::new()
+}
+
+/// What separates two header segments: one space, as the header always
+/// read (`llmux 0.2.26 :3456 pid 1 up 3h`).
+const HEADER_SEPARATOR: &str = " ";
+
+/// The cells between the verdict and the first identity segment.
+const HEADER_GAP: &str = "  ";
+
+/// The header's segments as twolab-tui `StatusBar` lays them out.
+fn header_bar(segments: Vec<twolab_tui::status_bar::Segment>) -> twolab_tui::status_bar::StatusBar {
+    twolab_tui::status_bar::StatusBar::new(KEYBAR_THEME)
+        .style(dim())
+        .separator(HEADER_SEPARATOR)
+        .segments(segments)
+}
+
+/// Cells the header takes with every segment on it.
+fn header_width(verdict: &[Span<'static>], segments: &[twolab_tui::status_bar::Segment]) -> usize {
+    let verdict = Line::from(verdict.to_vec()).width();
+    if segments.is_empty() {
+        return verdict;
+    }
+    let texts: usize = segments.iter().map(|s| cells::width(&s.text)).sum();
+    verdict + HEADER_GAP.len() + texts + HEADER_SEPARATOR.len() * (segments.len() - 1)
+}
+
+/// One header row: the verdict first and whole (cut with `…` only when the
+/// row is narrower than the verdict itself), then the segments that fit
+/// beside it — twolab-tui's `StatusBar` drops the least important ones
+/// whole. The bar would cut the last one standing; here a segment that
+/// does not fit whole goes too, and the next most important one that fits
+/// takes its place (a long attach marker gives way to the version).
+fn draw_header_row(
+    frame: &mut Frame,
+    area: Rect,
+    verdict: Vec<Span<'static>>,
+    mut segments: Vec<twolab_tui::status_bar::Segment>,
+) {
+    let width = usize::from(area.width);
+    let mut line = cells::truncate_line(Line::from(verdict), width);
+    let room = width.saturating_sub(line.width() + HEADER_GAP.len()) as u16;
+    while !segments.is_empty() {
+        let bar = header_bar(segments.clone());
+        let layout = bar.layout(room);
+        let cut = layout
+            .kept
+            .iter()
+            .zip(&layout.widths)
+            .find(|&(&i, &w)| cells::width(&segments[i].text) != w)
+            .map(|(&i, _)| i);
+        match cut {
+            Some(i) => {
+                segments.remove(i);
+            }
+            None => {
+                if !layout.kept.is_empty() {
+                    line.spans.push(Span::styled(HEADER_GAP, dim()));
+                    line.spans.extend(bar.line(room).spans);
+                }
+                break;
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Right-align the header tail at the end of the tabs row ([`draw_header`]
@@ -5250,9 +5651,10 @@ fn draw_tabs_tail(frame: &mut Frame, area: Rect, tail: Vec<Span<'static>>) {
     );
 }
 
-/// The header up to (and including) the upstream: health verdict, identity,
-/// upstream — everything but the movable tail.
-fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
+/// The header's verdict: the health tag and its headline condition (or
+/// `healthy` and the error rate). It always leads the row and is never
+/// dropped.
+fn header_verdict_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
     // glance-triage atom 1: the header row IS the health verdict — always
     // present (green included: a positive signal, never health-by-absence),
     // zero added height, [OK]/[WARN]/[FAIL] text first so the state survives
@@ -5296,21 +5698,56 @@ fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>
             ));
         }
     }
-    spans.push(Span::styled(
-        format!(
-            "  llmux {} :{} pid {} up {} ·{}",
-            view.display_version(),
-            view.port,
-            view.pid,
-            format::countdown(view.uptime),
-            view.snapshot.accounts.len()
-        ),
-        dim(),
-    ));
-    if let Some(upstream) = &view.upstream {
-        spans.push(Span::styled(format!(" → {upstream} "), dim()));
-    }
     spans
+}
+
+/// The header's identity after the verdict, as segments that drop whole —
+/// the least important first — when the row is too narrow. Highest stays
+/// longest: version, port, uptime, pid, upstream, the version's build tag
+/// (`(preview …)`), the account count (the accounts title repeats it).
+/// Joined by one space they read exactly as the header always did.
+fn header_identity_segments(view: &DashboardView) -> Vec<twolab_tui::status_bar::Segment> {
+    use twolab_tui::status_bar::Segment;
+    let version = view.display_version();
+    let (number, tag) = match version.split_once(' ') {
+        Some((number, tag)) => (number, Some(tag)),
+        None => (version, None),
+    };
+    let mut segments = vec![Segment::new(format!("llmux {number}")).priority(7)];
+    if let Some(tag) = tag {
+        segments.push(Segment::new(tag).priority(2));
+    }
+    segments.push(Segment::new(format!(":{}", view.port)).priority(6));
+    segments.push(Segment::new(format!("pid {}", view.pid)).priority(4));
+    segments.push(Segment::new(format!("up {}", format::countdown(view.uptime))).priority(5));
+    segments.push(Segment::new(format!("·{}", view.snapshot.accounts.len())).priority(1));
+    if let Some(upstream) = &view.upstream {
+        // The trailing space keeps the header's two-space step to `cfg`.
+        segments.push(Segment::new(format!("→ {upstream} ")).priority(3));
+    }
+    segments
+}
+
+/// The header's tail when it stays in the header row: ` cfg {path} ` (the
+/// least important segment of all — it goes first) and the attach marker
+/// (the most important — `reconnecting` must not be the part that drops).
+fn header_tail_segments(
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Vec<twolab_tui::status_bar::Segment> {
+    use twolab_tui::status_bar::Segment;
+    let mut segments = Vec::new();
+    if let Some(path) = &view.config_path {
+        segments.push(Segment::new(format!("cfg {path} ")).priority(0));
+    }
+    for span in attach_spans(chrome) {
+        segments.push(
+            Segment::new(span.content.trim_start())
+                .style(span.style)
+                .priority(8),
+        );
+    }
+    segments
 }
 
 /// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) `,
@@ -5525,17 +5962,26 @@ fn draw_accounts_with(
     let table: Vec<usize> = (0..ctx.order.len())
         .filter(|pos| fold.is_none_or(|f| !f.members.contains(pos)))
         .collect();
+    // The fold block sits directly under the table's rows. It is drawn
+    // first — the rows are its own, the table below never reaches them — so
+    // the title can count the members it could not show.
+    let (fold_hits, fold_hidden) = match fold {
+        Some(fold) => {
+            let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
+            draw_fold(frame, area, top, fold)
+        }
+        None => (Vec::new(), 0),
+    };
     // The title carries the active within-group order (`o` toggles it), so the
     // operator never has to guess why two rows swapped — plus the per-group
     // account counts and, when the pane is shorter than the table, how many
     // accounts it cannot show (never a silent cut): hidden table rows, then
-    // the folded accounts on the fold lines below the pane's edge.
+    // the folded accounts the block could not show.
     let title = if snapshot.accounts.is_empty() {
         format!(" accounts · sort {} ", chrome.account_sort.label())
     } else {
         let lines = usize::from(area.height.saturating_sub(2));
-        let hidden = table.len().saturating_sub(lines)
-            + fold.map_or(0, |f| f.hidden(lines.saturating_sub(table.len())));
+        let hidden = table.len().saturating_sub(lines) + fold_hidden;
         accounts_title(
             chrome.account_sort.label(),
             view,
@@ -5544,14 +5990,13 @@ fn draw_accounts_with(
             hidden,
         )
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
+    let body = section(frame, area, &title);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(block);
-        frame.render_widget(empty, area);
+        )));
+        frame.render_widget(empty, body);
         return Vec::new();
     }
     let selected = cursor_pos(chrome, ctx.order.len());
@@ -5620,16 +6065,15 @@ fn draw_accounts_with(
     };
 
     let table_widget = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(block);
-    // With the fold, the table stops at its own rows so the block can take
-    // the lines below them.
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    // With the fold, the table stops at its own rows (and its header) so
+    // the fold block can take the lines below them.
     let table_area = match fold {
         Some(_) => Rect {
-            height: area.height.min((table.len() as u16).saturating_add(2)),
-            ..area
+            height: body.height.min((table.len() as u16).saturating_add(1)),
+            ..body
         },
-        None => area,
+        None => body,
     };
     frame.render_widget(table_widget, table_area);
     // Row hit map (UI-3 U11): table row `i` renders at area.y + 2 + i (top
@@ -5650,9 +6094,316 @@ fn draw_accounts_with(
             display_idx: pos,
         })
         .collect();
-    if let Some(fold) = fold {
-        let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
-        hits.extend(draw_fold(frame, area, top, fold));
+    hits.extend(fold_hits);
+    hits
+}
+
+/// MAIN uses the compact account list instead of the table when the table
+/// would show fewer account rows than this and still hide some.
+const COMPACT_BELOW: usize = 5;
+
+/// Cells a compact entry keeps at the least: focus mark, glyph, a space and
+/// eleven cells of the name; narrower than that the list takes fewer
+/// columns and counts the rest.
+const COMPACT_ENTRY_MIN: u16 = 14;
+
+/// Blank cells between two columns of the compact list.
+const COMPACT_GAP: u16 = 2;
+
+/// Whether MAIN's accounts table, `height` rows tall (title and header
+/// included), would show fewer than [`COMPACT_BELOW`] account rows and still
+/// hide some — with the fold's block counted when the fold applies.
+fn table_crowded(accounts: usize, fold: Option<&FoldPlan>, height: u16) -> bool {
+    let lines = usize::from(height.saturating_sub(2));
+    let rows = accounts - fold.map_or(0, |f| f.members.len());
+    let hidden =
+        rows.saturating_sub(lines) + fold.map_or(0, |f| f.hidden(lines.saturating_sub(rows)));
+    rows.min(lines) < COMPACT_BELOW && hidden > 0
+}
+
+/// What the compact account list says an account is doing. Seven states,
+/// each with its own glyph, every glyph one cell on a CJK terminal; the
+/// twolab-tui `agent_list` has six, so `spent` and `paused` share a state's
+/// tone and tally slot (cooling's, stale's) and llmux draws their glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactKind {
+    /// Authentication failed (`✗`).
+    Error,
+    /// Over a 5h / 7d / Fable ceiling until the window resets (`◌`).
+    Spent,
+    /// Parked by a cooldown (`◉`).
+    Cooling,
+    /// The scheduler's current account (`⠋`, turning).
+    Active,
+    /// Eligible (`◦`).
+    Ok,
+    /// Paused by the operator (`ǁ`).
+    Paused,
+    /// Its usage is too old to trust (`?`).
+    Stale,
+}
+
+impl CompactKind {
+    fn of(gate: Option<IneligibleReason>, is_current: bool) -> CompactKind {
+        match gate {
+            None if is_current => CompactKind::Active,
+            None => CompactKind::Ok,
+            Some(IneligibleReason::AuthUnhealthy) => CompactKind::Error,
+            Some(
+                IneligibleReason::FiveHourOverThreshold
+                | IneligibleReason::SevenDayOverThreshold
+                | IneligibleReason::FableWeeklyExhausted,
+            ) => CompactKind::Spent,
+            Some(IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown) => {
+                CompactKind::Cooling
+            }
+            Some(IneligibleReason::Paused) => CompactKind::Paused,
+            Some(IneligibleReason::UsageStale) => CompactKind::Stale,
+        }
+    }
+
+    /// The `agent_list` state: tone, sort priority and tally slot.
+    fn state(self) -> twolab_tui::agent_list::AgentState {
+        use twolab_tui::agent_list::AgentState as S;
+        match self {
+            CompactKind::Error => S::Failed,
+            CompactKind::Spent | CompactKind::Cooling => S::Waiting,
+            CompactKind::Active => S::Working,
+            CompactKind::Ok => S::Idle,
+            CompactKind::Paused | CompactKind::Stale => S::Unknown,
+        }
+    }
+
+    /// The glyph llmux draws over the state's own, for the two states the
+    /// library has no glyph for.
+    fn glyph(self) -> Option<&'static str> {
+        match self {
+            CompactKind::Spent => Some("◌"),
+            CompactKind::Paused => Some("ǁ"),
+            _ => None,
+        }
+    }
+
+    /// How the tally counts it.
+    fn word(self) -> &'static str {
+        match self {
+            CompactKind::Error => "error",
+            CompactKind::Spent => "spent",
+            CompactKind::Cooling => "cooling",
+            CompactKind::Active => "active",
+            CompactKind::Ok => "ok",
+            CompactKind::Paused => "paused",
+            CompactKind::Stale => "stale",
+        }
+    }
+}
+
+/// The word at the right of a compact entry: the state, with what it is
+/// waiting on (`7d spent`, `cooling 45m10s`, `error 401`).
+fn compact_word(
+    account: &AccountSnapshot,
+    gate: Option<IneligibleReason>,
+    kind: CompactKind,
+    now: SystemTime,
+) -> String {
+    let left = |until: Option<SystemTime>| {
+        until
+            .and_then(|t| t.duration_since(now).ok())
+            .map(select::compact_duration)
+    };
+    match (kind, gate) {
+        (CompactKind::Error, _) => account
+            .auth_failure_status
+            .map_or_else(|| "auth error".to_string(), |s| format!("error {s}")),
+        (CompactKind::Spent, Some(IneligibleReason::FiveHourOverThreshold)) => "5h spent".into(),
+        (CompactKind::Spent, Some(IneligibleReason::FableWeeklyExhausted)) => "fbl spent".into(),
+        (CompactKind::Spent, _) => "7d spent".into(),
+        (CompactKind::Cooling, Some(IneligibleReason::FableCoolingDown)) => {
+            match left(account.fable_cooldown_until(now)) {
+                Some(t) => format!("fbl cooling {t}"),
+                None => "fbl cooling".into(),
+            }
+        }
+        (CompactKind::Cooling, _) => match left(account.cooldown_until) {
+            Some(t) => format!("cooling {t}"),
+            None => "cooling".into(),
+        },
+        (kind, _) => kind.word().into(),
+    }
+}
+
+/// The compact account list (`V` on the accounts tab; MAIN's own choice
+/// when the table would show fewer than [`COMPACT_BELOW`] rows): a
+/// twolab-tui `agent_list` with one row per account — focus mark, state
+/// glyph, name, the state's word — in the table's order, running down and
+/// then across in as many columns as fit. The title keeps the sort, says
+/// what the accounts are doing in one line (`agent_list` tally) and counts
+/// what does not fit (`+N more`). The focused account (the switcher's or a
+/// gate's cursor) is highlighted and kept in view; each entry is the same
+/// click target as its table row.
+fn draw_accounts_compact(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) -> Vec<AccountRowHit> {
+    use twolab_tui::agent_list::{AgentItem, AgentList, AgentListState, AgentState, Sort, Tally};
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let selected = cursor_pos(chrome, ctx.order.len());
+    let (kinds, items): (Vec<CompactKind>, Vec<AgentItem>) = ctx
+        .order
+        .iter()
+        .enumerate()
+        .map(|(pos, &idx)| {
+            let account = &snapshot.accounts[idx];
+            let gate = select::eligibility(account, params, ctx.now, ctx.headers_only);
+            let kind = CompactKind::of(gate, snapshot.is_current(&account.id));
+            let label = row_account_name(&account.id.0, ctx.mask, &view.domain_abbrev);
+            let item = AgentItem::new(kind.state(), label)
+                .word(compact_word(account, gate, kind, ctx.now))
+                .focused(selected == Some(pos));
+            (kind, item)
+        })
+        .unzip();
+    let n = items.len();
+    // Columns: as many as the accounts need, each as wide as the widest
+    // entry, never narrower than COMPACT_ENTRY_MIN.
+    let rows = usize::from(area.height.saturating_sub(1));
+    let natural = items
+        .iter()
+        .map(|i| {
+            let word = i.word.as_deref().map_or(0, cells::width);
+            3 + cells::width(&i.label).min(usize::from(NAME_COL_MAX)) + 1 + word
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    let fit = (area.width.saturating_add(COMPACT_GAP) / (COMPACT_ENTRY_MIN + COMPACT_GAP)).max(1);
+    let cols = n.div_ceil(rows.max(1)).clamp(1, usize::from(fit)) as u16;
+    let col_w = ((area.width.saturating_sub((cols - 1) * COMPACT_GAP)) / cols).min(natural.max(1));
+    // The window: from the top, or moved just far enough to show the focus.
+    let room = rows * usize::from(cols);
+    let start = selected.filter(|&f| f >= room).map_or(0, |f| f + 1 - room);
+    let hidden = n.saturating_sub(room);
+
+    // Title: the sort, the count (and the groups when they fit), the tally
+    // with each state's glyph — the list's legend — and `+N more`.
+    let mut slots: Vec<(AgentState, Vec<CompactKind>)> = Vec::new();
+    for &kind in &kinds {
+        let state = kind.state();
+        match slots.iter_mut().find(|(s, _)| *s == state) {
+            Some((_, held)) if !held.contains(&kind) => held.push(kind),
+            Some(_) => {}
+            None => slots.push((state, vec![kind])),
+        }
+    }
+    let mut tally = Tally::new(items.iter().map(|i| i.state))
+        .glyphs(true)
+        .empty("no accounts")
+        .theme(KEYBAR_THEME);
+    // A slot two llmux states share names both (`spent+cooling`); a slot
+    // that holds only `spent` or only `paused` shows that state's glyph.
+    let mut glyph_swaps: Vec<(char, &'static str)> = Vec::new();
+    for (state, mut held) in slots {
+        // In declaration order.
+        held.sort_by_key(|k| *k as u8);
+        let words: Vec<&str> = held.iter().map(|k| k.word()).collect();
+        tally = tally.word(state, words.join("+"));
+        if let [only] = held.as_slice() {
+            if let Some(glyph) = only.glyph() {
+                glyph_swaps.push((state.still(), glyph));
+            }
+        }
+    }
+    let tally_line = |width: u16| -> Vec<Span<'static>> {
+        tally
+            .line(width)
+            .spans
+            .into_iter()
+            .map(|mut span| {
+                let swap = glyph_swaps
+                    .iter()
+                    .find(|(lib, _)| span.content.starts_with(*lib));
+                if let Some(&(lib, glyph)) = swap {
+                    let rest = span.content[lib.len_utf8()..].to_string();
+                    span.content = format!("{glyph}{rest}").into();
+                }
+                span
+            })
+            .collect()
+    };
+    let more = if hidden > 0 {
+        format!(" · +{hidden} more ")
+    } else {
+        " ".to_string()
+    };
+    let sort = chrome.account_sort.label();
+    let groups = accounts_title(sort, view, &ctx.order, "", 0);
+    let grouped = format!("{} · ", groups.trim_end());
+    let plain = format!(" accounts · sort {sort} · {n} · ");
+    // The rule draws its lead (`── `) and a space after the title; the
+    // lead's and `more`'s own outer spaces are those spaces.
+    let room_for = |lead: &str| {
+        area.width
+            .saturating_sub((RULE_LEAD + cells::width(lead) + cells::width(&more)) as u16)
+    };
+    let tally_wide = cells::spans_width(&tally_line(u16::MAX)) as u16;
+    let lead = if tally_wide <= room_for(&grouped) {
+        grouped
+    } else {
+        plain
+    };
+    // No room for any of the tally: the lead ends at the count, without a
+    // separator that leads to nothing.
+    let tally = tally_line(room_for(&lead));
+    let mut title = if tally.iter().all(|s| s.content.trim().is_empty()) {
+        vec![Span::raw(
+            lead.trim_end().trim_end_matches('·').trim_end().to_string(),
+        )]
+    } else {
+        let mut title = vec![Span::raw(lead.clone())];
+        title.extend(tally);
+        title
+    };
+    title.push(Span::raw(more));
+    // Entries, column by column; each column holds exactly the rows it can
+    // show, so the count of what is hidden lives in the title.
+    let body = section_line(frame, area, Line::from(title));
+    let mut hits = Vec::new();
+    for c in 0..cols {
+        let from = start + usize::from(c) * rows;
+        let to = (from + rows).min(n);
+        if from >= to || body.is_empty() {
+            break;
+        }
+        let rect = Rect {
+            x: body.x + c * (col_w + COMPACT_GAP),
+            width: col_w,
+            ..body
+        };
+        // The words only when every entry keeps its whole name beside its
+        // word; else the glyph says the state and the name gets the room.
+        let list = AgentList::new(&items[from..to])
+            .sort(Sort::Given)
+            .words(col_w >= natural)
+            .frame(ctx.frame)
+            .empty("no accounts")
+            .theme(KEYBAR_THEME);
+        let mut state = AgentListState::new();
+        frame.render_stateful_widget(&list, rect, &mut state);
+        for &(i, r) in &state.layout().items {
+            let pos = from + i;
+            if let Some(glyph) = kinds[pos].glyph() {
+                if let Some(cell) = frame.buffer_mut().cell_mut((r.x + 1, r.y)) {
+                    cell.set_symbol(glyph);
+                }
+            }
+            hits.push(AccountRowHit {
+                area: r,
+                display_idx: pos,
+            });
+        }
     }
     hits
 }
@@ -5833,9 +6584,6 @@ fn account_row(parts: RowParts, bar_width: usize) -> Row<'static> {
     Row::new(cells)
 }
 
-/// Blank cells between two fold entries on one line.
-const FOLD_ENTRY_GAP: usize = 3;
-
 /// What MAIN's fold (`z`) does this frame — decided in [`draw_main`] and
 /// stated in the accounts title, so the toggle never claims a fold that did
 /// not happen.
@@ -5897,56 +6645,38 @@ struct FoldPlan {
     /// Display positions (`ctx.order` indices) of the folded accounts, in
     /// table order.
     members: Vec<usize>,
-    /// One entry per member, in table order: its table cells as fields.
-    entries: Vec<Vec<FoldField>>,
-    /// Index into `members` of the account under the cursor, if folded.
-    cursor: Option<usize>,
+    /// The block: one entry per member, in table order — its table cells as
+    /// fields under a dim header word each — packed by twolab-tui's
+    /// [`PackedGrid`], the entry under the cursor selected.
+    grid: PackedGrid<'static>,
     /// The status text every member shares, shown once in the accounts
     /// title; `None` = the statuses differ, each entry has its own field.
     shared_status: Option<String>,
-    /// Entries per line, and each entry column's field widths.
+    /// Entries per line.
     per_line: usize,
-    columns: Vec<Vec<usize>>,
 }
 
 impl FoldPlan {
+    /// Members the block cannot show when only its first `lines` lines fit
+    /// the pane (the compact list's crowding test counts them).
+    fn hidden(&self, lines: usize) -> usize {
+        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
+        self.members.len().saturating_sub(shown)
+    }
+
     /// Lines the block takes: the field header, then one line per
     /// `per_line` entries.
     fn lines(&self) -> usize {
         1 + self.members.len().div_ceil(self.per_line)
     }
-
-    /// Members the block cannot show when only its first `lines` lines fit
-    /// the pane.
-    fn hidden(&self, lines: usize) -> usize {
-        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
-        self.members.len().saturating_sub(shown)
-    }
 }
 
-/// One field of a fold entry: the header word over it, its alignment and
-/// the table cell's text.
-struct FoldField {
-    header: &'static str,
-    right: bool,
-    spans: Vec<Span<'static>>,
-    /// The widest form a clock tick can give this field ([`FoldBounds`]);
-    /// 0 for a field only a poll or an event can change.
-    min: usize,
-}
-
-impl FoldField {
-    /// Cells the field's column must hold for this entry: the live text,
-    /// or its widest clock-driven form when that is wider — so a value
-    /// past that form (a 100-day countdown) widens the column, never cut.
-    fn width(&self) -> usize {
-        self.spans
-            .iter()
-            .map(Span::width)
-            .sum::<usize>()
-            .max(self.min)
-    }
-}
+/// One field of a fold entry: the header word over it, and the table
+/// cell's text as a grid field — right-aligned for the numbers, with the
+/// widest form a clock tick can give it ([`FoldBounds`]; 0 for a field only
+/// a poll or an event can change) as its `widest`, so a value past that
+/// form (a 100-day countdown) widens the column, never cut.
+type FoldField = (&'static str, packed_grid::Field<'static>);
 
 /// The widest form of each fold field the clock alone can change (rule B:
 /// a tick never moves the fold), formatted by the same code as the live
@@ -5970,34 +6700,34 @@ impl FoldBounds {
             WindowDisplayState::Stale,
             WindowDisplayState::PollDegraded,
         ];
-        let bar = |text: String, marker: Option<char>| GaugeParts::Bar {
-            fill: 1.0,
-            color: Color::Reset,
-            text,
-            bold_chars: 0,
-            over: true,
-            marker,
-        };
+        let mode = crate::config::QuotaDisplay::Remaining;
         let cells = |spans: Vec<Span<'static>>| spans.iter().map(Span::width).sum::<usize>();
+        let bar = |span: Duration, state: WindowDisplayState| {
+            let window = QuotaWindow {
+                utilization: 0.0,
+                resets_at: now + span,
+                fetched_at: now,
+                source: crate::scheduler::window::WindowSource::Headers,
+            };
+            let (meter, marker) = quota_meter(&window, 0.0, now, state, mode, reset_absolute);
+            GaugeParts::Bar {
+                meter: meter.over(true),
+                marker,
+            }
+        };
         let reset = BOUND_SPANS
             .into_iter()
-            .flat_map(|span| {
-                let window = QuotaWindow {
-                    utilization: 1.0,
-                    resets_at: now + span,
-                    fetched_at: now,
-                    source: crate::scheduler::window::WindowSource::Headers,
-                };
-                glyphs.map(|state| {
-                    let (text, _, _) = quota_bar_text(&window, now, state, reset_absolute);
-                    cells(bar(text, Some(state.glyph())).text_fields().0)
-                })
-            })
+            .flat_map(|span| glyphs.map(|state| cells(bar(span, state).text_fields().0)))
             .max()
             .unwrap_or(0);
         Self {
             reset,
-            percent: cells(bar(String::new(), None).text_fields().1),
+            // A full fill and the `!`: `100%!`.
+            percent: cells(
+                bar(Duration::ZERO, WindowDisplayState::Populated)
+                    .text_fields()
+                    .1,
+            ),
         }
     }
 }
@@ -6007,15 +6737,13 @@ impl FoldBounds {
 /// colors kept, only the fill bar goes), and the status field is left out
 /// when the label column shows the status every member shares.
 fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<FoldField> {
-    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| FoldField {
-        header,
-        right,
-        spans,
-        min: 0,
+    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| {
+        let field = packed_grid::Field::new(spans);
+        (header, if right { field.right() } else { field })
     };
-    let bounded = |mut field: FoldField, min: usize| {
-        field.min = min;
-        field
+    let bounded = |(header, mut field): FoldField, min: usize| {
+        field.widest = min;
+        (header, field)
     };
     // Only a drawn gauge has a countdown that ticks; a bare state (`○ cold`,
     // `-`) changes on a poll.
@@ -6049,41 +6777,6 @@ fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<F
         fields.push(field("tok", false, vec![Span::raw(tokens)]));
     }
     fields
-}
-
-/// Field widths per entry column when `per_line` entries share a line:
-/// column `c` holds entries `c`, `c + per_line`, …, and each of its fields
-/// is as wide as its widest entry or its header.
-fn fold_columns(widths: &[Vec<usize>], headers: &[usize], per_line: usize) -> Vec<Vec<usize>> {
-    (0..per_line)
-        .map(|c| {
-            headers
-                .iter()
-                .enumerate()
-                .map(|(f, &header)| {
-                    widths
-                        .iter()
-                        .skip(c)
-                        .step_by(per_line)
-                        .map(|w| w[f])
-                        .max()
-                        .unwrap_or(0)
-                        .max(header)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Width of one entry: its fields and the one-cell gap between each pair.
-fn fold_entry_width(column: &[usize]) -> usize {
-    column.iter().sum::<usize>() + column.len().saturating_sub(1)
-}
-
-/// Width of a full fold line: the entries and the gaps between them.
-fn fold_line_width(columns: &[Vec<usize>]) -> usize {
-    columns.iter().map(|c| fold_entry_width(c)).sum::<usize>()
-        + FOLD_ENTRY_GAP * columns.len().saturating_sub(1)
 }
 
 /// The fold for this frame ([`Fold`]), planned with the table's own
@@ -6160,18 +6853,18 @@ fn fold_plan(
             fold_fields(parts, shared_status.is_none(), &bounds)
         })
         .collect();
-    let widths: Vec<Vec<usize>> = entries
-        .iter()
-        .map(|entry| entry.iter().map(FoldField::width).collect())
-        .collect();
-    let headers: Vec<usize> = entries[0]
-        .iter()
-        .map(|f| Line::from(f.header).width())
-        .collect();
-    let Some((per_line, columns)) = (1..=members.len()).rev().find_map(|per_line| {
-        let columns = fold_columns(&widths, &headers, per_line);
-        (fold_line_width(&columns) <= usize::from(width)).then_some((per_line, columns))
-    }) else {
+    let headers: Vec<&'static str> = entries[0].iter().map(|(header, _)| *header).collect();
+    // The cursor's entry is drawn the way the table draws the row under
+    // the cursor: reverse video (the theme's `selected`).
+    let grid = PackedGrid::new(
+        entries
+            .into_iter()
+            .map(|entry| entry.into_iter().map(|(_, field)| field).collect()),
+    )
+    .headers(headers)
+    .cursor(members.iter().position(|&pos| selected == Some(pos)))
+    .theme(KEYBAR_THEME);
+    let Some(GridPlan { per_line, .. }) = grid.plan(width) else {
         return Fold::TooNarrow;
     };
     // The fold never makes the pane taller (rule A): its header line plus
@@ -6180,115 +6873,43 @@ fn fold_plan(
         return Fold::SavesNoRow;
     }
     Fold::Applied(FoldPlan {
-        cursor: members.iter().position(|&pos| selected == Some(pos)),
         members,
-        entries,
+        grid,
         shared_status,
         per_line,
-        columns,
     })
 }
 
-/// Lay one entry's (or the header's) fields out at the column widths, a
-/// one-cell gap between fields; `reversed` paints the whole entry the way
-/// the table paints the row under the cursor.
-fn fold_cells(
-    fields: impl Iterator<Item = (Vec<Span<'static>>, bool)>,
-    widths: &[usize],
-    reversed: bool,
-) -> Vec<Span<'static>> {
-    let paint = |style: Style| {
-        if reversed {
-            style.add_modifier(Modifier::REVERSED)
-        } else {
-            style
-        }
+/// Draw the fold block from row `top` down, from the table's left column,
+/// and return a click target per drawn entry, mapped to its account's
+/// display position, and how many members it could not show. When the
+/// pane is too short for every line the block's last line says `+N more`
+/// (the accounts title counts them too); with no row left at all, every
+/// member is hidden.
+fn draw_fold(
+    frame: &mut Frame,
+    area: Rect,
+    top: u16,
+    fold: &FoldPlan,
+) -> (Vec<AccountRowHit>, usize) {
+    let block = Rect {
+        y: top,
+        height: area.bottom().saturating_sub(top),
+        ..area
     };
-    let blank = |n: usize| Span::styled(" ".repeat(n), paint(Style::new()));
-    let mut out = Vec::new();
-    for (f, ((spans, right), &width)) in fields.zip(widths).enumerate() {
-        if f > 0 {
-            out.push(blank(1));
-        }
-        let fill = width.saturating_sub(spans.iter().map(Span::width).sum());
-        if right && fill > 0 {
-            out.push(blank(fill));
-        }
-        out.extend(
-            spans
-                .into_iter()
-                .map(|span| Span::styled(span.content, paint(span.style))),
-        );
-        if !right && fill > 0 {
-            out.push(blank(fill));
-        }
+    if block.is_empty() {
+        return (Vec::new(), fold.members.len());
     }
-    out
-}
-
-/// Draw the fold block from row `top` down, from the table's left column
-/// (lines past the pane's bottom are cut, and counted in its title), and
-/// return a click target per visible entry, mapped to its account's display
-/// position.
-fn draw_fold(frame: &mut Frame, area: Rect, top: u16, fold: &FoldPlan) -> Vec<AccountRowHit> {
-    let gap = || Span::raw(" ".repeat(FOLD_ENTRY_GAP));
-    // Line 0: the dim field header over every entry column.
-    let mut header = Vec::new();
-    for (c, widths) in fold.columns.iter().enumerate() {
-        if c > 0 {
-            header.push(gap());
-        }
-        let fields = fold.entries[0]
-            .iter()
-            .map(|f| (vec![Span::styled(f.header, dim())], f.right));
-        header.extend(fold_cells(fields, widths, false));
-    }
-    let mut lines = vec![(Line::from(header), Vec::new())];
-    for (i, chunk) in fold.entries.chunks(fold.per_line).enumerate() {
-        let mut spans = Vec::new();
-        let mut x = 0;
-        let mut targets = Vec::new();
-        for (c, entry) in chunk.iter().enumerate() {
-            if c > 0 {
-                spans.push(gap());
-                x += FOLD_ENTRY_GAP;
-            }
-            let member = i * fold.per_line + c;
-            let fields = entry.iter().map(|f| (f.spans.clone(), f.right));
-            spans.extend(fold_cells(
-                fields,
-                &fold.columns[c],
-                fold.cursor == Some(member),
-            ));
-            let width = fold_entry_width(&fold.columns[c]);
-            targets.push((x, width, fold.members[member]));
-            x += width;
-        }
-        lines.push((Line::from(spans), targets));
-    }
-    let mut hits = Vec::new();
-    for (i, (line, targets)) in lines.into_iter().enumerate() {
-        let y = top.saturating_add(i as u16);
-        if y >= area.bottom() {
-            break;
-        }
-        let row = Rect {
-            y,
-            height: 1,
-            ..area
-        };
-        frame.render_widget(Paragraph::new(line), row);
-        hits.extend(targets.into_iter().map(|(x, width, pos)| AccountRowHit {
-            area: Rect {
-                x: area.x.saturating_add(x as u16),
-                y,
-                width: width as u16,
-                height: 1,
-            },
-            display_idx: pos,
-        }));
-    }
-    hits
+    let drawn = fold.grid.render_layout(block, frame.buffer_mut());
+    let hits = drawn
+        .hits
+        .iter()
+        .map(|hit| AccountRowHit {
+            area: hit.rect,
+            display_idx: fold.members[hit.index],
+        })
+        .collect();
+    (hits, drawn.hidden)
 }
 
 /// Status column: active (green) / ready (default) / the concrete blocking
@@ -6379,153 +7000,84 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     }
 }
 
-/// Build one in-bar quota line: a `width`-column bar whose leading
-/// `fill`-fraction of columns render REVERSE-video in `color` (the fill), with
-/// `text` overlaid centered on top. The first `bold_chars` characters of
-/// `text` (the larger countdown unit) are emboldened. Spans are split at the
-/// fill boundary so the fill shows behind the text — a single-style span
-/// could not paint a partial background. The text stands alone — no label
-/// in front of the countdown (owner 2026-11-04: the `rst ` prefix is gone;
-/// the header's `RESET` names the time). Only spaces + the caller's text are
-/// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
-/// `anim.rs` is untouched.
+/// One quota window as a twolab-tui [`Meter`]: `used` of the window gone,
+/// filled by what is used or what is left (`quota_display`, the `u` toggle),
+/// coloured by the FR6 bands on the USED share whichever way it fills
+/// (green below 70 %, yellow to 90 %, red above), the reset inside the bar —
+/// the top-2-unit countdown (`7d 10h`, the first unit bold) or, under `t`,
+/// the UTC stamp `MM/DD HH:MM` (the date bold); an expired window reads `0s`
+/// in both — and the display-state glyph (issue #33: `○` cold, `◑` stale,
+/// `!` poll-degraded) pinned to the bar's last cell when the value is not
+/// fresh, so the centred time never moves when it comes and goes (Z
+/// 2026-07-15). No label in front of the countdown (owner 2026-11-04: the
+/// `rst ` prefix is gone; the header's `RESET` names the time). The meter
+/// places the text by grapheme and measures it in cells; it draws only
+/// spaces, the text and the glyph, no bar glyphs.
 ///
-/// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
-/// the FIXED last bar column, independent of the centered `text`, so the
-/// time never shifts when the marker appears or disappears (Z 2026-07-15).
-/// A text long enough to reach that column loses its last char to the
-/// marker — the marker is the rarer, higher-signal fact.
-fn quota_bar_line(
-    fill: f64,
-    color: Color,
-    text: &str,
-    bold_chars: usize,
-    width: usize,
-    marker: Option<char>,
-) -> Line<'static> {
-    let fill_cols = ((fill.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    let chars: Vec<char> = text.chars().collect();
-    let text_len = chars.len().min(width);
-    let start = (width - text_len) / 2;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut run_style: Option<Style> = None;
-    for col in 0..width {
-        let ch = if marker.is_some() && col == width.saturating_sub(1) {
-            marker.unwrap_or(' ')
-        } else if col >= start && col < start + text_len {
-            chars[col - start]
-        } else {
-            ' '
-        };
-        let mut style = Style::new().fg(color);
-        if col < fill_cols {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        if col >= start && col < start + bold_chars.min(text_len) {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if run_style == Some(style) {
-            run.push(ch);
-        } else {
-            if let Some(prev) = run_style {
-                spans.push(Span::styled(std::mem::take(&mut run), prev));
-            }
-            run.push(ch);
-            run_style = Some(style);
-        }
-    }
-    if let Some(prev) = run_style {
-        spans.push(Span::styled(run, prev));
-    }
-    Line::from(spans)
-}
-
-/// The text overlaid inside a quota bar: the top-2-unit reset countdown
-/// (`7d 10h`), plus the window display-state glyph when the value is not
-/// fresh (issue #33) — returned SEPARATELY so the renderer can pin it to a
-/// fixed trailing column instead of appending it to the centered time (the
-/// append shifted the time sideways whenever the glyph came and went — Z
-/// 2026-07-15 "가운데 시간 표시 위치 고정"). The parked/over `!` is NOT here —
-/// it rides the percent label to the right of the bar, where it always
-/// lived. Returns `(text, bold_chars, marker)` where `bold_chars` covers the
-/// FIRST countdown unit — the day/hour magnitude carries most of the signal,
-/// so it gets the emphasis. An expired window (no live reset) reads `0s` —
-/// honest and ASCII-narrow.
-fn quota_bar_text(
+/// Returns the glyph too: the meter keeps its own private, and the fold's
+/// text form writes it after the reset.
+fn quota_meter(
     window: &QuotaWindow,
+    used: f64,
     now: SystemTime,
     display: WindowDisplayState,
+    mode: crate::config::QuotaDisplay,
     absolute: bool,
-) -> (String, usize, Option<char>) {
-    let live = window
-        .resets_at
-        .duration_since(now)
-        .ok()
-        .filter(|rem| !rem.is_zero());
-    let (text, bold_chars) = match (absolute, live) {
-        // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
-        (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
-        (false, Some(rem)) => {
-            let (head, tail) = format::countdown_units(rem);
-            let bold = head.chars().count();
-            let mut text = head;
-            if let Some(tail) = tail {
-                text.push(' ');
-                text.push_str(&tail);
-            }
-            (text, bold)
-        }
-        // Expired window: no live reset to point at in either mode.
-        (_, None) => ("0s".to_string(), 2),
+) -> (Meter, Option<char>) {
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => Fill::Used,
+        crate::config::QuotaDisplay::Remaining => Fill::Left,
+    };
+    let meter = Meter::new(used)
+        .thresholds(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT)
+        .fill(fill)
+        .theme(KEYBAR_THEME);
+    let meter = if absolute {
+        meter.resets_at(window.resets_at, now, 0)
+    } else {
+        meter.resets_in(window.resets_at.duration_since(now).unwrap_or_default())
     };
     let marker = (!matches!(display, WindowDisplayState::Populated)).then(|| display.glyph());
-    (text, bold_chars, marker)
+    let meter = match marker {
+        Some(glyph) => meter.marker(glyph),
+        None => meter,
+    };
+    (meter, marker)
 }
 
-/// Assemble one full quota gauge cell line: the countdown bar
-/// ([`quota_bar_line`], `bar_width` cols) + a space + the right-aligned
-/// percent label (`QUOTA_LABEL_WIDTH` cols, `!`-marked when parked/over) —
-/// `bar_width + 1 + QUOTA_LABEL_WIDTH` columns total (`QUOTA_CELL_WIDTH` is the
-/// minimum, when the terminal has no leftover width to pour into the bar). The
-/// label is the percent of the
-/// FILL fraction, so number and bar always say the same thing: in the default
-/// `remaining` mode a fresh account reads a full green bar + `100%` and
-/// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
-/// past threshold) stays keyed on USED utilization either way, as do the
-/// color bands.
-#[allow(clippy::too_many_arguments)]
-fn quota_cell_line(
-    fill: f64,
-    color: Color,
-    bar_text: &str,
-    bold_chars: usize,
-    over: bool,
-    bar_width: usize,
-    marker: Option<char>,
-) -> Line<'static> {
-    let mut label = format::percent(fill);
-    if over {
-        label.push('!');
+/// One full quota gauge cell: the meter's bar in `bar_width` cells, a space,
+/// and its percent label right-aligned in `QUOTA_LABEL_WIDTH` cells (`!` when
+/// parked or over) — `bar_width + 1 + QUOTA_LABEL_WIDTH` cells, at least
+/// `QUOTA_CELL_WIDTH`. The label is the percent of the FILL, so number and
+/// bar always say the same thing: in the default `remaining` mode a fresh
+/// account reads a full green bar and `100%` and drains toward `0%`.
+///
+/// [`Meter::line`] draws it whenever the bar holds its widest text; in the
+/// one case it does not — the 11-cell bar with the absolute stamp and a
+/// display-state glyph, where the meter would give up the label — the bar
+/// is drawn alone (the stamp falls back to its bold date) and the label is
+/// put back beside it, so the percent never disappears.
+fn quota_cell_line(meter: &Meter, bar_width: usize) -> Line<'static> {
+    let width = bar_width + 1 + QUOTA_LABEL_WIDTH;
+    if usize::from(meter.full_width()) <= width {
+        return meter.line(width as u16);
     }
-    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width, marker);
+    let mut line = meter.clone().label(false).line(bar_width as u16);
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
-        format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
-        Style::new().fg(color),
+        cells::pad(&meter.label_text(), QUOTA_LABEL_WIDTH, cells::Align::Right),
+        KEYBAR_THEME.level(meter.current_level()),
     ));
     line
 }
 
-/// One quota window → its gauge cell: the WHOLE cell is one bar whose
-/// reverse-video fill is the utilization (fill direction per `quota_display`:
-/// `used` grows as quota burns, `remaining` drains toward the reset), with the
-/// reset countdown overlaid inside ([`quota_bar_text`]). This supersedes req4
-/// ("the gauge label is ALWAYS the percentage"): that rule existed because the
-/// countdown once REPLACED the percent label — now both facts render at once
-/// (fill + color carry utilization, the in-bar text carries the reset), so
-/// neither hides the other. Color bands stay keyed on USED utilization
-/// regardless of the fill direction.
+/// One quota window → its gauge: the WHOLE cell is one bar whose
+/// reverse-video fill is the utilization, with the reset inside
+/// ([`quota_meter`]). This supersedes req4 ("the gauge label is ALWAYS the
+/// percentage"): that rule existed because the countdown once REPLACED the
+/// percent label — now both facts render at once (fill + color carry
+/// utilization, the in-bar text carries the reset), so neither hides the
+/// other.
 ///
 /// Issue #33: the cell still carries the [`WindowDisplayState`] so a
 /// never-used (`cold`), stale, or poll-degraded window is visibly distinct
@@ -6554,38 +7106,18 @@ fn window_gauge_parts(
         ));
     };
     let utilization = window.effective_utilization(now);
-    let color = level_color(format::gauge_level(utilization));
+    let (meter, marker) = quota_meter(window, utilization, now, display, mode, reset_absolute);
     // The `!` flags an account that is parked or past its threshold — carried
     // on the percent label, where it always lived.
-    let over = parked || utilization > threshold;
-    let fill = match mode {
-        crate::config::QuotaDisplay::Used => utilization,
-        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-    };
-    let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
-    GaugeParts::Bar {
-        fill,
-        color,
-        text,
-        bold_chars,
-        over,
-        marker,
-    }
+    let meter = meter.over(parked || utilization > threshold);
+    GaugeParts::Bar { meter, marker }
 }
 
 /// A quota gauge's content before it is drawn: a bare state text
-/// (`○ cold`, `-`), or a fill with its reset text, display-state marker and
-/// `!`-marked percent label.
+/// (`○ cold`, `-`), or a meter and its display-state glyph.
 enum GaugeParts {
     Bare(Span<'static>),
-    Bar {
-        fill: f64,
-        color: Color,
-        text: String,
-        bold_chars: usize,
-        over: bool,
-        marker: Option<char>,
-    },
+    Bar { meter: Meter, marker: Option<char> },
 }
 
 impl GaugeParts {
@@ -6593,16 +7125,7 @@ impl GaugeParts {
     fn cell(self, bar_width: usize) -> Cell<'static> {
         match self {
             GaugeParts::Bare(span) => Cell::from(span),
-            GaugeParts::Bar {
-                fill,
-                color,
-                text,
-                bold_chars,
-                over,
-                marker,
-            } => Cell::from(quota_cell_line(
-                fill, color, &text, bold_chars, over, bar_width, marker,
-            )),
+            GaugeParts::Bar { meter, .. } => Cell::from(quota_cell_line(&meter, bar_width)),
         }
     }
 
@@ -6613,43 +7136,35 @@ impl GaugeParts {
     fn text_fields(&self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         match self {
             GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
-            GaugeParts::Bar {
-                fill,
-                color,
-                text,
-                bold_chars,
-                over,
-                marker,
-            } => {
-                let style = Style::new().fg(*color);
-                let head: String = text.chars().take(*bold_chars).collect();
-                let tail: String = text.chars().skip(*bold_chars).collect();
-                let mut reset = vec![Span::styled(head, style.add_modifier(Modifier::BOLD))];
+            GaugeParts::Bar { meter, marker } => {
+                let style = KEYBAR_THEME.level(meter.current_level());
+                let (text, bold) = meter.bar_text();
+                let (head, _) = cells::take_cells(&text, bold);
+                let tail = &text[head.len()..];
+                let mut reset = vec![Span::styled(
+                    head.to_string(),
+                    style.add_modifier(Modifier::BOLD),
+                )];
                 if !tail.is_empty() {
-                    reset.push(Span::styled(tail, style));
+                    reset.push(Span::styled(tail.to_string(), style));
                 }
                 reset.extend(marker.map(|m| Span::styled(format!(" {m}"), style)));
-                let mut label = format::percent(*fill);
-                if *over {
-                    label.push('!');
-                }
-                (reset, vec![Span::styled(label, style)])
+                (reset, vec![Span::styled(meter.label_text(), style)])
             }
         }
     }
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
-/// following the same pattern as [`window_cells`] but as a single cell (no
-/// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
-/// critical coloring:
+/// following the same pattern as [`window_gauge_parts`] but as a single cell
+/// (no paired reset column — W0 keeps the Fbl slot light) and with
+/// scope-aware critical coloring:
 ///
-/// - Present window: the same in-bar countdown gauge as the 7d window
-///   ([`quota_bar_line`]) at EVERY width (.prd/18 rule 3 — the compact narrow
+/// - Present window: the same in-bar countdown meter as the 7d window
+///   ([`quota_meter`]) at EVERY width (.prd/18 rule 3 — the compact narrow
 ///   `F 22h!` marker is gone; the Fbl gauge never gives way, the `status` and
-///   `account` columns absorb a tight width instead). Colored by fill level through
-///   the SAME [`format::gauge_level`] / [`level_color`] palette, EXCEPT the
-///   scope's own signal wins —
+///   `account` columns absorb a tight width instead). Colored by the SAME
+///   70 % / 90 % bands, EXCEPT the scope's own signal wins —
 ///   a *constraining* Fable limit reads red regardless of the raw percent (the
 ///   limit is engaged upstream even if the number looks calm). "Constraining"
 ///   is [`ScopedQuotaWindow::is_constraining`], so the red is **reset-aware**:
@@ -6690,44 +7205,37 @@ fn fable_gauge_parts(
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
     let Some(scoped) = scoped else {
-        // Cold / absent: mirror the `window_cells` absent branch — the glyph +
-        // label — so a never-seen Fable window reads distinctly from an honest
-        // 0%.
+        // Cold / absent: mirror the 7d absent branch — the glyph + label — so
+        // a never-seen Fable window reads distinctly from an honest 0%.
         return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
     };
     let utilization = scoped.window.effective_utilization(now);
+    let (mut meter, marker) = quota_meter(
+        &scoped.window,
+        utilization,
+        now,
+        display,
+        mode,
+        reset_absolute,
+    );
     // Scope signal wins: a *constraining* Fable limit is red no matter the
     // percent — but `is_constraining` is reset-aware (it short-circuits on an
     // expired/reset window), so a stale-`Critical` severity no longer paints a
     // just-reset 0% window red. `is_active` is NOT a red trigger either — it
-    // marks the representative limit, not an exhausted one. Otherwise fall to
-    // the fill band.
-    let critical = scoped.is_constraining(now, fable_max);
-    let level = if critical {
-        GaugeLevel::Red
-    } else {
-        format::gauge_level(utilization)
-    };
-    let color = level_color(level);
-    // `!` on the red-critical read, same signal window_cells carries with its
+    // marks the representative limit, not an exhausted one. Otherwise the
+    // fill band decides. The critical override only changes the color/`!`,
+    // never the fill math.
+    if scoped.is_constraining(now, fable_max) {
+        meter = meter.level(Level::Crit);
+    }
+    // `!` on the red read, the same signal the 7d gauge carries with its
     // over-threshold `!`.
-    let over = matches!(level, GaugeLevel::Red);
-    // Same in-bar countdown gauge as the 7d cell, at every width; the critical
-    // override only changes the color/`!`, never the fill math.
-    let fill = match mode {
-        crate::config::QuotaDisplay::Used => utilization,
-        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-    };
-    let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+    let red = meter.current_level() == Level::Crit;
     GaugeParts::Bar {
-        fill,
-        color,
-        text,
-        bold_chars,
-        over,
+        meter: meter.over(red),
         marker,
     }
 }
@@ -7342,9 +7850,11 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
 
 /// The band's left title: today's `poller` and `totals` lines, word for
 /// word and style for style, joined with ` · `; `totals = None` leaves
-/// ` · totals …` for the mode row.
+/// ` · totals …` for the mode row. It opens with the same two-cell lead as
+/// every other section rule (`── scheduler · …`, [`section`]).
 fn band_title_spans_from(poller: &str, totals: Option<&[Span<'static>]>) -> Vec<Span<'static>> {
     let mut spans = vec![
+        Span::raw(rule_fill(RULE_LEAD)),
         Span::raw(" scheduler · "),
         Span::styled("poller ", dim()),
         Span::raw(poller.to_string()),
@@ -7461,14 +7971,22 @@ fn draw_band(
         (!geometry.totals_on_mode_row).then_some(summary.totals.as_slice()),
     );
     let title_w = Line::from(title.clone()).width();
-    title.push(Span::raw(
-        "─".repeat(geometry.detail_title_x.saturating_sub(title_w)),
-    ));
+    title.push(Span::raw(rule_fill(
+        geometry.detail_title_x.saturating_sub(title_w),
+    )));
     let detail_title_w = Line::from(BAND_DETAIL_TITLE).width();
     title.push(Span::raw(BAND_DETAIL_TITLE));
-    title.push(Span::raw("─".repeat(
-        width.saturating_sub(geometry.detail_title_x + detail_title_w),
-    )));
+    // Where Ambiguous glyphs draw wide, the titles' own (`·`, `…`) take
+    // extra cells: the tail stops short by them, as [`section`] does.
+    let wide_extra = if AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        let text: String = title.iter().map(|span| span.content.as_ref()).collect();
+        ambiguous_extra(&text)
+    } else {
+        0
+    };
+    title.push(Span::raw(rule_fill(width.saturating_sub(
+        geometry.detail_title_x + detail_title_w + wide_extra,
+    ))));
     frame.render_widget(
         Paragraph::new(Line::from(title)),
         Rect { height: 1, ..area },
@@ -7571,8 +8089,8 @@ fn draw_summary(frame: &mut Frame, area: Rect, parts: &SummaryParts) {
     totals.extend(parts.totals.iter().cloned());
     lines.push(Line::from(totals));
     lines.extend(parts.tail.iter().cloned());
-    let block = Block::new().borders(Borders::TOP).title(" scheduler ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " scheduler ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Build the scheduler summary's parts (see [`SummaryParts`]).
@@ -7976,10 +8494,8 @@ fn draw_detail_parts(frame: &mut Frame, area: Rect, parts: &DetailParts) {
     ];
     lines.extend(parts.auth.clone());
     lines.extend(parts.reset.clone());
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" detail · h / click account: full history ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " detail · h / click account: full history ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Build the selected account's [`DetailParts`]; `None` when the order is
@@ -8359,23 +8875,6 @@ pub(crate) struct AccountRowHit {
     pub display_idx: usize,
 }
 
-/// The rendered context menu's layout (UI-3 U11): the whole popup rect plus
-/// one row rect per item, for the click hit-test.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct MenuChrome {
-    pub area: Rect,
-    pub items: Vec<Rect>,
-}
-
-impl MenuChrome {
-    /// Which menu item a click lands on, if any.
-    pub(crate) fn hit_item(&self, col: u16, row: u16) -> Option<usize> {
-        self.items
-            .iter()
-            .position(|r| row == r.y && col >= r.x && col < r.right())
-    }
-}
-
 /// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
 /// its segment cycles the setting to its next value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8405,7 +8904,10 @@ pub(crate) struct MainChrome {
     pub tabs: Vec<TabHit>,
     pub separators: Vec<SeparatorHit>,
     pub account_rows: Vec<AccountRowHit>,
-    pub menu: Option<MenuChrome>,
+    /// The models strip's click targets this frame: one per drawn model
+    /// (packed entry or table row), `index` into `model_usage`.
+    pub models_strip: Vec<packed_grid::GridHit>,
+    pub menu: Option<twolab_tui::menu::MenuLayout>,
     pub settings: Vec<SettingHit>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
     /// select): the data-row rect + the index of its first visible session.
@@ -8426,11 +8928,20 @@ pub(crate) struct MainChrome {
     /// Where the Logs overlay's pager drew this frame (`None`: not open), so
     /// a scroll key or wheel step moves from what is on screen.
     pub logs: Option<twolab_tui::scrollbar::ScrollPos>,
+    /// The rect the Logs pager drew in this frame: the mouse paints the same
+    /// pager there off-screen so a drag selects the cells on screen.
+    pub logs_area: Option<Rect>,
+    /// The open keys, sessions or usage table's scrollbar this frame, when
+    /// its rows overflow: a press on the track jumps, a drag moves the thumb.
+    pub table_scroll: Option<TableScroll>,
     /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
     /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
     /// the raw modal owns its content and never closes on entry aging.
     pub raw_modal: Option<RawModalChrome>,
+    /// Cells the open text field (add key · limits · config value) was drawn
+    /// in this frame — its window follows the caret from there.
+    pub field_width: Option<u16>,
 }
 
 /// Per-frame raw-viewer chrome (UI-8): what the runtime needs to clamp scroll
@@ -8438,8 +8949,13 @@ pub(crate) struct MainChrome {
 /// are mouse targets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RawModalChrome {
-    /// Largest valid (vertical, horizontal) scroll for the ACTIVE tab.
-    pub max_scroll: (u16, u16),
+    /// Largest valid scroll (in wrapped rows) for the ACTIVE tab.
+    pub max_scroll: usize,
+    /// Rows a PgUp/PgDn moves: the view's height less one.
+    pub page: usize,
+    /// The body's scrollbar when its lines overflow: a press on the track
+    /// jumps, a drag on the thumb scrolls.
+    pub bar: Option<TableScroll>,
     /// One rect per rendered tab label, with the tab index it selects.
     pub tabs: Vec<(usize, Rect)>,
     /// One rect per rendered action button.
@@ -8996,7 +9512,6 @@ fn draw_activity(
     } else {
         format!(" activity — {} in flight ", in_flight.len())
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
     // Paragraph styles graphemes, but resets wide-glyph continuation cells.
     // Apply the row background to the final buffer so both those cells and
     // the unused trailing width share the endpoint color.
@@ -9007,7 +9522,8 @@ fn draw_activity(
         .map(|(index, _)| body_top.saturating_add(index as u16))
         .filter(|y| *y < area.bottom())
         .collect();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, &title);
+    frame.render_widget(Paragraph::new(lines), body);
     for y in openai_rows {
         frame.buffer_mut().set_style(
             Rect::new(area.x, y, area.width, 1),
@@ -10012,17 +10528,14 @@ fn model_label_spans(
     (group, name)
 }
 
-/// Fields of one packed models-strip entry: marker · group · model · share ·
-/// req · tok · $ · last.
-const STRIP_FIELDS: usize = 8;
-/// Spaces between two packed entries on one line.
-const STRIP_ENTRY_GAP: usize = 3;
+/// Cells the packed strip keeps left of its grid: the breathing room the
+/// marker's leading space gives the table's marker column. In the grid the
+/// marker is its glyph alone, one cell in every entry column, so the packer
+/// measures every column alike and the first entry still sits one cell in.
+const STRIP_MARGIN: u16 = 1;
 /// The dim column legend a packed strip carries in its border fill (the
 /// packed layout has no header row).
 const STRIP_LEGEND: &str = " group · model · share · req · tok · $ · last ";
-
-/// Display width of each [`STRIP_FIELDS`] field of one entry.
-type StripWidths = [usize; STRIP_FIELDS];
 
 /// The models strip's plan for one frame, decided once in [`draw_main`]:
 /// `per_line >= 2` packs that many entries per line under a one-row title
@@ -10046,88 +10559,84 @@ fn strip_last(m: &ModelUsageDoc, now: SystemTime) -> String {
     }
 }
 
-/// Widest `last` cell, for the packing decision: `N in-flight` with N at
-/// its type's widest (`ModelUsageDoc::in_flight` is a u32) — wider than any
-/// age (`compact_duration`, 6–7 cells), `now` or `—`. Rendering aligns on
-/// the live text; only the decision uses this, so the strip's height does
-/// not change when a model starts or stops running or its age ticks.
-fn strip_last_bound() -> usize {
-    format!("{} in-flight", u32::MAX).chars().count()
+/// Widest `last` cell: `N in-flight` with N at its type's widest
+/// (`ModelUsageDoc::in_flight` is a u32) — wider than any age
+/// (`compact_duration`, 6–7 cells), `now` or `—`. Every packed entry
+/// reserves it, so neither the strip's height nor any of its columns moves
+/// when a model starts or stops running or its age ticks.
+fn strip_last_widest() -> String {
+    format!("{} in-flight", u32::MAX)
 }
 
-/// [`strip_entry_widths`] with the time-driven `last` cell at its bound —
-/// what [`strip_plan`] decides on.
-fn strip_entry_bound(m: &ModelUsageDoc) -> StripWidths {
-    let mut widths = strip_entry_widths(m, UNIX_EPOCH);
-    widths[STRIP_FIELDS - 1] = strip_last_bound();
-    widths
-}
-
-/// Display width (terminal cells) of each field exactly as the packed strip
-/// renders it — the uppercase group word, the model name (wide CJK names
-/// count two cells per character), the counts.
-fn strip_entry_widths(m: &ModelUsageDoc, now: SystemTime) -> StripWidths {
-    let cells = |text: String| Line::from(text).width();
-    [
-        2,
-        cells(m.group.to_uppercase()),
-        cells(m.model.clone()),
-        MODEL_BAR_WIDTH,
-        cells(format::human_count(m.requests)),
-        cells(format::human_count(model_total(m))),
-        cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
-            .line()
-            .width(),
-        cells(strip_last(m, now)),
+/// One packed models-strip entry as twolab-tui grid fields — marker ·
+/// group · model · share · req · tok · $ · last — each drawn as the table
+/// draws its cell. The marker drops its leading space ([`STRIP_MARGIN`]);
+/// the share bar reserves its full width (it reads `—` when no model has
+/// tokens) and `last` its widest form ([`strip_last_widest`]).
+fn strip_fields(
+    m: &ModelUsageDoc,
+    max_total: u64,
+    view: &DashboardView,
+    now: SystemTime,
+    frame: usize,
+) -> Vec<packed_grid::Field<'static>> {
+    let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
+    let (group, name) = model_label_spans(m, active, frame, view.tui_effects, view.gradient);
+    let marker = model_active_marker(m, now, frame);
+    let glyph: String = marker.content.chars().skip(1).collect();
+    let mut share = packed_grid::Field::new(
+        share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+            .style(group_color(Some(m.group.as_str())))
+            .spans(),
+    );
+    share.widest = MODEL_BAR_WIDTH;
+    vec![
+        packed_grid::Field::new(Span::styled(glyph, marker.style)),
+        packed_grid::Field::new(group),
+        packed_grid::Field::new(name),
+        share,
+        packed_grid::Field::new(format::human_count(m.requests)),
+        packed_grid::Field::new(format::human_count(model_total(m))),
+        packed_grid::Field::new(cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line()),
+        packed_grid::Field::new(Span::styled(strip_last(m, now), dim()))
+            .widest(&strip_last_widest()),
     ]
 }
 
-/// Per-column field maxima for `entries` laid out row-major, `per_line` to a
-/// line — every field aligns down its entry column. Past the first column
-/// the marker drops its leading breathing space (the entry gap already
-/// separates it), so it is one cell there.
-fn strip_columns(entries: &[StripWidths], per_line: usize) -> Vec<StripWidths> {
-    let mut columns = vec![[0; STRIP_FIELDS]; per_line.min(entries.len())];
-    for (i, entry) in entries.iter().enumerate() {
-        let column = &mut columns[i % per_line];
-        for (have, want) in column.iter_mut().zip(entry) {
-            *have = (*have).max(*want);
-        }
-    }
-    for column in columns.iter_mut().skip(1) {
-        column[0] = column[0].min(1);
-    }
-    columns
-}
-
-/// Width of one packed line: fields 1 space apart, entries
-/// [`STRIP_ENTRY_GAP`] apart.
-fn strip_line_width(columns: &[StripWidths]) -> usize {
-    columns
+/// The first `n` models as one entry each ([`strip_fields`]), in strip
+/// order — the share bars scaled to the busiest model of them all.
+fn strip_entries(
+    view: &DashboardView,
+    n: usize,
+    now: SystemTime,
+    frame: usize,
+) -> Vec<Vec<packed_grid::Field<'static>>> {
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
+    view.model_usage
         .iter()
-        .map(|c| c.iter().sum::<usize>() + STRIP_FIELDS - 1)
-        .sum::<usize>()
-        + STRIP_ENTRY_GAP * columns.len().saturating_sub(1)
+        .take(n)
+        .map(|m| strip_fields(m, max_total, view, now, frame))
+        .collect()
 }
 
-/// Whether `entries`, `per_line` to a line, fit `width` without clipping.
-fn strip_fits(entries: &[StripWidths], per_line: usize, width: u16) -> bool {
-    strip_line_width(&strip_columns(entries, per_line)) <= usize::from(width)
-}
-
-/// Rule 4, pure: the largest entries-per-line count (2..=entries) whose
-/// packed line fits `width`; 1 (= today's table) when not even two fit.
-fn strip_per_line(entries: &[StripWidths], width: u16) -> usize {
-    (2..=entries.len())
-        .rev()
-        .find(|&k| strip_fits(entries, k, width))
-        .unwrap_or(1)
+/// Rule 4, pure: the most entries per line (two or more) whose aligned
+/// line fits `width` beside the margin — twolab-tui's packer; 1 (= today's
+/// table) when not even two fit.
+fn strip_per_line(widths: &[Vec<usize>], width: u16) -> usize {
+    packed_grid::per_line(
+        widths,
+        &[],
+        usize::from(width.saturating_sub(STRIP_MARGIN)),
+        2,
+    )
+    .unwrap_or(1)
 }
 
 /// The strip's plan: auto height = title + ceil(n/k) packed lines (n = the
 /// top [`MODEL_STRIP_ROWS`]), or today's table height when fewer than two
 /// entries fit a line. A drag override keeps its height; packing then
-/// shows as many entries as its lines hold.
+/// shows as many entries as its lines hold. Decided on the fields the grid
+/// draws, every clock-driven one at its widest form — so at a fixed clock.
 fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan {
     let total = view.model_usage.len();
     if total == 0 {
@@ -10137,7 +10646,10 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             height: 0,
         };
     }
-    let widths: Vec<StripWidths> = view.model_usage.iter().map(strip_entry_bound).collect();
+    let widths: Vec<Vec<usize>> = strip_entries(view, total, UNIX_EPOCH, 0)
+        .iter()
+        .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+        .collect();
     match drag.map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT)) {
         None => {
             let shown = total.min(MODEL_STRIP_ROWS);
@@ -10154,103 +10666,60 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             }
         }
         Some(height) => {
+            // The most entries the lines hold at k per line, for the
+            // largest k at which the packer puts at least k of them on a
+            // line — it may put more, which only leaves a line spare.
             let lines = usize::from(height - 1);
             (2..=total)
                 .rev()
-                .map(|k| (k, total.min(lines * k)))
-                .find(|&(k, shown)| strip_fits(&widths[..shown], k, width))
-                .map_or(
-                    StripPlan {
-                        shown: total.min(usize::from(height - 2)),
-                        per_line: 1,
-                        height,
-                    },
-                    |(per_line, shown)| StripPlan {
+                .find_map(|k| {
+                    let shown = total.min(lines * k);
+                    let per_line = strip_per_line(&widths[..shown], width);
+                    (per_line >= k).then_some(StripPlan {
                         shown,
                         per_line,
                         height,
-                    },
-                )
+                    })
+                })
+                .unwrap_or(StripPlan {
+                    shown: total.min(usize::from(height - 2)),
+                    per_line: 1,
+                    height,
+                })
         }
     }
 }
 
-/// Packed models strip: `plan.per_line` entries per line, row-major, every
-/// field aligned down its entry column; the title is today's, with the
-/// column legend in the border fill when it fits.
+/// Packed models strip on twolab-tui's [`PackedGrid`]: `plan.per_line`
+/// entries per line, row-major, every field aligned down its entry column;
+/// the title is today's, with the column legend in the border fill when it
+/// fits. Returns a click target per drawn entry, carrying its model's index
+/// in the strip order.
 fn draw_models_strip_packed(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     plan: StripPlan,
-) {
-    let now = ctx.now;
+) -> Vec<packed_grid::GridHit> {
     let per_line = plan.per_line.max(1);
     let shown = plan
         .shown
-        .min(usize::from(area.height.saturating_sub(1)) * per_line);
-    let entries = &view.model_usage[..shown.min(view.model_usage.len())];
-    let widths: Vec<StripWidths> = entries.iter().map(|m| strip_entry_widths(m, now)).collect();
-    let columns = strip_columns(&widths, per_line);
-    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
-    let frame_n = ctx.frame;
-    let pad = |spans: &mut Vec<Span<'static>>, field: Vec<Span<'static>>, width: usize| {
-        let w = Line::from(field.clone()).width();
-        spans.extend(field);
-        if width > w {
-            spans.push(Span::raw(" ".repeat(width - w)));
-        }
-    };
-    let lines: Vec<Line> = entries
-        .chunks(per_line)
-        .map(|line| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (j, m) in line.iter().enumerate() {
-                if j > 0 {
-                    spans.push(Span::raw(" ".repeat(STRIP_ENTRY_GAP)));
-                }
-                let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-                let (group, name) =
-                    model_label_spans(m, active, frame_n, view.tui_effects, view.gradient);
-                let marker = model_active_marker(m, now, frame_n);
-                let fields: [Vec<Span<'static>>; STRIP_FIELDS] = [
-                    vec![if j == 0 {
-                        marker
-                    } else {
-                        Span::styled(
-                            marker.content.chars().skip(1).collect::<String>(),
-                            marker.style,
-                        )
-                    }],
-                    vec![group],
-                    name,
-                    share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
-                        .style(group_color(Some(m.group.as_str())))
-                        .spans(),
-                    vec![Span::raw(format::human_count(m.requests))],
-                    vec![Span::raw(format::human_count(model_total(m)))],
-                    cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
-                        .line()
-                        .spans,
-                    vec![Span::styled(strip_last(m, now), dim())],
-                ];
-                for (f, field) in fields.into_iter().enumerate() {
-                    if f > 0 {
-                        spans.push(Span::raw(" "));
-                    }
-                    pad(&mut spans, field, columns[j][f]);
-                }
-            }
-            Line::from(spans)
-        })
-        .collect();
+        .min(usize::from(area.height.saturating_sub(1)) * per_line)
+        .min(view.model_usage.len());
     let title = strip_title(view, shown);
-    let title_w = Line::from(title.as_str()).width();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(title)),
-        area,
-    );
+    let title_w = section_title_width(&title);
+    section(frame, area, &title);
+    let grid = PackedGrid::new(strip_entries(view, shown, ctx.now, ctx.frame))
+        .min_per_line(2)
+        .theme(KEYBAR_THEME);
+    let inner = Rect {
+        x: area.x.saturating_add(STRIP_MARGIN),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(STRIP_MARGIN),
+        height: area.height.saturating_sub(1),
+    };
+    let hits = grid.render_hits(inner, frame.buffer_mut());
     let legend_w = Line::from(STRIP_LEGEND).width();
     if area.height > 0 && title_w + TITLE_GAP + legend_w <= usize::from(area.width) {
         frame.render_widget(
@@ -10262,7 +10731,14 @@ fn draw_models_strip_packed(
                 1,
             ),
         );
+        // The legend's own `·` push the rule's tail on a wide terminal.
+        rule_stop_short(
+            frame,
+            Rect { height: 1, ..area },
+            &format!("{title}{STRIP_LEGEND}"),
+        );
     }
+    hits
 }
 
 /// ` models — top N of M by tokens — {scope} (g: all) ` — shared by the
@@ -10284,6 +10760,8 @@ fn strip_title(view: &DashboardView, shown: usize) -> String {
 /// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
 /// drop the bar so the column set stays readable (req29). A plan that packs
 /// two or more entries per line renders [`draw_models_strip_packed`].
+/// Returns a click target per drawn model — its entry, or its table row —
+/// carrying the model's index in the strip order.
 fn draw_models_strip(
     frame: &mut Frame,
     area: Rect,
@@ -10291,10 +10769,9 @@ fn draw_models_strip(
     ctx: &FrameCtx,
     now: SystemTime,
     plan: StripPlan,
-) {
+) -> Vec<packed_grid::GridHit> {
     if plan.per_line >= 2 {
-        draw_models_strip_packed(frame, area, view, ctx, plan);
-        return;
+        return draw_models_strip_packed(frame, area, view, ctx, plan);
     }
     // Fill the pane: rows follow the AREA height (border + header take 2), so
     // a drag-resized strip (U8) shows more than the MODEL_STRIP_ROWS default
@@ -10370,9 +10847,20 @@ fn draw_models_strip(
     };
     let title = strip_title(view, shown);
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
+    // Data row `i` sits under the title and the header row.
+    (0..shown)
+        .map(|index| packed_grid::GridHit {
+            rect: Rect {
+                y: area.y + 2 + index as u16,
+                height: 1,
+                ..area
+            },
+            index,
+        })
+        .collect()
 }
 
 /// Detailed model view body: the full scrollable table beside (or above) the
@@ -10388,9 +10876,9 @@ fn draw_models_full(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no model usage yet — send a request through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" models "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " models ");
+        frame.render_widget(empty, body);
         return;
     }
     if area.width >= SIDE_BY_SIDE_AT {
@@ -10522,9 +11010,9 @@ fn draw_models_table(
         view.data_quality.cost
     );
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Drill-down panel for the cursored model row: token + cache split, account
@@ -10562,24 +11050,6 @@ fn draw_model_detail(
             group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
         ),
         Span::styled(m.model.clone(), Style::new().add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" req   ", dim()),
-        Span::raw(format!("{} (", format::human_count(m.requests))),
-        Span::styled(
-            format!("{} ok", format::human_count(m.ok)),
-            Style::new().fg(Color::Green),
-        ),
-        Span::raw("/"),
-        Span::styled(
-            format!("{} err", format::human_count(m.errors)),
-            if m.errors > 0 {
-                Style::new().fg(Color::Red)
-            } else {
-                dim()
-            },
-        ),
-        Span::raw(")"),
         Span::styled(
             if m.in_flight > 0 {
                 format!(" · {} in-flight", m.in_flight)
@@ -10589,44 +11059,49 @@ fn draw_model_detail(
             Style::new().fg(Color::Cyan),
         ),
     ]));
+    // The counts on a fact table: requests and cost on the left, the four
+    // token classes on the right (one column under the other when the pane
+    // is too narrow), each figure right-aligned on its last digit. A cache
+    // class the upstream never reported, or a cost no rate prices, is `—` —
+    // never a made-up 0 (req9).
+    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+        Fact::new("requests", format::human_count(m.requests)),
+        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(Color::Green)),
+        Fact::new("errors", format::human_count(m.errors)).style(if m.errors > 0 {
+            Style::new().fg(Color::Red)
+        } else {
+            dim()
+        }),
+        Fact::maybe("cost", model_cost(m).map(twolab_tui::fact_table::money)),
+        Fact::new("tokens in", format::human_count(m.tokens_in)),
+        Fact::new("tokens out", format::human_count(m.tokens_out)),
+        Fact::maybe("cache read", m.cache_read.map(format::human_count)),
+        Fact::maybe("cache write", m.cache_creation.map(format::human_count)),
+    ]);
+    lines.extend(facts.lines(area.width));
+    // The rest is text, its labels on the facts' indent.
+    let pad = " ".repeat(twolab_tui::fact_table::INDENT);
+    let label = |l: &str| Span::styled(format!("{pad}{l:<8}"), dim());
     lines.push(Line::from(vec![
-        Span::styled(" tok   ", dim()),
-        Span::raw(format!(
-            "in {} · out {}",
-            format::human_count(m.tokens_in),
-            format::human_count(m.tokens_out)
-        )),
-    ]));
-    // Cache split — explicit "—" when the upstream did not report it (req9),
-    // and a reminder that quota windows are account-level only (req27).
-    lines.push(Line::from(vec![
-        Span::styled(" cache ", dim()),
-        Span::raw(format!(
-            "read {} · creation {}",
-            opt_count(m.cache_read),
-            opt_count(m.cache_creation)
-        )),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" last  ", dim()),
+        label("last"),
         Span::raw(model_age_compact(m.last_used_ms, now)),
         Span::styled(" ago", dim()),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" effort", dim()),
-        Span::raw(format!(" {}", counts(&m.efforts))),
+        label("effort"),
+        Span::raw(counts(&m.efforts)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" route ", dim()),
+        label("route"),
         Span::raw(counts(&m.endpoints)),
     ]));
-    lines.push(Line::from(Span::styled(" accounts", dim())));
+    lines.push(Line::from(label("accounts")));
     if m.accounts.is_empty() {
-        lines.push(Line::from(Span::styled("   —", dim())));
+        lines.push(Line::from(Span::styled(format!("{pad}  —"), dim())));
     } else {
         for a in &m.accounts {
             lines.push(Line::from(vec![
-                Span::raw(format!("   {} ", masked_name(&a.name, ctx.mask))),
+                Span::raw(format!("{pad}  {} ", masked_name(&a.name, ctx.mask))),
                 Span::styled(
                     format!(
                         "{} req · in {}/out {}",
@@ -10642,12 +11117,12 @@ fn draw_model_detail(
     // Quota windows are an account/provider fact, never per-model (req27) — make
     // that explicit so the per-account list above isn't read as a model limit.
     lines.push(Line::from(Span::styled(
-        " quota is account-level (see accounts table)",
+        format!("{pad}quota is account-level (see accounts table)"),
         dim(),
     )));
 
-    let block = Block::new().borders(Borders::TOP).title(" model detail ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " model detail ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// The heatmap cells for `window`, or an empty slice when the doc carries no
@@ -10683,7 +11158,7 @@ fn draw_heatmap(
     let cells = heatmap_cells(view, window);
     let total = cells.len();
     let title = format!(" token heatmap — {} (best-effort) ", window.label());
-    let block = Block::new().borders(Borders::TOP).title(title);
+    let body = section(frame, area, &title);
 
     let mut lines: Vec<Line> = Vec::new();
     // The accuracy contract (mandatory): a visible best-effort qualifier so the
@@ -10697,7 +11172,7 @@ fn draw_heatmap(
             " no windowed activity yet",
             Style::new().fg(Color::Yellow),
         )));
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        frame.render_widget(Paragraph::new(lines), body);
         return;
     }
 
@@ -10742,7 +11217,7 @@ fn draw_heatmap(
             dim(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// A footer keybar fitted to `width` cells by twolab-tui's
@@ -10798,6 +11273,82 @@ fn keybar_after(
     Line::from(spans)
 }
 
+/// The fewest cells a text field is given (its `❯` column and ten cells of
+/// text); past that the hints after it drop whole instead.
+const FIELD_MIN: u16 = 12;
+
+/// A footer field this wide still leaves every hint after it in view.
+const FIELD_ROOMY: u16 = 24;
+
+/// The keys of a text field (add key · limits · config value), Enter's label
+/// first: the prompt's bar and the `?` help read this one table.
+fn field_keys(enter: &'static str) -> [(&'static str, &'static str); 5] {
+    [
+        ("Enter", enter),
+        ("Esc", "cancel"),
+        ("←→ Home/End", "move"),
+        ("ctrl+u/k/w", "cut"),
+        ("ctrl+y", "put back"),
+    ]
+}
+
+/// A text field as one line `width` cells wide (twolab-tui composer): `❯`,
+/// the window of the value around the caret (a reversed cell), `‹` / `›`
+/// when the value runs past either side, `placeholder` dim while empty. A
+/// masked field draws `∙` glyphs only. The field's window is moved on a
+/// copy; the runtime moves its own the same way ([`MainChrome::field_width`]).
+fn field_line(
+    field: &twolab_tui::composer::ComposerState,
+    placeholder: &str,
+    width: u16,
+) -> Line<'static> {
+    let mut state = field.clone();
+    twolab_tui::composer::Composer::new()
+        .placeholder(placeholder)
+        .theme(KEYBAR_THEME)
+        .line(&mut state, width)
+}
+
+/// A footer prompt with a text field: `label`, the field, then the key bar
+/// ([`field_keys`]: Enter and Esc first, then the editing keys). On a wide
+/// row every hint keeps its place and the field takes the rest; otherwise
+/// the field keeps room for Enter, Esc and the `… +N more` that counts the
+/// editing keys, never less than [`FIELD_MIN`] cells. Returns the line and
+/// the field's width.
+fn field_bar(
+    label: &'static str,
+    field: &twolab_tui::composer::ComposerState,
+    placeholder: &str,
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+) -> (Line<'static>, u16) {
+    use twolab_tui::key_hints::KeyHints;
+    let natural = |hints: &[(&'static str, &'static str)]| {
+        let line = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
+            .no_more()
+            .theme(KEYBAR_THEME)
+            .line(u16::MAX);
+        cells::spans_width(&line.spans) as u16
+    };
+    // The field and the two spaces after it.
+    let room = width
+        .saturating_sub(cells::width(label) as u16 + 1)
+        .saturating_sub(2);
+    let all = natural(hints);
+    let (keep, rest) = hints.split_at(hints.len().min(2));
+    let counted = cells::width(&format!("  … +{} more", rest.len())) as u16;
+    let essential = natural(keep) + if rest.is_empty() { 0 } else { counted };
+    let field_w = if room >= all + FIELD_ROOMY {
+        room - all
+    } else {
+        room.saturating_sub(essential).max(FIELD_MIN.min(room))
+    };
+    let mut lead = vec![Span::raw(label), Span::raw(" ")];
+    lead.extend(field_line(field, placeholder, field_w).spans);
+    lead.push(Span::raw("  "));
+    (keybar_after(lead, hints, width), field_w)
+}
+
 /// The theme every twolab-tui widget on the dashboard draws with (key bars,
 /// confirm gates, pickers): ANSI colours with labels in the terminal's
 /// default foreground (as before the move to KeyHints) — ANSI grey labels
@@ -10808,6 +11359,32 @@ const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
     text_secondary: Color::Reset,
     ..twolab_tui::Theme::ansi()
 };
+
+/// A loading label (sessions, the keys title, the raw viewer) on twolab-tui's
+/// shimmer, `age` after it appeared: still for 600 ms — a load that ends
+/// sooner never sweeps — then a band passes across it every 4 s. On the
+/// dashboard's ANSI theme the band is weight only (dim at rest, bold at the
+/// crest) over `style`'s colour, so the `NO_COLOR` decolor pass keeps it.
+/// Plain bold under reduced motion. The text is `label`, unchanged.
+fn loading_label(
+    label: &str,
+    style: Style,
+    age: Duration,
+    motion: twolab_tui::Motion,
+) -> Vec<Span<'static>> {
+    twolab_tui::shimmer::Shimmer::new(label)
+        .style(style)
+        .spans_at(age, &KEYBAR_THEME.with_motion(motion))
+}
+
+/// The spinner frame beside a loading label: `frame`, or the first glyph held
+/// under reduced motion.
+fn loading_spin(frame: usize, motion: twolab_tui::Motion) -> usize {
+    match motion {
+        twolab_tui::Motion::Reduced => 0,
+        twolab_tui::Motion::Full => frame,
+    }
+}
 
 /// The option an account gate (remove / reset) keeps marked: Cancel, so
 /// Enter — like every key but `1` / `y` — never deletes or spends anything.
@@ -11086,12 +11663,13 @@ const GO_TO_KEYS: [(&str, &str); 10] = [
 ];
 
 /// MAIN bindings the clickable settings bar and the rows stand in for.
-const OTHER_KEYS: [(&str, &str); 6] = [
+const OTHER_KEYS: [(&str, &str); 7] = [
     ("f m e", "codex fast / model / effort"),
     ("h", "account detail"),
     ("click", "tab · row detail · value edit"),
     ("right-click", "account menu"),
     ("wheel", "activity · overlay cursors"),
+    ("drag", "scrollbar · pane border"),
     ("ctrl+c", "quit anywhere"),
 ];
 
@@ -11118,6 +11696,10 @@ fn help_groups(chrome: &Chrome) -> Vec<twolab_tui::key_hints::HintGroup<'static>
         groups.push(group(title, &overlay_hints(overlay, chrome, true).1));
     }
     groups.push(group("switcher (s)", &SELECT_KEYS));
+    groups.push(group(
+        "text fields (add key · limits · config)",
+        &field_keys("apply"),
+    ));
     groups.push(group("keys: model picker (f)", &KEYS_PICKER_KEYS));
     groups.push(group("raw viewer", &RAW_KEYS));
     groups.push(group("other", &OTHER_KEYS));
@@ -11156,6 +11738,7 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("o", "sort"),
                 ("S", "sched"),
                 ("↑↓", "scroll"),
+                ("v", "copy mode"),
             ]);
             // The fold (`z`) is advertised only while it is on: the
             // bar that `z` turns off.
@@ -11181,6 +11764,16 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("a", "add"),
                 ("n", "login"),
                 ("r", "remove"),
+                // The view toggles: `V` first — its label is the one only
+                // this group has, so it is the one the `?` help must show.
+                (
+                    "V",
+                    if chrome.compact_accounts {
+                        "table"
+                    } else {
+                        "compact"
+                    },
+                ),
                 ("u", "used/left"),
                 ("t", "eta/utc"),
                 ("o", "sort"),
@@ -11210,7 +11803,8 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("q", "quit"),
             ],
         ),
-        // Logs overlay: the log ring in a pager; End follows new lines.
+        // Logs overlay: the log ring in a pager; End follows new lines, a
+        // drag selects and copies.
         Overlay::Logs => (
             Some("logs"),
             vec![
@@ -11218,6 +11812,8 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("↑/k ↓/j", "scroll"),
                 ("PgUp/PgDn", "page"),
                 ("Home/End", "top/follow"),
+                ("drag", "copy"),
+                ("v", "copy mode"),
                 ("q", "quit"),
             ],
         ),
@@ -11267,24 +11863,106 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
-    // Status messages quote account names ("switched to a@x.com") — mask any
-    // embedded email under the email-anonymous setting.
-    let status = Line::from(Span::styled(
-        format!(
-            " {}",
-            masked_text(chrome.status_line.as_deref().unwrap_or(""), mask)
+/// The footer's key-bar row in copy mode (`v`): one reversed bar in the
+/// accent colour, so it reads as a banner with or without colour, naming
+/// what happened and the way back. Too narrow for the sentence, it says only
+/// the way back rather than losing it off the right edge.
+fn copy_mode_banner(width: u16) -> Line<'static> {
+    const FULL: &str = " copy mode — mouse released for selecting; press v/Esc to return";
+    const SHORT: &str = " copy mode — v/Esc to return";
+    let text = if cells::width(FULL) <= usize::from(width) {
+        FULL
+    } else {
+        SHORT
+    };
+    Line::from(Span::styled(
+        cells::pad(text, usize::from(width), cells::Align::Left),
+        Style::new()
+            .fg(KEYBAR_THEME.accent)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    ))
+}
+
+/// A message led by its outcome as a glyph and a word — `✓ ok   switched to
+/// …`, `! warn reset cancelled …`, `✗ fail refresh failed: …` (twolab-tui
+/// `Flash`, with the toast kind's glyph in front) — so ok, warn and fail
+/// read apart without colour; under `NO_COLOR` a failure is bold too.
+fn outcome_spans(outcome: twolab_tui::banner::Outcome, text: &str) -> Vec<Span<'static>> {
+    use twolab_tui::banner::Flash;
+    use twolab_tui::toast::ToastKind;
+    let kind = ToastKind::from(outcome);
+    let mut spans = vec![
+        Span::styled(
+            kind.glyph(),
+            kind.style(&KEYBAR_THEME).add_modifier(Modifier::BOLD),
         ),
-        Style::new().fg(Color::Yellow),
-    ));
+        Span::raw(" "),
+    ];
+    if let Some(line) = Flash::new(outcome, text).theme(KEYBAR_THEME).line() {
+        spans.extend(line.spans);
+    }
+    spans
+}
+
+/// The footer's status row: the live message with its outcome, cut with `…`
+/// at the width (it used to run off the right edge). Status messages quote
+/// account names ("switched to a@x.com") — any embedded email is masked
+/// under the email-anonymous setting.
+fn status_row(msg: Option<&StatusMsg>, mask: bool, width: u16) -> Line<'static> {
+    let Some(msg) = msg.filter(|m| !m.text.is_empty()) else {
+        return Line::default();
+    };
+    let mut spans = vec![Span::raw(" ")];
+    spans.extend(outcome_spans(msg.outcome, &masked_text(&msg.text, mask)));
+    cells::truncate_line(Line::from(spans), usize::from(width))
+}
+
+/// Status messages with several facts — a multi-account refresh with
+/// failures — as twolab-tui toast cards stacked in the top-right corner of
+/// `area` (under the tab row, above the footer): the outcome's word in the
+/// border, its glyph and the summary, then one line per fact and `+N more`
+/// past four. Each stays for its kind's time (8 s for a failure) on the
+/// dashboard's clock, so a burst is read one card after another. Up to two
+/// thirds of the width, so long errors are not cut early on a wide terminal;
+/// at 64 columns or fewer a card becomes a one-row banner. Account names
+/// are masked like the status row.
+fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+    use twolab_tui::toast::{Anchor, Toast, ToastStack, DEFAULT_MAX_WIDTH};
+    let cap = (area.width.saturating_mul(2) / 3).max(DEFAULT_MAX_WIDTH);
+    let shown: Vec<Toast> = chrome
+        .toasts
+        .visible(chrome.clock)
+        .into_iter()
+        .map(|t| {
+            Toast::new(t.kind_of(), masked_text(t.title(), mask))
+                .lines(t.body_lines().iter().map(|l| masked_text(l, mask)))
+                .ttl(t.ttl_of())
+                .max_width(cap)
+        })
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    ToastStack::new(&shown)
+        .anchor(Anchor::TopRight)
+        .queued(chrome.toasts.waiting())
+        .dropped(chrome.toasts.dropped())
+        .theme(KEYBAR_THEME)
+        .render(area, frame.buffer_mut());
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) -> Option<u16> {
+    let status = status_row(chrome.status_line.as_ref(), mask, area.width);
+    let mut field_width = None;
     let keybar = match chrome.mode {
-        // Config-editor prompts render their own inline hint line inside the
-        // overlay; the keybar mirrors the essentials.
-        Mode::ConfigEdit { .. } => keybar(
-            Some("edit"),
-            &[("Enter", "apply"), ("Esc", "cancel")],
-            area.width,
-        ),
+        // Copy mode (`v`) owns the bar over every surface and prompt: the
+        // mouse is the terminal's now, and this row says so and how to get
+        // it back. The status row above keeps its message — it may be the
+        // very text being selected.
+        _ if chrome.copy_mode => copy_mode_banner(area.width),
+        // Config-editor prompts render their own inline field and hint line
+        // inside the overlay; the keybar lists the field's keys.
+        Mode::ConfigEdit { .. } => keybar(Some("edit"), &field_keys("apply"), area.width),
         // The gate card above names the setting and its old → new value.
         Mode::ConfigConfirm { .. } => keybar(
             Some("confirm"),
@@ -11320,32 +11998,30 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             keybar(title, &hints, area.width)
         }
         Mode::Select { .. } => keybar(None, &SELECT_KEYS, area.width),
-        // The typed key is shown ONLY as a masked width — never the raw
-        // characters (AGENTS.md credential rule).
-        Mode::EditLimits { .. } => keybar_after(
-            vec![
-                Span::raw(" limits (5h,7d,fbl %): "),
-                Span::styled(
-                    format!("{}▏", chrome.limits_input),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-            ],
-            &[("Enter", "apply"), ("Esc", "cancel")],
-            area.width,
-        ),
-        Mode::AddKey => keybar_after(
-            vec![
-                Span::raw(" add account — key: "),
-                Span::styled(
-                    "•".repeat(chrome.add_input_len),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-            ],
-            &[("Enter", "add"), ("Esc", "cancel")],
-            area.width,
-        ),
+        Mode::EditLimits { .. } => {
+            let (bar, width) = field_bar(
+                " limits (5h,7d,fbl %)",
+                &chrome.field,
+                "empty = global",
+                &field_keys("apply"),
+                area.width,
+            );
+            field_width = Some(width);
+            bar
+        }
+        // The key is a masked composer: the field draws one `∙` per
+        // character and can draw nothing else (AGENTS.md credential rule).
+        Mode::AddKey => {
+            let (bar, width) = field_bar(
+                " add account — key",
+                &chrome.field,
+                "paste an API key",
+                &field_keys("add"),
+                area.width,
+            );
+            field_width = Some(width);
+            bar
+        }
         Mode::ContextMenu { .. } => keybar(
             None,
             &[
@@ -11392,6 +12068,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);
+    field_width
 }
 
 #[cfg(test)]
@@ -11401,6 +12078,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashMap};
+    use twolab_tui::composer::{ComposerState, Mask};
 
     fn model_row(group: &str, model: &str, tokens_in: u64, tokens_out: u64) -> ModelUsageDoc {
         ModelUsageDoc {
@@ -11820,6 +12498,128 @@ mod tests {
             ..Default::default()
         };
         (view, panel)
+    }
+
+    /// Batch 2 scrollbar: a keys table longer than the panel carries the
+    /// library scrollbar on its right border beside the data rows — thumb at
+    /// the top, then at the bottom once scrolled to the end — at 80×24 and
+    /// 179×43; a table that fits keeps its plain border.
+    #[test]
+    fn keys_overlay_draws_a_scrollbar_on_its_border_when_rows_overflow() {
+        let (view, panel) = big_keys_panel();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &keys_chrome(panel.clone()), w, h);
+            let frame = rows.join("\n");
+            let bar = hits.table_scroll.expect("the rows overflow");
+            assert_eq!(bar.track.x, w - 1, "{w}x{h}: on the right border\n{frame}");
+            let edge = |y: u16| rows[usize::from(y)].chars().last().unwrap_or(' ');
+            assert_eq!(edge(bar.track.y), '▐', "{w}x{h}: thumb at the top\n{frame}");
+            assert_eq!(
+                edge(bar.track.bottom() - 1),
+                '╎',
+                "{w}x{h}: track below\n{frame}"
+            );
+            assert_eq!(
+                edge(bar.track.y - 1),
+                '│',
+                "{w}x{h}: header row keeps the border"
+            );
+
+            let end = crate::tui::KeysPanel {
+                scroll: usize::MAX,
+                ..panel.clone()
+            };
+            let (rows, _) = render_with_hits(&view, &keys_chrome(end), w, h);
+            let edge = |y: u16| rows[usize::from(y)].chars().last().unwrap_or(' ');
+            assert_eq!(
+                edge(bar.track.y),
+                '╎',
+                "{w}x{h}: scrolled away from the top"
+            );
+            assert_eq!(
+                edge(bar.track.bottom() - 1),
+                '▐',
+                "{w}x{h}: thumb at the end"
+            );
+        }
+        let (rows, hits) = render_with_hits(&keys_view(), &keys_chrome(loaded_panel()), 80, 24);
+        assert_eq!(hits.table_scroll, None, "a table that fits has no bar");
+        assert!(!rows.join("").contains('▐'), "and draws none");
+    }
+
+    /// The sessions and usage tables give the scrollbar their last column
+    /// (beside the data rows, under the header) only while they overflow;
+    /// side by side the sessions bar stays on the list, off the detail pane.
+    #[test]
+    fn sessions_and_usage_tables_draw_a_scrollbar_only_when_they_overflow() {
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions = (0..60)
+            .map(|i| crate::session::Session {
+                user_id: Some(format!("u-{i:02}")),
+                ..one_session()
+            })
+            .collect();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let bar = hits.table_scroll.expect("60 sessions overflow");
+            let table = hits.sessions_table.expect("table drawn");
+            assert_eq!(
+                bar.track.x,
+                table.rows.right(),
+                "{w}x{h}: right of the rows\n{frame}"
+            );
+            assert_eq!(bar.track.y, table.rows.y, "{w}x{h}: beside the data rows");
+            if w >= SIDE_BY_SIDE_AT {
+                assert!(bar.track.x < w - 46, "{w}x{h}: on the list, not the detail");
+            }
+            let at = |y: u16| rows[usize::from(y)].chars().nth(usize::from(bar.track.x));
+            assert_eq!(at(bar.track.y), Some('▐'), "{w}x{h}:\n{frame}");
+            assert_eq!(at(bar.track.bottom() - 1), Some('╎'), "{w}x{h}:\n{frame}");
+        }
+        chrome.sessions.truncate(3);
+        let (_, hits) = render_with_hits(&view, &chrome, 80, 24);
+        assert_eq!(hits.table_scroll, None, "three sessions fit");
+
+        let row = |bucket: u64, model: &str| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket,
+            label: format!("day-{bucket:02}"),
+            group: "claude".into(),
+            model: model.into(),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.1,
+            priced: true,
+        };
+        let mut view = view_with(Vec::new());
+        view.usage_stats = (0..20u64)
+            .rev()
+            .flat_map(|b| [row(b, "m1"), row(b, "m2")])
+            .collect();
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.usage_gran = crate::tui::activity::UsageGran::Day;
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let bar = hits.table_scroll.expect("60 usage rows overflow");
+            assert_eq!(bar.track.x, w - 1, "{w}x{h}: the last column\n{frame}");
+            assert_eq!((bar.pos.top, bar.pos.max), (0, 60 - bar.pos.viewport));
+            let at = |y: u16| rows[usize::from(y)].chars().last();
+            assert_eq!(at(bar.track.y), Some('▐'), "{w}x{h}:\n{frame}");
+            assert_eq!(
+                at(bar.track.y - 1),
+                Some(' '),
+                "{w}x{h}: the header row has no bar"
+            );
+        }
+        view.usage_stats.truncate(4);
+        let (_, hits) = render_with_hits(&view, &chrome, 80, 24);
+        assert_eq!(hits.table_scroll, None, "two buckets fit");
     }
 
     #[test]
@@ -12374,11 +13174,11 @@ mod tests {
             .expect("codex row");
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::ConfirmReset { idx: codex_pos };
-        chrome.status_line = Some(super::super::reset_confirm_status(
+        chrome.status_line = Some(StatusMsg::warn(super::super::reset_confirm_status(
             "codex:me@example.com",
             Some(3),
             Some(0),
-        ));
+        )));
         let rows = render_rows(&view, &chrome, 160, 30);
         let frame = rows.join("\n");
         assert!(frame.contains("codex:me@example.com"), "{frame}");
@@ -12411,7 +13211,12 @@ mod tests {
         // and the daemon facts keep their rows.
         let small = render_rows(&view, &chrome, 80, 24).join("\n");
         assert!(small.contains("… +"), "{small}");
-        assert!(small.contains("accounts 2 · raw-io"), "{small}");
+        let facts = small
+            .lines()
+            .find(|r| r.contains("llmux  ") && r.contains("accounts"))
+            .unwrap_or_else(|| panic!("{small}"));
+        assert!(facts.trim_end().ends_with(" 2"), "{small}");
+        assert!(small.contains("raw-io "), "{small}");
     }
 
     /// The hand-built prompts are fitted like every other bar: on a narrow
@@ -12421,28 +13226,41 @@ mod tests {
         let view = usage_control_view();
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::EditLimits { idx: 0 };
-        chrome.limits_input = "80,90".into();
+        // The field is a composer now: `❯` and the value, the caret a
+        // reversed cell after it (it was a literal `▏`).
+        chrome.field = ComposerState::with_text("80,90").single_line();
         let wide = render_rows(&view, &chrome, 80, 24);
         let bar = wide[wide.len() - 1].clone();
         assert!(
-            bar.contains("80,90▏") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
+            bar.contains("❯ 80,90") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
             "{bar}"
         );
         let narrow = render_rows(&view, &chrome, 40, 24);
         let bar = narrow[narrow.len() - 1].clone();
-        assert!(bar.contains("80,90▏"), "{bar}");
+        assert!(bar.contains("❯ 80,90"), "{bar}");
         assert!(bar.contains("… +"), "{bar}");
         assert!(
             !bar.contains("Enter a ") && !bar.trim_end().ends_with("Ente"),
             "{bar}"
         );
 
+        // A 30-character key: the masked field scrolls (`‹` says more is to
+        // the left) instead of drawing all 30 bullets and pushing the keys
+        // off; at 56 columns Esc and the count of the rest stay, at 80 Enter
+        // and Esc both do.
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::AddKey;
-        chrome.add_input_len = 30;
+        chrome.field = ComposerState::with_text(&"k".repeat(30)).masked(Mask::default());
         let bar = render_rows(&view, &chrome, 56, 24).pop().expect("footer");
-        assert!(bar.contains(&"•".repeat(30)), "masked width kept: {bar}");
-        assert!(bar.contains("… +"), "{bar}");
+        assert!(bar.contains("‹ ∙∙∙"), "masked and scrolled: {bar}");
+        assert!(!bar.contains("kk"), "{bar}");
+        assert!(bar.contains("Esc cancel") && bar.contains("… +"), "{bar}");
+        let bar = render_rows(&view, &chrome, 80, 24).pop().expect("footer");
+        assert!(bar.contains("‹ ∙∙∙") && !bar.contains("kk"), "{bar}");
+        assert!(
+            bar.contains("Enter add") && bar.contains("Esc cancel"),
+            "{bar}"
+        );
     }
 
     /// The raw viewer's legend sits on its bottom border above the footer and
@@ -12460,8 +13278,9 @@ mod tests {
             title: "raw".into(),
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: Default::default(),
             spin: 0,
+            since: Duration::ZERO,
             flash: None,
             state: super::super::RawModalState::Failed("gone".into()),
         });
@@ -12476,6 +13295,53 @@ mod tests {
             legend.contains("esc close"),
             "the close key stays: {legend}"
         );
+    }
+
+    /// Every status message leads with its outcome as a glyph and a word
+    /// (all of them were yellow, `refresh failed` included): ok, warn and
+    /// fail read apart at 80 and 179 columns, also once `NO_COLOR` has
+    /// stripped the colour — the failure is bold then — and a long message
+    /// ends in `…` at the edge instead of running off it.
+    #[test]
+    fn status_row_says_ok_warn_or_fail_also_without_colour() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for (msg, lead) in [
+                (StatusMsg::ok("fold on"), " ✓ ok   fold on"),
+                (
+                    StatusMsg::warn("reset cancelled — nothing was spent"),
+                    " ! warn reset cancelled",
+                ),
+                (
+                    StatusMsg::fail("refresh failed: upstream 502"),
+                    " ✗ fail refresh failed",
+                ),
+            ] {
+                chrome.status_line = Some(msg.clone());
+                let mut buf = render_buffer(&view, &chrome, w, h);
+                twolab_tui::theme::decolor(&mut buf);
+                let y = h - 2;
+                let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+                assert!(row.starts_with(lead), "{w}x{h}: {row:?}");
+                // The message text starts in one column for every outcome.
+                let text_col = 8;
+                let bold = buf[(text_col, y)].modifier.contains(Modifier::BOLD);
+                assert_eq!(
+                    bold,
+                    msg.outcome == twolab_tui::banner::Outcome::Fail,
+                    "only a failure is bold without colour: {row:?}"
+                );
+            }
+        }
+        chrome.status_line = Some(StatusMsg::fail(format!(
+            "refresh failed: error sending request for url ({})",
+            "http://localhost:3456/llmux/refresh-usage".repeat(3)
+        )));
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let row = rows[22].trim_end();
+        assert!(row.ends_with('…'), "{row:?}");
+        assert!(cells::width(row) <= 80, "{row:?}");
     }
 
     /// Under `NO_COLOR` the frame loop strips every colour; the gate's marked
@@ -12530,9 +13396,33 @@ mod tests {
         assert_eq!(row_account_name("plainname", false, &abbrev), "plainname");
     }
 
+    /// A quota meter's bar alone, `width` cells: `fill` of it used (and
+    /// filled), coloured for `level`, `text` centred inside with its first
+    /// `bold` cells bold, `marker` in the last cell — what llmux's own
+    /// `quota_bar_line` drew before the gauges moved to twolab-tui's meter.
+    fn meter_bar(
+        fill: f64,
+        level: Level,
+        text: &str,
+        bold: usize,
+        width: usize,
+        marker: Option<char>,
+    ) -> ratatui::text::Line<'static> {
+        let meter = Meter::new(fill)
+            .level(level)
+            .text(text, bold)
+            .label(false)
+            .theme(KEYBAR_THEME);
+        match marker {
+            Some(glyph) => meter.marker(glyph),
+            None => meter,
+        }
+        .line(width as u16)
+    }
+
     #[test]
     fn quota_bar_line_is_cell_width_and_splits_at_fill_boundary() {
-        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None);
+        let line = meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, None);
         let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, 16, "cell is exactly bar-width wide");
         // First 8 columns reversed (the fill), the rest plain.
@@ -12555,15 +13445,8 @@ mod tests {
         let flat = |line: ratatui::text::Line| -> String {
             line.spans.iter().map(|s| s.content.as_ref()).collect()
         };
-        let without = flat(quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None));
-        let with = flat(quota_bar_line(
-            0.5,
-            Color::Green,
-            "7d 10h",
-            2,
-            16,
-            Some('○'),
-        ));
+        let without = flat(meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, None));
+        let with = flat(meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, Some('○')));
         assert_eq!(
             without.find("7d 10h"),
             with.find("7d 10h"),
@@ -12580,7 +13463,7 @@ mod tests {
     #[test]
     fn quota_bar_line_empty_and_full_fill() {
         for (fill, want_rev) in [(0.0, 0usize), (1.0, 16usize)] {
-            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16, None);
+            let line = meter_bar(fill, Level::Crit, "17m 35s", 3, 16, None);
             let rev: usize = line
                 .spans
                 .iter()
@@ -12593,7 +13476,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_bolds_only_the_leading_unit() {
-        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16, None);
+        let line = meter_bar(0.0, Level::Ok, "7d 10h", 2, 16, None);
         let bold: String = line
             .spans
             .iter()
@@ -12611,7 +13494,7 @@ mod tests {
     #[test]
     fn quota_bar_countdown_stands_alone_without_rst_prefix() {
         for marker in [None, Some('○'), Some('◑')] {
-            let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 32, marker);
+            let line = meter_bar(0.5, Level::Ok, "7d 10h", 2, 32, marker);
             let cells: Vec<_> = line
                 .spans
                 .iter()
@@ -12651,7 +13534,7 @@ mod tests {
     fn quota_bar_long_countdown_keeps_its_centered_column() {
         // Nine countdown characters at width 16: centered at column 3.
         for marker in [None, Some('○')] {
-            let line = quota_bar_line(0.5, Color::Green, "1234d 10h", 5, 16, marker);
+            let line = meter_bar(0.5, Level::Ok, "1234d 10h", 5, 16, marker);
             let text: String = line
                 .spans
                 .iter()
@@ -12670,7 +13553,7 @@ mod tests {
             ("10/20 12:34", 5, None, "10/20 12:34"),
             ("0s", 2, Some('○'), "    0s    ○"),
         ] {
-            let line = quota_bar_line(0.5, Color::Green, time, bold_chars, 11, marker);
+            let line = meter_bar(0.5, Level::Ok, time, bold_chars, 11, marker);
             let text: String = line
                 .spans
                 .iter()
@@ -12858,13 +13741,20 @@ mod tests {
             usage_gran: Default::default(),
             usage_scroll: 0,
             logs_scroll: None,
+            logs_selection: None,
+            copy_mode: false,
             input_modal: None,
             raw_modal: None,
             account_modal: None,
+            ambiguous_wide: false,
             frame: 0,
             mode: Mode::Normal,
             overlay,
             status_line: None,
+            toasts: Default::default(),
+            clock: Duration::ZERO,
+            attach_wait: Duration::ZERO,
+            motion: Default::default(),
             activity_scroll: 0,
             expanded_activity: None,
             expanded_run: None,
@@ -12873,6 +13763,7 @@ mod tests {
             sessions: Vec::new(),
             sessions_loading: false,
             sessions_pct: 100,
+            sessions_since: Duration::ZERO,
             session_cursor: 0,
             session_sort: Default::default(),
             account_sort: Default::default(),
@@ -12881,14 +13772,76 @@ mod tests {
             confirm_choice: 0,
             reset_held: None,
             config_saved: Default::default(),
-            add_input_len: 0,
+            field: Default::default(),
             quota_display_override: None,
             reset_absolute: false,
             fold_exhausted: false,
-            limits_input: String::new(),
+            compact_accounts: false,
             attach: None,
             keys: Default::default(),
         }
+    }
+
+    /// The attach screen before the first document is a working row, not
+    /// static yellow text: a spinner that turns with the clock, how long it
+    /// has been retrying (`42s`, then `1m 05s`) and the quit key, at 80 and
+    /// 179 columns. Under reduced motion the spinner holds its first glyph
+    /// and the label is plain bold while the clock still counts.
+    #[test]
+    fn connecting_screen_spins_and_counts_the_retry_time() {
+        use super::super::Attach;
+        let render = |chrome: &Chrome, w: u16, h: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+            let mut hits = None;
+            terminal
+                .draw(|f| draw(f, None, chrome, &mut hits))
+                .expect("draw");
+            terminal.backend().buffer().clone()
+        };
+        let row = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        let mut chrome = Chrome {
+            attach: Some(Attach {
+                pid: Some(42),
+                connected: false,
+            }),
+            attach_wait: Duration::from_secs(42),
+            ..chrome_overlay(Overlay::None)
+        };
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            chrome.clock = Duration::ZERO;
+            let first = row(&render(&chrome, w, h), 1);
+            assert_eq!(
+                first.trim_end(),
+                " ⠋ connecting to daemon — retrying… (42s) - q quit",
+                "{w}x{h}"
+            );
+            chrome.clock = Duration::from_millis(120);
+            let next = row(&render(&chrome, w, h), 1);
+            assert!(
+                next.starts_with(" ⠙ connecting"),
+                "the spinner turns: {next:?}"
+            );
+        }
+        chrome.attach_wait = Duration::from_secs(65);
+        let later = row(&render(&chrome, 80, 24), 1);
+        // The note after the clock keeps its column while the minutes tick.
+        assert!(later.contains("(1m 05s)  - q quit"), "{later:?}");
+
+        chrome.motion = twolab_tui::Motion::Reduced;
+        let still: Vec<String> = [0u64, 120, 4_000]
+            .iter()
+            .map(|&ms| {
+                chrome.clock = Duration::from_millis(ms);
+                let buf = render(&chrome, 80, 24);
+                let label = (3..35).all(|x| buf[(x, 1)].modifier.contains(Modifier::BOLD));
+                assert!(label, "the label is plain bold: {}", row(&buf, 1));
+                row(&buf, 1)
+            })
+            .collect();
+        assert!(still.iter().all(|r| r == &still[0]), "{still:?}");
+        assert!(still[0].starts_with(" ⠋ connecting"), "{:?}", still[0]);
     }
 
     /// attach_spans (TUI-14): connected -> "attached → pid N"; disconnected ->
@@ -13117,6 +14070,91 @@ mod tests {
             "lower rows reachable (req13)"
         );
         assert!(text.contains("model detail"), "drill-down panel present");
+    }
+
+    /// The drill-down's counts were free text (`req 3.7k (3.7k ok/14 err)`,
+    /// `tok in 41.2M · out 6.9M`, `cache read 38.0M · creation —`), so no
+    /// figure lined up with another and the cost was not there. They are a
+    /// fact table now: requests and cost on the left, the four token classes
+    /// on the right, every figure right-aligned on its last digit, and `—`
+    /// for a class the upstream never reported.
+    #[test]
+    fn model_detail_counts_line_up_in_two_columns() {
+        let mut m = model_row("claude", "claude-opus-4-8", 41_200_000, 6_900_000);
+        m.requests = 3_665;
+        m.ok = 3_651;
+        m.errors = 14;
+        m.in_flight = 2;
+        m.cache_read = Some(38_000_000);
+        m.cache_creation = None;
+        m.cost_usd = 397.5;
+        let view = view_with(vec![m]);
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Stats), 179, 43);
+        let text = rows.join("\n");
+        let row = |label: &str| {
+            rows.iter()
+                .find(|r| r.contains(&format!("  {label}  ")))
+                .unwrap_or_else(|| panic!("{label}:\n{text}"))
+                .as_str()
+        };
+        // The column where `needle` ends on `row`, in cells.
+        let end = |row: &str, needle: &str| {
+            let at = row
+                .rfind(needle)
+                .unwrap_or_else(|| panic!("{needle}: {row}"));
+            cells::width(&row[..at]) + cells::width(needle)
+        };
+        // Two columns: each left fact shares its row with a token class.
+        assert!(row("requests").contains("tokens in"), "{text}");
+        assert!(row("ok").contains("tokens out"), "{text}");
+        assert!(row("errors").contains("cache read"), "{text}");
+        assert!(row("cost").contains("cache write"), "{text}");
+        // Figures end on one column per side.
+        let left = end(row("requests"), "3.7k ");
+        assert_eq!(end(row("ok"), "3.7k "), left, "{text}");
+        assert_eq!(end(row("errors"), "14 "), left, "{text}");
+        assert_eq!(end(row("cost"), "$397.50 "), left, "{text}");
+        let right = end(row("requests"), "41.2M");
+        assert_eq!(end(row("ok"), "6.9M"), right, "{text}");
+        assert_eq!(end(row("errors"), "38.0M"), right, "{text}");
+        // A cache class nobody reported is unknown, not zero.
+        assert_eq!(end(row("cost"), "—"), right, "{text}");
+        assert!(text.contains("claude-opus-4-8 · 2 in-flight"), "{text}");
+    }
+
+    /// The misc tab's build and daemon facts were two run-on lines
+    /// (`llmux … · daemon pid 1 · port 3456 · up 1s`); they are a fact table
+    /// now — the build on the left, the daemon on the right, figures on
+    /// their last digit, `—` for a size not measured yet — and take the
+    /// same rows as before.
+    #[test]
+    fn misc_facts_line_up_build_left_daemon_right() {
+        let mut view = view_with(Vec::new());
+        view.config_path = Some("/home/me/.config/llmux/config.toml".into());
+        view.config_facts.raw_io_enabled = true;
+        view.config_facts.raw_io_bytes = Some(12_400_000);
+        for (w, h) in [(179, 43), (80, 24)] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::Misc), w, h);
+            let text = rows.join("\n");
+            let at = rows
+                .iter()
+                .position(|r| r.starts_with("  llmux  "))
+                .unwrap_or_else(|| panic!("{text}"));
+            let facts: Vec<&str> = rows[at..at + 5].iter().map(|r| r.trim_end()).collect();
+            assert_eq!(
+                facts,
+                [
+                    "  llmux       0.0 (test)    accounts           0",
+                    "  daemon pid           1    raw-io            on",
+                    "  port              3456    raw-io store  12.4MB",
+                    "  up                  1s    activity log       —",
+                    "  config  /home/me/.config/llmux/config.toml",
+                ],
+                "{text}"
+            );
+            // The facts sit right above the footer rows, as they did.
+            assert_eq!(at + 5, usize::from(h) - 2, "{text}");
+        }
     }
 
     // --- issue #5: MAIN-always + summoned overlays -------------------------
@@ -13627,7 +14665,7 @@ mod tests {
         let view = c5_long_totals_view();
         let mut chrome = chrome_overlay(Overlay::Usage);
         for status in [Some("refresh failed: retry later"), None] {
-            chrome.status_line = status.map(str::to_string);
+            chrome.status_line = status.map(StatusMsg::fail);
             let rows = render_rows(&view, &chrome, 100, 50);
             if let Some(status) = status {
                 assert!(
@@ -13667,7 +14705,7 @@ mod tests {
     fn c5_usage_title_fits_legacy_width_with_long_totals() {
         let view = c5_long_totals_view();
         let mut chrome = chrome_overlay(Overlay::Usage);
-        chrome.status_line = Some("refresh failed: retry later".into());
+        chrome.status_line = Some(StatusMsg::fail("refresh failed: retry later"));
         for width in [80, 74] {
             let rows = render_rows(&view, &chrome, width, 50);
             assert!(
@@ -13746,7 +14784,7 @@ mod tests {
             },
         ];
         let mut chrome = chrome_overlay(Overlay::Usage);
-        chrome.status_line = Some("refresh failed: retry later".into());
+        chrome.status_line = Some(StatusMsg::fail("refresh failed: retry later"));
         let rows = render_rows(&view, &chrome, 80, 50);
         assert!(rows[48].contains("refresh failed: retry later"));
         assert!(
@@ -13827,7 +14865,7 @@ mod tests {
         for (overlay, keybar) in [
             (
                 Overlay::None,
-                " q quit  R reload  u used/left  t eta/utc  o sort  S sched  ↑↓ scroll",
+                " q quit  R reload  u used/left  t eta/utc  o sort  S sched  ↑↓ scroll  v copy mode",
             ),
             (
                 Overlay::Stats,
@@ -13835,16 +14873,17 @@ mod tests {
             ),
             (
                 Overlay::Logs,
-                " logs — l/Esc back  ↑/k ↓/j scroll  PgUp/PgDn page  Home/End top/follow  q quit",
+                " logs — l/Esc back  ↑/k ↓/j scroll  PgUp/PgDn page  Home/End top/follow  drag copy  v copy mode  q quit",
             ),
         ] {
             let mut chrome = chrome_overlay(overlay);
             for status in [None, Some("switched to codex@example.com")] {
-                chrome.status_line = status.map(str::to_string);
+                chrome.status_line = status.map(StatusMsg::ok);
                 let rows = render_rows(&view, &chrome, 160, 50);
+                // The status row leads with its outcome (glyph and word).
                 assert_eq!(
                     rows[48].trim_end(),
-                    status.map_or(String::new(), |status| format!(" {status}")),
+                    status.map_or(String::new(), |status| format!(" ✓ ok   {status}")),
                     "non-Usage status line is unchanged"
                 );
                 assert_eq!(rows[49].trim_end(), keybar, "non-Usage keybar is unchanged");
@@ -14165,6 +15204,73 @@ mod tests {
         assert_eq!(pos.max, 103 - 18, "101 lines, the long one on 3 rows");
     }
 
+    /// Copy mode (`v`) at 80x24 and 179x43, on MAIN and over the Logs
+    /// pager: the key-bar row is the banner — reversed across the row, so it
+    /// reads under `NO_COLOR` too — and the status row above keeps its
+    /// message (it may be what is being selected). Too narrow for the
+    /// sentence, the banner keeps the way back.
+    #[test]
+    fn copy_mode_banner_replaces_the_key_bar_and_keeps_the_status_row() {
+        let view = view_with(Vec::new());
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for overlay in [Overlay::None, Overlay::Logs] {
+                let mut chrome = chrome_overlay(overlay);
+                chrome.copy_mode = true;
+                chrome.status_line = Some(StatusMsg::fail("refresh failed: retry later"));
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+                let mut hits = None;
+                terminal
+                    .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+                    .expect("draw");
+                let buf = terminal.backend().buffer().clone();
+                let row = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+                assert_eq!(
+                    row(h - 1).trim_end(),
+                    " copy mode — mouse released for selecting; press v/Esc to return",
+                    "{w}x{h} {overlay:?}"
+                );
+                assert_eq!(row(h - 2).trim_end(), " ✗ fail refresh failed: retry later");
+                assert!(
+                    (0..w).all(|x| buf[(x, h - 1)].modifier.contains(Modifier::REVERSED)),
+                    "the whole row is the banner"
+                );
+            }
+        }
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.copy_mode = true;
+        let rows = render_rows(&view, &chrome, 50, 24);
+        assert_eq!(rows[23].trim_end(), " copy mode — v/Esc to return");
+    }
+
+    /// A drag selection in the Logs pager is drawn reversed on exactly the
+    /// selected cells, and the title says the pager is held for it.
+    #[test]
+    fn logs_selection_is_drawn_reversed_and_the_title_says_held() {
+        let mut view = view_with(Vec::new());
+        view.logs = log_lines(5);
+        let mut chrome = chrome_overlay(Overlay::Logs);
+        chrome.logs_scroll = Some(0);
+        chrome.logs_selection = Some(twolab_tui::pager::Selection::range((1, 7), (1, 18)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        assert!(
+            row(2).contains("logs · 5 lines · held for the selection — End follows"),
+            "{}",
+            row(2)
+        );
+        assert_eq!(row(4).trim_end(), "  INFO log line 001");
+        let reversed: Vec<u16> = (0..80)
+            .filter(|&x| buf[(x, 4)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(reversed, (7..=18).collect::<Vec<_>>(), "`log line 001`");
+        assert!((0..80).all(|x| !buf[(x, 3)].modifier.contains(Modifier::REVERSED)));
+    }
+
     /// Sessions overlay (issue #34): renders the folded session list with the
     /// confidence label, the user_id, and the per-session aggregates.
     #[test]
@@ -14295,6 +15401,196 @@ mod tests {
             !text.contains("loading…"),
             "loading title gone once the load is done"
         );
+    }
+
+    /// When the loading labels below began loading, on the dashboard clock.
+    /// Not zero, so a label swept from the dashboard's start would read apart.
+    const LOADING_SINCE: Duration = Duration::from_secs(5);
+
+    /// The cells that spell `label` on the first row that holds it (one cell
+    /// per char: the loading labels are narrow text), and that whole row.
+    fn label_cells(
+        buf: &ratatui::buffer::Buffer,
+        label: &str,
+    ) -> (Vec<ratatui::buffer::Cell>, Vec<ratatui::buffer::Cell>) {
+        let want: Vec<String> = label.chars().map(String::from).collect();
+        let n = want.len() as u16;
+        for y in 0..buf.area.height {
+            for x in 0..=buf.area.width.saturating_sub(n) {
+                if (0..n).all(|i| buf[(x + i, y)].symbol() == want[i as usize]) {
+                    let cells = (0..n).map(|i| buf[(x + i, y)].clone()).collect();
+                    let row = (0..buf.area.width).map(|c| buf[(c, y)].clone()).collect();
+                    return (cells, row);
+                }
+            }
+        }
+        panic!("{label:?} is not on screen");
+    }
+
+    /// A loading label on the twolab-tui shimmer, drawn by `at(age, motion)`
+    /// `age` after its load began: dim and still at first (a load that ends
+    /// within 600 ms never sweeps), a band 1.1 s in — a bold crest between
+    /// dim cells, also once `NO_COLOR`'s decolor pass has run — and under
+    /// reduced motion plain bold with its row (spinner included) the same
+    /// at every moment. Returns the mid-sweep frame.
+    fn assert_loading_label_shimmers(
+        label: &str,
+        at: impl Fn(Duration, twolab_tui::Motion) -> ratatui::buffer::Buffer,
+    ) -> ratatui::buffer::Buffer {
+        use twolab_tui::Motion;
+        let (rest, _) = label_cells(&at(Duration::ZERO, Motion::Full), label);
+        assert!(
+            rest.iter()
+                .all(|c| c.modifier.contains(Modifier::DIM) && !c.modifier.contains(Modifier::BOLD)),
+            "{label} at rest: {rest:?}"
+        );
+        let mid = at(Duration::from_millis(1_100), Motion::Full);
+        let mut decolored = mid.clone();
+        twolab_tui::theme::decolor(&mut decolored);
+        for buf in [&mid, &decolored] {
+            let (cells, _) = label_cells(buf, label);
+            let bold = cells
+                .iter()
+                .filter(|c| c.modifier.contains(Modifier::BOLD))
+                .count();
+            let dim = cells
+                .iter()
+                .filter(|c| c.modifier.contains(Modifier::DIM))
+                .count();
+            assert!(bold > 0 && dim > 0, "a band across {label}: {cells:?}");
+        }
+        let still: Vec<_> = [0u64, 1_100, 4_000]
+            .iter()
+            .map(|&ms| {
+                let (cells, row) =
+                    label_cells(&at(Duration::from_millis(ms), Motion::Reduced), label);
+                assert!(
+                    cells.iter().all(|c| c.modifier.contains(Modifier::BOLD)
+                        && !c.modifier.contains(Modifier::DIM)),
+                    "{label} plain bold under reduced motion: {cells:?}"
+                );
+                row
+            })
+            .collect();
+        assert!(
+            still.iter().all(|r| r == &still[0]),
+            "{label} holds still under reduced motion"
+        );
+        mid
+    }
+
+    /// The sessions overlay's loading labels shimmer from when the load
+    /// began: the spinner's `loading sessions…` while nothing has arrived,
+    /// then the title's `loading…` before ` N%` while the table fills — at
+    /// 80×24 and 179×43, the text unchanged. Under reduced motion the label
+    /// is plain bold and the spinner holds its first glyph.
+    #[test]
+    fn sessions_loading_labels_shimmer_from_when_the_load_began() {
+        let view = view_with(Vec::new());
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for filling in [false, true] {
+                let at = |age: Duration, motion| {
+                    let mut chrome = chrome_overlay(Overlay::Sessions);
+                    chrome.sessions_loading = true;
+                    chrome.sessions_since = LOADING_SINCE;
+                    chrome.clock = LOADING_SINCE + age;
+                    // The shared tick turns the spinner.
+                    chrome.frame = (age.as_millis() / 80) as usize;
+                    chrome.motion = motion;
+                    if filling {
+                        chrome.sessions = vec![one_session()];
+                        chrome.sessions_pct = 42;
+                    }
+                    render_buffer(&view, &chrome, w, h)
+                };
+                let label = if filling {
+                    "loading…"
+                } else {
+                    "loading sessions…"
+                };
+                let mid = assert_loading_label_shimmers(label, at);
+                let (_, row) = label_cells(&mid, label);
+                let text: String = row.iter().map(|c| c.symbol()).collect();
+                let want = if filling {
+                    "(o) — loading… 42% "
+                } else {
+                    " loading sessions…"
+                };
+                assert!(text.contains(want), "{w}x{h}: {text:?}");
+            }
+        }
+    }
+
+    /// The keys panel's title says `· loading…` with a shimmer band while a
+    /// query is in flight — on the first load (no rows yet) and on a refresh
+    /// over the table — swept from when the panel started loading, at 80×24
+    /// and 179×43; plain bold under reduced motion.
+    #[test]
+    fn keys_title_loading_shimmers_while_a_query_is_in_flight() {
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for refresh in [false, true] {
+                let at = |age: Duration, motion| {
+                    let base = if refresh {
+                        loaded_panel()
+                    } else {
+                        crate::tui::KeysPanel::default()
+                    };
+                    let mut chrome = keys_chrome(crate::tui::KeysPanel {
+                        loading: true,
+                        loading_since: LOADING_SINCE,
+                        ..base
+                    });
+                    chrome.clock = LOADING_SINCE + age;
+                    chrome.motion = motion;
+                    let view = if refresh {
+                        keys_view()
+                    } else {
+                        view_with(Vec::new())
+                    };
+                    render_buffer(&view, &chrome, w, h)
+                };
+                let mid = assert_loading_label_shimmers("loading…", at);
+                let (_, row) = label_cells(&mid, "loading…");
+                let text: String = row.iter().map(|c| c.symbol()).collect();
+                assert!(text.contains(" requests · loading… "), "{w}x{h}: {text:?}");
+            }
+        }
+    }
+
+    /// The raw viewer's `loading raw record…` line shimmers from when the
+    /// viewer opened, in the wait colour, at 80×24 and 179×43; under reduced
+    /// motion it is plain bold and its spinner holds its first glyph.
+    #[test]
+    fn raw_viewer_loading_line_shimmers_from_when_it_opened() {
+        let view = usage_control_view();
+        let entry = completed_request(7_000, Some("claude"), Some("claude-opus-4-8"), 1, 1, 200);
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let at = |age: Duration, motion| {
+                let mut chrome = chrome_overlay(Overlay::None);
+                chrome.raw_modal = Some(super::super::RawModal {
+                    key: key_of(&entry),
+                    id: 1,
+                    generation: 1,
+                    title: "raw".into(),
+                    tab: 0,
+                    scroll: 0,
+                    view: Default::default(),
+                    spin: (age.as_millis() / 80) as usize,
+                    since: LOADING_SINCE,
+                    flash: None,
+                    state: super::super::RawModalState::Loading,
+                });
+                chrome.clock = LOADING_SINCE + age;
+                chrome.motion = motion;
+                render_buffer(&view, &chrome, w, h)
+            };
+            let mid = assert_loading_label_shimmers("loading raw record…", at);
+            let (cells, _) = label_cells(&mid, "loading raw record…");
+            assert!(
+                cells.iter().all(|c| c.fg == KEYBAR_THEME.wait),
+                "{w}x{h}: the band keeps the wait colour: {cells:?}"
+            );
+        }
     }
 
     /// Issue #5 acceptance: local and attach render IDENTICALLY from the same
@@ -14783,6 +16079,187 @@ mod tests {
         );
     }
 
+    /// A raw viewer over a Ready record for the frame tests: a JSON request
+    /// whose `content` string is `len` bytes long, and a short response.
+    fn raw_modal_over(len: usize) -> super::super::RawModal {
+        let body = format!(
+            r#"{{"model":"claude-opus-4-8","messages":[{{"role":"user","content":"{}"}}],"stream":true}}"#,
+            "ab".repeat(len / 2)
+        );
+        let record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            Some("claude".into()),
+            None,
+            None,
+            Some(200),
+            body.as_bytes(),
+            br#"{"id":"msg_1","type":"message"}"#,
+            16 << 20,
+            Some(vec![("content-type".into(), "application/json".into())]),
+            None,
+            None,
+        );
+        let general = RawGeneral {
+            lines: vec![
+                raw_section("general"),
+                Line::from("request     POST /v1/messages"),
+            ],
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            base_url: "http://localhost:3456".into(),
+        };
+        super::super::RawModal {
+            key: ActivityKey {
+                at_ms: 0,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                status: 200,
+            },
+            id: 7,
+            generation: 1,
+            title: "🔍 raw — POST /v1/messages".into(),
+            tab: 0,
+            scroll: 0,
+            view: Default::default(),
+            spin: 0,
+            since: Duration::ZERO,
+            flash: None,
+            state: super::super::RawModalState::Ready(std::sync::Arc::new(
+                raw_content_from_record(general, &record),
+            )),
+        }
+    }
+
+    /// The cells `x..x + w` of a frame row (one symbol per cell).
+    fn row_cells(row: &str, x: u16, w: u16) -> String {
+        row.chars()
+            .skip(usize::from(x))
+            .take(usize::from(w))
+            .collect()
+    }
+
+    /// Batch 2 raw viewer: Request/Response on the library tab strip (the
+    /// main row's divider and weight, click rects measured in cells over the
+    /// labels as drawn), and the lines in a JsonView — the general and header
+    /// sections plain, then the body, whose long string wraps at the width
+    /// under its indent instead of running off the edge, `lines a–b of n`
+    /// below and a scrollbar while it overflows — at 80×24 and 179×43.
+    #[test]
+    fn raw_viewer_tabs_and_wrapped_body_at_80x24_and_179x43() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.raw_modal = Some(raw_modal_over(400));
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let raw = hits.raw_modal.expect("the raw viewer drew");
+            assert_eq!(raw.tabs.len(), 2, "{w}x{h}:\n{frame}");
+            for (i, label) in ["Request", "Response"].into_iter().enumerate() {
+                let (index, rect) = raw.tabs[i];
+                assert_eq!(index, i);
+                let row = &rows[usize::from(rect.y)];
+                assert_eq!(row_cells(row, rect.x, rect.width), label, "{w}x{h}: {row}");
+            }
+            let strip = &rows[usize::from(raw.tabs[0].1.y)];
+            assert!(strip.contains("Request │ Response"), "{w}x{h}: {strip}");
+            let at = rows
+                .iter()
+                .position(|r| r.contains("\"content\": \"abab"))
+                .unwrap_or_else(|| panic!("{w}x{h}:\n{frame}"));
+            assert!(
+                rows[at + 1].contains("│      abababab"),
+                "{w}x{h}: the string wraps under its indent:\n{frame}"
+            );
+            assert!(
+                frame.contains("content-type: application/json"),
+                "headers kept"
+            );
+            assert!(
+                frame.contains("── general ──"),
+                "general kept before the body"
+            );
+        }
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let raw = hits.raw_modal.expect("drawn");
+        let bar = raw.bar.expect("17 lines overflow 80x24");
+        assert!(frame.contains("lines 1–11 of 17"), "{frame}");
+        let edge =
+            |rows: &[String], y: u16| rows[usize::from(y)].chars().nth(usize::from(bar.track.x));
+        assert_eq!(edge(&rows, bar.track.y), Some('▐'), "{frame}");
+        assert_eq!(raw.max_scroll, bar.pos.max);
+        let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+        assert!(rows.join("\n").contains("17 lines"), "all of it fits");
+        assert_eq!(
+            hits.raw_modal.and_then(|r| r.bar),
+            None,
+            "no bar when it fits"
+        );
+
+        // Scrolled to the end: the last line and the thumb at the bottom.
+        chrome.raw_modal.as_mut().expect("open").scroll = usize::MAX;
+        let (rows, _) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        assert!(
+            frame.contains("of 17") && frame.contains("–17 of 17"),
+            "{frame}"
+        );
+        assert_eq!(edge(&rows, bar.track.bottom() - 1), Some('▐'), "{frame}");
+
+        // Under NO_COLOR the active tab still reads by weight.
+        chrome.raw_modal.as_mut().expect("open").scroll = 0;
+        let mut buf = render_buffer(&view, &chrome, 80, 24);
+        twolab_tui::theme::decolor(&mut buf);
+        let (_, req) = raw.tabs[0];
+        let (_, resp) = raw.tabs[1];
+        assert!(buf[(req.x, req.y)].modifier.contains(Modifier::BOLD));
+        assert!(!buf[(resp.x, resp.y)].modifier.contains(Modifier::BOLD));
+    }
+
+    /// An 8 MiB string is one source line: the viewer wraps it once at the
+    /// width (kept across frames) and the footer counts the body's own
+    /// lines, not the wrapped rows; a frame inside it draws only its rows.
+    #[test]
+    fn raw_viewer_wraps_an_8_mib_line_once_and_counts_source_lines() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.raw_modal = Some(raw_modal_over(8 << 20));
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let raw = hits.raw_modal.expect("drawn");
+        assert!(raw.max_scroll > 100_000, "the string wraps to many rows");
+        assert!(
+            rows.join("\n").contains("lines 1–11 of 17"),
+            "{}",
+            rows.join("\n")
+        );
+        let cached = |chrome: &Chrome| {
+            let cache = chrome
+                .raw_modal
+                .as_ref()
+                .expect("open")
+                .view
+                .0
+                .lock()
+                .expect("lock");
+            cache.long.as_ref().map(|l| (l.key, l.lines.as_ptr()))
+        };
+        let before = cached(&chrome).expect("long lines wrapped at the width");
+
+        chrome.raw_modal.as_mut().expect("open").scroll = raw.max_scroll / 2;
+        let (rows, _) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        assert!(
+            frame.contains("lines 11–11 of 17"),
+            "inside the long line:\n{frame}"
+        );
+        assert!(frame.contains("ababababab"), "{frame}");
+        // The same wrapped lines (key and buffer): the second frame did not
+        // wrap the 8 MiB again. Pinned by identity, not by a wall-clock bound
+        // a busy machine could break.
+        assert_eq!(cached(&chrome), Some(before), "not wrapped again");
+    }
+
     #[test]
     fn raw_content_builds_four_tabs_for_translated_exchanges(/* UI-8 */) {
         let general = || RawGeneral {
@@ -14845,8 +16322,8 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&four.record_json).expect("save-all payload is valid JSON");
         assert_eq!(parsed["id"].as_u64(), Some(7));
-        // Every tab measured its widest line for the horizontal scroll bound.
-        assert!(four.tabs.iter().all(|t| t.width > 0));
+        // No line here is long enough to need wrapping ahead of the frame.
+        assert!(four.tabs.iter().all(|t| !t.long_lines));
     }
 
     #[test]
@@ -14928,18 +16405,52 @@ mod tests {
         );
     }
 
+    /// A monster line stays ONE source line (it was cut into 2048-byte
+    /// chunks, each a line of its own); the viewer wraps it at its width.
+    /// Wrapped ahead of the frame, an ASCII line gets exactly the rows
+    /// `JsonView` would give it — continuation rows hang under its indent —
+    /// and anything else goes through the library's own wrap.
     #[test]
-    fn wrap_raw_line_bounds_monster_lines_on_char_boundaries(/* UI-7 */) {
-        let big = "x".repeat(RAW_LINE_WRAP * 2 + 10);
-        let chunks = wrap_raw_line(&big);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|c| c.len() <= RAW_LINE_WRAP));
-        // Multi-byte chars are never split mid-scalar.
-        let uni = "€".repeat(RAW_LINE_WRAP);
-        for chunk in wrap_raw_line(&uni) {
-            assert!(chunk.len() <= RAW_LINE_WRAP);
-            assert!(chunk.chars().all(|c| c == '€'), "no torn scalars");
+    fn raw_monster_lines_stay_one_line_and_wrap_like_json_view(/* UI-7 */) {
+        let big = "x".repeat(RAW_LONG_LINE * 2 + 10);
+        let lines = raw_body_lines(&big);
+        assert_eq!(lines.len(), 1, "one source line");
+        let tab = raw_tab("Request", lines, big.clone(), String::new());
+        assert!(tab.long_lines);
+
+        let indented = Line::from(vec![
+            Span::styled("    \"data\": \"", Style::new().fg(Color::Cyan)),
+            Span::styled("ab".repeat(70), Style::new().fg(Color::Green)),
+            Span::raw("\","),
+        ]);
+        for width in [1usize, 7, 37, 80] {
+            assert_eq!(
+                wrap_ascii(&indented, width),
+                Some(twolab_tui::json_view::wrap_line(&indented, width)),
+                "width {width}"
+            );
         }
+        let uni = Line::from("€".repeat(50));
+        assert_eq!(
+            wrap_ascii(&uni, 10),
+            None,
+            "not ASCII: the library wraps it"
+        );
+
+        // Display lines map back to source lines for the footer.
+        let lines = vec![
+            Line::from("head"),
+            Line::from("y".repeat(RAW_LONG_LINE + 1)),
+            Line::from("tail"),
+        ];
+        let long = raw_long_lines(&lines, 100, (1, 100));
+        let rows = (RAW_LONG_LINE + 1).div_ceil(100);
+        assert_eq!(long.lines.len(), 2 + rows);
+        assert_eq!(long.added(), rows - 1);
+        assert_eq!(long.source(0), 0);
+        assert_eq!(long.source(1), 1);
+        assert_eq!(long.source(rows), 1, "the long line's last row");
+        assert_eq!(long.source(rows + 1), 2, "the line after it");
     }
 
     #[test]
@@ -16994,6 +18505,174 @@ mod tests {
         assert!(text.contains("tokens per day"), "chart still renders");
     }
 
+    /// Tokens-per-day rows for the trend-chart tests: history starts five
+    /// days back, nothing at all was recorded three days back, and on the
+    /// day two back only fable served (codex read 0 that day).
+    fn trend_view() -> DashboardView {
+        use crate::dashboard::{DailyPerfDoc, DailyUsageDoc};
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_secs()
+            / 86_400;
+        let usage = |d: u64, group: &str, model: &str, tokens_in: u64| DailyUsageDoc {
+            day: today - d,
+            group: group.into(),
+            model: model.into(),
+            tokens_in,
+            tokens_out: 50_000,
+            cache_read: 0,
+            cache_creation: 0,
+        };
+        view.daily_usage = [0u64, 1, 2, 4, 5]
+            .into_iter()
+            .flat_map(|d| {
+                let mut rows = vec![usage(d, "claude", "claude-fable-5", 100_000 * (d + 1))];
+                if d != 2 {
+                    rows.push(usage(d, "codex", "gpt-5.6-sol", 0));
+                }
+                rows
+            })
+            .collect();
+        let perf = |d: u64, model: &str, tps_n: u64, output_tokens: u64| DailyPerfDoc {
+            day: today - d,
+            group: "codex".into(),
+            model: model.into(),
+            fast: Some(false),
+            requests: 10,
+            ok: 9,
+            errors: 1,
+            tps_n,
+            output_tokens,
+            e2e_ms: 20_000,
+            measured_n: 6,
+            measured_output: 3_000,
+            post_ttft_ms: 10_000,
+            ttfb_n: 8,
+            ttfb_ms_sum: 1_600,
+        };
+        view.daily_perf = [0u64, 1, 2, 4, 5]
+            .into_iter()
+            .flat_map(|d| {
+                // Day one back is thin for gpt-5.5: two samples.
+                let n = if d == 1 { 2 } else { 8 };
+                [
+                    perf(d, "gpt-5.5", n, 6_000),
+                    perf(d, "gpt-5.6-sol", 8, 2_000),
+                ]
+            })
+            .collect();
+        view
+    }
+
+    /// One trend chart drawn on its own `w`×13 terminal (the overlays'
+    /// slice): `draw` gets the frame and the theme.
+    fn render_trend(w: u16, draw: impl FnOnce(&mut Frame, &FrameCtx)) -> ratatui::buffer::Buffer {
+        let view = trend_view();
+        let ctx = frame_ctx(&view, &chrome_overlay(Overlay::Stats));
+        let mut terminal =
+            Terminal::new(TestBackend::new(w, DAILY_CHART_HEIGHT)).expect("terminal");
+        terminal.draw(|f| draw(f, &ctx)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Under `NO_COLOR` both trend charts told their series apart by colour
+    /// only — four identical lines, legend `●` dots (two cells on CJK-wide
+    /// terminals). Mono now marks every sample with its series' glyph
+    /// (`*` `+` `x` `o`, the same glyph in the legend), and no chart cell
+    /// carries a colour.
+    #[test]
+    fn trend_charts_tell_series_apart_without_colour() {
+        let view = trend_view();
+        let mono = twolab_tui::Theme::mono();
+        let tokens = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, mono);
+        });
+        let perf = render_trend(80, |f, ctx| {
+            draw_perf_chart(f, f.area(), &view, ctx, 14, " perf ", mono);
+        });
+        for buf in [&tokens, &perf] {
+            let rows = buffer_rows(buf);
+            let text = rows.join("\n");
+            assert!(!text.contains('●'), "{text}");
+            assert!(
+                buf.content()
+                    .iter()
+                    .all(|c| (c.fg, c.bg) == (Color::Reset, Color::Reset)),
+                "{text}"
+            );
+            // Five sampled days per series, one glyph each.
+            let plot = rows[1..10].join("\n");
+            assert_eq!(plot.matches('*').count(), 5, "{text}");
+            assert_eq!(plot.matches('+').count(), 5, "{text}");
+        }
+        let legend = |buf: &ratatui::buffer::Buffer| buffer_rows(buf)[12].trim_end().to_string();
+        assert_eq!(legend(&tokens), "* fable-5 90.7%  + gpt-5.6-sol 9.3%");
+        assert_eq!(
+            legend(&perf),
+            "* codex gpt-5.5  + codex gpt-5.6-sol  (dim = n<5)"
+        );
+        // The thin day (two samples) is the one dim glyph of its series.
+        let dim_stars = perf
+            .content()
+            .iter()
+            .filter(|c| c.symbol() == "*" && c.modifier.contains(Modifier::DIM))
+            .count();
+        assert_eq!(dim_stars, 1, "{}", buffer_rows(&perf).join("\n"));
+        // In colour the lines keep the hues they always had, rank by rank.
+        let colour = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, CHART_THEME);
+        });
+        assert_eq!(colour[(0, 12)].fg, Color::Magenta);
+        let second = buffer_rows(&colour)[12].find("⠒⠒ gpt").expect("legend");
+        let second = cells::width(&buffer_rows(&colour)[12][..second]) as u16;
+        assert_eq!(colour[(second, 12)].fg, Color::Cyan);
+    }
+
+    /// The tokens chart zero-filled the whole span, so a fourteen-day span
+    /// over five days of history drew nine days of a flat 0 and a cliff
+    /// into the first real day. Days before history — and a day with no
+    /// record at all — are gaps now; a recorded day on which a model served
+    /// nothing still reads 0.
+    #[test]
+    fn tokens_chart_draws_nothing_before_history_or_on_unrecorded_days() {
+        let view = trend_view();
+        let buf = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, twolab_tui::Theme::mono());
+        });
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        // Plot rows 1–9 right of the `650.0k│` gutter: 73 cells for 14 days;
+        // the first recorded day (index 8) is at cell 44.
+        let plot: Vec<Vec<&str>> = (1..10)
+            .map(|y| (7..80).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        for row in &plot {
+            assert!(row[..44].iter().all(|s| *s == " "), "{text}");
+        }
+        // Day index 10 (three back) is unrecorded: no glyph of either
+        // series in its column, and no line through it.
+        let day10 = (10.0_f64 * 145.0 / 13.0).round() as usize / 2;
+        for row in &plot {
+            assert_eq!(row[day10], " ", "{text}");
+        }
+        // Codex served nothing two days back while fable did: a `+` on the
+        // zero row in that day's column.
+        let day11 = (11.0_f64 * 145.0 / 13.0).round() as usize / 2;
+        assert_eq!(plot[8][day11], "+", "{text}");
+    }
+
     #[test]
     fn tab_row_stays_visible_under_every_overlay() {
         // Review R1 MUST-FIX 3: overlays used to paint over the tab strip
@@ -17039,6 +18718,135 @@ mod tests {
         assert!(text.contains("sched"), "scheduler segment visible");
         assert!(text.contains("effort:bypass"), "codex bypass label visible");
         assert!(text.contains("effort:high"), "grok effort value visible");
+    }
+
+    /// Catalog `status_bar` (plan batch 3): the settings bar drops whole
+    /// groups — the account counts first, then grok — and says `+N`; every
+    /// click rect covers exactly the value drawn in it, measured in cells,
+    /// so with a wide (CJK) model name the effort and fast toggles still
+    /// land on `bypass` and `off` (char counting put them two cells left).
+    #[test]
+    fn group_settings_bar_drops_whole_groups_and_clicks_land_on_drawn_values() {
+        let (mut view, chrome) = recompose_view();
+        view.codex.model = "模型-一二".into();
+        let cells_of = |buf: &ratatui::buffer::Buffer, r: Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        for w in [179u16, 100, 80, 60] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, 43);
+            let buf = render_buffer(&view, &chrome, w, 43);
+            let bar = row_of(&rows, " sched ");
+            let frame = rows[bar].clone();
+            for hit in &hits.settings {
+                assert_eq!(usize::from(hit.area.y), bar, "{frame}");
+                let drawn = cells_of(&buf, hit.area);
+                let want = match hit.action {
+                    SettingAction::SchedMode => view.select_params.mode.label().to_string(),
+                    SettingAction::CodexModel => "模型-一二".into(),
+                    SettingAction::CodexEffort => "bypass".into(),
+                    SettingAction::CodexFast => "off".into(),
+                    SettingAction::GrokEffort => "xhigh".into(),
+                };
+                // A wide glyph's second cell is blank in the buffer.
+                assert_eq!(
+                    drawn.replace(' ', ""),
+                    want,
+                    "{:?} at {w}:\n{frame}",
+                    hit.action
+                );
+                assert_eq!(
+                    usize::from(hit.area.width),
+                    cells::width(&want),
+                    "{:?} rect is the value's cells at {w}:\n{frame}",
+                    hit.action
+                );
+            }
+            let actions: Vec<SettingAction> = hits.settings.iter().map(|h| h.action).collect();
+            match w {
+                179 => {
+                    assert!(frame.contains("claude 14 acc") && frame.contains("gemini 1 acc"));
+                    assert_eq!(actions.len(), 5, "{frame}");
+                }
+                100 => {
+                    assert!(
+                        frame.trim_end().ends_with("grok effort:xhigh  │  +2"),
+                        "{frame}"
+                    );
+                    assert!(!frame.contains("claude 14"), "{frame}");
+                    assert_eq!(actions.len(), 5, "{frame}");
+                }
+                80 => {
+                    assert!(frame.trim_end().ends_with("fast:off  │  +3"), "{frame}");
+                    assert!(!actions.contains(&SettingAction::GrokEffort), "{frame}");
+                }
+                _ => {
+                    assert!(frame.trim_end().ends_with("default  │  +4"), "{frame}");
+                    assert_eq!(actions, vec![SettingAction::SchedMode], "{frame}");
+                }
+            }
+        }
+    }
+
+    /// Catalog `status_bar` (plan batch 3): the header keeps its verdict
+    /// and drops identity segments whole by importance. At 80 columns it
+    /// read `… +2  llmux 0.2.25 (p` (cut mid-segment); now it ends with the
+    /// whole version. At 120 the least important went (the build tag, the
+    /// account count, cfg, then pid) while the attach marker, port and
+    /// uptime stayed. At every width the row is the verdict followed by
+    /// whole segments only.
+    #[test]
+    fn header_drops_whole_segments_by_importance_and_keeps_the_verdict() {
+        let (view, chrome) = fold_view();
+        // The verdict's age ticks between renders: compare with digits masked.
+        let digits = |t: &str| -> String {
+            t.chars()
+                .map(|c| if c.is_ascii_digit() { '9' } else { c })
+                .collect()
+        };
+        let verdict: String = header_verdict_spans(&view, SystemTime::now())
+            .iter()
+            .map(|s| digits(&s.content))
+            .collect();
+        let row0 = |w: u16| {
+            let rows = render_rows(&view, &chrome, w, 24);
+            let (verdict_part, rest) = rows[0].split_at(verdict.len());
+            (digits(verdict_part), rest.to_string())
+        };
+        assert_eq!(
+            row0(80),
+            (
+                verdict.clone(),
+                "  llmux 0.2.25".to_string() + &" ".repeat(80 - verdict.len() - 14)
+            ),
+            "verdict whole, then the version whole"
+        );
+        let whole = [
+            "llmux 0.2.25",
+            "(preview 2026-10-16-0709-a162822a9215)",
+            ":3456",
+            "pid 1695",
+            "up 4d 13h",
+            "·21",
+            "→ https://api.anthropic.com",
+            "cfg /etc/llmux/llmux.json",
+            "attached → pid 1695",
+        ];
+        assert_eq!(
+            row0(120).1.trim_end(),
+            "  llmux 0.2.25 :3456 up 4d 13h attached → pid 1695",
+        );
+        for w in (verdict.len() as u16..=179).rev().step_by(3) {
+            let (kept, rest) = row0(w);
+            assert_eq!(kept, verdict, "verdict kept at {w}");
+            let rest = rest.trim();
+            let mut tail = rest;
+            for seg in whole {
+                if let Some(after) = tail.strip_prefix(seg) {
+                    tail = after.trim_start();
+                }
+            }
+            assert!(tail.is_empty(), "only whole segments at {w}: {rest:?}");
+        }
     }
 
     #[test]
@@ -17132,6 +18940,85 @@ mod tests {
             !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
             "no fallback to the row occupant"
         );
+    }
+
+    /// Catalog `menu` (plan batch 3): right-clicked near the bottom of an
+    /// 80x24 MAIN the menu opens ABOVE the clicked row instead of covering
+    /// it; every item shows the key that runs it; delete is drawn
+    /// destructive; `switch now` on a paused account is dim and has no
+    /// click rect (the scheduler refuses a paused target).
+    #[test]
+    fn context_menu_opens_above_a_low_row_with_keys_and_states() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str, paused: bool| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            auth_failure_status: None,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![acct("claude:a@x.com", false), acct("claude:b@x.com", true)];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.mode = Mode::ContextMenu { idx: 0, item: 0 };
+        chrome.menu_account = Some("claude:b@x.com".into());
+        // Clicked two rows above the 2-row footer: no room below.
+        chrome.menu_anchor = Some((30, 20));
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let menu = hits.menu.expect("menu drawn");
+        assert!(menu.above, "opened above the clicked row:\n{frame}");
+        assert!(menu.area.bottom() <= 20, "row 20 stays visible:\n{frame}");
+        assert_eq!(menu.area.x, 30, "lines up with the click:\n{frame}");
+        let row = |label: &str| {
+            rows.iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("{label} drawn:\n{frame}"))
+        };
+        assert_eq!(
+            row("┌ b@x.com "),
+            14,
+            "titled with the pinned account:\n{frame}"
+        );
+        for (label, key) in [
+            ("switch now", "⏎"),
+            ("resume", "p"),
+            ("set limit", "L"),
+            ("delete", "r"),
+        ] {
+            let line = &rows[row(label)];
+            let after = &line[line.find(label).expect("label") + label.len()..];
+            assert_eq!(
+                after.trim_start().chars().next(),
+                Some(key.chars().next().expect("key")),
+                "{label} shows its key {key}:\n{frame}"
+            );
+        }
+        let buf = render_buffer(&view, &chrome, 80, 24);
+        let delete = row("delete") as u16;
+        assert_eq!(buf[(menu.area.x + 2, delete)].fg, Color::Red, "destructive");
+        let switch = row("switch now") as u16;
+        assert_eq!(buf[(menu.area.x + 2, switch)].fg, Color::DarkGray, "dim");
+        // The dim item has no rect; the selection settled on `resume`.
+        assert_eq!(menu.hit(menu.area.x + 2, switch), None);
+        assert_eq!(menu.hit(menu.area.x + 2, row("resume") as u16), Some(1));
+        assert_eq!(menu.hit(menu.area.x + 2, delete), Some(3));
+        let resume = row("resume") as u16;
+        assert!(buf[(menu.area.x + 2, resume)]
+            .modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -18712,7 +20599,7 @@ mod tests {
 
     fn email_everywhere_chrome(overlay: Overlay) -> Chrome {
         let mut chrome = chrome_overlay(overlay);
-        chrome.status_line = Some(format!("switched to {LEAK} (manual)"));
+        chrome.status_line = Some(StatusMsg::ok(format!("switched to {LEAK} (manual)")));
         chrome.sessions = vec![crate::session::Session {
             user_id: Some("acct_x".into()),
             requests: 1,
@@ -19429,6 +21316,62 @@ mod tests {
         );
     }
 
+    /// The packed strip on twolab-tui's packed grid: one click rect per
+    /// drawn entry, on the entry's own cells and carrying its model's
+    /// index; and the columns sit on the widest `last` form, so a model
+    /// starting to run (`12 in-flight` where `9s` was) moves no entry —
+    /// llmux's own packer aligned on the live text, and the second column
+    /// slid sideways.
+    #[test]
+    fn packed_strip_entries_are_clickable_and_never_slide() {
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let with_last = |in_flight: u32| {
+            let (mut view, chrome) = fold_view();
+            for m in &mut view.model_usage {
+                m.in_flight = in_flight;
+                m.last_used_ms = ms(now - Duration::from_secs(9));
+            }
+            (view, chrome)
+        };
+        let strip = |in_flight: u32| {
+            let (view, chrome) = with_last(in_flight);
+            let chrome = Chrome {
+                fold_exhausted: false,
+                ..chrome
+            };
+            let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+            (view, rows, hits.models_strip)
+        };
+        let (view, rows, quiet) = strip(0);
+        let frame = rows.join("\n");
+        let title = row_of(&rows, " models — top 5 of 6 ");
+        assert_eq!(quiet.len(), 5, "{frame}");
+        for hit in &quiet {
+            let row = &rows[usize::from(hit.rect.y)];
+            let cells: String = row
+                .chars()
+                .skip(usize::from(hit.rect.x))
+                .take(usize::from(hit.rect.width))
+                .collect();
+            let model = &view.model_usage[hit.index].model;
+            assert!(
+                cells.contains(model.as_str()),
+                "{model} in {cells:?}\n{frame}"
+            );
+            assert!(hit.rect.y > title as u16, "{frame}");
+        }
+        let indexes: Vec<usize> = quiet.iter().map(|h| h.index).collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
+        let (_, busy_rows, busy) = strip(12);
+        assert!(
+            busy_rows[title + 1].contains("12 in-flight"),
+            "{}",
+            busy_rows.join("\n")
+        );
+        assert_eq!(busy, quiet, "no entry moved");
+    }
+
     /// Index of the first row containing `needle`, with the frame in the
     /// panic message.
     fn row_of(rows: &[String], needle: &str) -> usize {
@@ -19624,8 +21567,11 @@ mod tests {
         out
     }
 
+    // The title opens with the section rule's two-cell lead (`── `) like
+    // every other heading; ` detail `, set past the widest title the band
+    // can show, moves two cells right with it, and the tail is two shorter.
     const BAND_179_TITLE: &str =
-        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ──────────────────────────────";
+        "── scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ────────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -19950,7 +21896,7 @@ mod tests {
             );
             let detail_at: String = rows[sched].chars().skip(w as usize - 48).collect();
             assert_eq!(
-                detail_at.starts_with(" detail "),
+                detail_at.starts_with("── detail "),
                 w >= SIDE_BY_SIDE_AT,
                 "{w}x{h}:\n{frame}"
             );
@@ -20268,14 +22214,24 @@ mod tests {
         );
     }
 
-    /// Rule 4, pure: the largest per-line count whose aligned line fits.
+    /// Rule 4, pure: the largest per-line count whose aligned line fits,
+    /// on twolab-tui's packer — the same breakpoints as llmux's own: the
+    /// marker is one cell in every column and the strip keeps one cell of
+    /// margin, where the first column's marker used to carry it.
     #[test]
     fn strip_per_line_packs_the_most_entries_that_fit() {
-        // 2+6+15+10+6+9+9+11 fields + 7 gaps = 75 cells; past the first
-        // column the marker is 1 cell, so a second entry adds 3 + 74.
-        let entry: StripWidths = [2, 6, 15, 10, 6, 9, 9, 11];
-        let five = [entry; 5];
-        assert_eq!(strip_line_width(&strip_columns(&five, 2)), 75 + 3 + 74);
+        // 1+6+15+10+6+9+9+11 fields + 7 gaps = 74 cells; a second entry
+        // adds 3 + 74, the margin 1.
+        let entry = vec![1, 6, 15, 10, 6, 9, 9, 11];
+        let five = vec![entry; 5];
+        let line = |widths: &[Vec<usize>], k: usize| {
+            GridPlan {
+                per_line: k,
+                columns: packed_grid::columns(widths, &[], k),
+            }
+            .line_width()
+        };
+        assert_eq!(usize::from(STRIP_MARGIN) + line(&five, 2), 1 + 74 + 3 + 74);
         assert_eq!(strip_per_line(&five, 179), 2);
         assert_eq!(strip_per_line(&five, 152), 2);
         assert_eq!(strip_per_line(&five, 151), 1, "below two → today's table");
@@ -20284,9 +22240,9 @@ mod tests {
         assert_eq!(strip_per_line(&five[..1], 400), 1, "one entry never packs");
         // Columns align per entry column: a long name in column 0 does not
         // widen column 1.
-        let mut long = five;
+        let mut long = five.clone();
         long[2][2] = 30;
-        let columns = strip_columns(&long, 2);
+        let columns = packed_grid::columns(&long, &[], 2);
         assert_eq!((columns[0][2], columns[1][2]), (30, 15));
     }
 
@@ -20358,9 +22314,12 @@ mod tests {
         assert_eq!(tail(None), " cfg ~/.config/llmux.json ");
     }
 
-    /// Review item 1: when cfg fits the header and only the attach marker
-    /// overflows it, and the tabs row has no room for the moved tail, the
-    /// header renders exactly as before — cfg stays visible in row 0.
+    /// Review item 1, under the catalog `status_bar` (plan batch 3): when the
+    /// tabs row has no room for the moved tail, cfg is never moved to
+    /// nowhere — the tail stays in the header and competes for the row. At
+    /// a width that holds cfg but not cfg AND the attach marker, the least
+    /// important segment (cfg) drops WHOLE and the attach marker stays;
+    /// with room for both, both stay. Nothing is cut mid-segment.
     #[test]
     fn header_keeps_cfg_when_the_tabs_row_cannot_take_the_tail() {
         let mut view = view_with(Vec::new());
@@ -20372,7 +22331,8 @@ mod tests {
             }),
             ..chrome_overlay(Overlay::None)
         };
-        let lead = Line::from(header_lead_spans(&view, SystemTime::now())).width();
+        let verdict = header_verdict_spans(&view, SystemTime::now());
+        let lead = header_width(&verdict, &header_identity_segments(&view));
         let cfg = Line::from(format!(
             " cfg {} ",
             view.config_path.as_deref().unwrap_or("")
@@ -20382,8 +22342,17 @@ mod tests {
         let w = (lead + cfg + 2) as u16;
         let rows = render_rows(&view, &chrome, w, 30);
         assert!(
-            rows[0].contains(" cfg /opt/deep/"),
-            "cfg must stay in the header at {w}:\n{}\n{}",
+            rows[0].contains(" attached → pid 7 ") && !rows[0].contains("cfg"),
+            "cfg drops whole, the attach marker stays at {w}:\n{}\n{}",
+            rows[0],
+            rows[1]
+        );
+        assert!(!rows[1].contains("cfg"), "the tabs row took no tail");
+        let w = w + 18;
+        let rows = render_rows(&view, &chrome, w, 30);
+        assert!(
+            rows[0].contains(" cfg /opt/deep/") && rows[0].contains(" attached → pid 7 "),
+            "both stay in the header at {w}:\n{}\n{}",
             rows[0],
             rows[1]
         );
@@ -20492,11 +22461,14 @@ mod tests {
 
     /// Review item 6: a long poller back-off list pushes `totals …` out of
     /// the title onto the mode row, which then ends with the totals text,
-    /// carries its own `│` right of the block, and cuts nothing.
+    /// carries its own `│` right of the block, and cuts nothing. Two
+    /// backed-off accounts since the title took the section rule's two-cell
+    /// lead: with three, the bare title alone now needs 181 columns, and at
+    /// 179 MAIN keeps the plain scheduler and detail panes instead.
     #[test]
     fn totals_ride_the_mode_row_when_the_title_is_full() {
         let (mut view, chrome) = recompose_view();
-        for n in [1, 2, 3] {
+        for n in [1, 2] {
             if let Some(health) = view.poll_health.get_mut(&rid("claude", n)) {
                 health.consecutive_failures = 3;
             }
@@ -20718,7 +22690,44 @@ mod tests {
     /// each entry two cells wider), dollars in the default colour over dim
     /// cents and a dim `$` instead of all green; every other cell unchanged
     /// (previous digest 7_483_902_083_238_678_069).
-    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
+    /// Re-pinned the same day for status messages with an outcome (twolab-tui
+    /// `Flash`): the fixture has no status, and the empty status row (row 41)
+    /// no longer starts with a space in the old all-yellow status colour —
+    /// `Yellow×1 Reset×178` reads `Reset×179`; every other cell, text and
+    /// style, unchanged (previous digest 11_040_274_043_730_846_167).
+    /// Re-pinned the same day when copy mode joined (round 2 of #232): MAIN's
+    /// key bar gains `v copy mode` after `↑↓ scroll` (the bottom row's text
+    /// and its key cell's Cyan bold run); every other row unchanged
+    /// (previous digest 11_178_084_734_170_114_220).
+    /// Re-pinned the same day for the section headings on twolab-tui's
+    /// `Rule`: the four rule rows in this frame (accounts, the band's top
+    /// border, models, activity) open with the rule's two-cell lead, so
+    /// each title reads `── accounts · …` (was ` accounts · …`), two cells
+    /// right; the band's ` detail ` (set past the widest band title) and
+    /// the strip legend move right with them, styles with their text, and
+    /// each row's closing fill is two cells shorter. Every row is still 179
+    /// cells, and every other cell is unchanged (previous digest
+    /// 16_419_190_790_333_588_667).
+    /// Not re-pinned when the quota gauges moved to twolab-tui's `meter`
+    /// (2026-11-06): the frame is identical, text and styles — so is this
+    /// fixture at 80×24 and with `t`, `u` or the fold on. The one change is
+    /// off this frame: a cursor row's bar keeps its empty part un-reversed
+    /// (`cursor_row_quota_bar_keeps_its_fill_visible`).
+    /// Re-pinned 2026-11-06 for the fold and the models strip on twolab-tui's
+    /// `packed_grid`: only the strip's two packed lines change. The second
+    /// entry column starts nine cells further right (`2 in-flight` then
+    /// fourteen spaces before `CLAUDE claude-opus-5`, was five): every entry
+    /// now reserves the widest `last` form, `4294967295 in-flight`, that the
+    /// packing decision already used, so a model starting or stopping never
+    /// slides the column; and the first entry's leading blank cell no longer
+    /// carries the marker's colour (the grid sits one cell in instead of the
+    /// marker carrying the space). Packing, heights and every other cell
+    /// unchanged (previous digest 11_040_274_043_730_846_167).
+    /// Merged with the rule re-pin above when the round-2 branches were put
+    /// together: the two touch different rows (the four rule rows vs the
+    /// strip's two packed lines), so the merged frame carries both changes
+    /// and nothing else (previous digest 8_543_463_821_239_879_891).
+    const FOLD_OFF_179X43_DIGEST: u64 = 17_866_181_982_027_554_185;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -20734,6 +22743,212 @@ mod tests {
             hash, FOLD_OFF_179X43_DIGEST,
             "fold-OFF frame changed:\n{frame}"
         );
+    }
+
+    /// Section headings are twolab-tui rules: each opens with the rule's
+    /// two-cell lead and a space, then its title, and runs the whole width
+    /// — on MAIN at 80×24 (the accounts title clipped with `…`, never
+    /// silently) and at 179×43, where the band's top border opens the same
+    /// way.
+    #[test]
+    fn section_headings_are_rules_with_a_lead_across_the_width() {
+        let (view, chrome) = recompose_view();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let rows = render_rows(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let mut headings = vec![
+                row_of(&rows, " accounts · sort "),
+                row_of(&rows, " activity — "),
+            ];
+            if w == 179 {
+                headings.push(row_of(&rows, " scheduler · poller "));
+                headings.push(row_of(&rows, " models — top "));
+            }
+            for y in headings {
+                assert!(rows[y].starts_with("── "), "{w}x{h} row {y}:\n{frame}");
+                assert_eq!(cells::width(&rows[y]), usize::from(w), "{w}x{h} row {y}");
+                assert!(!rows[y].trim_end().is_empty(), "{w}x{h} row {y}");
+            }
+        }
+        // The rule clips a title too long for its row with `…` (the
+        // accounts tab's table title at 80 columns; MAIN's 80x24 pane draws
+        // the compact list, whose title is fitted to the row).
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 80, 24);
+        let accounts = &rows[row_of(&rows, " accounts · sort ")];
+        assert!(accounts.starts_with("── "), "{accounts}");
+        assert!(accounts.contains('…'), "{accounts}");
+        // The strip's legend starts past the title as the rule draws it.
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let models = &rows[row_of(&rows, " models — top ")];
+        assert!(
+            models.contains("(g: all) ── group · model · share"),
+            "{models}"
+        );
+    }
+
+    /// `LLMUX_AMBIGUOUS_WIDE=1` (`Chrome::ambiguous_wide`): on MAIN and on
+    /// every overlay with section headings, each rule draws ASCII `-` for
+    /// `─` and, measured as a terminal that draws East-Asian Ambiguous
+    /// glyphs two cells wide, ends at the right edge (its title's own `·`
+    /// and `—` included). Rows that are not rules draw exactly as before.
+    #[test]
+    fn ambiguous_wide_rules_draw_ascii_and_end_at_the_edge() {
+        use unicode_width::UnicodeWidthStr;
+        let (view, mut chrome) = recompose_view();
+        let surfaces = [
+            (Overlay::None, 80u16, 24u16),
+            (Overlay::None, 179, 43),
+            (Overlay::Accounts, 100, 30),
+            (Overlay::Stats, 100, 30),
+            (Overlay::Usage, 100, 30),
+            (Overlay::Sessions, 100, 30),
+            (Overlay::Perf, 100, 30),
+            (Overlay::Misc, 100, 30),
+            (Overlay::Config, 100, 30),
+        ];
+        for (overlay, w, h) in surfaces {
+            chrome.overlay = overlay;
+            chrome.ambiguous_wide = false;
+            let narrow = render_rows(&view, &chrome, w, h);
+            chrome.ambiguous_wide = true;
+            let wide = render_rows(&view, &chrome, w, h);
+            let frame = wide.join("\n");
+            let rules: Vec<usize> = (0..narrow.len())
+                .filter(|&y| narrow[y].starts_with("── "))
+                .collect();
+            assert!(
+                !rules.is_empty(),
+                "{overlay:?} {w}x{h} has a rule:\n{frame}"
+            );
+            // The two frames are drawn at two instants: an age (`6.0s`,
+            // `4s ago`) may tick between them, so digits are not compared.
+            let figures = |row: &str| -> String {
+                row.chars()
+                    .map(|c| if c.is_ascii_digit() { '0' } else { c })
+                    .collect()
+            };
+            for (y, (before, after)) in narrow.iter().zip(&wide).enumerate() {
+                if !rules.contains(&y) {
+                    assert_eq!(
+                        figures(before),
+                        figures(after),
+                        "{overlay:?} {w}x{h} row {y}"
+                    );
+                    continue;
+                }
+                assert!(after.starts_with("-- "), "{overlay:?} row {y}:\n{frame}");
+                assert!(!after.contains('─'), "{overlay:?} row {y}: {after}");
+                assert!(
+                    after.trim_end().width_cjk() <= usize::from(w),
+                    "{overlay:?} {w}x{h} row {y} overflows a wide terminal: {after}"
+                );
+                let word = |row: &str| {
+                    let title: String = row.chars().skip(3).collect();
+                    title.split(' ').next().map(str::to_string)
+                };
+                assert_eq!(word(before), word(after), "{overlay:?} row {y}");
+            }
+        }
+    }
+
+    /// On the cursor row the row highlight used to reverse every cell of the
+    /// quota bar as well, so the bar read as one solid block — how full the
+    /// window is was gone on exactly the account being looked at. The meter
+    /// draws the bar's empty part un-reversed, so the fill stays visible
+    /// there; the percent label and the rest of the row keep the highlight.
+    /// (The only change the move to twolab-tui's meter makes on MAIN: the
+    /// fold fixture's 179×43 frame is identical, cell for cell.)
+    #[test]
+    fn cursor_row_quota_bar_keeps_its_fill_visible() {
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let first = view.snapshot.accounts[frame_ctx(&view, &chrome).order[0]]
+            .id
+            .0
+            .clone();
+        let chrome = cursor_on(&view, &chrome, &first);
+        let mut terminal = Terminal::new(TestBackend::new(179, 43)).expect("terminal");
+        let mut hits = None;
+        let buf = terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone();
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let at = |row: &str, needle: &str| {
+            cells::width(
+                &row[..row
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle}:\n{text}"))],
+            ) as u16
+        };
+        let header = rows
+            .iter()
+            .position(|r| r.contains("7d RESET"))
+            .expect("header");
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with('>'))
+            .unwrap_or_else(|| panic!("{text}"));
+        // The 7d cell: from its header to the end of `LEFT` — the bar, a
+        // space and the five-cell label.
+        let x0 = at(&rows[header], "7d RESET");
+        let x1 = at(&rows[header], "LEFT") + 4;
+        let bar = x1 - x0 - 6;
+        let reversed: Vec<bool> = (x0..x0 + bar)
+            .map(|x| buf[(x, y as u16)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        let fill = reversed.iter().take_while(|r| **r).count();
+        assert!(fill > 0 && fill < reversed.len(), "{reversed:?}\n{text}");
+        assert!(reversed[fill..].iter().all(|r| !r), "{reversed:?}");
+        for x in x1 - 5..x1 {
+            assert!(
+                buf[(x, y as u16)].modifier.contains(Modifier::REVERSED),
+                "the label keeps the row highlight"
+            );
+        }
+        // The account cell is highlighted as before.
+        assert!(buf[(4, y as u16)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Under `t` the bar shows the UTC stamp `MM/DD HH:MM`, all eleven cells
+    /// of the narrowest bar. With a display-state glyph in the last cell the
+    /// stamp used to lose the minute's last digit (`07/07 13:5◑`, which
+    /// reads as 13:05); the meter gives the stamp way to its bold date
+    /// instead, and the cell keeps its percent label.
+    #[test]
+    fn absolute_stamp_beside_a_glyph_falls_back_to_its_date() {
+        use crate::config::QuotaDisplay;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        // 2026-07-07 13:50 UTC, three days out.
+        let resets_at = UNIX_EPOCH + Duration::from_secs(1_783_432_200);
+        let now = resets_at - Duration::from_secs(3 * 86_400);
+        let window = QuotaWindow {
+            utilization: 0.58,
+            resets_at,
+            fetched_at: now,
+            source: WindowSource::Headers,
+        };
+        let cell = |state: WindowDisplayState, absolute: bool| {
+            let (meter, _) =
+                quota_meter(&window, 0.58, now, state, QuotaDisplay::Remaining, absolute);
+            let line = quota_cell_line(&meter, QUOTA_BAR_WIDTH);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(cells::width(&text), QUOTA_CELL_WIDTH, "{text:?}");
+            text
+        };
+        assert_eq!(cell(WindowDisplayState::Stale, true), "   07/07  ◑   42%");
+        // Without a glyph the whole stamp fits, as before; countdowns fit
+        // beside one.
+        assert_eq!(
+            cell(WindowDisplayState::Populated, true),
+            "07/07 13:50   42%"
+        );
+        assert_eq!(cell(WindowDisplayState::Stale, false), "   3d 0h  ◑   42%");
     }
 
     /// The backend group of fixture account `n`.
@@ -21160,7 +23375,9 @@ mod tests {
         // The band follows the block; activity gains three rows.
         assert_eq!(row_of(&rows, " scheduler · poller "), head + 6, "{frame}");
         assert!(
-            rows[42].trim_end().ends_with("↑↓ scroll  z fold"),
+            rows[42]
+                .trim_end()
+                .ends_with("↑↓ scroll  v copy mode  z fold"),
             "{frame}"
         );
         let off = render_rows(&view, &fold_off(&chrome), 179, 43);
@@ -21330,7 +23547,8 @@ mod tests {
                 .map(|h| (h.display_idx, h.area.x))
                 .collect();
             println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
-            Some((plan.per_line, plan.columns.clone(), starts))
+            let columns = plan.grid.plan(w).expect("the plan's width").columns;
+            Some((plan.per_line, columns, starts))
         };
         let (base_view, base_chrome) = live_view();
         for w in [fold_bound(&base_view, &base_chrome), 179, 250] {
@@ -21487,8 +23705,11 @@ mod tests {
     }
 
     /// The `+N more` count on a short terminal: table rows first, then the
-    /// fold block — N counts the hidden table rows plus the accounts on the
-    /// fold lines the pane cannot show.
+    /// fold block — N counts the hidden table rows plus the accounts the
+    /// block cannot show. The block (twolab-tui's packed grid) says it on
+    /// its own last line instead of stopping at the pane's edge, so that
+    /// line holds `+5 more` where the third entry line was cut (the title
+    /// read `+3 more` then).
     #[test]
     fn fold_on_a_short_terminal_counts_the_hidden_entries() {
         let (view, chrome) = live_view();
@@ -21498,12 +23719,13 @@ mod tests {
         let band = row_of(&rows, " scheduler · poller ");
         assert_eq!(band - accounts, 18, "{frame}");
         assert!(
-            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +3 more "),
+            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +5 more "),
             "{frame}"
         );
         assert!(rows[accounts + 14].starts_with("   group "), "{frame}");
-        assert!(rows[band - 1].contains(&fold_name(12)), "{frame}");
-        assert!(!frame.contains(&fold_name(14)), "{frame}");
+        assert!(rows[band - 2].contains(&fold_name(7)), "{frame}");
+        assert_eq!(rows[band - 1].trim_end(), "+5 more", "{frame}");
+        assert!(!frame.contains(&fold_name(11)), "{frame}");
     }
 
     /// Membership is recomputed every frame: an account whose 7d window
@@ -21672,6 +23894,265 @@ mod tests {
         );
         assert_each_member_shows_its_status(&rows, &frame);
     }
+
+    // --- compact account list (twolab-tui agent_list) ----------------------
+
+    /// [`live_view`] with the fold off and an account in every state the
+    /// compact list tells apart: #1 failed auth (401), #8 cooling for 45m,
+    /// #9 with usage an hour old; #5 is paused, #4 over its 5h ceiling, the
+    /// members 7d-spent, #13 and #18 the current accounts, the other five
+    /// ok.
+    fn compact_view() -> (DashboardView, Chrome) {
+        let (mut view, chrome) = live_view();
+        let now = SystemTime::now();
+        let accounts = &mut view.snapshot.accounts;
+        accounts[0].healthy = false;
+        accounts[0].auth_failure_status = Some(401);
+        accounts[7].cooldown_until = Some(now + Duration::from_secs(45 * 60 + 30));
+        let stale = &mut accounts[8];
+        for window in [&mut stale.five_hour, &mut stale.seven_day]
+            .into_iter()
+            .flatten()
+        {
+            window.fetched_at = now - Duration::from_secs(3_600);
+        }
+        (view, fold_off(&chrome))
+    }
+
+    /// The compact list's glyph for each state, and the word an entry says.
+    const COMPACT_STATES: [(usize, &str, &str); 7] = [
+        (1, "✗", "error 401"),
+        (4, "◌", "5h spent"),
+        (2, "◌", "7d spent"),
+        (8, "◉", "cooling 45m"),
+        (13, "⠋", "active"),
+        (10, "◦", "ok"),
+        (5, "ǁ", "paused"),
+    ];
+
+    /// At 80×24 MAIN's accounts pane is four rows: the table showed two
+    /// accounts under its header and `+19 more`. The pane now holds the
+    /// compact list — an entry per account (focus mark, state glyph, name)
+    /// running down and across five columns, so ten accounts show — and
+    /// the title keeps the sort and the count, adds the one-line tally and
+    /// counts the rest. At 179×43 every row fits and the table stays.
+    #[test]
+    fn main_trades_a_crowded_table_for_the_compact_list() {
+        let (view, chrome) = compact_view();
+        let ctx = frame_ctx(&view, &chrome);
+        assert!(
+            table_crowded(21, None, 4),
+            "the 80x24 pane: 2 rows, 19 hidden"
+        );
+        assert!(!table_crowded(21, None, 7), "five rows are enough");
+        assert!(!table_crowded(2, None, 4), "nothing hidden");
+        assert_eq!(ctx.order.len(), 21);
+
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+        let title = &rows[accounts];
+        assert!(
+            title.contains(" accounts · sort name · 21 · ✗ 1 error · "),
+            "{frame}"
+        );
+        assert!(title.contains(" · +11 more "), "{frame}");
+        assert!(rows[accounts + 3].starts_with("── scheduler "), "{frame}");
+        let pane = rows[accounts + 1..accounts + 3].join("\n");
+        assert!(
+            !pane.contains("group") && !pane.contains("CLAUDE"),
+            "{frame}"
+        );
+        // Down, then across: #1 and #2 in the first column, #9 and #10 in
+        // the fifth; names cut to the column (`u08-fixtur…`), #11 on no row.
+        for (n, row) in [(1, 1), (2, 2), (7, 1), (8, 2), (9, 1), (10, 2)] {
+            let name: String = fold_name(n).chars().take(10).collect();
+            assert!(rows[accounts + row].contains(&name), "#{n}:\n{frame}");
+        }
+        assert!(rows[accounts + 1].contains("✗ u01@ex.io"), "{frame}");
+        assert!(rows[accounts + 2].contains("◉ u08-fixtur…"), "{frame}");
+        assert!(rows[accounts + 1].contains("? u09@ex.io"), "{frame}");
+        assert!(!frame.contains(&fold_name(11)), "{frame}");
+
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 (");
+        assert!(rows[accounts + 1].starts_with("   group "), "{frame}");
+        assert!(!rows[accounts].contains("✗ 1 error"), "{frame}");
+    }
+
+    /// `V` on the accounts tab: one row per account with its state's glyph
+    /// — each one cell, on a CJK terminal too — its name and what it waits
+    /// on, in the table's order; the title's tally names every state with
+    /// its glyph. A tally slot two states share names both.
+    #[test]
+    fn compact_list_gives_each_state_its_glyph_and_word() {
+        let (view, _) = compact_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let rows = render_rows(&view, &chrome, 80, 30);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+        assert!(rows[accounts + 1].starts_with(" ✗ u01@ex.io "), "{frame}");
+        for (n, glyph, word) in COMPACT_STATES.iter().copied().chain([(9, "?", "stale")]) {
+            let ch = glyph.chars().next().expect("glyph");
+            assert_eq!(
+                (
+                    unicode_width::UnicodeWidthChar::width(ch),
+                    unicode_width::UnicodeWidthChar::width_cjk(ch)
+                ),
+                (Some(1), Some(1)),
+                "{glyph} is one cell"
+            );
+            let name = fold_name(n);
+            let y = row_of(&rows, &format!("{glyph} {name} "));
+            let at = usize::from(col_of(&rows[y], &name));
+            let entry: String = rows[y].chars().skip(at).take(34).collect();
+            assert!(
+                entry.contains(&format!(" {word}")),
+                "#{n} says {word:?}: {entry:?}\n{frame}"
+            );
+        }
+        // Every account is on screen exactly once, in the table's order.
+        let ctx = frame_ctx(&view, &chrome);
+        let (_, hits) = render_with_hits(&view, &chrome, 80, 30);
+        let seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        assert_eq!(seen, (0..ctx.order.len()).collect::<Vec<_>>(), "{frame}");
+
+        let rows = render_rows(&view, &chrome, 179, 30);
+        let title = &rows[row_of(&rows, " accounts · sort name · 21 (")];
+        assert!(
+            title.contains(
+                " · ✗ 1 error · ◉ 11 spent+cooling · ⠋ 2 active · ◦ 5 ok · ? 2 paused+stale "
+            ),
+            "{title}"
+        );
+        // A slot one llmux state holds alone shows that state's glyph.
+        let (view, chrome0) = live_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            ..fold_off(&chrome0)
+        };
+        let chrome = Chrome {
+            overlay: Overlay::Accounts,
+            ..chrome
+        };
+        let rows = render_rows(&view, &chrome, 179, 30);
+        let title = &rows[row_of(&rows, " accounts · sort name · 21 (")];
+        assert!(
+            title.contains(" · ◌ 10 spent · ⠋ 2 active · ◦ 8 ok · ǁ 1 paused "),
+            "{title}"
+        );
+    }
+
+    /// The switcher's cursor is the list's focus: `›` and the selected
+    /// (reversed) style on its entry, and a cursor past the last entry that
+    /// fits moves the list just far enough to show it, the rest counted.
+    #[test]
+    fn compact_list_highlights_and_follows_the_cursor() {
+        let (view, _) = compact_view();
+        let (w, h) = (40u16, 14u16);
+        for idx in [0usize, 20] {
+            let chrome = Chrome {
+                compact_accounts: true,
+                mode: Mode::Select { idx },
+                ..chrome_overlay(Overlay::Accounts)
+            };
+            let buf = render_buffer(&view, &chrome, w, h);
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            let frame = rows.join("\n");
+            let name = fold_name(idx + 1);
+            let y = row_of(&rows, &format!("›{}", if idx == 0 { "✗" } else { "◦" }));
+            assert!(rows[y].contains(&name), "{frame}");
+            let x = col_of(&rows[y], "›");
+            assert!(
+                buf[(x, y as u16)].modifier.contains(Modifier::REVERSED)
+                    && buf[(x + 4, y as u16)].modifier.contains(Modifier::REVERSED),
+                "{frame}"
+            );
+            let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+            assert!(rows[accounts].contains(" more "), "{frame}");
+            // Only the focused entry is marked.
+            let detail = row_of(&rows, " detail ");
+            let marks: usize = rows[accounts + 1..detail]
+                .iter()
+                .map(|r| r.matches('›').count())
+                .sum();
+            assert_eq!(marks, 1, "{frame}");
+        }
+    }
+
+    /// A compact entry is its account's click target, like the table row:
+    /// a left click opens that account's detail modal, a right click its
+    /// context menu, on the same account the table row would.
+    #[test]
+    fn compact_entry_clicks_open_the_same_account_as_its_table_row() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (view, chrome) = compact_view();
+        let press = |hits: &[AccountRowHit], button: MouseButton, column: u16, row: u16| {
+            let mut app = fold_app();
+            app.account_row_chrome = hits.to_vec();
+            let down = MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(app.on_mouse(down, Some(&view)), "click at {column},{row}");
+            app
+        };
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort name · 21 · ");
+        for n in [1usize, 7, 10] {
+            let row = accounts + 1 + (n + 1) % 2;
+            let x = col_of(&rows[row], &fold_name(n)) + 1;
+            let app = press(&hits.account_rows, MouseButton::Left, x, row as u16);
+            assert_eq!(
+                app.account_modal.as_ref().map(|m| m.account.clone()),
+                Some(live_id(n)),
+                "#{n}:\n{frame}"
+            );
+            let app = press(&hits.account_rows, MouseButton::Right, x, row as u16);
+            assert_eq!(app.menu_account, Some(live_id(n)), "#{n}:\n{frame}");
+        }
+        // The table row of #7 at 179x43 opens the same account.
+        let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+        let y = row_of(&rows, &format!(" 7  {}", fold_name(7)));
+        let app = press(&hits.account_rows, MouseButton::Left, 10, y as u16);
+        assert_eq!(
+            app.account_modal.as_ref().map(|m| m.account.clone()),
+            Some(live_id(7))
+        );
+    }
+
+    /// `v` is on the accounts footer — `compact`, or `table` while the list
+    /// shows — and in the `?` help, where the accounts group shows it even
+    /// at 179×43 (the hints the grid cuts off there are the ones the
+    /// dashboard group lists too).
+    #[test]
+    fn the_compact_key_is_on_the_accounts_footer_and_in_the_help() {
+        let (view, _) = compact_view();
+        for (compact, label) in [(false, "V compact"), (true, "V table")] {
+            let chrome = Chrome {
+                compact_accounts: compact,
+                ..chrome_overlay(Overlay::Accounts)
+            };
+            let rows = render_rows(&view, &chrome, 179, 43);
+            assert!(rows[42].contains(label), "{}", rows[42]);
+        }
+        let rows = render_rows(&view, &chrome_attach(Overlay::Misc), 179, 43);
+        assert!(
+            rows.iter().any(|r| r.contains(" V    compact ")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
     #[test]
     fn usage_history_failure_summary_visible_in_expanded_main_band() {
         let (mut view, name) = rich_account_view();
