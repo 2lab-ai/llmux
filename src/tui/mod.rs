@@ -1321,6 +1321,12 @@ struct App {
     /// mouse capture while it is on and holds the frame still, so the text
     /// under the terminal's own selection does not move.
     copy_mode: bool,
+    /// When copy mode last turned on (`None` while it is off): the
+    /// dashboard's clock stands still from then, since the screen does.
+    copy_since: Option<Instant>,
+    /// How long copy mode has held the screen, all spells of it together:
+    /// time the dashboard's clock does not count ([`Self::clock_at`]).
+    held_for: Duration,
     /// The click-opened input-text modal (UI-6 item 3); `None` when closed. The
     /// scroll offset is clamped after each draw against the wrapped line count
     /// the render pass reports (`MainChrome::input_modal_max_scroll`).
@@ -1439,6 +1445,8 @@ impl App {
             logs_area: None,
             logs_sel: None,
             copy_mode: false,
+            copy_since: None,
+            held_for: Duration::ZERO,
             input_modal: None,
             raw_modal: None,
             account_modal: None,
@@ -1727,9 +1735,32 @@ impl App {
             .map(|(msg, _)| msg.text.as_str())
     }
 
-    /// The dashboard's own clock at `now`: time since it started.
+    /// The dashboard's own clock at `now`: time since it started, less the
+    /// time copy mode held the screen. It stands still while copy mode is on
+    /// — no frame is drawn then — so a toast that arrives meanwhile, or was
+    /// up when `v` was pressed, is not used up before anyone could read it.
     fn clock_at(&self, now: Instant) -> Duration {
+        let holding = self
+            .copy_since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         now.saturating_duration_since(self.started)
+            .saturating_sub(self.held_for.saturating_add(holding))
+    }
+
+    /// Turn copy mode on or off at `now`, stopping or restarting the
+    /// dashboard's clock with it.
+    fn set_copy_mode(&mut self, on: bool, now: Instant) {
+        if on == self.copy_mode {
+            return;
+        }
+        self.copy_mode = on;
+        if on {
+            self.copy_since = Some(now);
+        } else if let Some(since) = self.copy_since.take() {
+            self.held_for = self
+                .held_for
+                .saturating_add(now.saturating_duration_since(since));
+        }
     }
 
     /// Show a status message. A short one is the footer's one-row flash; one
@@ -1861,7 +1892,7 @@ impl App {
         // move what is being selected.
         if self.copy_mode {
             if matches!(key.code, KeyCode::Char('v') | KeyCode::Esc) {
-                self.copy_mode = false;
+                self.set_copy_mode(false, Instant::now());
             }
             return;
         }
@@ -1874,7 +1905,7 @@ impl App {
             && self.mode == Mode::Normal
             && !self.keys.picker.as_ref().is_some_and(|p| p.filtering)
         {
-            self.copy_mode = true;
+            self.set_copy_mode(true, Instant::now());
             return;
         }
         // The input modal (UI-6 item 3), when open, swallows every key beneath
@@ -8566,6 +8597,40 @@ mod tests {
         assert!(app.input_modal.is_some(), "and leaves the modal open");
         app.on_key(press(KeyCode::Esc), None);
         assert!(app.input_modal.is_none(), "the next Esc closes the modal");
+    }
+
+    /// A toast up while copy mode holds the screen is not used up unseen:
+    /// the dashboard's clock stands still from the `v` to the way back, so
+    /// a failure card (8 s) is still there after a minute of selecting —
+    /// and gone a minute later without copy mode.
+    #[test]
+    fn copy_mode_stops_the_clock_so_a_toast_outlives_the_hold() {
+        let mut app = remote_app();
+        let started = app.started;
+        let at = |secs| started + Duration::from_secs(secs);
+        let (on, off, after) = (at(1), at(61), at(63));
+        let lines = vec!["claude:a2@x.com: upstream 502".to_string()];
+        app.set_status(StatusMsg::fail("refresh: 1 ok, 1 FAILED").with_lines(lines));
+        let shown = |app: &App, now: Instant| {
+            let chrome = app.chrome_at(now);
+            chrome.toasts.visible(chrome.clock).len()
+        };
+        assert_eq!(shown(&app, after), 0, "unheld, the card is gone by then");
+        app.set_copy_mode(true, on);
+        assert_eq!(app.clock_at(at(30)), Duration::from_secs(1), "it stands");
+        app.set_copy_mode(false, off);
+        assert_eq!(app.clock_at(after), Duration::from_secs(3));
+        assert_eq!(shown(&app, after), 1, "the card outlived the hold");
+        // A second hold adds to the first.
+        app.set_copy_mode(true, at(64));
+        app.set_copy_mode(false, at(70));
+        assert_eq!(app.clock_at(at(70)), Duration::from_secs(4));
+        assert_eq!(shown(&app, at(80)), 0, "and runs out on the clock");
+        // The `v` key turns the clock off and on with copy mode.
+        app.on_key(press(KeyCode::Char('v')), None);
+        assert!(app.copy_mode && app.copy_since.is_some());
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(!app.copy_mode && app.copy_since.is_none());
     }
 
     /// Copy mode holds the frame still while it stays on: the render tick
