@@ -2305,8 +2305,16 @@ impl App {
                     }
                     // A models-strip entry opens the Stats tab with that
                     // model under the cursor, its drill-down beside the table.
-                    Some(&ui::ClickTarget::StripEntry(model)) => {
-                        self.open_model(model, view);
+                    // Found by the model it showed, in the view the click
+                    // lands on; one gone since then opens nothing.
+                    Some(ui::ClickTarget::StripEntry { group, model }) => {
+                        let index = view.and_then(|v| {
+                            v.model_usage
+                                .iter()
+                                .position(|m| &m.group == group && &m.model == model)
+                        });
+                        let Some(index) = index else { return false };
+                        self.open_model(index, view);
                         return true;
                     }
                     _ => {}
@@ -7999,10 +8007,14 @@ mod tests {
             row: 30,
             modifiers: KeyModifiers::NONE,
         };
-        let entry = |x, index| {
+        let entry = |x, index: usize| {
+            let m = &view.model_usage[index];
             (
                 ratatui::layout::Rect::new(x, 30, 70, 1),
-                ui::ClickTarget::StripEntry(index),
+                ui::ClickTarget::StripEntry {
+                    group: m.group.clone(),
+                    model: m.model.clone(),
+                },
             )
         };
         let mut app = remote_app();
@@ -8015,6 +8027,52 @@ mod tests {
         assert!(app.on_mouse(click(80), Some(&view)));
         assert_eq!(app.overlay, Overlay::Stats);
         assert_eq!(app.model_cursor, 1, "the clicked model");
+    }
+
+    /// A strip entry's click target carries the model it showed: when the
+    /// view re-sorts between the frame and the click (a model overtakes
+    /// another by tokens), the click opens the model that was drawn under
+    /// the pointer, at its new place — and one that left the view since
+    /// opens nothing.
+    #[test]
+    fn a_strip_click_opens_the_model_drawn_there_after_a_re_sort() {
+        let mut view = stats_view();
+        let first = view.model_usage[0].clone();
+        view.model_usage = ["gpt-5.5", "gpt-5.6-sol", "gpt-5.4-mini"]
+            .into_iter()
+            .map(|model| crate::dashboard::ModelUsageDoc {
+                model: model.into(),
+                ..first.clone()
+            })
+            .collect();
+        let mut app = remote_app();
+        let rows = draw_and_adopt(&mut app, &view, 179, 43);
+        let (rect, drawn) = app
+            .hits
+            .iter()
+            .find_map(|(rect, t)| match t {
+                ui::ClickTarget::StripEntry { model, .. } if model == "gpt-5.5" => {
+                    Some((rect, model.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("gpt-5.5 is drawn:\n{}", rows.join("\n")));
+        assert!(rows[usize::from(rect.y)].contains("gpt-5.5"));
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 1, rect.y);
+        // The view re-sorts before the click: gpt-5.5 is now last.
+        view.model_usage.rotate_left(1);
+        assert!(app.on_mouse(click, Some(&view)));
+        assert_eq!(app.overlay, Overlay::Stats);
+        assert_eq!(app.model_cursor, 2);
+        assert_eq!(
+            view.model_usage[app.model_cursor].model, drawn,
+            "the drawn model"
+        );
+        // Gone from the view: the click opens nothing.
+        app.overlay = Overlay::None;
+        view.model_usage.retain(|m| m.model != drawn);
+        assert!(!app.on_mouse(click, Some(&view)));
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     /// Review of #234: the mouse wiring of the twolab-tui modal — a click on

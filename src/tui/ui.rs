@@ -783,11 +783,18 @@ fn draw_main(
     let mut map = Hits::new();
     map.extend(tabs);
     map.extend(account_rows);
-    map.extend(
-        models_strip
-            .into_iter()
-            .map(|h| (h.rect, ClickTarget::StripEntry(h.index))),
-    );
+    // Each entry carries the model it showed, not its place: the view may
+    // re-sort before the click lands.
+    map.extend(models_strip.into_iter().filter_map(|h| {
+        let m = view.model_usage.get(h.index)?;
+        Some((
+            h.rect,
+            ClickTarget::StripEntry {
+                group: m.group.clone(),
+                model: m.model.clone(),
+            },
+        ))
+    }));
     map.extend(activity);
     map.extend(separators.into_iter().map(|sep| {
         let row = Rect {
@@ -9005,9 +9012,10 @@ pub(crate) enum ClickTarget {
     /// limits / remove flows take). Left-click opens the account modal,
     /// right-click the context menu (UI-3 U11).
     AccountRow(usize),
-    /// A models-strip entry (packed entry or table row), `index` into
-    /// `model_usage`: opens the model in `stats`.
-    StripEntry(usize),
+    /// A models-strip entry (packed entry or table row), by the model it
+    /// showed: opens that model in `stats`, looked up in the view the click
+    /// lands on — a re-sort since the frame never opens another model.
+    StripEntry { group: String, model: String },
     /// A value on the group-settings bar (UI-3 U9/U10): rotates it.
     Setting(SettingAction),
     /// A request row of the activity panel, or one of its clickable detail
@@ -21722,7 +21730,10 @@ mod tests {
             };
             let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
             let entries: Vec<packed_grid::GridHit> = reachable(&hits.hits, |t| match t {
-                ClickTarget::StripEntry(index) => Some(*index),
+                ClickTarget::StripEntry { group, model } => view
+                    .model_usage
+                    .iter()
+                    .position(|m| &m.group == group && &m.model == model),
                 _ => None,
             })
             .into_iter()
