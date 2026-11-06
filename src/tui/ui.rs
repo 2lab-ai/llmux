@@ -569,53 +569,84 @@ fn draw_main(
 /// setting (scheduler mode, codex model / effort / fast, grok effort).
 /// Effort `bypass` = the client's own value rides through (UI-3 U12).
 /// Claude and gemini have no live settings, so they show an account count.
+///
+/// Laid out by twolab-tui's `StatusBar`, one segment per group joined by
+/// `  │  `: on a row too narrow for all of them whole groups drop — the
+/// account counts first, then grok, then codex; the scheduler mode stays —
+/// and `+N` says how many went. The click rects come from
+/// `StatusBar::hits`, so a click lands on the value that is drawn there,
+/// measured in cells (a wide model name included).
 fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+    use twolab_tui::status_bar::{Segment, StatusBar};
     if area.height == 0 {
         return Vec::new();
     }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut hits: Vec<SettingHit> = Vec::new();
-    let mut x = area.x;
-    let push_plain = |spans: &mut Vec<Span<'static>>, x: &mut u16, text: String, style| {
-        let w = text.chars().count() as u16;
-        spans.push(Span::styled(text, style));
-        *x += w;
-    };
+    let groups = settings_groups(view);
+    let bar = StatusBar::new(KEYBAR_THEME)
+        .style(dim())
+        .separator("  │  ")
+        .count_dropped(true)
+        .segments(groups.iter().map(|g| {
+            let text: String = g
+                .parts
+                .iter()
+                .map(|(span, _)| span.content.as_ref())
+                .collect();
+            Segment::new(text).priority(g.priority)
+        }));
+    let row = Rect { height: 1, ..area };
+    frame.render_widget(&bar, row);
+    let mut hits = Vec::new();
+    for (i, rect) in bar.hits(row) {
+        // The bar drew the group's text in one style; paint its own styles
+        // over exactly those cells, then map each value to where it is.
+        let parts = &groups[i].parts;
+        let spans: Vec<Span<'static>> = parts.iter().map(|(span, _)| span.clone()).collect();
+        let line = cells::truncate_line(Line::from(spans), usize::from(rect.width));
+        frame
+            .buffer_mut()
+            .set_line(rect.x, rect.y, &line, rect.width);
+        let mut x = rect.x;
+        for (span, action) in parts {
+            let right = x
+                .saturating_add(cells::width(&span.content) as u16)
+                .min(rect.right());
+            if let Some(action) = *action {
+                if right > x {
+                    hits.push(SettingHit {
+                        area: Rect::new(x, rect.y, right - x, 1),
+                        action,
+                    });
+                }
+            }
+            x = right;
+        }
+    }
+    hits
+}
+
+/// One group on the group-settings bar: its parts in their styles, each
+/// with the setting a click on it rotates, and how long it stays when the
+/// row is narrow (higher stays longer; equals drop from the right).
+struct SettingsGroup {
+    parts: Vec<(Span<'static>, Option<SettingAction>)>,
+    priority: u8,
+}
+
+/// The groups of the settings bar, left to right: the scheduler mode, then
+/// each backend group that is present.
+fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
     let clickable = Style::new()
         .fg(Color::Cyan)
         .add_modifier(Modifier::UNDERLINED);
-    let push_click = |spans: &mut Vec<Span<'static>>,
-                      hits: &mut Vec<SettingHit>,
-                      x: &mut u16,
-                      text: String,
-                      action: SettingAction| {
-        let w = text.chars().count() as u16;
-        hits.push(SettingHit {
-            area: Rect {
-                x: *x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-            action,
-        });
-        spans.push(Span::styled(text, clickable));
-        *x += w;
+    let plain = |text: String, style: Style| (Span::styled(text, style), None);
+    let click = |text: String, action: SettingAction| (Span::styled(text, clickable), Some(action));
+    let name = |group: &'static str| {
+        plain(
+            format!("{group} "),
+            group_color(Some(group)).add_modifier(Modifier::BOLD),
+        )
     };
-    let sep = |spans: &mut Vec<Span<'static>>, x: &mut u16| {
-        spans.push(Span::styled("  │  ", dim()));
-        *x += 5;
-    };
-
-    push_plain(&mut spans, &mut x, " sched ".into(), dim());
-    push_click(
-        &mut spans,
-        &mut hits,
-        &mut x,
-        view.select_params.mode.label().to_string(),
-        SettingAction::SchedMode,
-    );
-
     let count = |g: BackendGroup| {
         view.snapshot
             .accounts
@@ -623,79 +654,63 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
             .filter(|a| a.group == g)
             .count()
     };
+    let mut groups = vec![SettingsGroup {
+        parts: vec![
+            plain(" sched ".into(), dim()),
+            click(
+                view.select_params.mode.label().to_string(),
+                SettingAction::SchedMode,
+            ),
+        ],
+        priority: 3,
+    }];
     let claude_n = count(BackendGroup::Claude);
     if claude_n > 0 {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "claude ".into(),
-            group_color(Some("claude")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, format!("{claude_n} acc"), dim());
+        groups.push(SettingsGroup {
+            parts: vec![name("claude"), plain(format!("{claude_n} acc"), dim())],
+            priority: 1,
+        });
     }
     if view.codex.available {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "codex ".into(),
-            group_color(Some("codex")).add_modifier(Modifier::BOLD),
-        );
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.codex.model.clone(),
-            SettingAction::CodexModel,
-        );
-        push_plain(&mut spans, &mut x, " effort:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
-            SettingAction::CodexEffort,
-        );
-        push_plain(&mut spans, &mut x, " fast:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            if view.codex.fast { "on" } else { "off" }.into(),
-            SettingAction::CodexFast,
-        );
+        groups.push(SettingsGroup {
+            parts: vec![
+                name("codex"),
+                click(view.codex.model.clone(), SettingAction::CodexModel),
+                plain(" effort:".into(), dim()),
+                click(
+                    view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
+                    SettingAction::CodexEffort,
+                ),
+                plain(" fast:".into(), dim()),
+                click(
+                    if view.codex.fast { "on" } else { "off" }.into(),
+                    SettingAction::CodexFast,
+                ),
+            ],
+            priority: 2,
+        });
     }
     if view.grok.available {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "grok ".into(),
-            group_color(Some("grok")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, "effort:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
-            SettingAction::GrokEffort,
-        );
+        groups.push(SettingsGroup {
+            parts: vec![
+                name("grok"),
+                plain("effort:".into(), dim()),
+                click(
+                    view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
+                    SettingAction::GrokEffort,
+                ),
+            ],
+            priority: 2,
+        });
     }
     let gemini_n = count(BackendGroup::Gemini);
     if gemini_n > 0 {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "gemini ".into(),
-            group_color(Some("gemini")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, format!("{gemini_n} acc"), dim());
+        groups.push(SettingsGroup {
+            parts: vec![name("gemini"), plain(format!("{gemini_n} acc"), dim())],
+            priority: 1,
+        });
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    hits
+    groups
 }
 
 /// The tab strip (UI-3 U6): one row of clickable surface names right under
@@ -5205,9 +5220,11 @@ fn header_tail_spans(
 /// review 2026-10-22), knowing the room the tab labels leave (`tabs_room`):
 /// the whole header fits → today's header; else the tabs-row form of the
 /// tail ([`header_tail_spans`]) fits that room → the header drops its tail
-/// and the tail is returned for [`draw_tabs_tail`]; else today's whole
-/// header, clipped by its row as before (cfg is never lost to a tail that
-/// had nowhere to go).
+/// and the tail is returned for [`draw_tabs_tail`]; else the whole header
+/// with its tail. Whatever the header keeps is laid out by
+/// [`draw_header_row`]: the verdict always, then whole identity segments by
+/// importance — never a segment cut mid-word (cfg is never lost to a tail
+/// that had nowhere to go: it competes for the row like the rest).
 fn draw_header(
     frame: &mut Frame,
     area: Rect,
@@ -5216,21 +5233,84 @@ fn draw_header(
     now: SystemTime,
     tabs_room: usize,
 ) -> Vec<Span<'static>> {
-    let lead = header_lead_spans(view, now);
-    let mut full = lead.clone();
-    if let Some(path) = &view.config_path {
-        full.push(Span::styled(format!(" cfg {path} "), dim()));
-    }
-    full.extend(attach_spans(chrome));
-    if Line::from(full.clone()).width() > usize::from(area.width) {
+    let verdict = header_verdict_spans(view, now);
+    let identity = header_identity_segments(view);
+    let mut full = identity.clone();
+    full.extend(header_tail_segments(view, chrome));
+    if header_width(&verdict, &full) > usize::from(area.width) {
         let tail = header_tail_spans(view, chrome, dirs::home_dir().as_deref());
         if !tail.is_empty() && Line::from(tail.clone()).width() <= tabs_room {
-            frame.render_widget(Paragraph::new(Line::from(lead)), area);
+            draw_header_row(frame, area, verdict, identity);
             return tail;
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(full)), area);
+    draw_header_row(frame, area, verdict, full);
     Vec::new()
+}
+
+/// What separates two header segments: one space, as the header always
+/// read (`llmux 0.2.26 :3456 pid 1 up 3h`).
+const HEADER_SEPARATOR: &str = " ";
+
+/// The cells between the verdict and the first identity segment.
+const HEADER_GAP: &str = "  ";
+
+/// The header's segments as twolab-tui `StatusBar` lays them out.
+fn header_bar(segments: Vec<twolab_tui::status_bar::Segment>) -> twolab_tui::status_bar::StatusBar {
+    twolab_tui::status_bar::StatusBar::new(KEYBAR_THEME)
+        .style(dim())
+        .separator(HEADER_SEPARATOR)
+        .segments(segments)
+}
+
+/// Cells the header takes with every segment on it.
+fn header_width(verdict: &[Span<'static>], segments: &[twolab_tui::status_bar::Segment]) -> usize {
+    let verdict = Line::from(verdict.to_vec()).width();
+    if segments.is_empty() {
+        return verdict;
+    }
+    let texts: usize = segments.iter().map(|s| cells::width(&s.text)).sum();
+    verdict + HEADER_GAP.len() + texts + HEADER_SEPARATOR.len() * (segments.len() - 1)
+}
+
+/// One header row: the verdict first and whole (cut with `…` only when the
+/// row is narrower than the verdict itself), then the segments that fit
+/// beside it — twolab-tui's `StatusBar` drops the least important ones
+/// whole. The bar would cut the last one standing; here a segment that
+/// does not fit whole goes too, and the next most important one that fits
+/// takes its place (a long attach marker gives way to the version).
+fn draw_header_row(
+    frame: &mut Frame,
+    area: Rect,
+    verdict: Vec<Span<'static>>,
+    mut segments: Vec<twolab_tui::status_bar::Segment>,
+) {
+    let width = usize::from(area.width);
+    let mut line = cells::truncate_line(Line::from(verdict), width);
+    let room = width.saturating_sub(line.width() + HEADER_GAP.len()) as u16;
+    while !segments.is_empty() {
+        let bar = header_bar(segments.clone());
+        let layout = bar.layout(room);
+        let cut = layout
+            .kept
+            .iter()
+            .zip(&layout.widths)
+            .find(|&(&i, &w)| cells::width(&segments[i].text) != w)
+            .map(|(&i, _)| i);
+        match cut {
+            Some(i) => {
+                segments.remove(i);
+            }
+            None => {
+                if !layout.kept.is_empty() {
+                    line.spans.push(Span::styled(HEADER_GAP, dim()));
+                    line.spans.extend(bar.line(room).spans);
+                }
+                break;
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Right-align the header tail at the end of the tabs row ([`draw_header`]
@@ -5248,9 +5328,10 @@ fn draw_tabs_tail(frame: &mut Frame, area: Rect, tail: Vec<Span<'static>>) {
     );
 }
 
-/// The header up to (and including) the upstream: health verdict, identity,
-/// upstream — everything but the movable tail.
-fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
+/// The header's verdict: the health tag and its headline condition (or
+/// `healthy` and the error rate). It always leads the row and is never
+/// dropped.
+fn header_verdict_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
     // glance-triage atom 1: the header row IS the health verdict — always
     // present (green included: a positive signal, never health-by-absence),
     // zero added height, [OK]/[WARN]/[FAIL] text first so the state survives
@@ -5294,21 +5375,56 @@ fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>
             ));
         }
     }
-    spans.push(Span::styled(
-        format!(
-            "  llmux {} :{} pid {} up {} ·{}",
-            view.display_version(),
-            view.port,
-            view.pid,
-            format::countdown(view.uptime),
-            view.snapshot.accounts.len()
-        ),
-        dim(),
-    ));
-    if let Some(upstream) = &view.upstream {
-        spans.push(Span::styled(format!(" → {upstream} "), dim()));
-    }
     spans
+}
+
+/// The header's identity after the verdict, as segments that drop whole —
+/// the least important first — when the row is too narrow. Highest stays
+/// longest: version, port, uptime, pid, upstream, the version's build tag
+/// (`(preview …)`), the account count (the accounts title repeats it).
+/// Joined by one space they read exactly as the header always did.
+fn header_identity_segments(view: &DashboardView) -> Vec<twolab_tui::status_bar::Segment> {
+    use twolab_tui::status_bar::Segment;
+    let version = view.display_version();
+    let (number, tag) = match version.split_once(' ') {
+        Some((number, tag)) => (number, Some(tag)),
+        None => (version, None),
+    };
+    let mut segments = vec![Segment::new(format!("llmux {number}")).priority(7)];
+    if let Some(tag) = tag {
+        segments.push(Segment::new(tag).priority(2));
+    }
+    segments.push(Segment::new(format!(":{}", view.port)).priority(6));
+    segments.push(Segment::new(format!("pid {}", view.pid)).priority(4));
+    segments.push(Segment::new(format!("up {}", format::countdown(view.uptime))).priority(5));
+    segments.push(Segment::new(format!("·{}", view.snapshot.accounts.len())).priority(1));
+    if let Some(upstream) = &view.upstream {
+        // The trailing space keeps the header's two-space step to `cfg`.
+        segments.push(Segment::new(format!("→ {upstream} ")).priority(3));
+    }
+    segments
+}
+
+/// The header's tail when it stays in the header row: ` cfg {path} ` (the
+/// least important segment of all — it goes first) and the attach marker
+/// (the most important — `reconnecting` must not be the part that drops).
+fn header_tail_segments(
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Vec<twolab_tui::status_bar::Segment> {
+    use twolab_tui::status_bar::Segment;
+    let mut segments = Vec::new();
+    if let Some(path) = &view.config_path {
+        segments.push(Segment::new(format!("cfg {path} ")).priority(0));
+    }
+    for span in attach_spans(chrome) {
+        segments.push(
+            Segment::new(span.content.trim_start())
+                .style(span.style)
+                .priority(8),
+        );
+    }
+    segments
 }
 
 /// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) `,
@@ -17022,6 +17138,135 @@ mod tests {
         assert!(text.contains("effort:high"), "grok effort value visible");
     }
 
+    /// Catalog `status_bar` (plan batch 3): the settings bar drops whole
+    /// groups — the account counts first, then grok — and says `+N`; every
+    /// click rect covers exactly the value drawn in it, measured in cells,
+    /// so with a wide (CJK) model name the effort and fast toggles still
+    /// land on `bypass` and `off` (char counting put them two cells left).
+    #[test]
+    fn group_settings_bar_drops_whole_groups_and_clicks_land_on_drawn_values() {
+        let (mut view, chrome) = recompose_view();
+        view.codex.model = "模型-一二".into();
+        let cells_of = |buf: &ratatui::buffer::Buffer, r: Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        for w in [179u16, 100, 80, 60] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, 43);
+            let buf = render_buffer(&view, &chrome, w, 43);
+            let bar = row_of(&rows, " sched ");
+            let frame = rows[bar].clone();
+            for hit in &hits.settings {
+                assert_eq!(usize::from(hit.area.y), bar, "{frame}");
+                let drawn = cells_of(&buf, hit.area);
+                let want = match hit.action {
+                    SettingAction::SchedMode => view.select_params.mode.label().to_string(),
+                    SettingAction::CodexModel => "模型-一二".into(),
+                    SettingAction::CodexEffort => "bypass".into(),
+                    SettingAction::CodexFast => "off".into(),
+                    SettingAction::GrokEffort => "xhigh".into(),
+                };
+                // A wide glyph's second cell is blank in the buffer.
+                assert_eq!(
+                    drawn.replace(' ', ""),
+                    want,
+                    "{:?} at {w}:\n{frame}",
+                    hit.action
+                );
+                assert_eq!(
+                    usize::from(hit.area.width),
+                    cells::width(&want),
+                    "{:?} rect is the value's cells at {w}:\n{frame}",
+                    hit.action
+                );
+            }
+            let actions: Vec<SettingAction> = hits.settings.iter().map(|h| h.action).collect();
+            match w {
+                179 => {
+                    assert!(frame.contains("claude 14 acc") && frame.contains("gemini 1 acc"));
+                    assert_eq!(actions.len(), 5, "{frame}");
+                }
+                100 => {
+                    assert!(
+                        frame.trim_end().ends_with("grok effort:xhigh  │  +2"),
+                        "{frame}"
+                    );
+                    assert!(!frame.contains("claude 14"), "{frame}");
+                    assert_eq!(actions.len(), 5, "{frame}");
+                }
+                80 => {
+                    assert!(frame.trim_end().ends_with("fast:off  │  +3"), "{frame}");
+                    assert!(!actions.contains(&SettingAction::GrokEffort), "{frame}");
+                }
+                _ => {
+                    assert!(frame.trim_end().ends_with("default  │  +4"), "{frame}");
+                    assert_eq!(actions, vec![SettingAction::SchedMode], "{frame}");
+                }
+            }
+        }
+    }
+
+    /// Catalog `status_bar` (plan batch 3): the header keeps its verdict
+    /// and drops identity segments whole by importance. At 80 columns it
+    /// read `… +2  llmux 0.2.25 (p` (cut mid-segment); now it ends with the
+    /// whole version. At 120 the least important went (the build tag, the
+    /// account count, cfg, then pid) while the attach marker, port and
+    /// uptime stayed. At every width the row is the verdict followed by
+    /// whole segments only.
+    #[test]
+    fn header_drops_whole_segments_by_importance_and_keeps_the_verdict() {
+        let (view, chrome) = fold_view();
+        // The verdict's age ticks between renders: compare with digits masked.
+        let digits = |t: &str| -> String {
+            t.chars()
+                .map(|c| if c.is_ascii_digit() { '9' } else { c })
+                .collect()
+        };
+        let verdict: String = header_verdict_spans(&view, SystemTime::now())
+            .iter()
+            .map(|s| digits(&s.content))
+            .collect();
+        let row0 = |w: u16| {
+            let rows = render_rows(&view, &chrome, w, 24);
+            let (verdict_part, rest) = rows[0].split_at(verdict.len());
+            (digits(verdict_part), rest.to_string())
+        };
+        assert_eq!(
+            row0(80),
+            (
+                verdict.clone(),
+                "  llmux 0.2.25".to_string() + &" ".repeat(80 - verdict.len() - 14)
+            ),
+            "verdict whole, then the version whole"
+        );
+        let whole = [
+            "llmux 0.2.25",
+            "(preview 2026-10-16-0709-a162822a9215)",
+            ":3456",
+            "pid 1695",
+            "up 4d 13h",
+            "·21",
+            "→ https://api.anthropic.com",
+            "cfg /etc/llmux/llmux.json",
+            "attached → pid 1695",
+        ];
+        assert_eq!(
+            row0(120).1.trim_end(),
+            "  llmux 0.2.25 :3456 up 4d 13h attached → pid 1695",
+        );
+        for w in (verdict.len() as u16..=179).rev().step_by(3) {
+            let (kept, rest) = row0(w);
+            assert_eq!(kept, verdict, "verdict kept at {w}");
+            let rest = rest.trim();
+            let mut tail = rest;
+            for seg in whole {
+                if let Some(after) = tail.strip_prefix(seg) {
+                    tail = after.trim_start();
+                }
+            }
+            assert!(tail.is_empty(), "only whole segments at {w}: {rest:?}");
+        }
+    }
+
     #[test]
     fn group_settings_bar_counts_gemini_accounts_only_when_present() {
         use crate::routing::BackendGroup;
@@ -20418,9 +20663,12 @@ mod tests {
         assert_eq!(tail(None), " cfg ~/.config/llmux.json ");
     }
 
-    /// Review item 1: when cfg fits the header and only the attach marker
-    /// overflows it, and the tabs row has no room for the moved tail, the
-    /// header renders exactly as before — cfg stays visible in row 0.
+    /// Review item 1, under the catalog `status_bar` (plan batch 3): when the
+    /// tabs row has no room for the moved tail, cfg is never moved to
+    /// nowhere — the tail stays in the header and competes for the row. At
+    /// a width that holds cfg but not cfg AND the attach marker, the least
+    /// important segment (cfg) drops WHOLE and the attach marker stays;
+    /// with room for both, both stay. Nothing is cut mid-segment.
     #[test]
     fn header_keeps_cfg_when_the_tabs_row_cannot_take_the_tail() {
         let mut view = view_with(Vec::new());
@@ -20432,7 +20680,8 @@ mod tests {
             }),
             ..chrome_overlay(Overlay::None)
         };
-        let lead = Line::from(header_lead_spans(&view, SystemTime::now())).width();
+        let verdict = header_verdict_spans(&view, SystemTime::now());
+        let lead = header_width(&verdict, &header_identity_segments(&view));
         let cfg = Line::from(format!(
             " cfg {} ",
             view.config_path.as_deref().unwrap_or("")
@@ -20442,8 +20691,17 @@ mod tests {
         let w = (lead + cfg + 2) as u16;
         let rows = render_rows(&view, &chrome, w, 30);
         assert!(
-            rows[0].contains(" cfg /opt/deep/"),
-            "cfg must stay in the header at {w}:\n{}\n{}",
+            rows[0].contains(" attached → pid 7 ") && !rows[0].contains("cfg"),
+            "cfg drops whole, the attach marker stays at {w}:\n{}\n{}",
+            rows[0],
+            rows[1]
+        );
+        assert!(!rows[1].contains("cfg"), "the tabs row took no tail");
+        let w = w + 18;
+        let rows = render_rows(&view, &chrome, w, 30);
+        assert!(
+            rows[0].contains(" cfg /opt/deep/") && rows[0].contains(" attached → pid 7 "),
+            "both stay in the header at {w}:\n{}\n{}",
             rows[0],
             rows[1]
         );
