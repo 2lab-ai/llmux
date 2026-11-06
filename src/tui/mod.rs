@@ -133,6 +133,26 @@ fn usage_bucket_count(view: &DashboardView, gran: activity::UsageGran) -> usize 
     count
 }
 
+/// The usage bucket the table's scrollbar points at for table row `row`
+/// (a bucket row plus one row per model, as the overlay draws them): the
+/// first bucket that starts at or after `row`, the last when none does.
+fn usage_bucket_at_row(view: &DashboardView, gran: activity::UsageGran, row: usize) -> usize {
+    let mut starts: Vec<usize> = Vec::new();
+    let (mut rows, mut last) = (0usize, None);
+    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
+        if last != Some(r.bucket) {
+            starts.push(rows);
+            rows += 1;
+            last = Some(r.bucket);
+        }
+        rows += 1;
+    }
+    starts
+        .iter()
+        .position(|&start| start >= row)
+        .unwrap_or(starts.len().saturating_sub(1))
+}
+
 /// Can this client open a browser for an OAuth flow? The login dance (browser
 /// plus localhost callback) runs in the CLIENT, so this gates the `n` new-login
 /// key; when it returns false the picker is replaced by the `llmux login`
@@ -1022,6 +1042,10 @@ struct App {
     tab_chrome: Vec<ui::TabHit>,
     /// Sessions table hit layout from the last frame (mouse row select).
     sessions_chrome: Option<ui::SessionsChrome>,
+    /// The open keys / sessions / usage table's scrollbar from the last frame
+    /// (`None`: nothing overflows), and the press-drag-release on it.
+    table_scroll: Option<ui::TableScroll>,
+    table_drag: twolab_tui::scrollbar::ScrollbarDrag,
     /// Config-editor value-cell hits from the last frame.
     config_chrome: Vec<ui::ConfigHit>,
     /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
@@ -1211,6 +1235,8 @@ impl App {
             activity_chrome: ui::ActivityChrome::default(),
             tab_chrome: Vec::new(),
             sessions_chrome: None,
+            table_scroll: None,
+            table_drag: Default::default(),
             config_chrome: Vec::new(),
             raw_chrome: ui::RawModalChrome::default(),
             separator_chrome: Vec::new(),
@@ -1799,6 +1825,20 @@ impl App {
                 return true;
             }
         }
+        // The keys, sessions and usage tables' scrollbar: a press on the
+        // track jumps there (or grabs the thumb), a drag moves it, the
+        // release lets go. Checked before the row clicks below, so the bar's
+        // column never selects a row.
+        if matches!(
+            self.overlay,
+            Overlay::Keys | Overlay::Sessions | Overlay::Usage
+        ) && self.mode == Mode::Normal
+            && self.keys.picker.is_none()
+        {
+            if let Some(changed) = self.table_scrollbar_mouse(&mouse, view) {
+                return changed;
+            }
+        }
         // Wheel scrolling in the Usage overlay (usage-stats): its primary
         // interaction IS bucket scrolling, so the wheel must work where the
         // mouse opened the tab (review CR — the tab was mouse-openable but
@@ -1812,6 +1852,22 @@ impl App {
                 }
                 MouseEventKind::ScrollDown => {
                     self.on_key_usage(KeyCode::Down, view);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // The wheel scrolls the keys table like ↑/↓ (through the key handler,
+        // so its clamp applies).
+        if self.overlay == Overlay::Keys && self.mode == Mode::Normal && self.keys.picker.is_none()
+        {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.on_key_keys(KeyCode::Up, view);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.on_key_keys(KeyCode::Down, view);
                     return true;
                 }
                 _ => {}
@@ -2066,6 +2122,82 @@ impl App {
             MouseEventKind::ScrollDown => {
                 self.scroll_activity(-1, view);
                 true
+            }
+            _ => false,
+        }
+    }
+
+    /// A mouse event on the open table's scrollbar (keys, sessions, usage).
+    /// `Some(changed)` when the scrollbar took it — a press on the track, a
+    /// drag while the thumb is held, the release that ends it; `None` lets
+    /// the event through to the table's own clicks and wheel.
+    fn table_scrollbar_mouse(
+        &mut self,
+        mouse: &crossterm::event::MouseEvent,
+        view: Option<&DashboardView>,
+    ) -> Option<bool> {
+        let top = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let bar = self.table_scroll?;
+                let top = self
+                    .table_drag
+                    .press(bar.pos, bar.track, mouse.column, mouse.row)?;
+                (bar, top)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let bar = self.table_scroll?;
+                (bar, self.table_drag.drag(bar.pos, bar.track, mouse.row)?)
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.table_drag.is_dragging() => {
+                self.table_drag.release();
+                return Some(false);
+            }
+            _ => return None,
+        };
+        let (bar, top) = top;
+        Some(self.scroll_table_to(bar.pos, top, view))
+    }
+
+    /// Scroll the open table so its first row in view is `top` (a row of
+    /// `pos`, which the last frame drew). Keys: the panel's own offset.
+    /// Sessions: the view follows the cursor, so the cursor moves — the way
+    /// the wheel does — to the row that puts `top` first. Usage: the
+    /// scrollbar counts rows and the table scrolls by bucket, so the first
+    /// bucket that starts at or after `top` (dragging to the end shows the
+    /// last rows). Returns whether anything moved.
+    fn scroll_table_to(
+        &mut self,
+        pos: twolab_tui::scrollbar::ScrollPos,
+        top: usize,
+        view: Option<&DashboardView>,
+    ) -> bool {
+        if top == pos.top {
+            return false;
+        }
+        match self.overlay {
+            Overlay::Keys => {
+                self.keys.scroll = top;
+                true
+            }
+            Overlay::Sessions => {
+                let len = self.sessions.len();
+                let page = pos.viewport.max(1);
+                let cursor = if top == 0 {
+                    self.session_cursor.min(page - 1)
+                } else {
+                    top + page - 1
+                };
+                let cursor = cursor.min(len.saturating_sub(1));
+                let moved = cursor != self.session_cursor;
+                self.session_cursor = cursor;
+                moved
+            }
+            Overlay::Usage => {
+                let Some(view) = view else { return false };
+                let bucket = usage_bucket_at_row(view, self.usage_gran, top);
+                let moved = bucket != self.usage_scroll;
+                self.usage_scroll = bucket;
+                moved
             }
             _ => false,
         }
@@ -5893,6 +6025,7 @@ async fn event_loop(
             app.activity_chrome = main.activity;
             app.tab_chrome = main.tabs;
             app.sessions_chrome = main.sessions_table;
+            app.table_scroll = main.table_scroll;
             app.config_chrome = main.config_rows;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.separator_chrome = main.separators;
@@ -7905,6 +8038,233 @@ mod tests {
         assert_eq!(app.keys.scroll, 0);
         app.on_key_keys(KeyCode::PageUp, Some(&view));
         assert_eq!(app.keys.scroll, 0, "PageUp at the top stays put");
+    }
+
+    /// Draw the app's current frame and keep the hit record the mouse
+    /// handler reads, as the event loop does after each draw.
+    fn draw_and_adopt(app: &mut App, view: &DashboardView, w: u16, h: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        let chrome = app.chrome();
+        let mut hits = None;
+        terminal
+            .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
+            .expect("draw");
+        let main = hits.unwrap_or_default();
+        app.sessions_chrome = main.sessions_table;
+        app.table_scroll = main.table_scroll;
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn left(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The keys table's scrollbar (batch 2): a press low on the track jumps
+    /// the table there, the thumb can be grabbed and dragged back to the top,
+    /// and the release ends the drag — the wheel and keys still scroll.
+    #[test]
+    fn keys_table_scrollbar_jumps_on_a_track_click_and_drags_with_the_thumb() {
+        let (view, mut doc) = keys_view_and_doc();
+        let tenant = doc.tenants[0].clone();
+        doc.tenants = (0..40)
+            .map(|i| crate::dashboard::TenantUsageDoc {
+                tenant: format!("k-{i:04}"),
+                name: format!("tenant-{i:02}"),
+                ..tenant.clone()
+            })
+            .collect();
+        let mut app = remote_app();
+        app.overlay = Overlay::Keys;
+        app.keys.doc = Some(std::sync::Arc::new(doc));
+        let rows = draw_and_adopt(&mut app, &view, 120, 24);
+        let total = ui::keys_row_count(&view, &app.chrome());
+        assert!(total >= 80, "40 tenants and their model rows");
+        let bar = app.table_scroll.expect("the rows overflow the panel");
+        assert_eq!((bar.pos.top, bar.pos.max), (0, total - bar.pos.viewport));
+        assert_eq!(bar.track.x, 119, "on the panel's right border");
+        let col = |y: u16| rows[usize::from(y)].chars().last().unwrap_or(' ');
+        assert_eq!(
+            col(bar.track.y),
+            '▐',
+            "thumb at the top:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(col(bar.track.bottom() - 1), '╎', "track below it");
+
+        // A press on the last track row jumps to the end.
+        let last = bar.track.bottom() - 1;
+        assert!(app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 119, last),
+            Some(&view)
+        ));
+        assert_eq!(app.keys.scroll, bar.pos.max);
+        let rows = draw_and_adopt(&mut app, &view, 120, 24);
+        assert_eq!(
+            rows[usize::from(last)].chars().last(),
+            Some('▐'),
+            "thumb at the bottom"
+        );
+        assert!(
+            rows.join("\n").contains("tenant-39"),
+            "the last rows are on screen"
+        );
+
+        // The same press keeps dragging: back to the top row of the track.
+        let bar = app.table_scroll.expect("still overflowing");
+        app.on_mouse(
+            left(MouseEventKind::Drag(MouseButton::Left), 40, 0),
+            Some(&view),
+        );
+        assert_eq!(
+            app.keys.scroll, 0,
+            "dragged past the top end reaches the top"
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), 40, 0),
+            Some(&view),
+        );
+        assert!(
+            !app.on_mouse(
+                left(MouseEventKind::Drag(MouseButton::Left), 119, last),
+                Some(&view)
+            ),
+            "released: a drag no longer scrolls"
+        );
+        assert_eq!(app.keys.scroll, 0);
+        let _ = bar;
+
+        // Keys and the wheel still scroll.
+        app.on_key_keys(KeyCode::Down, Some(&view));
+        assert_eq!(app.keys.scroll, 1);
+        app.on_mouse(left(MouseEventKind::ScrollDown, 50, 10), Some(&view));
+        assert_eq!(app.keys.scroll, 2, "the wheel scrolls like ↓");
+    }
+
+    /// The sessions table follows its cursor, so its scrollbar moves the
+    /// cursor (as the wheel does) to the row that puts the dragged-to place
+    /// first; a click on a row still selects that row.
+    #[test]
+    fn sessions_table_scrollbar_drag_moves_the_view_through_the_cursor() {
+        let session = |i: u64| crate::session::Session {
+            user_id: Some(format!("u-{i:02}")),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            models: vec![],
+            accounts: vec![],
+            account_rotations: 0,
+            first_ms: i,
+            last_ms: i,
+            duration_ms_sum: 0,
+            timed_requests: 0,
+            tokens_out_timed: 0,
+            confidence: crate::session::Confidence::High,
+        };
+        let view = empty_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Sessions;
+        app.sessions = (0..60).map(session).collect();
+        draw_and_adopt(&mut app, &view, 80, 24);
+        let bar = app.table_scroll.expect("60 sessions overflow");
+        let page = bar.pos.viewport;
+        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        assert!(
+            rows_hit.right() <= bar.track.x,
+            "the bar's column is not a row"
+        );
+
+        // Press on the bottom of the track: the last page, cursor on the last row.
+        let last = bar.track.bottom() - 1;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        assert_eq!(app.session_cursor, 59);
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert!(rows.join("\n").contains("u-59"), "{}", rows.join("\n"));
+        assert_eq!(app.table_scroll.map(|b| b.pos.top), Some(60 - page));
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+
+        // A row click still selects that row, not the bar.
+        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 5, rows_hit.y),
+            Some(&view),
+        );
+        assert_eq!(app.session_cursor, 60 - page, "the first row in view");
+    }
+
+    /// The usage table scrolls by bucket while its scrollbar counts rows: a
+    /// press at the bottom of the track lands on the first bucket that shows
+    /// the last rows; one at the top returns to the newest bucket.
+    #[test]
+    fn usage_table_scrollbar_lands_on_buckets() {
+        let row = |bucket: u64, model: &str| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket,
+            label: format!("day-{bucket:02}"),
+            group: "claude".into(),
+            model: model.into(),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.1,
+            priced: true,
+        };
+        let mut view = empty_view();
+        // 20 day buckets of two models each: 60 table rows.
+        view.usage_stats = (0..20u64)
+            .rev()
+            .flat_map(|b| [row(b, "m1"), row(b, "m2")])
+            .collect();
+        let mut app = remote_app();
+        app.overlay = Overlay::Usage;
+        app.usage_gran = activity::UsageGran::Day;
+        draw_and_adopt(&mut app, &view, 120, 24);
+        let bar = app.table_scroll.expect("60 rows overflow");
+        assert_eq!(bar.pos.max, 60 - bar.pos.viewport);
+        let last = bar.track.bottom() - 1;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        // Rows before bucket k: 3k. The first bucket at or after max.
+        assert_eq!(app.usage_scroll, bar.pos.max.div_ceil(3));
+        let rows = draw_and_adopt(&mut app, &view, 120, 24);
+        assert!(
+            rows.join("\n").contains("day-00"),
+            "the oldest bucket shows"
+        );
+        app.on_mouse(
+            left(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.track.x,
+                bar.track.y,
+            ),
+            Some(&view),
+        );
+        assert_eq!(
+            app.usage_scroll, 0,
+            "the top of the track is the newest bucket"
+        );
     }
 
     /// K-3 `f`: Space toggles, Enter applies the selection AND re-queries;
