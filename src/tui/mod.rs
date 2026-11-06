@@ -148,42 +148,6 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
     )
 }
 
-/// Distinct buckets of one granularity on the view (usage-stats): the Usage
-/// overlay's scroll bound. Rows arrive grouped by bucket (newest first), so
-/// counting key CHANGES equals counting distinct buckets — the same grouping
-/// the renderer applies.
-fn usage_bucket_count(view: &DashboardView, gran: activity::UsageGran) -> usize {
-    let mut count = 0;
-    let mut last: Option<u64> = None;
-    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
-        if last != Some(r.bucket) {
-            count += 1;
-            last = Some(r.bucket);
-        }
-    }
-    count
-}
-
-/// The usage bucket the table's scrollbar points at for table row `row`
-/// (a bucket row plus one row per model, as the overlay draws them): the
-/// first bucket that starts at or after `row`, the last when none does.
-fn usage_bucket_at_row(view: &DashboardView, gran: activity::UsageGran, row: usize) -> usize {
-    let mut starts: Vec<usize> = Vec::new();
-    let (mut rows, mut last) = (0usize, None);
-    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
-        if last != Some(r.bucket) {
-            starts.push(rows);
-            rows += 1;
-            last = Some(r.bucket);
-        }
-        rows += 1;
-    }
-    starts
-        .iter()
-        .position(|&start| start >= row)
-        .unwrap_or(starts.len().saturating_sub(1))
-}
-
 /// Can this client open a browser for an OAuth flow? The login dance (browser
 /// plus localhost callback) runs in the CLIENT, so this gates the `n` new-login
 /// key; when it returns false the picker is replaced by the `llmux login`
@@ -779,8 +743,8 @@ pub(crate) struct Chrome {
     pub perf_day_off: Option<u64>,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     pub usage_gran: activity::UsageGran,
-    /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
-    /// recent at the top).
+    /// Usage-tab scroll offset: the table ROW at the top, bucket and model
+    /// rows alike (0 = the newest bucket's row at the top).
     pub usage_scroll: usize,
     /// Logs-overlay position: `None` follows the newest line (the pager
     /// sits at the bottom), `Some(top)` holds the view at wrapped row `top`.
@@ -788,6 +752,10 @@ pub(crate) struct Chrome {
     /// The Logs pager's drag selection (content rows and cells), drawn
     /// reversed; `None` when nothing is selected.
     pub logs_selection: Option<twolab_tui::pager::Selection>,
+    /// The log lines as they were when the pager was pressed, while a
+    /// selection is being made or shown: the pager draws these instead of
+    /// the live ring, so the text selected is the text on screen.
+    pub logs_frozen: Option<std::sync::Arc<[crate::logging::LogLine]>>,
     /// Copy mode (`v`): the mouse is released to the terminal for its own
     /// selection and the footer's key bar is the banner that says so.
     pub copy_mode: bool,
@@ -867,9 +835,15 @@ fn modal_key(state: &mut ModalState, code: KeyCode) -> bool {
 
 /// A mouse event on an open text modal: the wheel scrolls `step` rows, a
 /// press on the scrollbar jumps there or grabs the thumb, a drag moves it,
-/// and a press on `esc close` closes the modal (`true`). Every event is
-/// swallowed, so nothing reaches the rows beneath.
-fn modal_mouse(state: &mut ModalState, mouse: &crossterm::event::MouseEvent, step: isize) -> bool {
+/// and a press on `esc close` closes the modal (`true`). `target` is what
+/// the last frame drew under the pointer. Every event is swallowed, so
+/// nothing reaches the rows beneath.
+fn modal_mouse(
+    state: &mut ModalState,
+    mouse: &crossterm::event::MouseEvent,
+    target: Option<&ui::ClickTarget>,
+    step: isize,
+) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             state.scroll_by(-step);
@@ -877,9 +851,14 @@ fn modal_mouse(state: &mut ModalState, mouse: &crossterm::event::MouseEvent, ste
         MouseEventKind::ScrollDown => {
             state.scroll_by(step);
         }
-        MouseEventKind::Down(MouseButton::Left) => {
-            return state.press(mouse.column, mouse.row) == ModalOutcome::Closed;
-        }
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            Some(ui::ClickTarget::ModalClose) => return true,
+            Some(ui::ClickTarget::ModalScrollbar) => {
+                state.press(mouse.column, mouse.row);
+            }
+            // Anywhere else: swallowed, and a thumb still held is let go.
+            _ => state.release(),
+        },
         MouseEventKind::Drag(MouseButton::Left) => {
             state.drag(mouse.column, mouse.row);
         }
@@ -1175,30 +1154,20 @@ struct App {
     history_loading: bool,
     /// Sender the blocking history loader delivers on (mirrors `sessions_tx`).
     history_tx: Option<mpsc::Sender<Vec<activity::Completed>>>,
-    /// The activity panel's hit-test layout from the LAST rendered frame: the
-    /// panel rect + the clickable request rows. Recorded by the event loop after
-    /// each `draw`, read by the mouse handler to map a click to an entry.
-    activity_chrome: ui::ActivityChrome,
-    /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
-    /// one rect per tab label. Same record/read cycle as `activity_chrome`.
-    tab_chrome: Vec<ui::TabHit>,
-    /// Sessions table hit layout from the last frame (mouse row select).
-    sessions_chrome: Option<ui::SessionsChrome>,
+    /// Every click target the LAST rendered frame drew, in paint order (the
+    /// hit module): replaced after each `draw`, so a click never maps onto
+    /// an older layout. The mouse handler asks it once per event.
+    hits: ui::Hits,
     /// The open keys / sessions / usage table's scrollbar from the last frame
     /// (`None`: nothing overflows), and the press-drag-release on it.
     table_scroll: Option<ui::TableScroll>,
     table_drag: twolab_tui::scrollbar::ScrollbarDrag,
-    /// Config-editor value-cell hits from the last frame.
-    config_chrome: Vec<ui::ConfigHit>,
-    /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
-    /// payload-tab rects + top-right action buttons. Same record/read cycle
-    /// as `activity_chrome`; empty while the modal is closed.
+    /// The raw viewer's layout from the LAST rendered frame (UI-8): its
+    /// scroll clamp, page size and body scrollbar (its tabs and buttons are
+    /// in `hits`). Same record/read cycle as `hits`; empty while closed.
     raw_chrome: ui::RawModalChrome,
     /// A press-drag-release on the raw viewer's body scrollbar.
     raw_drag: twolab_tui::scrollbar::ScrollbarDrag,
-    /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
-    /// top-border row of a pane, dragging it resizes the pane ABOVE it.
-    separator_chrome: Vec<ui::SeparatorHit>,
     /// Session-local pane-height overrides set by separator drags.
     pane_heights: PaneHeights,
     /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
@@ -1207,16 +1176,6 @@ struct App {
     perf_days: u64,
     perf_cursor: usize,
     perf_day_off: Option<u64>,
-    /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
-    /// right-click target map.
-    account_row_chrome: Vec<ui::AccountRowHit>,
-    /// Models-strip entry rects from the LAST rendered frame — left-click
-    /// opens the model in the Stats tab.
-    strip_chrome: Vec<twolab_tui::packed_grid::GridHit>,
-    /// The rendered context menu's hit layout (UI-3 U11), when open.
-    menu_chrome: Option<twolab_tui::menu::MenuLayout>,
-    /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
-    setting_chrome: Vec<ui::SettingHit>,
     /// Anchor cell of the open context menu (col, row).
     menu_anchor: Option<(u16, u16)>,
     /// The REAL account id the open context menu targets, captured at open
@@ -1228,7 +1187,8 @@ struct App {
     /// Whether the limits editor was opened FROM the context menu (then it
     /// exits to Normal, not back into the switcher).
     limits_from_menu: bool,
-    /// The separator currently being dragged, if any (mouse button held).
+    /// The separator currently being dragged, if any (mouse button held):
+    /// the target its press landed on, kept for the drag that follows.
     drag: Option<ui::SeparatorHit>,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
@@ -1310,8 +1270,8 @@ struct App {
     compact_accounts: bool,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     usage_gran: activity::UsageGran,
-    /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
-    /// the granularity changes so a deep hourly scroll can't strand the
+    /// Usage-tab scroll offset in table ROWS (0 = the newest bucket's row at
+    /// the top); reset when the granularity changes so a deep hourly scroll can't strand the
     /// monthly table past its last row.
     usage_scroll: usize,
     /// Logs-overlay position (`None` = follow the tail); see
@@ -1325,10 +1285,24 @@ struct App {
     /// The Logs pager's drag selection; see [`Chrome::logs_selection`]. While
     /// one is shown the pager holds still instead of following.
     logs_sel: Option<twolab_tui::pager::Selection>,
+    /// The lines the Logs pager holds from a press on it until its
+    /// selection is gone; see [`Chrome::logs_frozen`].
+    logs_frozen: Option<std::sync::Arc<[crate::logging::LogLine]>>,
+    /// The log lines the Logs pager drew last frame (`None`: not open) —
+    /// what a press on it freezes.
+    logs_drawn: Option<std::sync::Arc<[crate::logging::LogLine]>>,
+    /// A press went to a toast: its drag and release are swallowed too.
+    toast_press: bool,
     /// Copy mode (`v`), see [`Chrome::copy_mode`]: the event loop releases
     /// mouse capture while it is on and holds the frame still, so the text
     /// under the terminal's own selection does not move.
     copy_mode: bool,
+    /// When copy mode last turned on (`None` while it is off): the
+    /// dashboard's clock stands still from then, since the screen does.
+    copy_since: Option<Instant>,
+    /// How long copy mode has held the screen, all spells of it together:
+    /// time the dashboard's clock does not count ([`Self::clock_at`]).
+    held_for: Duration,
     /// The click-opened input-text modal (UI-6 item 3); `None` when closed. The
     /// scroll offset is clamped after each draw against the wrapped line count
     /// the render pass reports (`MainChrome::input_modal_max_scroll`).
@@ -1406,26 +1380,18 @@ impl App {
             history_take: 0,
             history_loading: false,
             history_tx: None,
-            activity_chrome: ui::ActivityChrome::default(),
-            tab_chrome: Vec::new(),
-            sessions_chrome: None,
+            hits: ui::Hits::new(),
             table_scroll: None,
             table_drag: Default::default(),
-            config_chrome: Vec::new(),
             raw_chrome: ui::RawModalChrome::default(),
             raw_drag: Default::default(),
-            separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
             perf_days: 14,
             perf_cursor: 0,
             perf_day_off: None,
-            account_row_chrome: Vec::new(),
-            strip_chrome: Vec::new(),
-            menu_chrome: None,
             menu_anchor: None,
             menu_account: None,
-            setting_chrome: Vec::new(),
             limits_from_menu: false,
             drag: None,
             model_cursor: 0,
@@ -1454,7 +1420,12 @@ impl App {
             logs_pos: Default::default(),
             logs_area: None,
             logs_sel: None,
+            logs_frozen: None,
+            logs_drawn: None,
+            toast_press: false,
             copy_mode: false,
+            copy_since: None,
+            held_for: Duration::ZERO,
             input_modal: None,
             raw_modal: None,
             account_modal: None,
@@ -1704,6 +1675,7 @@ impl App {
             usage_scroll: self.usage_scroll,
             logs_scroll: self.logs_scroll,
             logs_selection: self.logs_sel,
+            logs_frozen: self.logs_frozen.clone(),
             copy_mode: self.copy_mode,
             input_modal: self.input_modal.clone(),
             // The Loading spinner rides the shared frame counter (set here so
@@ -1743,9 +1715,32 @@ impl App {
             .map(|(msg, _)| msg.text.as_str())
     }
 
-    /// The dashboard's own clock at `now`: time since it started.
+    /// The dashboard's own clock at `now`: time since it started, less the
+    /// time copy mode held the screen. It stands still while copy mode is on
+    /// — no frame is drawn then — so a toast that arrives meanwhile, or was
+    /// up when `v` was pressed, is not used up before anyone could read it.
     fn clock_at(&self, now: Instant) -> Duration {
+        let holding = self
+            .copy_since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         now.saturating_duration_since(self.started)
+            .saturating_sub(self.held_for.saturating_add(holding))
+    }
+
+    /// Turn copy mode on or off at `now`, stopping or restarting the
+    /// dashboard's clock with it.
+    fn set_copy_mode(&mut self, on: bool, now: Instant) {
+        if on == self.copy_mode {
+            return;
+        }
+        self.copy_mode = on;
+        if on {
+            self.copy_since = Some(now);
+        } else if let Some(since) = self.copy_since.take() {
+            self.held_for = self
+                .held_for
+                .saturating_add(now.saturating_duration_since(since));
+        }
     }
 
     /// Show a status message. A short one is the footer's one-row flash; one
@@ -1877,7 +1872,7 @@ impl App {
         // move what is being selected.
         if self.copy_mode {
             if matches!(key.code, KeyCode::Char('v') | KeyCode::Esc) {
-                self.copy_mode = false;
+                self.set_copy_mode(false, Instant::now());
             }
             return;
         }
@@ -1890,7 +1885,7 @@ impl App {
             && self.mode == Mode::Normal
             && !self.keys_filter_typing()
         {
-            self.copy_mode = true;
+            self.set_copy_mode(true, Instant::now());
             return;
         }
         // The input modal (UI-6 item 3), when open, swallows every key beneath
@@ -1980,12 +1975,39 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
+        // Copy mode has handed the mouse to the terminal: an event already
+        // queued behind the `v` in the same input drain (a click, the wheel)
+        // is swallowed, so nothing opens or scrolls under the selection.
+        if self.copy_mode {
+            return false;
+        }
+        // The drag and the release of a press a toast took are the toast's
+        // too: they must not finish a Logs selection (and copy it again) or
+        // move a thumb under it.
+        if self.toast_press {
+            match mouse.kind {
+                MouseEventKind::Up(_) => {
+                    self.toast_press = false;
+                    return true;
+                }
+                MouseEventKind::Drag(_) => return true,
+                _ => self.toast_press = false,
+            }
+        }
+        // What the last frame drew under the pointer, topmost first — the one
+        // lookup every click below matches on. Open modals, the menu and
+        // the current surface still decide who gets the event at all.
+        let hit = self
+            .hits
+            .hit(mouse.column, mouse.row)
+            .map(|(rect, target)| (rect, target.clone()));
+        let target = hit.as_ref().map(|(_, target)| target);
         // The input modal (UI-6 item 3), when open, owns the mouse: the wheel
         // scrolls it, its scrollbar can be clicked and dragged, `esc close`
         // closes it, and every other click is swallowed so it can't reach a
         // row beneath the modal.
         if let Some(modal) = self.input_modal.as_mut() {
-            if modal_mouse(&mut modal.state, &mouse, 1) {
+            if modal_mouse(&mut modal.state, &mouse, target, 1) {
                 self.input_modal = None;
             }
             return true;
@@ -1994,43 +2016,32 @@ impl App {
         // adds clickable payload tabs + the top-right action buttons, and the
         // body's scrollbar takes a press and a drag.
         if self.raw_modal.is_some() {
-            let hit = |r: &ratatui::layout::Rect| {
-                mouse.column >= r.x
-                    && mouse.column < r.x + r.width
-                    && mouse.row >= r.y
-                    && mouse.row < r.y + r.height
-            };
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let button = self
-                        .raw_chrome
-                        .buttons
-                        .iter()
-                        .find(|(_, r)| hit(r))
-                        .map(|&(b, _)| b);
-                    let tab = self
-                        .raw_chrome
-                        .tabs
-                        .iter()
-                        .find(|(_, r)| hit(r))
-                        .map(|&(i, _)| i);
-                    let bar = self.raw_chrome.bar;
-                    if let Some(btn) = button {
-                        self.raw_modal_action(btn);
-                    } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
-                        modal.tab = idx;
-                        modal.scroll = 0;
-                    } else if let (Some(bar), Some(modal)) = (bar, self.raw_modal.as_mut()) {
-                        // The body's scrollbar: a press on the track jumps,
-                        // one on the thumb grabs it for the drag below.
-                        if let Some(top) =
-                            self.raw_drag
-                                .press(bar.pos, bar.track, mouse.column, mouse.row)
-                        {
-                            modal.scroll = top;
+                MouseEventKind::Down(MouseButton::Left) => match target {
+                    Some(&ui::ClickTarget::RawButton(btn)) => self.raw_modal_action(btn),
+                    Some(&ui::ClickTarget::RawTab(idx)) => {
+                        if let Some(modal) = self.raw_modal.as_mut() {
+                            modal.tab = idx;
+                            modal.scroll = 0;
                         }
                     }
-                }
+                    // The body's scrollbar: a press on the track jumps, one
+                    // on the thumb grabs it for the drag below.
+                    Some(ui::ClickTarget::RawScrollbar) => {
+                        if let (Some(bar), Some(modal)) =
+                            (self.raw_chrome.bar, self.raw_modal.as_mut())
+                        {
+                            if let Some(top) =
+                                self.raw_drag
+                                    .press(bar.pos, bar.track, mouse.column, mouse.row)
+                            {
+                                modal.scroll = top;
+                            }
+                        }
+                    }
+                    // Anywhere else: swallowed, and a thumb still held is let go.
+                    _ => self.raw_drag.release(),
+                },
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let (Some(bar), Some(modal)) = (self.raw_chrome.bar, self.raw_modal.as_mut())
                     {
@@ -2061,17 +2072,30 @@ impl App {
         // every other event is swallowed so a click can't reach the row
         // beneath it.
         if let Some(modal) = self.account_modal.as_mut() {
-            if modal_mouse(&mut modal.state, &mouse, 3) {
+            if modal_mouse(&mut modal.state, &mouse, target, 3) {
                 self.account_modal = None;
             }
             return true;
+        }
+        // A toast lies over the rows, tabs and menu items beneath it: a left
+        // click on it takes it down (the next one waiting moves up), and no
+        // press on it reaches what it covers. The wheel and a held drag pass.
+        if let Some(&ui::ClickTarget::Toast(id)) = target {
+            if let MouseEventKind::Down(button) = mouse.kind {
+                self.toast_press = true;
+                if button == MouseButton::Left {
+                    let clock = self.clock_at(Instant::now());
+                    self.toasts.dismiss(id, clock);
+                }
+                return true;
+            }
         }
         // Tab-bar clicks (UI-3 U6) work from ANY overlay while no text-entry
         // interaction is pending — the tab bar is how the mouse navigates.
         if self.mode == Mode::Normal
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
-            if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
+            if let Some(&ui::ClickTarget::Tab(tab)) = target {
                 self.open_tab(tab, view);
                 return true;
             }
@@ -2088,7 +2112,7 @@ impl App {
                 self.scroll_logs_to(|pos| Some(pos.top.saturating_add_signed(step).min(pos.max)));
                 return true;
             }
-            if let Some(changed) = self.logs_select_mouse(&mouse, view) {
+            if let Some(changed) = self.logs_select_mouse(&mouse, target, view) {
                 return changed;
             }
         }
@@ -2100,9 +2124,11 @@ impl App {
             self.overlay,
             Overlay::Keys | Overlay::Sessions | Overlay::Usage
         ) && self.mode == Mode::Normal
-            && self.keys.picker.is_none()
+            // The keys tab's model picker blocks its own table's bar only: a
+            // picker left open under another tab blocks nothing there.
+            && !(self.overlay == Overlay::Keys && self.keys.picker.is_some())
         {
-            if let Some(changed) = self.table_scrollbar_mouse(&mouse, view) {
+            if let Some(changed) = self.table_scrollbar_mouse(&mouse, target, view) {
                 return changed;
             }
         }
@@ -2153,18 +2179,9 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(hit) = self
-                        .config_chrome
-                        .iter()
-                        .find(|h| {
-                            mouse.row == h.area.y
-                                && mouse.column >= h.area.x
-                                && mouse.column < h.area.right()
-                        })
-                        .copied()
-                    {
-                        self.config_cursor = hit.row;
-                        self.activate_config_action(hit.action, view);
+                    if let Some(&ui::ClickTarget::ConfigRow { row, action }) = target {
+                        self.config_cursor = row;
+                        self.activate_config_action(action, view);
                         return true;
                     }
                 }
@@ -2184,19 +2201,11 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(t) = self.sessions_chrome {
-                        let r = t.rows;
-                        if mouse.row >= r.y
-                            && mouse.row < r.bottom()
-                            && mouse.column >= r.x
-                            && mouse.column < r.right()
-                        {
-                            let idx = t.start + (mouse.row - r.y) as usize;
-                            if idx < self.sessions.len() {
-                                self.session_cursor = idx;
-                            }
-                            return true;
+                    if let Some(&ui::ClickTarget::SessionsRow(idx)) = target {
+                        if idx < self.sessions.len() {
+                            self.session_cursor = idx;
                         }
+                        return true;
                     }
                 }
                 _ => {}
@@ -2209,13 +2218,12 @@ impl App {
                 mouse.kind,
                 MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
             ) {
-                let menu = self.menu_chrome.as_ref();
-                match menu.and_then(|m| m.hit(mouse.column, mouse.row)) {
-                    Some(item) => self.run_menu_item(idx, item, view),
+                match target {
+                    Some(&ui::ClickTarget::MenuItem(item)) => self.run_menu_item(idx, item, view),
                     // A dim (cannot-run) item or the border: nothing runs,
                     // the menu stays.
-                    None if menu.is_some_and(|m| m.contains(mouse.column, mouse.row)) => {}
-                    None => self.close_menu(),
+                    Some(ui::ClickTarget::Surface(ui::Surface::Menu)) => {}
+                    _ => self.close_menu(),
                 }
                 return true;
             }
@@ -2226,16 +2234,7 @@ impl App {
             && self.mode == Mode::Normal
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
         {
-            if let Some(idx) = self
-                .account_row_chrome
-                .iter()
-                .find(|r| {
-                    mouse.row == r.area.y
-                        && mouse.column >= r.area.x
-                        && mouse.column < r.area.right()
-                })
-                .map(|r| r.display_idx)
-            {
+            if let Some(&ui::ClickTarget::AccountRow(idx)) = target {
                 // Pin the REAL account id now; display indexes reorder.
                 self.menu_account = view.and_then(|v| {
                     let order = v.display_order(self.account_sort, SystemTime::now());
@@ -2253,24 +2252,13 @@ impl App {
         // Left-click on an accounts row opens the account detail modal
         // (.prd/19 rule 6). Works on MAIN and on the accounts overlay, which
         // render the same table; the modal blocks above already returned when
-        // one is open, so no modal can be stacked. Checked BEFORE the MAIN
-        // match because the row rects are their own set — separator drags, the
-        // settings bar and the activity panel occupy different rows and are
-        // untouched.
+        // one is open, so no modal can be stacked. On the accounts overlay the
+        // overlay's rows lie over MAIN's, so the map answers with them.
         if self.mode == Mode::Normal
             && matches!(self.overlay, Overlay::None | Overlay::Accounts)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
-            if let Some(idx) = self
-                .account_row_chrome
-                .iter()
-                .find(|r| {
-                    mouse.row == r.area.y
-                        && mouse.column >= r.area.x
-                        && mouse.column < r.area.right()
-                })
-                .map(|r| r.display_idx)
-            {
+            if let Some(&ui::ClickTarget::AccountRow(idx)) = target {
                 // Pin the REAL account id now; display indexes reorder.
                 if let Some(id) = view.and_then(|v| {
                     let order = v.display_order(self.account_sort, SystemTime::now());
@@ -2291,46 +2279,49 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Separator rows first (UI-3 U7/U8): press starts a drag.
-                if let Some(sep) = self
-                    .separator_chrome
-                    .iter()
-                    .find(|s| s.y == mouse.row)
-                    .copied()
-                {
-                    self.drag = Some(sep);
-                    return true;
-                }
-                // Group-settings bar (UI-3 U9/U10): click a segment to
-                // rotate that setting.
-                if let Some(action) = self
-                    .setting_chrome
-                    .iter()
-                    .find(|h| {
-                        mouse.row == h.area.y
-                            && mouse.column >= h.area.x
-                            && mouse.column < h.area.right()
-                    })
-                    .map(|h| h.action)
-                {
-                    match action {
-                        ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
-                        ui::SettingAction::CodexModel => self.cycle_codex_model(view),
-                        ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
-                        ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
-                        ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                match target {
+                    // A separator row (UI-3 U7/U8): the press starts a drag.
+                    Some(&ui::ClickTarget::Separator(sep)) => {
+                        self.drag = Some(sep);
+                        return true;
                     }
-                    return true;
+                    // Group-settings bar (UI-3 U9/U10): click a segment to
+                    // rotate that setting.
+                    Some(&ui::ClickTarget::Setting(action)) => {
+                        match action {
+                            ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
+                            ui::SettingAction::CodexModel => self.cycle_codex_model(view),
+                            ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
+                            ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
+                            ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                        }
+                        return true;
+                    }
+                    // A models-strip entry opens the Stats tab with that
+                    // model under the cursor, its drill-down beside the table.
+                    // Found by the model it showed, in the view the click
+                    // lands on; one gone since then opens nothing.
+                    Some(ui::ClickTarget::StripEntry { group, model }) => {
+                        let index = view.and_then(|v| {
+                            v.model_usage
+                                .iter()
+                                .position(|m| &m.group == group && &m.model == model)
+                        });
+                        let Some(index) = index else { return false };
+                        self.open_model(index, view);
+                        return true;
+                    }
+                    _ => {}
                 }
-                // A models-strip entry opens the Stats tab with that model
-                // under the cursor, its drill-down beside the table.
-                if let Some(model) =
-                    twolab_tui::packed_grid::hit_test(&self.strip_chrome, mouse.column, mouse.row)
-                {
-                    self.open_model(model, view);
-                    return true;
-                }
-                match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
+                // An activity row or one of its detail lines: what the click
+                // means depends on where in the recorded rect it fell.
+                let click = match hit {
+                    Some((rect, ui::ClickTarget::Activity { key, kind })) => {
+                        Some(ui::activity_click(rect, key, kind, mouse.column))
+                    }
+                    _ => None,
+                };
+                match click {
                     // Clicking the `🔍 input` detail line opens the full-text
                     // modal instead of collapsing the entry (UI-6 item 3).
                     Some(ui::ActivityClick::OpenInput(key)) => {
@@ -2403,17 +2394,24 @@ impl App {
     }
 
     /// A mouse event on the open table's scrollbar (keys, sessions, usage).
-    /// `Some(changed)` when the scrollbar took it — a press on the track, a
-    /// drag while the thumb is held, the release that ends it; `None` lets
-    /// the event through to the table's own clicks and wheel.
+    /// `Some(changed)` when the scrollbar took it — a press on the track
+    /// (`target`, what the last frame drew under the pointer), a drag while
+    /// the thumb is held, the release that ends it; `None` lets the event
+    /// through to the table's own clicks and wheel.
     fn table_scrollbar_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
+        target: Option<&ui::ClickTarget>,
         view: Option<&DashboardView>,
     ) -> Option<bool> {
         let top = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let bar = self.table_scroll?;
+                if target != Some(&ui::ClickTarget::TableScrollbar) {
+                    // A press anywhere else lets go of a thumb still held.
+                    self.table_drag.release();
+                    return None;
+                }
                 let top = self
                     .table_drag
                     .press(bar.pos, bar.track, mouse.column, mouse.row)?;
@@ -2436,10 +2434,9 @@ impl App {
     /// Scroll the open table so its first row in view is `top` (a row of
     /// `pos`, which the last frame drew). Keys: the panel's own offset.
     /// Sessions: the view follows the cursor, so the cursor moves — the way
-    /// the wheel does — to the row that puts `top` first. Usage: the
-    /// scrollbar counts rows and the table scrolls by bucket, so the first
-    /// bucket that starts at or after `top` (dragging to the end shows the
-    /// last rows). Returns whether anything moved.
+    /// the wheel does — to the row that puts `top` first. Usage: the table
+    /// scrolls by row, as its scrollbar counts. Returns whether anything
+    /// moved.
     fn scroll_table_to(
         &mut self,
         pos: twolab_tui::scrollbar::ScrollPos,
@@ -2468,10 +2465,11 @@ impl App {
                 moved
             }
             Overlay::Usage => {
-                let Some(view) = view else { return false };
-                let bucket = usage_bucket_at_row(view, self.usage_gran, top);
-                let moved = bucket != self.usage_scroll;
-                self.usage_scroll = bucket;
+                if view.is_none() {
+                    return false;
+                }
+                let moved = top != self.usage_scroll;
+                self.usage_scroll = top;
                 moved
             }
             _ => false,
@@ -3064,6 +3062,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Esc => {
                 self.overlay = Overlay::None;
                 self.logs_sel = None;
+                self.logs_frozen = None;
                 return;
             }
             KeyCode::Char('k') => KeyCode::Up,
@@ -3080,6 +3079,7 @@ impl App {
     fn open_logs(&mut self) {
         self.logs_scroll = None;
         self.logs_sel = None;
+        self.logs_frozen = None;
         self.overlay = Overlay::Logs;
     }
 
@@ -3090,11 +3090,17 @@ impl App {
     /// off-screen at the rect it drew in last, so its mouse methods map the
     /// pointer onto the cells the person saw. Once the drag shows a
     /// selection the view holds still (new lines must not scroll it out from
-    /// under the pointer); a drag past the top or bottom edge scrolls.
+    /// under the pointer); a drag past the top or bottom edge scrolls. A
+    /// press off the pager (`target`: what the last frame drew under the
+    /// pointer) clears the selection, as one on its border does. From the
+    /// press until the selection is gone the pager holds the lines it had at
+    /// the press ([`Self::logs_frozen`]): a line arriving, or the ring
+    /// dropping its oldest, mid-drag never changes what is copied.
     /// `None`: not a left-button event, or no pager on screen.
     fn logs_select_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
+        target: Option<&ui::ClickTarget>,
         view: Option<&DashboardView>,
     ) -> Option<bool> {
         let (area, view) = (self.logs_area?, view?);
@@ -3107,8 +3113,24 @@ impl App {
         ) {
             return None;
         }
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && target != Some(&ui::ClickTarget::LogsPager)
+        {
+            self.logs_frozen = None;
+            return Some(self.logs_sel.take().is_some());
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            // The lines the last frame drew — already held, if a selection is
+            // up; a line that arrived since the frame is not on screen yet.
+            let drawn = &self.logs_drawn;
+            self.logs_frozen.get_or_insert_with(|| {
+                drawn.clone().unwrap_or_else(|| view.logs.as_slice().into())
+            });
+        }
         let before = (self.logs_sel, self.logs_scroll);
-        let mut pager = ui::logs_pager(view, self.logs_scroll, self.logs_sel);
+        let lines = self.logs_frozen.as_deref().unwrap_or(&view.logs);
+        let mask = view.email_anonymous;
+        let mut pager = ui::logs_pager(lines, mask, self.logs_scroll, self.logs_sel);
         let mut scratch = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&pager, area, &mut scratch);
         let changed = match mouse.kind {
@@ -3127,7 +3149,38 @@ impl App {
         if self.logs_sel.is_some_and(|s| s.is_visible()) {
             self.logs_scroll = Some(pager.scroll_offset());
         }
+        if self.logs_sel.is_none() {
+            self.logs_frozen = None;
+        }
         Some(changed || (self.logs_sel, self.logs_scroll) != before)
+    }
+
+    /// Take the Logs pager's record from the frame just drawn: where it drew
+    /// and from which row. The pager clamps a held offset itself; one at (or
+    /// past) the bottom follows the tail again — unless a selection holds
+    /// it. A frame without the pager (the tab was left, whichever way) lets
+    /// go of the selection and of the lines frozen for it.
+    fn adopt_logs(
+        &mut self,
+        area: Option<ratatui::layout::Rect>,
+        pos: Option<twolab_tui::scrollbar::ScrollPos>,
+        lines: Option<std::sync::Arc<[crate::logging::LogLine]>>,
+    ) {
+        self.logs_area = area;
+        self.logs_drawn = lines;
+        match pos {
+            Some(pos) => {
+                self.logs_pos = pos;
+                let selecting = self.logs_sel.is_some_and(|s| s.is_visible());
+                if !selecting && self.logs_scroll.is_some_and(|top| top >= pos.max) {
+                    self.logs_scroll = None;
+                }
+            }
+            None => {
+                self.logs_sel = None;
+                self.logs_frozen = None;
+            }
+        }
     }
 
     /// Queue the Logs selection for the clipboard on the raw viewer's export
@@ -3161,6 +3214,12 @@ impl App {
         let pos = pos.with_top(self.logs_scroll.unwrap_or(pos.max));
         if let Some(top) = to(pos) {
             self.logs_scroll = (top < pos.max).then_some(top);
+        }
+        // Following the tail again shows the live lines, which the held
+        // selection does not point into: it goes, and the lines with it.
+        if self.logs_scroll.is_none() && self.logs_frozen.is_some() {
+            self.logs_sel = None;
+            self.logs_frozen = None;
         }
     }
 
@@ -3913,38 +3972,46 @@ impl App {
     }
 
     /// Key handling for the Usage overlay (usage-stats). `g` cycles the
-    /// granularity (hour → day → month), arrows/`j`/`k` scroll by bucket,
-    /// `U`/Esc closes back to MAIN, `q` quits. The STORED offset is clamped
-    /// against the selected granularity's bucket count on every press —
-    /// clamping only a draw-time copy would let presses at the bottom
-    /// accumulate invisible overscroll debt (review R1 MUST-FIX 2).
+    /// granularity (hour → day → month), `U`/Esc closes back to MAIN, `q`
+    /// quits. The table scrolls by row (`usage_scroll` is its top row):
+    /// arrows/`j`/`k` (and the wheel) step to the next or previous bucket's
+    /// row — but never more than a page, so a bucket taller than the screen
+    /// is read a page at a time — PgUp/PgDn move a page, Home/End go to the
+    /// top and to [`ui::usage_max_top`]. The page is the screen the last
+    /// frame drew. The STORED offset is clamped on every press — clamping
+    /// only a draw-time copy would let presses at the bottom accumulate
+    /// invisible overscroll debt (review R1 MUST-FIX 2).
     fn on_key_usage(&mut self, code: KeyCode, view: Option<&DashboardView>) {
-        let max_scroll = view
-            .map(|v| usage_bucket_count(v, self.usage_gran).saturating_sub(1))
-            .unwrap_or(0);
-        match code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('U') | KeyCode::Esc => self.overlay = Overlay::None,
+        let (starts, total) = view.map_or((Vec::new(), 0), |v| ui::usage_rows(v, self.usage_gran));
+        // The rows on screen last frame; no scrollbar means they all fit.
+        let viewport = self.table_scroll.map_or(total, |bar| bar.pos.viewport);
+        let max = ui::usage_max_top(&starts, total, viewport);
+        let page = viewport.saturating_sub(1).max(1);
+        let top = self.usage_scroll.min(max);
+        let next = starts.iter().copied().find(|&s| s > top).unwrap_or(max);
+        let prev = starts.iter().copied().rev().find(|&s| s < top).unwrap_or(0);
+        self.usage_scroll = match code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            KeyCode::Char('U') | KeyCode::Esc => {
+                self.overlay = Overlay::None;
+                return;
+            }
             KeyCode::Char('g') => {
                 self.usage_gran = self.usage_gran.next();
-                self.usage_scroll = 0;
+                0
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.usage_scroll = self.usage_scroll.saturating_sub(1).min(max_scroll);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.usage_scroll = self.usage_scroll.saturating_add(1).min(max_scroll);
-            }
-            KeyCode::PageUp => {
-                self.usage_scroll = self.usage_scroll.saturating_sub(10).min(max_scroll);
-            }
-            KeyCode::PageDown => {
-                self.usage_scroll = self.usage_scroll.saturating_add(10).min(max_scroll);
-            }
-            KeyCode::Home => self.usage_scroll = 0,
-            KeyCode::End => self.usage_scroll = max_scroll,
-            _ => {}
+            KeyCode::Up | KeyCode::Char('k') => prev.max(top.saturating_sub(page)),
+            KeyCode::Down | KeyCode::Char('j') => next.min(top.saturating_add(page)),
+            KeyCode::PageUp => top.saturating_sub(page),
+            KeyCode::PageDown => top.saturating_add(page),
+            KeyCode::Home => 0,
+            KeyCode::End => max,
+            _ => top,
         }
+        .min(max);
     }
 
     /// Move the model cursor by `delta` rows, clamped to `[0, len-1]`.
@@ -6622,29 +6689,14 @@ async fn event_loop(
                 }
             })?;
             let main = hits.unwrap_or_default();
-            app.activity_chrome = main.activity;
-            app.tab_chrome = main.tabs;
-            app.sessions_chrome = main.sessions_table;
+            app.hits = main.hits;
             app.table_scroll = main.table_scroll;
-            app.config_chrome = main.config_rows;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
-            app.separator_chrome = main.separators;
-            app.account_row_chrome = main.account_rows;
-            app.strip_chrome = main.models_strip;
-            app.menu_chrome = main.menu;
-            app.setting_chrome = main.settings;
             // The open text field's window, as drawn.
             app.track_field(main.field_width);
             // The Logs pager clamps a held offset itself; one at (or past)
             // the bottom follows the tail again — unless a selection holds it.
-            app.logs_area = main.logs_area;
-            if let Some(pos) = main.logs {
-                app.logs_pos = pos;
-                let selecting = app.logs_sel.is_some_and(|s| s.is_visible());
-                if !selecting && app.logs_scroll.is_some_and(|top| top >= pos.max) {
-                    app.logs_scroll = None;
-                }
-            }
+            app.adopt_logs(main.logs_area, main.logs, main.logs_lines.clone());
             // Reconcile the input modal (UI-6 item 3) against what the frame
             // could actually render: `Some(layout)` is where it drew (the
             // clamped scroll, the page size and scrollbar track the next key
@@ -7484,26 +7536,24 @@ mod tests {
     fn tab_click_switches_overlay_and_active_tab_toggles_back() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let mut app = remote_app();
-        app.tab_chrome = vec![
-            ui::TabHit {
-                area: ratatui::layout::Rect {
-                    x: 1,
-                    y: 2,
-                    width: 9,
-                    height: 1,
-                },
-                overlay: Overlay::None,
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 1,
+                y: 2,
+                width: 9,
+                height: 1,
             },
-            ui::TabHit {
-                area: ratatui::layout::Rect {
-                    x: 13,
-                    y: 2,
-                    width: 8,
-                    height: 1,
-                },
-                overlay: Overlay::Config,
+            ui::ClickTarget::Tab(Overlay::None),
+        );
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 13,
+                y: 2,
+                width: 8,
+                height: 1,
             },
-        ];
+            ui::ClickTarget::Tab(Overlay::Config),
+        );
         let click = |x: u16, y: u16| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: x,
@@ -7532,11 +7582,14 @@ mod tests {
     fn separator_drag_resizes_the_pane_above() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let mut app = remote_app();
-        app.separator_chrome = vec![ui::SeparatorHit {
-            y: 10,
-            pane: ui::PaneId::Accounts,
-            pane_top: 3,
-        }];
+        app.hits.push(
+            ratatui::layout::Rect::new(0, 10, 80, 1),
+            ui::ClickTarget::Separator(ui::SeparatorHit {
+                y: 10,
+                pane: ui::PaneId::Accounts,
+                pane_top: 3,
+            }),
+        );
         let ev = |kind, row| MouseEvent {
             kind,
             column: 5,
@@ -7581,10 +7634,7 @@ mod tests {
 
         // pause (item 1): queues the remote pause POST.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
         assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 0 });
         assert!(app.menu_anchor.is_some());
@@ -7599,10 +7649,7 @@ mod tests {
         // set limit (item 2): opens the limits editor; Esc exits to Normal
         // (not into the switcher) because the menu opened it.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
         app.on_key(press(KeyCode::Down), Some(&view));
         app.on_key(press(KeyCode::Down), Some(&view));
@@ -7613,10 +7660,7 @@ mod tests {
 
         // delete (item 3): opens the destructive confirm, never silent.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
         // A key that is no item's own (`x`) closes; End moves, it does not.
         app.on_key(press(KeyCode::Char('x')), Some(&view));
@@ -7630,20 +7674,17 @@ mod tests {
 
         // Click outside the open menu dismisses it.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
-        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 10,
                 y: 6,
                 width: 14,
                 height: 5,
             },
-            ..Default::default()
-        });
+            ui::ClickTarget::Surface(ui::Surface::Menu),
+        );
         let lclick_outside = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 70,
@@ -7664,15 +7705,15 @@ mod tests {
         let mut view = stats_view_with_account();
         view.snapshot.accounts[0].paused = true;
         let open = |app: &mut App| {
-            app.account_row_chrome = vec![ui::AccountRowHit {
-                area: ratatui::layout::Rect {
+            app.hits.push(
+                ratatui::layout::Rect {
                     x: 0,
                     y: 5,
                     width: 80,
                     height: 1,
                 },
-                display_idx: 0,
-            }];
+                ui::ClickTarget::AccountRow(0),
+            );
             let rclick = MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Right),
                 column: 10,
@@ -7730,21 +7771,17 @@ mod tests {
             width: 14,
             height: 1,
         };
-        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 9,
                 y: 6,
                 width: 16,
                 height: 6,
             },
-            items: (1..4)
-                .map(|index| twolab_tui::menu::MenuHit {
-                    rect: rect(7 + index as u16),
-                    index,
-                })
-                .collect(),
-            ..Default::default()
-        });
+            ui::ClickTarget::Surface(ui::Surface::Menu),
+        );
+        app.hits
+            .extend((1..4).map(|index| (rect(7 + index as u16), ui::ClickTarget::MenuItem(index))));
         let lclick = |row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 12,
@@ -7821,26 +7858,24 @@ mod tests {
         view.codex.model = "gpt-5.6-sol".into();
         view.codex.effort = Some("xhigh".into());
         let mut app = remote_app();
-        app.setting_chrome = vec![
-            ui::SettingHit {
-                area: ratatui::layout::Rect {
-                    x: 0,
-                    y: 30,
-                    width: 10,
-                    height: 1,
-                },
-                action: ui::SettingAction::CodexEffort,
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 30,
+                width: 10,
+                height: 1,
             },
-            ui::SettingHit {
-                area: ratatui::layout::Rect {
-                    x: 20,
-                    y: 30,
-                    width: 6,
-                    height: 1,
-                },
-                action: ui::SettingAction::GrokEffort,
+            ui::ClickTarget::Setting(ui::SettingAction::CodexEffort),
+        );
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 20,
+                y: 30,
+                width: 6,
+                height: 1,
             },
-        ];
+            ui::ClickTarget::Setting(ui::SettingAction::GrokEffort),
+        );
         let click = |x: u16| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: x,
@@ -7901,15 +7936,15 @@ mod tests {
         let mut view = stats_view_with_account();
         view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 0,
                 y: 5,
                 width: 80,
                 height: 1,
             },
-            display_idx: 0,
-        }];
+            ui::ClickTarget::AccountRow(0),
+        );
         let rclick = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: 10,
@@ -7997,15 +8032,15 @@ mod tests {
         for overlay in [Overlay::None, Overlay::Accounts] {
             let mut app = remote_app();
             app.overlay = overlay;
-            app.account_row_chrome = vec![ui::AccountRowHit {
-                area: ratatui::layout::Rect {
+            app.hits.push(
+                ratatui::layout::Rect {
                     x: 0,
                     y: 6,
                     width: 80,
                     height: 1,
                 },
-                display_idx: 1,
-            }];
+                ui::ClickTarget::AccountRow(1),
+            );
             assert!(app.on_mouse(lclick, Some(&view)), "{overlay:?}");
             assert_eq!(
                 app.account_modal.as_ref().map(|m| m.account.as_str()),
@@ -8034,12 +8069,18 @@ mod tests {
             row: 30,
             modifiers: KeyModifiers::NONE,
         };
-        let entry = |x, index| twolab_tui::packed_grid::GridHit {
-            rect: ratatui::layout::Rect::new(x, 30, 70, 1),
-            index,
+        let entry = |x, index: usize| {
+            let m = &view.model_usage[index];
+            (
+                ratatui::layout::Rect::new(x, 30, 70, 1),
+                ui::ClickTarget::StripEntry {
+                    group: m.group.clone(),
+                    model: m.model.clone(),
+                },
+            )
         };
         let mut app = remote_app();
-        app.strip_chrome = vec![entry(1, 0), entry(74, 1)];
+        app.hits.extend([entry(1, 0), entry(74, 1)]);
         assert!(
             !app.on_mouse(click(72), Some(&view)),
             "the gap between entries"
@@ -8048,6 +8089,52 @@ mod tests {
         assert!(app.on_mouse(click(80), Some(&view)));
         assert_eq!(app.overlay, Overlay::Stats);
         assert_eq!(app.model_cursor, 1, "the clicked model");
+    }
+
+    /// A strip entry's click target carries the model it showed: when the
+    /// view re-sorts between the frame and the click (a model overtakes
+    /// another by tokens), the click opens the model that was drawn under
+    /// the pointer, at its new place — and one that left the view since
+    /// opens nothing.
+    #[test]
+    fn a_strip_click_opens_the_model_drawn_there_after_a_re_sort() {
+        let mut view = stats_view();
+        let first = view.model_usage[0].clone();
+        view.model_usage = ["gpt-5.5", "gpt-5.6-sol", "gpt-5.4-mini"]
+            .into_iter()
+            .map(|model| crate::dashboard::ModelUsageDoc {
+                model: model.into(),
+                ..first.clone()
+            })
+            .collect();
+        let mut app = remote_app();
+        let rows = draw_and_adopt(&mut app, &view, 179, 43);
+        let (rect, drawn) = app
+            .hits
+            .iter()
+            .find_map(|(rect, t)| match t {
+                ui::ClickTarget::StripEntry { model, .. } if model == "gpt-5.5" => {
+                    Some((rect, model.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("gpt-5.5 is drawn:\n{}", rows.join("\n")));
+        assert!(rows[usize::from(rect.y)].contains("gpt-5.5"));
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 1, rect.y);
+        // The view re-sorts before the click: gpt-5.5 is now last.
+        view.model_usage.rotate_left(1);
+        assert!(app.on_mouse(click, Some(&view)));
+        assert_eq!(app.overlay, Overlay::Stats);
+        assert_eq!(app.model_cursor, 2);
+        assert_eq!(
+            view.model_usage[app.model_cursor].model, drawn,
+            "the drawn model"
+        );
+        // Gone from the view: the click opens nothing.
+        app.overlay = Overlay::None;
+        view.model_usage.retain(|m| m.model != drawn);
+        assert!(!app.on_mouse(click, Some(&view)));
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     /// Review of #234: the mouse wiring of the twolab-tui modal — a click on
@@ -8072,6 +8159,7 @@ mod tests {
             modal.state.layout.pos = ScrollPos::of(60, 20, 0);
             modal.state.layout.track = Some(rect(70, 4, 1, 20));
             modal.state.layout.close = Some(rect(60, 2, 9, 1));
+            ui::push_modal(&mut app.hits, rect(0, 0, 80, 26), &modal.state.layout);
             app.account_modal = Some(modal);
         };
         let click = |col, row| mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -8109,15 +8197,15 @@ mod tests {
             app.account_modal = Some(modal);
         };
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 0,
                 y: 6,
                 width: 80,
                 height: 1,
             },
-            display_idx: 1,
-        }];
+            ui::ClickTarget::AccountRow(1),
+        );
         open(&mut app);
         // `q` never reaches the quit handler beneath the modal.
         app.on_key(press(KeyCode::Char('q')), Some(&view));
@@ -8633,6 +8721,40 @@ mod tests {
         assert!(app.input_modal.is_none(), "the next Esc closes the modal");
     }
 
+    /// A toast up while copy mode holds the screen is not used up unseen:
+    /// the dashboard's clock stands still from the `v` to the way back, so
+    /// a failure card (8 s) is still there after a minute of selecting —
+    /// and gone a minute later without copy mode.
+    #[test]
+    fn copy_mode_stops_the_clock_so_a_toast_outlives_the_hold() {
+        let mut app = remote_app();
+        let started = app.started;
+        let at = |secs| started + Duration::from_secs(secs);
+        let (on, off, after) = (at(1), at(61), at(63));
+        let lines = vec!["claude:a2@x.com: upstream 502".to_string()];
+        app.set_status(StatusMsg::fail("refresh: 1 ok, 1 FAILED").with_lines(lines));
+        let shown = |app: &App, now: Instant| {
+            let chrome = app.chrome_at(now);
+            chrome.toasts.visible(chrome.clock).len()
+        };
+        assert_eq!(shown(&app, after), 0, "unheld, the card is gone by then");
+        app.set_copy_mode(true, on);
+        assert_eq!(app.clock_at(at(30)), Duration::from_secs(1), "it stands");
+        app.set_copy_mode(false, off);
+        assert_eq!(app.clock_at(after), Duration::from_secs(3));
+        assert_eq!(shown(&app, after), 1, "the card outlived the hold");
+        // A second hold adds to the first.
+        app.set_copy_mode(true, at(64));
+        app.set_copy_mode(false, at(70));
+        assert_eq!(app.clock_at(at(70)), Duration::from_secs(4));
+        assert_eq!(shown(&app, at(80)), 0, "and runs out on the clock");
+        // The `v` key turns the clock off and on with copy mode.
+        app.on_key(press(KeyCode::Char('v')), None);
+        assert!(app.copy_mode && app.copy_since.is_some());
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(!app.copy_mode && app.copy_since.is_none());
+    }
+
     /// Copy mode holds the frame still while it stays on: the render tick
     /// and background deliveries draw nothing, a key it swallows asks for no
     /// frame, a resize still draws, and entering and leaving draw.
@@ -8671,6 +8793,59 @@ mod tests {
             &mut dirty,
         );
         assert!(dirty && !app.copy_mode, "leaving does");
+    }
+
+    /// Mouse events already queued behind the `v` in the same input drain
+    /// (the terminal sent them before it saw capture go off) are swallowed:
+    /// a click on an accounts row opens no modal, the wheel scrolls nothing,
+    /// and neither asks for a frame.
+    #[test]
+    fn copy_mode_swallows_the_mouse_events_queued_behind_the_v() {
+        let view = control_view();
+        let mut app = remote_app();
+        draw_and_adopt(&mut app, &view, 179, 43);
+        let (row, _) = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, ui::ClickTarget::AccountRow(_)))
+            .expect("an accounts row is drawn");
+        let (x, y) = (row.x + 1, row.y);
+        let (mut drain, mut dirty) = (Some(Some(control_view())), false);
+        apply_event(
+            &mut app,
+            Event::Key(press(KeyCode::Char('v'))),
+            &mut drain,
+            &mut dirty,
+        );
+        assert!(app.copy_mode);
+        dirty = false;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            apply_event(
+                &mut app,
+                Event::Mouse(mouse(kind, x, y)),
+                &mut drain,
+                &mut dirty,
+            );
+        }
+        assert!(app.account_modal.is_none(), "no modal opened");
+        assert_eq!(app.mode, Mode::Normal, "no menu opened");
+        assert_eq!(app.activity_scroll, 0, "nothing scrolled");
+        assert!(!dirty, "and no frame is asked for");
+        // Back out of copy mode, the same click opens the row.
+        app.on_key(press(KeyCode::Char('v')), Some(&view));
+        apply_event(
+            &mut app,
+            Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+            &mut drain,
+            &mut dirty,
+        );
+        assert!(app.account_modal.is_some(), "{dirty}");
     }
 
     /// A drag across the Logs pager (80x24) selects from the press to the
@@ -8734,6 +8909,129 @@ mod tests {
         );
         assert_eq!(app.logs_sel, None, "a plain click clears the selection");
         assert!(app.pending_clip.is_empty(), "and copies nothing");
+    }
+
+    /// A line that lands between the frame and the press is not on screen
+    /// yet: the press freezes the lines that frame drew, so the selection
+    /// starts on the row under the pointer, not one line further on.
+    #[test]
+    fn logs_press_freezes_the_lines_the_last_frame_drew() {
+        let line = |i: usize| crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: format!("log line {i:03}"),
+        };
+        let mut view = stats_view_with_account();
+        view.logs = (0..5).map(line).collect();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 000", "{rows:#?}");
+        // The ring drops its oldest before the press; no frame in between.
+        view.logs.remove(0);
+        view.logs.push(line(5));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let col = if matches!(kind, MouseEventKind::Down(_)) {
+                7
+            } else {
+                18
+            };
+            let row = if matches!(kind, MouseEventKind::Down(_)) {
+                3
+            } else {
+                4
+            };
+            app.on_mouse(left(kind, col, row), Some(&view));
+        }
+        let req = app.pending_clip.pop_front().expect("the release copies");
+        assert_eq!(req.payload, "log line 000\n  INFO log line 001");
+    }
+
+    /// From the press on the Logs pager until its selection is gone, the
+    /// pager holds the lines it showed at the press: a line arriving
+    /// mid-drag that makes the ring drop its oldest moves nothing on screen
+    /// and the release copies the text that was drawn — it used to copy the
+    /// lines one row further on. A plain click lets go and the live lines
+    /// show again; so does `End`, which follows the tail.
+    #[test]
+    fn logs_drag_copies_the_text_drawn_at_the_press_while_lines_arrive() {
+        let line = |i: usize| crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: format!("log line {i:03}"),
+        };
+        let mut view = stats_view_with_account();
+        view.logs = (0..5).map(line).collect();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 000", "{rows:#?}");
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        // A new line arrives; the ring drops its oldest.
+        view.logs.remove(0);
+        view.logs.push(line(5));
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 000", "held: {rows:#?}");
+        app.on_mouse(
+            left(MouseEventKind::Drag(MouseButton::Left), 18, 4),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), 18, 4),
+            Some(&view),
+        );
+        let req = app.pending_clip.pop_front().expect("the release copies");
+        assert_eq!(req.payload, "log line 000\n  INFO log line 001");
+        assert!(app.logs_frozen.is_some(), "held while the selection shows");
+        // A plain click clears the selection and lets go of the lines.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.on_mouse(left(kind, 10, 6), Some(&view));
+        }
+        assert_eq!((app.logs_sel, app.logs_frozen.is_some()), (None, false));
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 001", "{rows:#?}");
+        // A selection held, then `End`: the tail is followed, live.
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), 18, 4),
+            Some(&view),
+        );
+        app.pending_clip.clear();
+        view.logs.push(line(6));
+        app.on_key_logs(KeyCode::End);
+        assert_eq!((app.logs_sel, app.logs_frozen.is_some()), (None, false));
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert!(rows.join("\n").contains("log line 006"), "{rows:#?}");
+        // Closing the overlay forgets them too.
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        app.on_key_logs(KeyCode::Esc);
+        assert!(app.logs_frozen.is_none());
+        // Leaving by another tab (a click on the tab row, or a key that opens
+        // another overlay) lets go of them at the next frame.
+        app.overlay = Overlay::Logs;
+        draw_and_adopt(&mut app, &view, 80, 24);
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        assert!(app.logs_frozen.is_some(), "held from the press");
+        app.open_tab(Overlay::Stats, Some(&view));
+        draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!((app.logs_sel, app.logs_frozen.is_some()), (None, false));
     }
 
     /// A drag past the bottom of the Logs pager scrolls it (3 rows per row
@@ -8828,6 +9126,8 @@ mod tests {
     /// Usage-overlay scroll clamps the STORED offset at the last bucket
     /// (review R1 MUST-FIX 2): pressing `j` at the bottom must not bank
     /// invisible overscroll debt that later `k` presses have to pay off.
+    /// The offset counts table rows: bucket `b` of one model starts on row
+    /// `2b`, and `j`/`k` step from one bucket's row to the next.
     #[test]
     fn usage_scroll_clamps_stored_offset_no_overscroll_debt() {
         let row = |bucket: u64| crate::dashboard::UsageStatDoc {
@@ -8849,14 +9149,14 @@ mod tests {
         let mut app = remote_app();
         app.overlay = Overlay::Usage;
 
-        // Overscroll: 5 downs against 3 buckets pin at the LAST bucket (2).
+        // Overscroll: 5 downs against 3 buckets pin at the LAST bucket (row 4).
         for _ in 0..5 {
             app.on_key_usage(KeyCode::Char('j'), Some(&view));
         }
-        assert_eq!(app.usage_scroll, 2, "stored offset clamped at last bucket");
+        assert_eq!(app.usage_scroll, 4, "stored offset clamped at last bucket");
         // ONE up moves immediately — no invisible debt to pay first.
         app.on_key_usage(KeyCode::Char('k'), Some(&view));
-        assert_eq!(app.usage_scroll, 1);
+        assert_eq!(app.usage_scroll, 2, "the middle bucket's row");
         // Granularity cycle resets the scroll; the next granularity (month)
         // has no rows in this view, so the offset stays pinned at 0.
         app.on_key_usage(KeyCode::Char('g'), Some(&view));
@@ -8880,7 +9180,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(app.on_mouse(wheel(MouseEventKind::ScrollDown), Some(&view)));
-        assert_eq!(app.usage_scroll, 1, "wheel down scrolls one bucket");
+        assert_eq!(app.usage_scroll, 2, "wheel down scrolls one bucket");
         assert!(app.on_mouse(wheel(MouseEventKind::ScrollUp), Some(&view)));
         assert_eq!(app.usage_scroll, 0, "wheel up scrolls back");
     }
@@ -9133,12 +9433,9 @@ mod tests {
             .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
             .expect("draw");
         let main = hits.unwrap_or_default();
-        app.sessions_chrome = main.sessions_table;
+        app.hits = main.hits;
         app.table_scroll = main.table_scroll;
-        app.logs_area = main.logs_area;
-        if let Some(pos) = main.logs {
-            app.logs_pos = pos;
-        }
+        app.adopt_logs(main.logs_area, main.logs, main.logs_lines.clone());
         app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
         if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
             modal.scroll = modal.scroll.min(raw.max_scroll);
@@ -9147,6 +9444,16 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    /// Where the last frame drew the sessions table's data rows: the rows'
+    /// click targets together.
+    fn sessions_rows(hits: &ui::Hits) -> ratatui::layout::Rect {
+        hits.iter()
+            .filter(|(_, target)| matches!(target, ui::ClickTarget::SessionsRow(_)))
+            .map(|(rect, _)| rect)
+            .reduce(|a, b| a.union(b))
+            .expect("rows drawn")
     }
 
     fn left(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
@@ -9358,7 +9665,11 @@ mod tests {
             Some(raw.max_scroll),
             "End clamps to the last row"
         );
-        let (index, rect) = raw.tabs[1];
+        let index = 1;
+        let rect = app
+            .hits
+            .area_of(&ui::ClickTarget::RawTab(index))
+            .expect("the Response tab drawn");
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
             None,
@@ -9398,7 +9709,7 @@ mod tests {
         draw_and_adopt(&mut app, &view, 80, 24);
         let bar = app.table_scroll.expect("60 sessions overflow");
         let page = bar.pos.viewport;
-        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        let rows_hit = sessions_rows(&app.hits);
         assert!(
             rows_hit.right() <= bar.track.x,
             "the bar's column is not a row"
@@ -9420,7 +9731,7 @@ mod tests {
         );
 
         // A row click still selects that row, not the bar.
-        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        let rows_hit = sessions_rows(&app.hits);
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), 5, rows_hit.y),
             Some(&view),
@@ -9428,11 +9739,72 @@ mod tests {
         assert_eq!(app.session_cursor, 60 - page, "the first row in view");
     }
 
-    /// The usage table scrolls by bucket while its scrollbar counts rows: a
-    /// press at the bottom of the track lands on the first bucket that shows
-    /// the last rows; one at the top returns to the newest bucket.
+    /// A keys model picker left open (and filtering) on the keys tab blocks
+    /// only that tab's table: under the sessions tab the scrollbar takes a
+    /// press as usual, and back on the keys tab the picker still holds it.
     #[test]
-    fn usage_table_scrollbar_lands_on_buckets() {
+    fn a_keys_picker_left_open_does_not_block_another_tabs_scrollbar() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+        app.on_key_keys(KeyCode::Char('f'), None);
+        app.on_key_keys(KeyCode::Char('/'), None);
+        assert!(app.keys.picker.as_ref().is_some_and(|p| p.filtering));
+        app.open_tab(Overlay::Sessions, Some(&view));
+        assert_eq!(app.overlay, Overlay::Sessions);
+        assert!(app.keys.picker.is_some(), "the picker stays open under it");
+        app.sessions_loading = false;
+        app.sessions = (0..60u64)
+            .map(|i| crate::session::Session {
+                user_id: Some(format!("u-{i:02}")),
+                requests: 1,
+                tokens_in: 1,
+                tokens_out: 1,
+                models: vec![],
+                accounts: vec![],
+                account_rotations: 0,
+                first_ms: i,
+                last_ms: i,
+                duration_ms_sum: 0,
+                timed_requests: 0,
+                tokens_out_timed: 0,
+                confidence: crate::session::Confidence::High,
+            })
+            .collect();
+        draw_and_adopt(&mut app, &view, 80, 24);
+        let bar = app.table_scroll.expect("60 sessions overflow");
+        let last = bar.track.bottom() - 1;
+        assert!(app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        ));
+        assert_eq!(app.session_cursor, 59, "the bar took the press");
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        // Back on the keys tab, its own bar is held while the picker is up.
+        app.overlay = Overlay::Keys;
+        app.table_scroll = Some(bar);
+        let before = app.keys.scroll;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
+            Some(&view),
+        );
+        assert_eq!(app.keys.scroll, before, "the picker holds the keys bar");
+    }
+
+    /// The usage table scrolls by row, as its scrollbar counts: a press at
+    /// the bottom of the track shows the last rows (it used to snap to the
+    /// first bucket at or after them); one at the top returns to the newest
+    /// bucket.
+    #[test]
+    fn usage_table_scrollbar_reaches_the_last_rows() {
         let row = |bucket: u64, model: &str| crate::dashboard::UsageStatDoc {
             gran: "day".into(),
             bucket,
@@ -9459,6 +9831,19 @@ mod tests {
         draw_and_adopt(&mut app, &view, 120, 24);
         let bar = app.table_scroll.expect("60 rows overflow");
         assert_eq!(bar.pos.max, 60 - bar.pos.viewport);
+        // End, the wheel and the keys stop where the scrollbar ends: the
+        // last model on the last row, not the last bucket at the top with
+        // blank rows under it (the drawn top and the thumb used to differ).
+        app.on_key_usage(KeyCode::End, Some(&view));
+        assert_eq!(app.usage_scroll, bar.pos.max, "End is the bar's end");
+        for _ in 0..3 {
+            app.on_key_usage(KeyCode::Char('j'), Some(&view));
+        }
+        assert_eq!(app.usage_scroll, bar.pos.max, "j stops there too");
+        draw_and_adopt(&mut app, &view, 120, 24);
+        assert_eq!(app.table_scroll.map(|b| b.pos.top), Some(bar.pos.max));
+        app.on_key_usage(KeyCode::Home, Some(&view));
+        draw_and_adopt(&mut app, &view, 120, 24);
         let last = bar.track.bottom() - 1;
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), bar.track.x, last),
@@ -9468,13 +9853,13 @@ mod tests {
             left(MouseEventKind::Up(MouseButton::Left), bar.track.x, last),
             Some(&view),
         );
-        // Rows before bucket k: 3k. The first bucket at or after max.
-        assert_eq!(app.usage_scroll, bar.pos.max.div_ceil(3));
+        assert_eq!(app.usage_scroll, bar.pos.max, "the last page, by row");
         let rows = draw_and_adopt(&mut app, &view, 120, 24);
         assert!(
             rows.join("\n").contains("day-00"),
             "the oldest bucket shows"
         );
+        assert_eq!(app.table_scroll.map(|b| b.pos.top), Some(bar.pos.max));
         app.on_mouse(
             left(
                 MouseEventKind::Down(MouseButton::Left),
@@ -9487,6 +9872,86 @@ mod tests {
             app.usage_scroll, 0,
             "the top of the track is the newest bucket"
         );
+    }
+
+    /// One bucket of 40 models in an 18-row table: every model is reachable
+    /// — `↓` reads it a page at a time (there is no next bucket to step
+    /// to), PgDn pages, End shows the last model, a drag on the scrollbar
+    /// lands on any row — and `↑`/Home come back to the bucket's row. The
+    /// table used to scroll by bucket only, so models 18–40 never showed.
+    #[test]
+    fn usage_one_tall_bucket_scrolls_to_every_model() {
+        let row = |i: usize| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket: 7,
+            label: "day-07".into(),
+            group: "claude".into(),
+            model: format!("model-{i:02}"),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            // Cost descending keeps the drawn order model-00 … model-39.
+            cost_usd: 100.0 - i as f64,
+            priced: true,
+        };
+        let mut view = empty_view();
+        view.usage_stats = (0..40).map(row).collect();
+        let mut app = remote_app();
+        app.overlay = Overlay::Usage;
+        app.usage_gran = activity::UsageGran::Day;
+        let (w, h) = (120, 24);
+        let shown = |rows: &[String]| -> Vec<usize> {
+            (0..40)
+                .filter(|i| rows.iter().any(|r| r.contains(&format!("model-{i:02}"))))
+                .collect()
+        };
+        let rows = draw_and_adopt(&mut app, &view, w, h);
+        let bar = app.table_scroll.expect("41 rows overflow");
+        let viewport = bar.pos.viewport;
+        assert_eq!(bar.pos.max, 41 - viewport, "{rows:#?}");
+        assert!(!shown(&rows).contains(&39), "{rows:#?}");
+        // ↓ walks the bucket a page at a time and reaches its last model.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..10 {
+            seen.extend(shown(&draw_and_adopt(&mut app, &view, w, h)));
+            app.on_key_usage(KeyCode::Down, Some(&view));
+        }
+        assert_eq!(seen.len(), 40, "every model came into view by ↓: {seen:?}");
+        assert_eq!(app.usage_scroll, bar.pos.max, "and it stops there");
+        app.on_key_usage(KeyCode::Home, Some(&view));
+        assert_eq!(app.usage_scroll, 0);
+        app.on_key_usage(KeyCode::PageDown, Some(&view));
+        assert_eq!(app.usage_scroll, viewport - 1, "a page");
+        app.on_key_usage(KeyCode::End, Some(&view));
+        let rows = draw_and_adopt(&mut app, &view, w, h);
+        assert!(shown(&rows).contains(&39), "End shows the last: {rows:#?}");
+        app.on_key_usage(KeyCode::Up, Some(&view));
+        assert_eq!(app.usage_scroll, bar.pos.max - (viewport - 1), "↑ a page");
+        // A drag on the scrollbar lands on any row, not a bucket start.
+        app.on_key_usage(KeyCode::Home, Some(&view));
+        draw_and_adopt(&mut app, &view, w, h);
+        let mid = bar.track.y + bar.track.height / 2;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, mid),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), bar.track.x, mid),
+            Some(&view),
+        );
+        assert!(
+            (1..bar.pos.max).contains(&app.usage_scroll),
+            "mid-bucket: {}",
+            app.usage_scroll
+        );
+        let rows = draw_and_adopt(&mut app, &view, w, h);
+        assert!(shown(&rows)[0] > 0, "{rows:#?}");
+        // The footer still names the bucket the top row belongs to.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("top/displayed bucket day-07")));
     }
 
     /// K-3 `f`: Space toggles, Enter applies the selection AND re-queries;
@@ -10119,29 +10584,35 @@ mod tests {
         }
     }
 
-    /// Seed `app.activity_chrome` with one clickable request row spanning the
-    /// given screen rows, returning its key.
+    /// Seed `app.hits` with one clickable request row on screen row 6 of an
+    /// activity panel at rows 5..15, returning its key.
     fn seed_one_hit(app: &mut App) -> activity::ActivityKey {
+        seed_hit_as(app, ui::ActivityHitKind::Entry)
+    }
+
+    /// [`seed_one_hit`] as a target of `kind` (the frame's map holds only it).
+    fn seed_hit_as(app: &mut App, kind: ui::ActivityHitKind) -> activity::ActivityKey {
         let key = activity::ActivityKey {
             at_ms: 42,
             method: "POST".into(),
             path: "/v1/messages".into(),
             status: 200,
         };
-        app.activity_chrome = ui::ActivityChrome {
-            area: ratatui::layout::Rect {
-                x: 0,
-                y: 5,
-                width: 80,
-                height: 10,
-            },
-            hits: vec![ui::ActivityHit {
-                key: key.clone(),
-                y_start: 6,
-                height: 1,
-                kind: ui::ActivityHitKind::Entry,
-            }],
+        let panel = ratatui::layout::Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 10,
         };
+        app.hits.clear();
+        app.hits.push_clipped(
+            ratatui::layout::Rect::new(panel.x, 6, panel.width, 1),
+            panel,
+            ui::ClickTarget::Activity {
+                key: key.clone(),
+                kind,
+            },
+        );
         key
     }
 
@@ -10161,8 +10632,7 @@ mod tests {
     #[test]
     fn run_header_marker_toggles_and_body_expands_only(/* UI-5, Z 2026-07-15 */) {
         let mut app = remote_app();
-        let key = seed_one_hit(&mut app);
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::RunHeader { expanded: false };
+        let key = seed_hit_as(&mut app, ui::ActivityHitKind::RunHeader { expanded: false });
         // Marker-zone click (col < RUN_MARKER_ZONE) → opens the run.
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
         assert_eq!(app.expanded_run.as_ref(), Some(&key));
@@ -10183,9 +10653,8 @@ mod tests {
     #[test]
     fn click_input_line_opens_modal_and_swallows_mouse_beneath(/* UI-6 item 3 */) {
         let mut app = remote_app();
-        let key = seed_one_hit(&mut app);
         // Make the seeded hit the 🔍 input detail line.
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::InputLine;
+        let key = seed_hit_as(&mut app, ui::ActivityHitKind::InputLine);
         // Click it → opens the modal on that key WITHOUT expanding the row.
         let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
         assert!(changed, "opening the modal warrants a redraw");
@@ -10195,7 +10664,7 @@ mod tests {
             "the input click does not expand"
         );
         // A click beneath is now swallowed: nothing toggles, the modal stays.
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::Entry;
+        seed_hit_as(&mut app, ui::ActivityHitKind::Entry);
         let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
         assert!(changed, "the modal consumes the click (redraw)");
         assert_eq!(
@@ -12007,6 +12476,101 @@ mod tests {
             .expect("draw");
         let text = format!("{:?}", terminal.backend().buffer());
         assert!(!text.contains("FAILED"), "{text}");
+    }
+
+    /// A click that takes a toast down owns its release too: with a Logs
+    /// selection already made under the toast, the release does not finish
+    /// that selection again (it used to copy the old text a second time).
+    #[test]
+    fn a_click_on_a_toast_over_the_logs_does_not_copy_the_selection_again() {
+        let line = |i: usize| crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: format!("log line {i:03}"),
+        };
+        let mut view = stats_view_with_account();
+        view.logs = (0..30).map(line).collect();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        draw_and_adopt(&mut app, &view, 179, 43);
+        for (kind, col) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 18),
+            (MouseEventKind::Up(MouseButton::Left), 18),
+        ] {
+            app.on_mouse(left(kind, col, 4), Some(&view));
+        }
+        assert_eq!(app.pending_clip.len(), 1, "the selection copied once");
+        app.pending_clip.clear();
+        let lines = (2..=6)
+            .map(|n| format!("claude:a{n}@x.com: upstream 50{n}"))
+            .collect();
+        app.set_status(StatusMsg::fail("refresh: 1 ok, 5 FAILED").with_lines(lines));
+        draw_and_adopt(&mut app, &view, 179, 43);
+        let toast = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, ui::ClickTarget::Toast(_)))
+            .map(|(rect, _)| rect)
+            .expect("the toast is drawn over the pager");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(app.on_mouse(left(kind, toast.x + 2, toast.y + 1), Some(&view)));
+        }
+        assert!(app.toasts.is_empty(), "the click took the toast down");
+        assert!(app.pending_clip.is_empty(), "nothing copied again");
+    }
+
+    /// A toast lies over the accounts table: a left click on it takes it
+    /// down instead of opening the account modal of the row beneath (it
+    /// used to pass through), and any other press on it is swallowed too.
+    /// With the toast gone, the same cell is the row again.
+    #[test]
+    fn a_click_on_a_toast_takes_it_down_and_never_reaches_the_row_beneath() {
+        let view = control_view();
+        let mut app = remote_app();
+        let lines = (2..=6)
+            .map(|n| format!("claude:a{n}@x.com: upstream 50{n}"))
+            .collect();
+        app.set_status(StatusMsg::fail("refresh: 1 ok, 5 FAILED").with_lines(lines));
+        let rows = draw_and_adopt(&mut app, &view, 179, 43);
+        let toast = app
+            .hits
+            .iter()
+            .find(|(_, t)| matches!(t, ui::ClickTarget::Toast(_)))
+            .map(|(rect, _)| rect)
+            .expect("the toast is a click target");
+        let (x, y) = app
+            .hits
+            .iter()
+            .filter(|(_, t)| matches!(t, ui::ClickTarget::AccountRow(_)))
+            .find_map(|(row, _)| {
+                let both = row.intersection(toast);
+                (!both.is_empty()).then_some((both.x, both.y))
+            })
+            .unwrap_or_else(|| panic!("the toast lies over a row:\n{}", rows.join("\n")));
+        assert!(rows.iter().any(|r| r.contains("5 FAILED")), "{rows:#?}");
+        // A right click on it neither opens the row's menu nor takes it down.
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), x, y),
+            Some(&view)
+        ));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.toasts.is_empty(), "a right click keeps the toast");
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            Some(&view)
+        ));
+        assert!(app.account_modal.is_none(), "the row beneath stays shut");
+        assert!(app.toasts.is_empty(), "the click took the toast down");
+        let rows = draw_and_adopt(&mut app, &view, 179, 43);
+        assert!(!rows.iter().any(|r| r.contains("5 FAILED")), "{rows:#?}");
+        app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+            Some(&view),
+        );
+        assert!(app.account_modal.is_some(), "the row is clickable again");
     }
 
     /// The connecting screen counts how long the attach has been retrying
