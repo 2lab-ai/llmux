@@ -62,6 +62,18 @@ fn no_color() -> bool {
     *NO_COLOR.get_or_init(|| twolab_tui::Theme::from_env().is_mono())
 }
 
+/// Whether the dashboard's twolab-tui animations hold still:
+/// `LLMUX_REDUCED_MOTION` set to anything non-empty when the process started.
+/// The attach connecting screen's spinner keeps its first glyph and its
+/// label is plain bold; the clock still counts. Read once.
+fn motion() -> twolab_tui::Motion {
+    static MOTION: std::sync::OnceLock<twolab_tui::Motion> = std::sync::OnceLock::new();
+    *MOTION.get_or_init(|| match std::env::var_os("LLMUX_REDUCED_MOTION") {
+        Some(v) if !v.is_empty() => twolab_tui::Motion::Reduced,
+        _ => twolab_tui::Motion::Full,
+    })
+}
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -618,6 +630,12 @@ pub(crate) struct Chrome {
     /// The dashboard's own clock this frame: time since it started. The draw
     /// reads no clock; toasts (and anything that ages) go by this.
     pub clock: Duration,
+    /// How long the attach connection has been in its current state —
+    /// connecting, retrying — as the connecting screen counts it.
+    pub attach_wait: Duration,
+    /// Full or reduced motion (`LLMUX_REDUCED_MOTION`) for the twolab-tui
+    /// widgets that animate.
+    pub motion: twolab_tui::Motion,
     /// Activity-log scroll offset: number of newest completed entries skipped
     /// (0 = live tail). Lets the panel page through the full history (req6).
     pub activity_scroll: usize,
@@ -1038,6 +1056,9 @@ struct App {
     started: Instant,
     /// Status messages with several facts, shown as toast cards.
     toasts: twolab_tui::toast::ToastQueue,
+    /// When the attach connection entered its current state (connected or
+    /// not); the dashboard's start until the first fetch answers.
+    link_since: Instant,
     /// Which summoned overlay is open over MAIN (issue #5): `a`→Accounts,
     /// `g`→Stats, `l`→Logs, `Esc`→None. MAIN renders every frame regardless.
     overlay: Overlay,
@@ -1263,6 +1284,7 @@ impl App {
             status: None,
             started: Instant::now(),
             toasts: twolab_tui::toast::ToastQueue::new(),
+            link_since: Instant::now(),
             overlay: Overlay::None,
             activity_scroll: 0,
             last_top_key: None,
@@ -1573,6 +1595,8 @@ impl App {
                 .map(|(msg, _)| msg.clone()),
             toasts: self.toasts.clone(),
             clock: self.clock_at(now),
+            attach_wait: now.saturating_duration_since(self.link_since),
+            motion: motion(),
             attach: match &self.backend {
                 Backend::Local(_) => None,
                 Backend::Remote(remote) => Some(Attach {
@@ -1617,6 +1641,10 @@ impl App {
 
     fn apply_fetch(&mut self, msg: FetchMsg) {
         if let Backend::Remote(remote) = &mut self.backend {
+            let connected = matches!(msg, FetchMsg::Doc(_));
+            if connected != remote.connected {
+                self.link_since = Instant::now();
+            }
             match msg {
                 FetchMsg::Doc(doc) => {
                     remote.doc = Some(*doc);
@@ -10354,6 +10382,32 @@ mod tests {
             .expect("draw");
         let text = format!("{:?}", terminal.backend().buffer());
         assert!(!text.contains("FAILED"), "{text}");
+    }
+
+    /// The connecting screen counts how long the attach has been retrying
+    /// from the moment the link was lost — every further failed poll keeps
+    /// the count going rather than restarting it.
+    #[test]
+    fn attach_wait_counts_from_the_loss_not_from_each_failed_poll() {
+        let mut app = remote_app();
+        if let Backend::Remote(remote) = &mut app.backend {
+            remote.connected = true;
+        }
+        let ago = |secs| {
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .expect("monotonic clock far enough from its origin")
+        };
+        app.link_since = ago(300);
+        app.apply_fetch(FetchMsg::Lost);
+        assert!(
+            app.chrome().attach_wait < Duration::from_secs(5),
+            "lost now"
+        );
+        app.link_since = ago(30);
+        app.apply_fetch(FetchMsg::Lost);
+        let wait = app.chrome().attach_wait;
+        assert!(wait >= Duration::from_secs(30), "still retrying: {wait:?}");
     }
 
     /// The raw viewer's action flash says how it went and is aged by the

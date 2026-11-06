@@ -5107,9 +5107,14 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     chrome
 }
 
-/// Attach-mode pre-first-document screen: identity + a "connecting…" /
-/// reconnect line, plus the footer so `q` is discoverable.
+/// Attach-mode pre-first-document screen: identity, then a twolab-tui
+/// `Working` row — a spinner, the connecting / retrying label, how long it
+/// has been at it and the quit key (`⠋ connecting to daemon — retrying…
+/// (42s) - q quit`; it was static yellow text) — plus the footer. Under
+/// reduced motion the spinner holds its first glyph and the label is plain
+/// bold; the clock still counts.
 fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
+    use twolab_tui::working::Working;
     let [header_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -5131,12 +5136,20 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
         Some(attach) if attach.connected => "connecting — waiting for the first document…",
         _ => "connecting to daemon — retrying…",
     };
+    // The label's sweep restarts when the state (and so the label) changes.
+    let working = Working::new(connecting)
+        .elapsed(chrome.attach_wait)
+        .header_age(chrome.attach_wait)
+        .no_interrupt()
+        .inline("q quit");
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {connecting}"),
-            Style::new().fg(Color::Yellow),
-        ))),
-        body_area,
+        working.at(chrome.clock, KEYBAR_THEME.with_motion(chrome.motion)),
+        Rect {
+            x: body_area.x.saturating_add(1),
+            width: body_area.width.saturating_sub(1),
+            height: body_area.height.min(1),
+            ..body_area
+        },
     );
     // No document yet → no live setting to honor; nothing here shows emails.
     draw_footer(frame, footer_area, chrome, false);
@@ -12985,6 +12998,8 @@ mod tests {
             status_line: None,
             toasts: Default::default(),
             clock: Duration::ZERO,
+            attach_wait: Duration::ZERO,
+            motion: Default::default(),
             activity_scroll: 0,
             expanded_activity: None,
             expanded_run: None,
@@ -13009,6 +13024,68 @@ mod tests {
             attach: None,
             keys: Default::default(),
         }
+    }
+
+    /// The attach screen before the first document is a working row, not
+    /// static yellow text: a spinner that turns with the clock, how long it
+    /// has been retrying (`42s`, then `1m 05s`) and the quit key, at 80 and
+    /// 179 columns. Under reduced motion the spinner holds its first glyph
+    /// and the label is plain bold while the clock still counts.
+    #[test]
+    fn connecting_screen_spins_and_counts_the_retry_time() {
+        use super::super::Attach;
+        let render = |chrome: &Chrome, w: u16, h: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+            let mut hits = None;
+            terminal
+                .draw(|f| draw(f, None, chrome, &mut hits))
+                .expect("draw");
+            terminal.backend().buffer().clone()
+        };
+        let row = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        let mut chrome = Chrome {
+            attach: Some(Attach {
+                pid: Some(42),
+                connected: false,
+            }),
+            attach_wait: Duration::from_secs(42),
+            ..chrome_overlay(Overlay::None)
+        };
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            chrome.clock = Duration::ZERO;
+            let first = row(&render(&chrome, w, h), 1);
+            assert_eq!(
+                first.trim_end(),
+                " ⠋ connecting to daemon — retrying… (42s) - q quit",
+                "{w}x{h}"
+            );
+            chrome.clock = Duration::from_millis(120);
+            let next = row(&render(&chrome, w, h), 1);
+            assert!(
+                next.starts_with(" ⠙ connecting"),
+                "the spinner turns: {next:?}"
+            );
+        }
+        chrome.attach_wait = Duration::from_secs(65);
+        let later = row(&render(&chrome, 80, 24), 1);
+        // The note after the clock keeps its column while the minutes tick.
+        assert!(later.contains("(1m 05s)  - q quit"), "{later:?}");
+
+        chrome.motion = twolab_tui::Motion::Reduced;
+        let still: Vec<String> = [0u64, 120, 4_000]
+            .iter()
+            .map(|&ms| {
+                chrome.clock = Duration::from_millis(ms);
+                let buf = render(&chrome, 80, 24);
+                let label = (3..35).all(|x| buf[(x, 1)].modifier.contains(Modifier::BOLD));
+                assert!(label, "the label is plain bold: {}", row(&buf, 1));
+                row(&buf, 1)
+            })
+            .collect();
+        assert!(still.iter().all(|r| r == &still[0]), "{still:?}");
+        assert!(still[0].starts_with(" ⠋ connecting"), "{:?}", still[0]);
     }
 
     /// attach_spans (TUI-14): connected -> "attached → pid N"; disconnected ->

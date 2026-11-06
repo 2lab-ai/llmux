@@ -45,7 +45,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | status_bar | fx | the header is cut after `llmux 0.2.26` at 80 columns; the settings bar is cut mid-segment | whole segments drop by importance; settings-bar clicks land on the segment that is drawn | 3 |
 | status_card | Codex | the account modal prints quota windows as `util 0.123 · eff …` | a bar per window with its reset time | 3 |
 | trend_chart | llmux | series are told apart only by colour; the tokens chart zero-fills days before history | `* + x o` per series without colour, gaps for missing days | 3 |
-| working | Codex | the attach screen is static yellow text | a spinner and how long it has been retrying | 3 |
+| working | Codex | the attach screen is static yellow text | a spinner and how long it has been retrying | done |
 | mini_bar | llmux | an empty share bar when the total is zero | `—` when the share cannot be computed | 3 |
 | composer | fx + herdr | add-key and config edits only append or delete at the end | caret moves, mid-value edits, Ctrl+U/Ctrl+Y; the API key stays masked in every render | 3 |
 | text, spinner, gradient_text, osc52 | llmux, Codex | done in PR #231 | — | done |
