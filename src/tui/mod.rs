@@ -239,6 +239,16 @@ impl LoginKind {
         LoginKind::Gemini,
     ];
 
+    /// How the sign-in runs, beside the label in the picker.
+    pub(crate) fn flow(self) -> &'static str {
+        match self {
+            LoginKind::Anthropic | LoginKind::Codex => "browser sign-in",
+            LoginKind::Grok => "device code: a URL and a code to enter",
+            LoginKind::OpenRouter => "browser sign-in, mints an sk-or-v1 key",
+            LoginKind::Gemini => "browser sign-in; terms-of-service note first",
+        }
+    }
+
     /// One-line label for the picker + status line.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -385,16 +395,97 @@ pub(crate) struct KeysPanel {
     pub generation: u64,
 }
 
-/// The `f` multi-select model picker (keys-history K-0).
-#[derive(Debug, Clone, Default)]
+/// The `f` multi-select model picker (keys-history K-0) — twolab-tui's
+/// `multi_select`, which owns the offered models, their checkboxes (the
+/// working selection, applied to the panel only on Enter), the cursor and
+/// the filter.
+#[derive(Debug, Clone)]
 pub(crate) struct KeysPicker {
-    pub cursor: usize,
-    /// Working selection — applied to the panel only on Enter.
-    pub selected: std::collections::BTreeSet<String>,
-    /// Offered names: the models observed in the current window, UNIONED with
-    /// anything already selected (so a selection made under a wider window
-    /// stays visible and deselectable).
-    pub options: Vec<String>,
+    pub list: twolab_tui::multi_select::MultiSelect,
+    /// `/` opened the filter: printable keys type into it (so `a`, `c`, `j`,
+    /// `k`, `f` and `q` stay picker keys until then).
+    pub filtering: bool,
+}
+
+impl KeysPicker {
+    /// Rows the picker shows before it scrolls.
+    const ROWS: usize = 10;
+
+    /// A picker offering `options` (the models observed in the current
+    /// window, UNIONED with anything already selected, so a selection made
+    /// under a wider window stays visible and deselectable), `selected`
+    /// checked.
+    pub(crate) fn new(
+        options: Vec<String>,
+        selected: &std::collections::BTreeSet<String>,
+    ) -> KeysPicker {
+        KeysPicker {
+            list: Self::list(options, selected),
+            filtering: false,
+        }
+    }
+
+    fn list(
+        options: Vec<String>,
+        selected: &std::collections::BTreeSet<String>,
+    ) -> twolab_tui::multi_select::MultiSelect {
+        use twolab_tui::multi_select::{MultiItem, MultiSelect};
+        let items = options
+            .into_iter()
+            .map(|m| {
+                let checked = selected.contains(&m);
+                MultiItem::new(m.clone(), m).checked(checked)
+            })
+            .collect();
+        MultiSelect::new(items).max_rows(Self::ROWS)
+    }
+
+    /// The offered model names, in order.
+    pub(crate) fn options(&self) -> Vec<String> {
+        self.list.items().iter().map(|i| i.id.clone()).collect()
+    }
+
+    /// The working selection.
+    pub(crate) fn selected(&self) -> std::collections::BTreeSet<String> {
+        self.list.checked_ids().into_iter().collect()
+    }
+
+    /// Offer `options` instead, keeping what is checked, the filter and the
+    /// row under the cursor (the list has no way to set items or the cursor
+    /// in place — library gap — so it is rebuilt and moved back).
+    fn rebuild(&mut self, options: Vec<String>, selected: &std::collections::BTreeSet<String>) {
+        use twolab_tui::{Key, KeyInput};
+        let cursor = self
+            .list
+            .selected()
+            .and_then(|i| self.list.items().get(i))
+            .map(|i| i.id.clone());
+        let mut list = Self::list(options, selected).with_query(self.list.search_query());
+        if let Some(id) = cursor {
+            for _ in 0..list.visible_len() {
+                if list
+                    .selected()
+                    .and_then(|i| list.items().get(i))
+                    .map(|i| &i.id)
+                    == Some(&id)
+                {
+                    break;
+                }
+                list.key(KeyInput::new(Key::Down));
+            }
+        }
+        self.list = list;
+    }
+
+    /// `a` / `c`: check or clear every offered model.
+    fn set_all(&mut self, checked: bool) {
+        let all: std::collections::BTreeSet<String> = if checked {
+            self.options().into_iter().collect()
+        } else {
+            Default::default()
+        };
+        self.rebuild(self.options(), &all);
+    }
 }
 
 /// One dispatched keys-usage query, drained by the event loop.
@@ -514,6 +605,13 @@ pub(crate) struct Chrome {
     /// Config-editor cursor row + the edit/confirm prompt text.
     pub config_cursor: usize,
     pub config_input: String,
+    /// The marked option of the config confirm gate (0 = apply, 1 = cancel):
+    /// Enter answers it, ↑↓ move it. The account gates (remove / reset) keep
+    /// their mark on Cancel, so Enter there never spends or deletes anything.
+    pub confirm_choice: usize,
+    /// The redemption this client still holds, if any — the reset gate names
+    /// it (and its request id) for as long as the gate is open.
+    pub reset_held: Option<PendingRedemption>,
     /// Restart-only values saved THIS session (action → new value): the row
     /// keeps showing the effective boot value, and this map drives an
     /// explicit "saved: X (restart)" note — pending must never masquerade
@@ -930,6 +1028,8 @@ struct App {
     /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
     config_cursor: usize,
     config_input: String,
+    /// The marked option of the config confirm gate ([`Chrome::confirm_choice`]).
+    confirm_choice: usize,
     /// Pending confirmed settings request awaiting y/n (built at edit time so
     /// confirm applies EXACTLY what was validated).
     config_pending: Option<crate::proxy::server::SettingsRequest>,
@@ -1068,6 +1168,7 @@ impl App {
             account_sort: triage::AccountSort::default(),
             config_cursor: 0,
             config_input: String::new(),
+            confirm_choice: 0,
             config_pending: None,
             config_pending_value: None,
             config_saved: Default::default(),
@@ -1290,6 +1391,8 @@ impl App {
             account_sort: self.account_sort,
             config_cursor: self.config_cursor,
             config_input: self.config_input.clone(),
+            confirm_choice: self.confirm_choice,
+            reset_held: self.pending_redemption.clone(),
             config_saved: self.config_saved.clone(),
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
@@ -1639,17 +1742,11 @@ impl App {
         if self.overlay == Overlay::Config && self.mode == Mode::Normal {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    self.config_cursor = self.config_cursor.saturating_sub(1);
+                    self.on_key_config(KeyCode::Up, view);
                     return true;
                 }
                 MouseEventKind::ScrollDown => {
-                    let rows = view
-                        .map(|v| {
-                            let chrome = self.chrome();
-                            ui::config_row_count(v, &chrome)
-                        })
-                        .unwrap_or(0);
-                    self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+                    self.on_key_config(KeyCode::Down, view);
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2673,6 +2770,15 @@ impl App {
                 self.keys.available = doc.available_models.clone();
                 self.keys.doc = Some(std::sync::Arc::new(doc));
                 self.keys.error = None;
+                // An open picker offers what this answer observed: opened
+                // during the first load it used to say "no models observed"
+                // over a panel full of models.
+                if let Some(working) = self.keys.picker.as_ref().map(KeysPicker::selected) {
+                    let options = self.keys_picker_options(&working);
+                    if let Some(picker) = self.keys.picker.as_mut() {
+                        picker.rebuild(options, &working);
+                    }
+                }
             }
             // The previous answer is DROPPED on failure: showing older rows
             // under the new filter label is exactly the lie this panel must
@@ -2687,15 +2793,19 @@ impl App {
     /// Open the `f` model picker over the models the current answer observed,
     /// unioned with the current selection.
     fn open_keys_picker(&mut self) {
+        let options = self.keys_picker_options(&self.keys.models);
+        self.keys.picker = Some(KeysPicker::new(options, &self.keys.models));
+    }
+
+    /// What the picker offers: the models the last answer observed, unioned
+    /// with the applied filter and the `working` selection.
+    fn keys_picker_options(&self, working: &std::collections::BTreeSet<String>) -> Vec<String> {
         let mut options: Vec<String> = self.keys.available.clone();
         options.extend(self.keys.models.iter().cloned());
+        options.extend(working.iter().cloned());
         options.sort();
         options.dedup();
-        self.keys.picker = Some(KeysPicker {
-            cursor: 0,
-            selected: self.keys.models.clone(),
-            options,
-        });
+        options
     }
 
     /// Key handling for the Keys overlay (keys-history K-0): `w` cycles the
@@ -2735,56 +2845,93 @@ impl App {
         }
     }
 
-    /// Key handling inside the `f` picker: arrows move, Space toggles, `a`
-    /// selects every offered model, `c` clears, Enter applies (and re-queries),
-    /// `Esc`/`f` cancels without touching the active filter.
+    /// Key handling inside the `f` picker ([`KeysPicker`]): arrows and
+    /// `j`/`k` move, Space toggles, `a` checks every offered model, `c`
+    /// clears, `/` starts the filter, Enter applies (and re-queries),
+    /// `Esc`/`f` cancel without touching the active filter, `q` quits. While
+    /// the filter is open printable keys type into it, Backspace on an empty
+    /// filter or Esc closes it (the picker stays), and Space/Enter/arrows
+    /// keep working.
     fn on_key_keys_picker(&mut self, code: KeyCode) {
+        use twolab_tui::multi_select::Outcome;
         let Some(picker) = self.keys.picker.as_mut() else {
             return;
         };
-        let last = picker.options.len().saturating_sub(1);
-        match code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc | KeyCode::Char('f') => self.keys.picker = None,
-            KeyCode::Up | KeyCode::Char('k') => picker.cursor = picker.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => picker.cursor = (picker.cursor + 1).min(last),
-            KeyCode::Char(' ') => {
-                if let Some(model) = picker.options.get(picker.cursor).cloned() {
-                    if !picker.selected.remove(&model) {
-                        picker.selected.insert(model);
-                    }
+        let code = if picker.filtering {
+            match code {
+                KeyCode::Esc => {
+                    picker.list.set_search_query("");
+                    picker.filtering = false;
+                    return;
                 }
+                KeyCode::Backspace if picker.list.search_query().is_empty() => {
+                    picker.filtering = false;
+                    return;
+                }
+                code => code,
             }
-            KeyCode::Char('a') => picker.selected = picker.options.iter().cloned().collect(),
-            KeyCode::Char('c') => picker.selected.clear(),
-            KeyCode::Enter => {
-                let selected = picker.selected.clone();
-                self.keys.models = selected;
+        } else {
+            match code {
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Esc | KeyCode::Char('f') => {
+                    self.keys.picker = None;
+                    return;
+                }
+                KeyCode::Char('a') => return picker.set_all(true),
+                KeyCode::Char('c') => return picker.set_all(false),
+                KeyCode::Char('/') => {
+                    picker.filtering = true;
+                    return;
+                }
+                KeyCode::Char('k') => KeyCode::Up,
+                KeyCode::Char('j') => KeyCode::Down,
+                // Letters do not type until `/` opens the filter.
+                KeyCode::Char(c) if c != ' ' => return,
+                KeyCode::Backspace => return,
+                code => code,
+            }
+        };
+        let Some(key) = key_input(code) else {
+            return;
+        };
+        match picker.list.key(key) {
+            Outcome::Applied(models) => {
+                self.keys.models = models.into_iter().collect();
                 self.keys.picker = None;
                 self.keys.scroll = 0;
                 self.request_keys_usage();
             }
-            _ => {}
+            Outcome::Cancelled => self.keys.picker = None,
+            Outcome::Changed | Outcome::Ignored => {}
         }
     }
 
     /// Key handling for the Config overlay (`c`, config-editor v1): arrows
-    /// move the cursor, Enter activates the row (toggle / cycle / edit
-    /// prompt), `c`/`Esc` closes.
+    /// (and `j`/`k`, PgUp/PgDn, Home/End) move the cursor over the editable
+    /// rows — read-only rows are skipped — and stop at the ends; Enter
+    /// activates the row (toggle / cycle / edit prompt), `c`/`Esc` closes.
     fn on_key_config(&mut self, code: KeyCode, view: Option<&DashboardView>) {
-        let rows = view.map(|v| {
-            let chrome = self.chrome();
-            ui::config_row_count(v, &chrome)
-        });
-        let rows = rows.unwrap_or(0);
+        let code = match code {
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('j') => KeyCode::Down,
+            code => code,
+        };
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') | KeyCode::Esc => self.overlay = Overlay::None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.config_cursor = self.config_cursor.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
+                if let (Some(view), Some(key)) = (view, key_input(code)) {
+                    let chrome = self.chrome();
+                    self.config_cursor = ui::config_cursor_after(view, &chrome, key);
+                }
             }
             KeyCode::Enter => {
                 let action = view.and_then(|v| {
@@ -2843,11 +2990,13 @@ impl App {
         // Scheduler mode applies through its own live path
         // (toggle_scheduler_mode) — enter the confirm gate directly.
         if action == ui::ConfigAction::SchedMode {
-            self.config_input =
-                confirm_prompt(action, &crate::proxy::server::SettingsRequest::default());
+            self.open_config_confirm(
+                action,
+                &crate::proxy::server::SettingsRequest::default(),
+                view,
+            );
             self.config_pending = None;
             self.config_pending_value = None;
-            self.mode = Mode::ConfigConfirm { action };
             return;
         }
         // Toggle actions: build the request from the CURRENT view value.
@@ -2856,12 +3005,46 @@ impl App {
             return self.set_status("config: value unavailable".into());
         };
         if action.needs_confirm() {
-            self.config_input = confirm_prompt(action, &req);
+            self.open_config_confirm(action, &req, view);
             self.config_pending = Some(req);
-            self.mode = Mode::ConfigConfirm { action };
         } else {
             self.send_settings(req, None, view);
         }
+    }
+
+    /// Open the confirm gate for `req`: the question names the setting and
+    /// its current → new value, and the mark starts on Apply (Enter always
+    /// applied on this gate).
+    fn open_config_confirm(
+        &mut self,
+        action: ui::ConfigAction,
+        req: &crate::proxy::server::SettingsRequest,
+        view: Option<&DashboardView>,
+    ) {
+        let old = self.config_current_value(action, view);
+        self.config_input = confirm_prompt(action, req, &old, view);
+        self.confirm_choice = 0;
+        self.mode = Mode::ConfigConfirm { action };
+    }
+
+    /// The value a config row holds now, as the gate's "old" side: the value
+    /// saved this session (restart rows) when there is one, else what the
+    /// editor shows.
+    fn config_current_value(
+        &self,
+        action: ui::ConfigAction,
+        view: Option<&DashboardView>,
+    ) -> String {
+        let saved = self.config_saved.get(&action).cloned();
+        if action == ui::ConfigAction::RawIoRetention {
+            return saved
+                .and_then(|d| d.parse::<u64>().ok())
+                .or_else(|| view.map(|v| v.config_facts.raw_io_retention_days))
+                .map_or_else(|| "?".into(), retention_label);
+        }
+        saved
+            .or_else(|| view.and_then(|v| ui::config_row_value(v, &self.chrome(), action)))
+            .unwrap_or_else(|| "?".into())
     }
 
     /// Build the SettingsRequest a TOGGLE row produces (inverse of the
@@ -2942,10 +3125,9 @@ impl App {
                                 })
                             };
                         if needs {
-                            self.config_input = confirm_prompt(action, &req);
+                            self.open_config_confirm(action, &req, view);
                             self.config_pending = Some(req);
                             self.config_pending_value = Some(raw.trim().to_string());
-                            self.mode = Mode::ConfigConfirm { action };
                         } else {
                             self.send_settings(req, Some((action, raw.trim().to_string())), view);
                         }
@@ -2956,16 +3138,18 @@ impl App {
         }
     }
 
-    /// Keys on the confirm gate (Mode::ConfigConfirm): `y`/Enter applies the
-    /// pending request, anything declining cancels with no change.
+    /// Keys on the confirm gate (Mode::ConfigConfirm): `1` / `y` apply the
+    /// pending request, `2` / `n` / Esc cancel with no change, ↑↓ move the
+    /// mark and Enter answers it (Apply until moved — Enter always applied
+    /// here). Other keys do nothing.
     fn on_key_config_confirm(
         &mut self,
         code: KeyCode,
         action: ui::ConfigAction,
         view: Option<&DashboardView>,
     ) {
-        match code {
-            KeyCode::Char('y') | KeyCode::Enter => {
+        match gate_answer(code, self.confirm_choice) {
+            GateAnswer::Confirm => {
                 self.config_input.clear();
                 self.mode = Mode::Normal;
                 if action == ui::ConfigAction::SchedMode {
@@ -2978,14 +3162,15 @@ impl App {
                     self.send_settings(req, origin, view);
                 }
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            GateAnswer::Cancel => {
                 self.config_input.clear();
                 self.config_pending = None;
                 self.config_pending_value = None;
                 self.mode = Mode::Normal;
                 self.set_status("config: cancelled".into());
             }
-            _ => {}
+            GateAnswer::Moved(choice) => self.confirm_choice = choice,
+            GateAnswer::Ignored => {}
         }
     }
 
@@ -3524,8 +3709,9 @@ impl App {
         ));
     }
 
-    /// Key handling for `Mode::ConfirmReset`: arrows pick the account, `y`
-    /// redeems ONE reset, anything else closes the dialog.
+    /// Key handling for `Mode::ConfirmReset`: arrows pick the account, `1` /
+    /// `y` redeems ONE reset, anything else — Enter included, the gate keeps
+    /// its mark on Cancel — closes the dialog.
     ///
     /// Closing is NOT abandoning: a redemption this client is still holding
     /// stays held (and the daemon keeps its own pending receipt), so reopening
@@ -3552,11 +3738,11 @@ impl App {
                 self.mode = Mode::ConfirmReset { idx };
                 self.set_reset_confirm_status(idx, view);
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            _ if gate_answer(code, ui::ACCOUNT_GATE_MARK) == GateAnswer::Confirm => {
                 self.submit_reset(idx, view);
                 self.mode = Mode::Normal;
             }
-            // Any other key (Esc/n/q/…) closes the dialog only.
+            // Any other key (Esc/n/2/Enter/q/…) closes the dialog only.
             _ => {
                 self.mode = Mode::Normal;
                 self.set_status(match self.pending_redemption.as_ref() {
@@ -4135,7 +4321,9 @@ impl App {
         if can_open_browser() {
             self.mode = Mode::NewLogin { idx: 0 };
             self.set_status(
-                "new login: ↑↓ pick provider, Enter to open the browser, Esc to cancel".into(),
+                "new login: 1-5 or ↑↓ + Enter picks the provider and opens the browser, Esc \
+                 cancels"
+                    .into(),
             );
         } else {
             self.mode = Mode::Normal;
@@ -4143,31 +4331,52 @@ impl App {
         }
     }
 
-    /// Key handling for `Mode::NewLogin` — the provider picker. Up/down move
-    /// the cursor; Enter queues the chosen login for the event loop (which
-    /// suspends the TUI, runs the browser flow, then re-inits); Esc cancels.
+    /// Key handling for `Mode::NewLogin` — the provider picker
+    /// ([`ui::login_list`]). The arrows (and `j`/`k`, PgUp/PgDn, Home/End)
+    /// move the cursor and stop at the ends; a digit `1`–`5` or Enter queues
+    /// that login for the event loop (which suspends the TUI, runs the
+    /// browser flow, then re-inits); any other key cancels.
     fn on_key_new_login(&mut self, code: KeyCode, idx: usize) {
+        use twolab_tui::scroll::ListAction;
+        use twolab_tui::select_list::Outcome;
         let len = LoginKind::ALL.len();
         let idx = idx.min(len - 1);
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+        let code = match code {
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('j') => KeyCode::Down,
+            code => code,
+        };
+        let mut list = ui::login_list(idx);
+        let outcome = key_input(code).map(|key| {
+            if ListAction::from_key(key).is_some() {
+                // Movement never cancels, and never wraps past an end.
+                let wrapped = match code {
+                    KeyCode::Up => idx == 0,
+                    KeyCode::Down => idx + 1 == len,
+                    _ => false,
+                };
+                if !wrapped {
+                    list.key(key);
+                }
+                Outcome::Changed
+            } else {
+                list.key(key)
+            }
+        });
+        match outcome {
+            Some(Outcome::Changed) => {
                 self.mode = Mode::NewLogin {
-                    idx: idx.saturating_sub(1),
+                    idx: list.selected().unwrap_or(idx).min(len - 1),
                 };
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.mode = Mode::NewLogin {
-                    idx: (idx + 1).min(len - 1),
-                };
-            }
-            KeyCode::Enter => {
-                let kind = LoginKind::ALL[idx];
+            Some(Outcome::Accepted(i)) => {
+                let kind = LoginKind::ALL[i.min(len - 1)];
                 self.pending_login = Some(kind);
                 self.mode = Mode::Normal;
                 self.set_status(format!("opening browser for {}…", kind.label()));
             }
             // Any other key cancels.
-            _ => {
+            Some(Outcome::Cancelled | Outcome::Ignored) | None => {
                 self.mode = Mode::Normal;
                 self.set_status("new login cancelled".into());
             }
@@ -4229,8 +4438,9 @@ impl App {
     }
 
     /// Key handling for `Mode::ConfirmRemove` — a destructive delete gate.
-    /// `y` confirms the removal; any other key cancels. Arrow/j/k move the
-    /// target row so the operator can pick which account to delete.
+    /// `1` / `y` confirm the removal; any other key (Enter included — the
+    /// gate keeps its mark on Cancel) cancels. Arrow/j/k move the target row
+    /// so the operator can pick which account to delete.
     fn on_key_confirm_remove(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
         let len = view.map_or(0, |v| v.snapshot.accounts.len());
         if len == 0 {
@@ -4249,11 +4459,11 @@ impl App {
                     idx: (idx + 1).min(len - 1),
                 };
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            _ if gate_answer(code, ui::ACCOUNT_GATE_MARK) == GateAnswer::Confirm => {
                 self.submit_remove(idx, view);
                 self.mode = Mode::Normal;
             }
-            // Any other key (Esc/n/q/…) cancels — delete is never silent.
+            // Any other key (Esc/n/2/Enter/q/…) cancels — delete is never silent.
             _ => {
                 self.mode = Mode::Normal;
                 self.set_status("remove cancelled".into());
@@ -4814,17 +5024,85 @@ pub(crate) fn reset_confirm_status(
     owned: Option<u64>,
     applicable: Option<u64>,
 ) -> String {
-    let inventory = match owned {
+    let inventory = reset_inventory(owned, applicable);
+    format!(
+        "redeem ONE rate-limit reset for {account}? ({inventory}) — y confirms, Esc cancels; \
+         this spends a reset upstream and cannot be undone"
+    )
+}
+
+/// An account's reset inventory as the gate and its status line say it.
+pub(crate) fn reset_inventory(owned: Option<u64>, applicable: Option<u64>) -> String {
+    match owned {
         None => "inventory unknown".to_string(),
         Some(owned) => match applicable {
             Some(applicable) => format!("{owned} owned · {applicable} applicable now"),
             None => format!("{owned} owned · applicable unknown"),
         },
+    }
+}
+
+/// A crossterm key as twolab-tui's [`KeyInput`](twolab_tui::KeyInput), the
+/// input every catalog widget takes. The handlers see only the key code
+/// (Ctrl-C is handled above them), so no modifiers are set. Written here
+/// rather than through the crate's `crossterm` feature, which would change
+/// the lockfiles of llmux and the three islands crates for ten lines.
+fn key_input(code: KeyCode) -> Option<twolab_tui::KeyInput> {
+    use twolab_tui::Key;
+    let key = match code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        _ => return None,
     };
-    format!(
-        "redeem ONE rate-limit reset for {account}? ({inventory}) — y confirms, Esc cancels; \
-         this spends a reset upstream and cannot be undone"
-    )
+    Some(twolab_tui::KeyInput::new(key))
+}
+
+/// What a key does on a two-option confirm gate (option 1 confirms, option 2
+/// cancels — the card drawn by `ui::draw_gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAnswer {
+    Confirm,
+    Cancel,
+    /// ↑↓ / Tab moved the mark to this option.
+    Moved(usize),
+    Ignored,
+}
+
+/// Run `code` through the gate's [`ChoiceForm`](twolab_tui::choice_form::ChoiceForm)
+/// with option `marked` marked: digits answer at once, Enter answers the
+/// marked option, Esc cancels, ↑↓ / Tab move the mark. `y` and `n` stay as
+/// aliases for options 1 and 2 (the keys these gates always had).
+fn gate_answer(code: KeyCode, marked: usize) -> GateAnswer {
+    use twolab_tui::choice_form::{ChoiceAnswer, ChoiceEvent, ChoiceForm, ChoiceState};
+    match code {
+        KeyCode::Char('y' | 'Y') => return GateAnswer::Confirm,
+        KeyCode::Char('n' | 'N') => return GateAnswer::Cancel,
+        _ => {}
+    }
+    let Some(key) = key_input(code) else {
+        return GateAnswer::Ignored;
+    };
+    let form = ChoiceForm::new("", ["confirm", "cancel"]).no_other();
+    let mut state = ChoiceState::at(marked);
+    match form.key(&mut state, key) {
+        ChoiceEvent::Answered(ChoiceAnswer::Option(0)) => GateAnswer::Confirm,
+        ChoiceEvent::Answered(_) | ChoiceEvent::Cancelled => GateAnswer::Cancel,
+        ChoiceEvent::Moved => GateAnswer::Moved(state.selected()),
+        ChoiceEvent::Edited | ChoiceEvent::Ignored => GateAnswer::Ignored,
+    }
 }
 
 /// Map a daemon-side control error onto a client outcome. The two errors that
@@ -5889,35 +6167,93 @@ fn settings_status(applied: &[&str], restart: &[&str]) -> String {
     }
 }
 
-/// The y/n confirm prompt for a blast-radius change.
-fn confirm_prompt(action: ui::ConfigAction, req: &crate::proxy::server::SettingsRequest) -> String {
+/// Raw-io retention in days as the confirm gate says it.
+fn retention_label(days: u64) -> String {
+    if days == 0 {
+        "keep forever".into()
+    } else {
+        format!("{days}d")
+    }
+}
+
+/// The confirm gate's question for a blast-radius config change: the
+/// setting, its current value `old` → the new one, and what applying it
+/// does — on two lines, so the card keeps the consequence in view.
+fn confirm_prompt(
+    action: ui::ConfigAction,
+    req: &crate::proxy::server::SettingsRequest,
+    old: &str,
+    view: Option<&DashboardView>,
+) -> String {
     use ui::ConfigAction as A;
-    match action {
-        A::SchedMode => "flip scheduler mode (live scheduling policy)?".into(),
-        A::RoutingEnabled => format!(
-            "set routing.enabled = {} (reroutes LIVE traffic)?",
-            req.routing_enabled.unwrap_or_default()
-        ),
-        A::RawIoEnabled => format!(
-            "set raw-io capture = {} (writes FULL request/response payloads to disk)?",
-            req.raw_io_enabled.unwrap_or_default()
-        ),
-        A::Upstream => format!(
-            "set upstream = {} (restart required; wrong URL breaks ALL requests)?",
-            req.upstream.clone().unwrap_or_default()
-        ),
-        A::CodexUpstream => format!(
-            "set codex upstream = {} (restart required)?",
-            req.codex_upstream.clone().unwrap_or_default()
-        ),
-        A::Ceiling5h | A::Ceiling7d | A::CeilingFbl => {
-            "set a ceiling to 0% (locks that window's scheduling)?".into()
+    let onoff = |v: Option<bool>| if v.unwrap_or_default() { "on" } else { "off" };
+    let pct = |v: Option<f64>| format!("{:.0}%", v.unwrap_or_default() * 100.0);
+    let text = |v: &Option<String>| v.clone().unwrap_or_default();
+    let (change, effect) = match action {
+        A::SchedMode => {
+            use crate::config::SchedulerMode;
+            let current = view.map_or(SchedulerMode::Default, |v| v.select_params.mode);
+            let next = match current {
+                SchedulerMode::Default => SchedulerMode::RoundRobin,
+                SchedulerMode::RoundRobin => SchedulerMode::Default,
+            };
+            (
+                format!(
+                    "Change scheduler mode: {} → {}?",
+                    current.label(),
+                    next.label()
+                ),
+                "It changes the live scheduling policy.".to_string(),
+            )
         }
-        A::RawIoRetention => format!(
-            "reduce raw-io retention to {}d (older history will be pruned)?",
-            req.raw_io_retention_days.unwrap_or_default()
+        A::RoutingEnabled => (
+            format!(
+                "Set routing.enabled: {old} → {}?",
+                onoff(req.routing_enabled)
+            ),
+            "It reroutes LIVE traffic.".to_string(),
         ),
-        _ => "apply this change?".into(),
+        A::RawIoEnabled => (
+            format!("Set raw-io capture: {old} → {}?", onoff(req.raw_io_enabled)),
+            if req.raw_io_enabled.unwrap_or_default() {
+                "It writes FULL request/response payloads to disk.".to_string()
+            } else {
+                "Request/response payloads stop being written to disk.".to_string()
+            },
+        ),
+        A::Upstream => (
+            format!("Set upstream: {old} → {}?", text(&req.upstream)),
+            "Restart required; a wrong URL breaks ALL requests.".to_string(),
+        ),
+        A::CodexUpstream => (
+            format!("Set codex upstream: {old} → {}?", text(&req.codex_upstream)),
+            "Restart required.".to_string(),
+        ),
+        A::Ceiling5h => (
+            format!("Set 5h ceiling: {old} → {}?", pct(req.five_hour_max)),
+            "A 0% ceiling locks that window's scheduling.".to_string(),
+        ),
+        A::Ceiling7d => (
+            format!("Set 7d ceiling: {old} → {}?", pct(req.seven_day_max)),
+            "A 0% ceiling locks that window's scheduling.".to_string(),
+        ),
+        A::CeilingFbl => (
+            format!("Set fbl ceiling: {old} → {}?", pct(req.fable_weekly_max)),
+            "A 0% ceiling locks that window's scheduling.".to_string(),
+        ),
+        A::RawIoRetention => (
+            format!(
+                "Reduce raw-io retention: {old} → {}?",
+                retention_label(req.raw_io_retention_days.unwrap_or_default())
+            ),
+            "Older history will be pruned.".to_string(),
+        ),
+        _ => ("Apply this change?".to_string(), String::new()),
+    };
+    if effect.is_empty() {
+        change
+    } else {
+        format!("{change}\n{effect}")
     }
 }
 
@@ -6124,6 +6460,55 @@ mod tests {
         app.mode = Mode::NewLogin { idx: 4 };
         app.on_key_new_login(KeyCode::Enter, 4);
         assert_eq!(app.take_pending_login(), Some(LoginKind::Gemini));
+    }
+
+    /// The picker is a select list: a digit picks its provider at once, and
+    /// any key that is not a picker key still cancels.
+    #[test]
+    fn new_login_picker_digits_pick_and_other_keys_cancel() {
+        let mut app = remote_app();
+        app.mode = Mode::NewLogin { idx: 0 };
+        app.on_key_new_login(KeyCode::Char('4'), 0);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::OpenRouter));
+
+        app.mode = Mode::NewLogin { idx: 2 };
+        app.on_key_new_login(KeyCode::Char('j'), 2);
+        assert_eq!(app.mode, Mode::NewLogin { idx: 3 }, "j moves down");
+        app.on_key_new_login(KeyCode::End, 3);
+        assert_eq!(app.mode, Mode::NewLogin { idx: 4 }, "End: last provider");
+        app.on_key_new_login(KeyCode::Char('x'), 4);
+        assert_eq!(app.mode, Mode::Normal, "any other key cancels");
+        assert_eq!(app.take_pending_login(), None);
+    }
+
+    /// The config cursor moves over editable rows only (read-only rows are
+    /// the list's disabled rows) and stops at both ends.
+    #[test]
+    fn config_cursor_skips_read_only_rows_and_stops_at_the_ends() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        let chrome = app.chrome();
+        let editable: Vec<usize> = (0..60)
+            .filter(|&i| ui::config_row_action(&view, &chrome, i).is_some())
+            .collect();
+        // Rows 5 and 6 (per-account limits, paused accounts) are read-only.
+        assert!(!editable.contains(&5) && !editable.contains(&6));
+        app.config_cursor = 4;
+        app.on_key_config(KeyCode::Down, Some(&view));
+        assert_eq!(app.config_cursor, 7, "Down skips the read-only rows");
+        app.on_key_config(KeyCode::Char('k'), Some(&view));
+        assert_eq!(app.config_cursor, 4, "k skips them going up");
+        app.on_key_config(KeyCode::Home, Some(&view));
+        assert_eq!(app.config_cursor, editable[0]);
+        app.on_key_config(KeyCode::Up, Some(&view));
+        assert_eq!(app.config_cursor, editable[0], "Up stops at the top");
+        app.on_key_config(KeyCode::End, Some(&view));
+        let last = *editable.last().expect("editable rows");
+        assert_eq!(app.config_cursor, last);
+        app.on_key_config(KeyCode::Down, Some(&view));
+        assert_eq!(app.config_cursor, last, "Down stops at the bottom");
     }
 
     #[test]
@@ -7362,8 +7747,8 @@ mod tests {
 
         app.on_key_keys(KeyCode::Char('f'), None);
         let picker = app.keys.picker.as_ref().expect("picker opened");
-        assert_eq!(picker.options, vec!["model-a", "model-b"]);
-        assert!(picker.selected.is_empty(), "starts from the live filter");
+        assert_eq!(picker.options(), vec!["model-a", "model-b"]);
+        assert!(picker.selected().is_empty(), "starts from the live filter");
 
         app.on_key_keys(KeyCode::Char(' '), None); // select model-a
         app.on_key_keys(KeyCode::Down, None);
@@ -7400,10 +7785,10 @@ mod tests {
 
         app.on_key_keys(KeyCode::Char('f'), None);
         app.on_key_keys(KeyCode::Char('a'), None);
-        assert_eq!(app.keys.picker.as_ref().unwrap().selected.len(), 2, "all");
+        assert_eq!(app.keys.picker.as_ref().unwrap().selected().len(), 2, "all");
         app.on_key_keys(KeyCode::Char('c'), None);
         assert!(
-            app.keys.picker.as_ref().unwrap().selected.is_empty(),
+            app.keys.picker.as_ref().unwrap().selected().is_empty(),
             "clear"
         );
 
@@ -7475,9 +7860,102 @@ mod tests {
         app.on_key_keys(KeyCode::Char('f'), None);
         let picker = app.keys.picker.as_ref().expect("picker opened");
         assert_eq!(
-            picker.options,
+            picker.options(),
             vec!["model-a".to_string(), "model-b".to_string()],
             "cached options survive the in-flight query"
+        );
+    }
+
+    /// The picker refreshes its options when the query lands: `f` pressed
+    /// during the first load used to keep an empty list ("no models
+    /// observed") over a panel full of models. Checks and the cursor row
+    /// survive the refresh.
+    #[test]
+    fn the_model_picker_refreshes_its_options_when_the_query_lands() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.overlay = Overlay::Keys;
+        app.on_key_keys(KeyCode::Char('f'), None);
+        assert!(app.keys.picker.as_ref().expect("open").options().is_empty());
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(
+            frame.contains("loading the models in this window"),
+            "{frame}"
+        );
+
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc.clone()),
+        });
+        let picker = app.keys.picker.as_ref().expect("still open");
+        assert_eq!(picker.options(), vec!["model-a", "model-b"]);
+        app.on_key_keys(KeyCode::Down, None);
+        app.on_key_keys(KeyCode::Char(' '), None); // check model-b
+                                                   // A later answer (a refresh) rebuilds again and keeps the check and
+                                                   // the cursor on model-b.
+        app.request_keys_usage();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        let picker = app.keys.picker.as_ref().expect("still open");
+        assert_eq!(
+            picker.selected().into_iter().collect::<Vec<_>>(),
+            vec!["model-b"]
+        );
+        assert_eq!(picker.list.selected(), Some(1), "cursor stays on model-b");
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("1 of 2 selected"), "{frame}");
+    }
+
+    /// Type-to-filter starts on `/` (letters are picker keys until then):
+    /// the count still covers every model and says how many the filter
+    /// hides; Esc closes the filter, not the picker.
+    #[test]
+    fn the_model_picker_filters_after_slash_and_counts_every_model() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.overlay = Overlay::Keys;
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+        app.on_key_keys(KeyCode::Char('f'), None);
+        app.on_key_keys(KeyCode::Char('b'), None);
+        assert_eq!(
+            app.keys.picker.as_ref().unwrap().list.search_query(),
+            "",
+            "a letter before `/` types nothing"
+        );
+        app.on_key_keys(KeyCode::Char('/'), None);
+        for c in "del-b".chars() {
+            app.on_key_keys(KeyCode::Char(c), None);
+        }
+        let picker = app.keys.picker.as_ref().unwrap();
+        assert_eq!(picker.list.search_query(), "del-b");
+        assert_eq!(picker.list.visible_len(), 1);
+        app.on_key_keys(KeyCode::Char(' '), None); // check model-b under the filter
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("1 of 2 selected"), "{frame}");
+        assert!(frame.contains("(1 hidden by the filter)"), "{frame}");
+        assert!(frame.contains("Esc stop filtering"), "{frame}");
+        // `a` while filtering is a letter of the filter, not "select all".
+        app.on_key_keys(KeyCode::Char('a'), None);
+        assert_eq!(app.keys.picker.as_ref().unwrap().selected().len(), 1);
+        app.on_key_keys(KeyCode::Esc, None);
+        let picker = app
+            .keys
+            .picker
+            .as_ref()
+            .expect("Esc closes the filter only");
+        assert!(!picker.filtering && picker.list.search_query().is_empty());
+        app.on_key_keys(KeyCode::Enter, None);
+        assert_eq!(
+            app.keys.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["model-b".to_string()]
         );
     }
 
@@ -8802,6 +9280,49 @@ mod tests {
         assert!(app.pending_redemption.is_none());
     }
 
+    /// Only `1` / `y` spend a reset: Enter (the marked "Cancel"), `2`, Tab
+    /// and any other key close the gate with nothing queued (review of #233
+    /// — the remove gate had this pinned by key, the reset gate only by text).
+    #[test]
+    fn reset_gate_spends_only_on_1_or_y() {
+        let mut view = control_view();
+        view.usage_controls
+            .insert("codex:c@x.com".into(), control_doc(Some(3), None));
+        let open = |app: &mut App| {
+            app.mode = Mode::Normal;
+            app.overlay = Overlay::Accounts;
+            app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+            let Mode::ConfirmReset { idx } = app.mode else {
+                panic!("expected the reset gate, got {:?}", app.mode);
+            };
+            idx
+        };
+        for cancel in [
+            KeyCode::Enter,
+            KeyCode::Char('2'),
+            KeyCode::Char('n'),
+            KeyCode::Tab,
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+        ] {
+            let mut app = remote_app();
+            let idx = open(&mut app);
+            app.on_key_confirm_reset(cancel, idx, Some(&view));
+            assert_eq!(app.mode, Mode::Normal, "{cancel:?} closes the gate");
+            assert_eq!(app.pending_control, None, "{cancel:?} spends nothing");
+            assert!(app.pending_redemption.is_none(), "{cancel:?} holds nothing");
+        }
+        for confirm in [KeyCode::Char('1'), KeyCode::Char('y')] {
+            let mut app = remote_app();
+            let idx = open(&mut app);
+            app.on_key_confirm_reset(confirm, idx, Some(&view));
+            assert!(
+                app.pending_control.is_some() || app.pending_redemption.is_some(),
+                "{confirm:?} spends one reset"
+            );
+        }
+    }
+
     /// A roster with no codex OR claude account cannot open the gate at all;
     /// a claude-only roster can (its grants are a reset entitlement too).
     #[test]
@@ -8889,6 +9410,169 @@ mod tests {
             ControlOp::Reset { account, .. } => assert_eq!(account, "claude:a@x.com"),
             other => panic!("expected a redemption, got {other:?}"),
         }
+    }
+
+    /// Render the app's current frame as one string (the runtime's own draw
+    /// call, on a test backend).
+    fn render_app(app: &App, view: &DashboardView, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        let chrome = app.chrome();
+        let mut hits = None;
+        terminal
+            .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Age the status line past its TTL, as five seconds of waiting would.
+    fn expire_status(app: &mut App) {
+        if let Some((_, at)) = app.status.as_mut() {
+            *at = Instant::now()
+                .checked_sub(STATUS_TTL + Duration::from_secs(1))
+                .expect("monotonic clock far enough from its origin");
+        }
+        assert_eq!(app.status_line(), None, "the status line expired");
+    }
+
+    /// The reset gate names its account, the inventory and the numbered
+    /// choices for as long as it is open — after the five-second status line
+    /// is gone too (the bug: the footer then read a bare `redeem ONE reset?`).
+    #[test]
+    fn reset_gate_names_its_account_after_the_status_line_expires() {
+        let mut view = control_view();
+        view.usage_controls
+            .insert("codex:c@x.com".into(), control_doc(Some(3), None));
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&view));
+        let order = view.display_order(Default::default(), SystemTime::now());
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].id.0 == "codex:c@x.com")
+            .expect("codex row");
+        app.mode = Mode::ConfirmReset { idx: codex_pos };
+        expire_status(&mut app);
+        for (w, h) in [(80, 24), (179, 43)] {
+            let frame = render_app(&app, &view, w, h);
+            assert!(frame.contains("codex:c@x.com"), "{frame}");
+            assert!(frame.contains("Redeem ONE rate-limit reset"), "{frame}");
+            assert!(frame.contains("3 owned"), "{frame}");
+            assert!(frame.contains("1) Redeem one reset"), "{frame}");
+            assert!(
+                frame.contains("❯ 2) Cancel"),
+                "the mark rests on Cancel: {frame}"
+            );
+            assert!(frame.contains("1/y redeem"), "{frame}");
+        }
+        // A held redemption is named with its request id instead.
+        app.pending_redemption = Some(PendingRedemption {
+            account: "codex:c@x.com".into(),
+            request_id: "rid-7".into(),
+            credit_id: None,
+        });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("UNRESOLVED redemption"), "{frame}");
+        assert!(frame.contains("rid-7"), "{frame}");
+    }
+
+    /// The remove gate says WHICH account it deletes (it used to read
+    /// `remove selected?`), follows the cursor, and keeps "any other key
+    /// cancels": Enter and `2` cancel, only `1` / `y` remove.
+    #[test]
+    fn remove_gate_names_the_account_and_only_1_or_y_remove() {
+        let view = control_view();
+        let order = view.display_order(Default::default(), SystemTime::now());
+        let name = |idx: usize| view.snapshot.accounts[order[idx]].id.0.clone();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('r'), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains(&format!("Remove {}", name(0))), "{frame}");
+        app.on_key_confirm_remove(KeyCode::Down, 0, Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 1 });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains(&format!("Remove {}", name(1))), "{frame}");
+
+        for cancel in [
+            KeyCode::Enter,
+            KeyCode::Char('2'),
+            KeyCode::Tab,
+            KeyCode::Char('q'),
+        ] {
+            app.mode = Mode::ConfirmRemove { idx: 1 };
+            app.on_key_confirm_remove(cancel, 1, Some(&view));
+            assert_eq!(app.mode, Mode::Normal, "{cancel:?} closes the gate");
+            assert_eq!(
+                app.take_pending_remove(),
+                None,
+                "{cancel:?} removes nothing"
+            );
+        }
+        app.mode = Mode::ConfirmRemove { idx: 1 };
+        app.on_key_confirm_remove(KeyCode::Char('1'), 1, Some(&view));
+        assert_eq!(
+            app.take_pending_remove(),
+            Some(name(1)),
+            "1 removes the named account"
+        );
+    }
+
+    /// The config gate states the setting and its old → new value on the
+    /// card; ↑↓ move the mark, Enter answers it (Apply until moved), `2` and
+    /// `n` cancel.
+    #[test]
+    fn config_gate_states_old_and_new_and_enter_answers_the_mark() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.activate_config_action(ui::ConfigAction::RoutingEnabled, Some(&view));
+        assert!(
+            matches!(app.mode, Mode::ConfigConfirm { .. }),
+            "{:?}",
+            app.mode
+        );
+        expire_status(&mut app);
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("Set routing.enabled: off → on?"), "{frame}");
+        assert!(frame.contains("reroutes LIVE traffic"), "{frame}");
+        assert!(frame.contains("❯ 1) Apply"), "{frame}");
+
+        // Moving the mark to Cancel makes Enter cancel.
+        app.on_key_config_confirm(KeyCode::Down, ui::ConfigAction::RoutingEnabled, Some(&view));
+        assert_eq!(app.confirm_choice, 1);
+        assert!(render_app(&app, &view, 80, 24).contains("❯ 2) Cancel"));
+        app.on_key_config_confirm(
+            KeyCode::Enter,
+            ui::ConfigAction::RoutingEnabled,
+            Some(&view),
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.config_pending.is_none(),
+            "Enter on Cancel applies nothing"
+        );
+
+        // Reopening starts on Apply again; a ceiling driven to 0 names both values.
+        app.mode = Mode::ConfigEdit {
+            action: ui::ConfigAction::Ceiling5h,
+        };
+        app.config_input = "0".into();
+        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, Some(&view));
+        assert_eq!(app.confirm_choice, 0);
+        let p = (view.select_params.five_hour_max * 100.0).round();
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(
+            frame.contains(&format!("Set 5h ceiling: {p}% → 0%?")),
+            "{frame}"
+        );
+        app.on_key_config_confirm(KeyCode::Char('2'), ui::ConfigAction::Ceiling5h, Some(&view));
+        assert_eq!(app.mode, Mode::Normal, "2 cancels");
     }
 
     /// The redemption id is minted ONCE by the client and held before the
