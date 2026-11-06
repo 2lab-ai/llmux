@@ -119,8 +119,11 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   is the group, the model, the 10-cell share bar, requests, tokens, cost and
   last use, aligned in columns, and the title row adds a dim
   `group · model · share · req · tok · $ · last` legend when there is room.
-  Token counts are shown whole (`154581.1M`); the old fixed-width column cut
-  the unit off. Narrower terminals keep the one-model-per-row table. The
+  Counts take at most six cells and keep their unit: `999`, `1.2k`, `3.4M`,
+  then `154.6G`, `T` and up, and a count that would read `1000.0k` reads
+  `1.0M` (they used to stay in `M`, so the one-model-per-row table cut
+  243.6 billion tokens to `243578.5`). A percentage that cannot be computed
+  reads `—`. Narrower terminals keep the one-model-per-row table. The
   packing choice reserves room for the widest `last` value (`N in-flight`),
   so a model starting or finishing a request does not change the strip's
   height.
