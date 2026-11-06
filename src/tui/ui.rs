@@ -24310,6 +24310,234 @@ mod tests {
         );
     }
 
+    /// A left click at `(column, row)`, as crossterm delivers it.
+    fn left_click(column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// The hit map's paint order: the account modal, drawn over the
+    /// accounts table, covers every row of it — a click on a row is the
+    /// modal's (swallowed, the modal stays pinned), at 80×24 and 179×43 —
+    /// and its `esc close` button from the same frame closes it.
+    #[test]
+    fn hit_map_a_modal_over_the_account_rows_takes_their_clicks() {
+        let (view, mut chrome) = live_view();
+        let id = live_id(1);
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            chrome.account_modal = None;
+            let (_, under) = render_with_hits(&view, &chrome, w, h);
+            let rows = account_rows(&under);
+            assert!(rows.len() > 5, "{w}x{h}: the rows beneath");
+            chrome.account_modal = Some(AccountModal::new(id.clone()));
+            let (drawn, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = drawn.join("\n");
+            let layout = hits.account_modal.clone().expect("the modal drew");
+            assert!(
+                hits.hits
+                    .iter()
+                    .any(|(_, t)| matches!(t, ClickTarget::AccountRow(_))),
+                "{w}x{h}: the rows are recorded, beneath the modal"
+            );
+            assert!(
+                account_rows(&hits).is_empty(),
+                "{w}x{h}: no row is reachable under the modal:\n{frame}"
+            );
+            let mut app = fold_app();
+            app.hits = hits.hits.clone();
+            let mut modal = AccountModal::new(id.clone());
+            super::super::adopt_modal_layout(&mut modal.state, layout.clone());
+            app.account_modal = Some(modal);
+            let mut over = 0;
+            for (row, _) in &rows {
+                let (x, y) = (row.x + 2, row.y);
+                let target = hits.hits.hit_test(x, y);
+                assert!(
+                    matches!(
+                        target,
+                        Some(
+                            ClickTarget::Surface(Surface::Modal)
+                                | ClickTarget::ModalScrollbar
+                                | ClickTarget::ModalClose
+                        )
+                    ),
+                    "{w}x{h}: the modal is on top at {x},{y}: {target:?}"
+                );
+                if target == Some(&ClickTarget::ModalClose) {
+                    continue;
+                }
+                over += usize::from(layout.outer.contains((x, y).into()));
+                assert!(app.on_mouse(left_click(x, y), Some(&view)));
+                assert_eq!(
+                    app.account_modal.as_ref().map(|m| m.account.as_str()),
+                    Some(id.as_str()),
+                    "{w}x{h}: the row at {x},{y} did not re-pin the modal"
+                );
+                assert_eq!(app.menu_account, None);
+            }
+            assert!(over > 0, "{w}x{h}: some rows lie under the popup itself");
+            let close = layout.close.expect("`esc close` drawn");
+            assert_eq!(
+                hits.hits.hit_test(close.x, close.y),
+                Some(&ClickTarget::ModalClose)
+            );
+            assert!(app.on_mouse(left_click(close.x, close.y), Some(&view)));
+            assert!(app.account_modal.is_none(), "{w}x{h}: esc close closes it");
+        }
+    }
+
+    /// The hit map's paint order: the context menu lies over the rows below
+    /// the one it was opened on, so a click on an item there runs the item
+    /// (delete: the confirm gate) — the row beneath does not open its modal.
+    #[test]
+    fn hit_map_a_menu_item_over_an_account_row_runs_the_item() {
+        let (view, mut chrome) = live_view();
+        let (_, under) = render_with_hits(&view, &chrome, 179, 43);
+        let rows = account_rows(&under);
+        let (first, idx) = rows[0];
+        let order = view.display_order(chrome.account_sort, SystemTime::now());
+        let pinned = view.snapshot.accounts[order[idx]].id.0.clone();
+        chrome.mode = Mode::ContextMenu { idx, item: 0 };
+        chrome.menu_account = Some(pinned.clone());
+        chrome.menu_anchor = Some((first.x + 10, first.y));
+        let (drawn, hits) = render_with_hits(&view, &chrome, 179, 43);
+        let frame = drawn.join("\n");
+        let delete = hits
+            .hits
+            .area_of(&ClickTarget::MenuItem(3))
+            .expect("delete has a rect");
+        let (x, y) = (delete.x + 1, delete.y);
+        assert!(
+            hits.hits.iter().any(|(row, t)| {
+                matches!(t, ClickTarget::AccountRow(_)) && row.contains((x, y).into())
+            }),
+            "delete lies over an account row recorded beneath it:\n{frame}"
+        );
+        assert_eq!(hits.hits.hit_test(x, y), Some(&ClickTarget::MenuItem(3)));
+        let mut app = fold_app();
+        app.hits = hits.hits.clone();
+        app.mode = chrome.mode;
+        app.menu_account = Some(pinned);
+        app.menu_anchor = chrome.menu_anchor;
+        assert!(app.on_mouse(left_click(x, y), Some(&view)));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx }, "{frame}");
+        assert!(app.account_modal.is_none(), "the row beneath stayed shut");
+    }
+
+    /// The hit map's paint order: an expanded entry's `🔍 input` and
+    /// `🔍 request` lines lie inside its block, pushed after it, so a click
+    /// on either opens its viewer while the block's other rows toggle the
+    /// entry.
+    #[test]
+    fn hit_map_the_input_line_lies_over_its_entry_block() {
+        let entry = completed_with_excerpt(Some("user"), "hello there");
+        let key = key_of(&entry);
+        let CompletedBody::Request { id, .. } = entry.body else {
+            unreachable!("a request")
+        };
+        let mut view = view_with(Vec::new());
+        view.completed = vec![entry];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.expanded_activity = Some(key.clone());
+        let (drawn, hits) = render_with_hits(&view, &chrome, 120, 40);
+        let frame = drawn.join("\n");
+        let target = |kind| ClickTarget::Activity {
+            key: key.clone(),
+            kind,
+        };
+        let block = hits
+            .hits
+            .area_of(&target(ActivityHitKind::Entry))
+            .expect("the entry's block");
+        let input = hits
+            .hits
+            .area_of(&target(ActivityHitKind::InputLine))
+            .expect("the input line");
+        let raw = hits
+            .hits
+            .area_of(&target(ActivityHitKind::RawLine { id }))
+            .expect("the request line");
+        for line in [input, raw] {
+            assert!(
+                block.contains(line.as_position()) && block.height > 2,
+                "{line:?} is inside the block {block:?}:\n{frame}"
+            );
+        }
+        let col = block.x + 8;
+        assert_eq!(
+            activity_at(&hits.hits, col, input.y),
+            Some(ActivityClick::OpenInput(key.clone()))
+        );
+        assert_eq!(
+            activity_at(&hits.hits, col, raw.y),
+            Some(ActivityClick::OpenRaw(key.clone(), id))
+        );
+        assert_eq!(
+            activity_at(&hits.hits, col, block.y),
+            Some(ActivityClick::Entry(key.clone()))
+        );
+        let mut app = fold_app();
+        app.hits = hits.hits.clone();
+        app.expanded_activity = Some(key.clone());
+        assert!(app.on_mouse(left_click(col, input.y), Some(&view)));
+        assert_eq!(app.input_modal.as_ref().map(|m| &m.key), Some(&key));
+        assert_eq!(
+            app.expanded_activity.as_ref(),
+            Some(&key),
+            "the entry did not collapse"
+        );
+    }
+
+    /// The hit map is rebuilt by every draw: drawing a resized frame into the
+    /// record the event loop holds gives exactly the record a fresh one
+    /// would — no rect of the last frame survives — so a row the old frame
+    /// had where the new one has nothing takes no click, and a frame without
+    /// a view leaves no record at all.
+    #[test]
+    fn hit_map_is_cleared_each_frame_and_a_resize_drops_old_rects() {
+        let (view, chrome) = live_view();
+        let draw_into = |hits: &mut Option<MainChrome>, view: Option<&DashboardView>, w, h| {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+            terminal
+                .draw(|f| draw(f, view, &chrome, hits))
+                .expect("draw");
+        };
+        let mut hits = None;
+        draw_into(&mut hits, Some(&view), 179, 43);
+        let before = hits.clone().expect("a record");
+        draw_into(&mut hits, Some(&view), 80, 24);
+        let after = hits.clone().expect("a record");
+        let mut fresh = None;
+        draw_into(&mut fresh, Some(&view), 80, 24);
+        assert_eq!(after.hits, fresh.expect("a record").hits);
+        let screen = Rect::new(0, 0, 80, 24);
+        assert!(
+            after.hits.iter().all(|(r, _)| screen.union(r) == screen),
+            "every rect is on the 80x24 screen"
+        );
+        // An accounts row reached column 100 then: a click there opened its
+        // account. The next frame's record replaces the map, as the event
+        // loop does, and the same click takes nothing.
+        let (row, _) = account_rows(&before)[0];
+        let (x, y) = (100, row.y);
+        assert!(row.right() > x);
+        let mut app = fold_app();
+        app.hits = before.hits.clone();
+        assert!(app.on_mouse(left_click(x, y), Some(&view)), "a row then");
+        assert!(app.account_modal.take().is_some());
+        app.hits = after.hits.clone();
+        assert!(!app.on_mouse(left_click(x, y), Some(&view)), "nothing now");
+        assert!(app.account_modal.is_none());
+        // No view (the connecting screen): no record, so an empty map.
+        draw_into(&mut hits, None, 80, 24);
+        assert_eq!(hits, None);
+        assert!(hits.unwrap_or_default().hits.is_empty());
+    }
+
     /// `v` is on the accounts footer — `compact`, or `table` while the list
     /// shows — and in the `?` help, where the accounts group shows it even
     /// at 179×43 (the hints the grid cuts off there are the ones the
