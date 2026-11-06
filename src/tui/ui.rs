@@ -16225,9 +16225,7 @@ mod tests {
         let view = usage_control_view();
         let mut chrome = chrome_overlay(Overlay::None);
         chrome.raw_modal = Some(raw_modal_over(8 << 20));
-        let first = std::time::Instant::now();
         let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
-        let first = first.elapsed();
         let raw = hits.raw_modal.expect("drawn");
         assert!(raw.max_scroll > 100_000, "the string wraps to many rows");
         assert!(
@@ -16249,22 +16247,17 @@ mod tests {
         let before = cached(&chrome).expect("long lines wrapped at the width");
 
         chrome.raw_modal.as_mut().expect("open").scroll = raw.max_scroll / 2;
-        let again = std::time::Instant::now();
         let (rows, _) = render_with_hits(&view, &chrome, 80, 24);
-        let again = again.elapsed();
         let frame = rows.join("\n");
         assert!(
             frame.contains("lines 11–11 of 17"),
             "inside the long line:\n{frame}"
         );
         assert!(frame.contains("ababababab"), "{frame}");
+        // The same wrapped lines (key and buffer): the second frame did not
+        // wrap the 8 MiB again. Pinned by identity, not by a wall-clock bound
+        // a busy machine could break.
         assert_eq!(cached(&chrome), Some(before), "not wrapped again");
-        // Generous for a debug build on a busy machine: the first frame wraps
-        // 8 MiB once; the next draws 20 rows.
-        assert!(
-            again < std::time::Duration::from_millis(500),
-            "{again:?} (first {first:?})"
-        );
     }
 
     #[test]
@@ -22730,6 +22723,10 @@ mod tests {
     /// carries the marker's colour (the grid sits one cell in instead of the
     /// marker carrying the space). Packing, heights and every other cell
     /// unchanged (previous digest 11_040_274_043_730_846_167).
+    /// Merged with the rule re-pin above when the round-2 branches were put
+    /// together: the two touch different rows (the four rule rows vs the
+    /// strip's two packed lines), so the merged frame carries both changes
+    /// and nothing else (previous digest 8_543_463_821_239_879_891).
     const FOLD_OFF_179X43_DIGEST: u64 = 17_866_181_982_027_554_185;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before

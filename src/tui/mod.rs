@@ -5082,18 +5082,22 @@ impl App {
                 let kept: String = text.chars().filter(|&c| limits_char(c)).collect();
                 self.field.insert_str(&kept)
             }
-            _ => {
-                for c in text.chars() {
-                    let code = match c {
-                        '\r' | '\n' => KeyCode::Enter,
-                        '\t' => KeyCode::Tab,
-                        c if c.is_control() => continue,
-                        c => KeyCode::Char(c),
-                    };
-                    self.on_key(KeyEvent::new(code, KeyModifiers::NONE), view);
+            // The keys picker's open filter is the one other place text
+            // goes: its printable characters land as typed (a pasted newline
+            // applies nothing).
+            Mode::Normal
+                if !self.copy_mode && self.keys.picker.as_ref().is_some_and(|p| p.filtering) =>
+            {
+                let mut typed = false;
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), view);
+                    typed = true;
                 }
-                !text.is_empty()
+                typed
             }
+            // Anywhere else a paste is not keys: a pasted `y` never confirms
+            // a removal, a pasted `q` never quits, and copy mode stays on.
+            _ => false,
         }
     }
 
@@ -6703,7 +6707,14 @@ fn apply_event(
         Event::Key(key) => {
             let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
             let held = app.copy_mode;
+            let overlay = app.overlay;
             app.on_key(key, view.as_ref());
+            // A thumb held across a key that changes the table under it, or
+            // that releases the mouse (whose `Up` then never arrives), lets
+            // go: the next drag cannot scroll a table it was not pressed on.
+            if app.overlay != overlay || app.copy_mode {
+                app.table_drag.release();
+            }
             // A key copy mode swallowed changes nothing on screen: no redraw,
             // so the text under the terminal's selection holds still.
             if !(held && app.copy_mode) {
@@ -8577,6 +8588,37 @@ mod tests {
         assert!(app.should_quit, "Ctrl-C quits from copy mode");
     }
 
+    /// Copy mode over a modal (docs: "or over a modal"): the modal is where
+    /// the text worth selecting is — the request input, an account's last
+    /// error. `v` releases the mouse with the modal still open; while copy
+    /// mode is on the modal's keys are held like every other key (the
+    /// selection must not scroll away); the first `Esc` takes the mouse
+    /// back, the next one closes the modal.
+    #[test]
+    fn copy_mode_over_a_modal_keeps_it_open_and_esc_leaves_copy_mode_first() {
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        app.open_input_modal(key);
+        app.input_modal.as_mut().unwrap().state.layout.pos = ScrollPos::of(40, 12, 0);
+        app.on_key(press(KeyCode::Char('v')), None);
+        assert!(app.copy_mode, "v over the modal releases the mouse");
+        assert!(app.input_modal.is_some(), "the modal stays under it");
+        for code in [KeyCode::Down, KeyCode::Char('q'), KeyCode::Enter] {
+            app.on_key(press(code), None);
+        }
+        assert_eq!(
+            app.input_modal.as_ref().map(|m| m.state.scroll),
+            Some(0),
+            "the selection does not scroll away; q/Enter do not close it"
+        );
+        assert!(!app.should_quit);
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(!app.copy_mode, "the first Esc takes the mouse back");
+        assert!(app.input_modal.is_some(), "and leaves the modal open");
+        app.on_key(press(KeyCode::Esc), None);
+        assert!(app.input_modal.is_none(), "the next Esc closes the modal");
+    }
+
     /// Copy mode holds the frame still while it stays on: the render tick
     /// and background deliveries draw nothing, a key it swallows asks for no
     /// frame, a resize still draws, and entering and leaving draw.
@@ -9102,6 +9144,43 @@ mod tests {
         }
     }
 
+    /// A thumb held while a key changes the table under it (another tab)
+    /// or releases the mouse (copy mode: its `Up` never arrives) lets go, so
+    /// the next drag cannot scroll a table it was not pressed on.
+    #[test]
+    fn a_held_table_thumb_lets_go_when_a_key_changes_the_table_or_releases_the_mouse() {
+        let (view, mut doc) = keys_view_and_doc();
+        let tenant = doc.tenants[0].clone();
+        doc.tenants = (0..40)
+            .map(|i| crate::dashboard::TenantUsageDoc {
+                tenant: format!("k-{i:04}"),
+                name: format!("tenant-{i:02}"),
+                ..tenant.clone()
+            })
+            .collect();
+        let mut app = remote_app();
+        app.overlay = Overlay::Keys;
+        app.keys.doc = Some(std::sync::Arc::new(doc));
+        for leave in [KeyCode::Esc, KeyCode::Char('v')] {
+            app.overlay = Overlay::Keys;
+            app.copy_mode = false;
+            draw_and_adopt(&mut app, &view, 120, 24);
+            let bar = app.table_scroll.expect("the rows overflow the panel");
+            app.on_mouse(
+                left(MouseEventKind::Down(MouseButton::Left), 119, bar.track.y),
+                Some(&view),
+            );
+            assert!(app.table_drag.is_dragging(), "{leave:?}: pressed");
+            let (mut cached, mut dirty) = (Some(None), false);
+            apply_event(&mut app, Event::Key(press(leave)), &mut cached, &mut dirty);
+            assert!(
+                app.overlay != Overlay::Keys || app.copy_mode,
+                "{leave:?} leaves the table or releases the mouse"
+            );
+            assert!(!app.table_drag.is_dragging(), "{leave:?}: let go");
+        }
+    }
+
     /// The keys table's scrollbar (batch 2): a press low on the track jumps
     /// the table there, the thumb can be grabbed and dragged back to the top,
     /// and the release ends the drag — the wheel and keys still scroll.
@@ -9616,6 +9695,13 @@ mod tests {
             .as_ref()
             .expect("Esc closes the filter only");
         assert!(!picker.filtering && picker.list.search_query().is_empty());
+        // A paste lands in the open filter as typed; its newline applies
+        // nothing.
+        app.on_key_keys(KeyCode::Char('/'), None);
+        assert!(app.on_paste("del-b\n", None));
+        let picker = app.keys.picker.as_ref().expect("the paste applies nothing");
+        assert_eq!(picker.list.search_query(), "del-b");
+        app.on_key_keys(KeyCode::Esc, None);
         app.on_key_keys(KeyCode::Enter, None);
         assert_eq!(
             app.keys.models.iter().cloned().collect::<Vec<_>>(),
@@ -9906,11 +9992,26 @@ mod tests {
             }
             Backend::Local(_) => unreachable!("remote app"),
         }
-        // Outside a field a paste is typed key by key, as before.
+        // Outside a field a paste is not keys: a pasted `a` opens nothing,
+        // a pasted `q` does not quit, a pasted `yes` confirms no removal and
+        // copy mode stays on under a pasted `v`.
         app.mode = Mode::Normal;
         app.overlay = Overlay::None;
-        assert!(app.on_paste("a", Some(&view)));
-        assert_eq!(app.overlay, Overlay::Accounts);
+        assert!(!app.on_paste("a", Some(&view)));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(!app.on_paste("q", Some(&view)));
+        assert!(!app.should_quit);
+        app.mode = Mode::ConfirmRemove { idx: 0 };
+        assert!(!app.on_paste("yes\n", Some(&view)));
+        assert_eq!(
+            app.mode,
+            Mode::ConfirmRemove { idx: 0 },
+            "nothing confirmed"
+        );
+        app.mode = Mode::Normal;
+        app.copy_mode = true;
+        assert!(!app.on_paste("v", Some(&view)));
+        assert!(app.copy_mode);
     }
 
     /// A config value edits mid-value: the field opens on the current value
