@@ -267,7 +267,7 @@ pub(crate) fn draw(
         Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
-        Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
+        Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
         Overlay::Keys => draw_keys_overlay(frame, overlay_area, view, chrome),
@@ -2604,48 +2604,24 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
     );
 }
 
-fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
+fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+    use twolab_tui::key_hints::KeyHelp;
     frame.render_widget(Clear, area);
-    let key = |k: &'static str, what: &'static str| {
-        Line::from(vec![
-            Span::styled(format!("   {k:<10}"), Style::new().fg(Color::Cyan)),
-            Span::raw(what),
-        ])
-    };
     let bytes = |b: Option<u64>| match b {
         Some(b) => format!("{}B", format::human_count(b)),
         None => "—".into(),
     };
     let f = &view.config_facts;
-    let lines = vec![
-        Line::from(Span::styled(" keys", dim().add_modifier(Modifier::BOLD))),
-        key(
-            "a g U K p l s",
-            "accounts / stats / usage / keys / perf / logs / sessions",
-        ),
-        key("? c", "this surface / config editor"),
-        key(
-            "click",
-            "tabs switch · activity row expands · config value edits · session selects",
-        ),
-        key("wheel", "activity history · overlay cursors"),
-        key("f m e", "codex fast / model / effort"),
-        key("u t S R", "gauge fill / reset display / scheduler / reload"),
-        key("z", "dashboard: fold the 7d-spent accounts into text"),
-        key("o d", "sessions sort · perf/stats span"),
-        key("h l", "perf day drill-down (←/→)"),
-        key("j k ⏎ y/n", "config editor: cursor · activate · confirm"),
-        key("q Esc", "quit / back to dashboard"),
+    let facts = vec![
         Line::default(),
         Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!("   llmux {}", view.display_version()))),
         Line::from(Span::raw(format!(
-            "   daemon pid {} · port {} · up {}",
+            "   llmux {} · daemon pid {} · port {} · up {}",
+            view.display_version(),
             view.pid,
             view.port,
             format::countdown(view.uptime)
         ))),
-        Line::default(),
         Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
         Line::from(Span::raw(format!(
             "   config {}",
@@ -2659,8 +2635,32 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             bytes(f.activity_log_bytes),
         ))),
     ];
-    let block = Block::new().borders(Borders::TOP).title(" misc ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(" misc — keys · build · daemon ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // The facts keep their rows at the bottom; the key grid takes the rest
+    // and, when it does not fit, ends in `… +N more` — never cut silently.
+    let facts_h = (facts.len() as u16).min(inner.height.saturating_sub(2));
+    let help_area = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        height: inner.height - facts_h,
+        ..inner
+    };
+    frame.render_widget(
+        KeyHelp::new(help_groups(chrome)).theme(KEYBAR_THEME),
+        help_area,
+    );
+    frame.render_widget(
+        Paragraph::new(facts),
+        Rect {
+            y: help_area.bottom(),
+            height: facts_h,
+            ..inner
+        },
+    );
 }
 
 /// One editable (or honestly-labeled read-only) config row's action
@@ -4622,8 +4622,30 @@ pub(crate) fn raw_content_from_record(
 /// scrollbars on the right + bottom edges. Returns the frame's
 /// [`RawModalChrome`] (scroll clamps + click rects) so the runtime can clamp
 /// offsets and route clicks.
+/// The raw viewer's keys (its bottom-border legend; the `?` help lists them).
+const RAW_KEYS: [(&str, &str); 9] = [
+    ("←→/tab", "switch"),
+    ("↑↓", "scroll"),
+    ("H/L", "pan"),
+    ("c", "copy"),
+    ("C", "curl"),
+    ("a", "copy all"),
+    ("s", "save"),
+    ("S", "save all"),
+    ("esc", "close"),
+];
+
 fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
-    let area = centered_rect(frame.area(), 94, 92);
+    let mut area = centered_rect(frame.area(), 94, 92);
+    // Its bottom border carries the key legend: keep it above the two footer
+    // rows (at 24 rows the footer used to cover it).
+    area.height = area.height.min(
+        frame
+            .area()
+            .bottom()
+            .saturating_sub(2)
+            .saturating_sub(area.y),
+    );
     frame.render_widget(Clear, area);
 
     // The bottom hint doubles as the action-feedback line: a fresh flash
@@ -4634,11 +4656,17 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
             Span::styled(format!(" {msg} "), Style::new().fg(Color::Yellow)),
         )
         .centered(),
-        _ => Line::from(Span::styled(
-            " ←→/tab switch · ↑↓ scroll · H/L pan · c copy · C curl · a copy all · s save · S save all · esc ",
-            dim(),
-        ))
-        .centered(),
+        // The key legend fitted to the border it sits on: whole hints drop
+        // (`… +N more`) instead of the line being cut on both sides.
+        _ => {
+            let mut legend = keybar_after(
+                vec![Span::raw(" ")],
+                &RAW_KEYS,
+                area.width.saturating_sub(4),
+            );
+            legend.spans.push(Span::raw(" "));
+            legend.centered()
+        }
     };
     // Action buttons ride the top border, right-aligned (UI-8). Reserve their
     // width FIRST and clip the title to what's left (+ a 1-cell gap) so the
@@ -10524,29 +10552,45 @@ fn keybar(
     hints: &[(&'static str, &'static str)],
     width: u16,
 ) -> Line<'static> {
-    use twolab_tui::key_hints::{KeyHint, KeyHints};
     let lead = match title {
         Some(t) => format!(" {t} — "),
         None => " ".to_string(),
     };
-    let room = width.saturating_sub(cells::width(&lead) as u16);
-    let hints = hints.iter().map(|&(k, l)| {
-        let priority = match l {
-            "quit" => 9,
-            "back" | "cancel" | "close" => 8,
-            // The prompt's own action outlasts navigation.
-            _ if k == "Enter" || k == "y" || k.ends_with("/y") => 7,
-            _ => 5,
-        };
-        // `R disabled (attached)`: the key exists, does nothing here — dim.
-        let disabled = l.starts_with("disabled");
-        KeyHint::new(k, l).priority(priority).disabled(disabled)
-    });
-    let bar = KeyHints::new(hints)
+    keybar_after(vec![Span::raw(lead)], hints, width)
+}
+
+/// One footer hint as twolab-tui draws it — shared by every key bar and the
+/// `?` help, so a key reads the same in both. `quit` stays longest, then
+/// `back` / `cancel`, then the prompt's own action; `R disabled (attached)`
+/// is drawn dim: the key exists but does nothing here.
+fn key_hint(keys: &'static str, label: &'static str) -> twolab_tui::key_hints::KeyHint<'static> {
+    let priority = match label {
+        "quit" => 9,
+        "back" | "cancel" | "close" => 8,
+        // The prompt's own action outlasts navigation.
+        _ if keys == "Enter" || keys == "y" || keys.ends_with("/y") => 7,
+        _ => 5,
+    };
+    twolab_tui::key_hints::KeyHint::new(keys, label)
+        .priority(priority)
+        .disabled(label.starts_with("disabled"))
+}
+
+/// A key bar after `lead` (a title, or a prompt with what has been typed):
+/// the hints fill what `lead` leaves of `width`, dropping whole hints and
+/// counting them (`… +N more`) instead of letting the terminal cut the bar.
+fn keybar_after(
+    lead: Vec<Span<'static>>,
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+) -> Line<'static> {
+    use twolab_tui::key_hints::KeyHints;
+    let room = width.saturating_sub(cells::spans_width(&lead) as u16);
+    let bar = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
         .no_more()
         .theme(KEYBAR_THEME)
         .line(room);
-    let mut spans = vec![Span::raw(lead)];
+    let mut spans = lead;
     spans.extend(bar.spans);
     Line::from(spans)
 }
@@ -10813,6 +10857,203 @@ fn draw_login_picker(frame: &mut Frame, chrome: &Chrome) {
     }
 }
 
+/// The account switcher's keys (`s`; its footer and the `?` help).
+const SELECT_KEYS: [(&str, &str); 6] = [
+    ("↑/k ↓/j", "move"),
+    ("Enter", "switch"),
+    ("p", "pause"),
+    ("L", "limits"),
+    ("n", "new login"),
+    ("Esc", "cancel"),
+];
+
+/// Keys no bar advertises: the surface summons (the tab row is their bar)
+/// and the rest of MAIN's bindings.
+const GO_TO_KEYS: [(&str, &str); 10] = [
+    ("a", "accounts"),
+    ("g", "stats"),
+    ("U", "usage"),
+    ("K", "keys"),
+    ("p", "perf"),
+    ("l", "logs"),
+    ("s", "sessions"),
+    ("?", "this help"),
+    ("c", "config"),
+    ("Esc", "dashboard"),
+];
+
+/// MAIN bindings the clickable settings bar and the rows stand in for.
+const OTHER_KEYS: [(&str, &str); 6] = [
+    ("f m e", "codex fast / model / effort"),
+    ("h", "account detail"),
+    ("click", "tab · row detail · value edit"),
+    ("right-click", "account menu"),
+    ("wheel", "activity · overlay cursors"),
+    ("ctrl+c", "quit anywhere"),
+];
+
+/// The `?` help, grouped: every surface's key bar from [`overlay_hints`] —
+/// the footer's own table, so the two cannot disagree — the switcher and raw
+/// viewer bars, and the keys no bar advertises.
+fn help_groups(chrome: &Chrome) -> Vec<twolab_tui::key_hints::HintGroup<'static>> {
+    use twolab_tui::key_hints::HintGroup;
+    let group = |title: &'static str, hints: &[(&'static str, &'static str)]| {
+        HintGroup::new(title, hints.iter().map(|&(k, l)| key_hint(k, l)))
+    };
+    let mut groups = vec![group("go to", &GO_TO_KEYS)];
+    for (title, overlay) in [
+        ("dashboard", Overlay::None),
+        ("accounts", Overlay::Accounts),
+        ("stats", Overlay::Stats),
+        ("usage", Overlay::Usage),
+        ("keys", Overlay::Keys),
+        ("perf", Overlay::Perf),
+        ("sessions", Overlay::Sessions),
+        ("logs", Overlay::Logs),
+        ("config", Overlay::Config),
+    ] {
+        groups.push(group(title, &overlay_hints(overlay, chrome, true).1));
+    }
+    groups.push(group("switcher (s)", &SELECT_KEYS));
+    groups.push(group("raw viewer", &RAW_KEYS));
+    groups.push(group("other", &OTHER_KEYS));
+    groups
+}
+
+/// A footer table: the bar's title and its `(keys, label)` hints.
+type HintTable = (Option<&'static str>, Vec<(&'static str, &'static str)>);
+
+/// The key bar of each surface while no prompt is open — the ONE table both
+/// the footer and the `?` help read, so they cannot disagree (the help used
+/// to say `R reload` while the attached footer said `R disabled
+/// (attached)`). `help` adds the hints the footer shows only while they
+/// apply (`z fold` while the fold is on).
+fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
+    // Attach mode disables the config-mutation keys (a/r/R act on the server
+    // host's config); the keybar shows what is actually available.
+    let attached = chrome.attach.is_some();
+    match overlay {
+        // MAIN: the tab bar owns surface navigation by click (UI-3 U6),
+        // so the per-overlay summon keys are no longer advertised here
+        // (UI-4 V4 — the `a`/`g`/`l`/`s`/`?`/`c` BINDINGS still work).
+        // The `f`/`m`/`e` codex toggles are likewise covered by the
+        // clickable group-settings bar (U9/U10), so their hint is gone
+        // too (UI-4 V7).
+        Overlay::None => {
+            let mut hints: Vec<(&'static str, &'static str)> = vec![("q", "quit")];
+            hints.push(if attached {
+                ("R", "disabled (attached)")
+            } else {
+                ("R", "reload")
+            });
+            hints.extend([
+                ("u", "used/left"),
+                ("t", "eta/utc"),
+                ("o", "sort"),
+                ("S", "sched"),
+                ("↑↓", "scroll"),
+            ]);
+            // The fold (`z`) is advertised only while it is on: the
+            // bar that `z` turns off.
+            // (`?` help lists it always.)
+            if chrome.fold_exhausted || help {
+                hints.push(("z", "fold"));
+            }
+            (None, hints)
+        }
+        // Accounts overlay: the issue #3/#4 affordances. a (add) and r
+        // (remove) act on the DAEMON via the control endpoints, so they are
+        // live in attach mode too.
+        // `f` (refresh usage) and `R` (redeem ONE reset) are the .prd/16
+        // controls. `R` is deliberately the SHIFTED key next to `r`
+        // remove: a redemption spends something upstream, so it must not
+        // share a keystroke with anything else.
+        Overlay::Accounts => (
+            Some("accounts"),
+            vec![
+                ("s", "switch"),
+                ("f", "refresh"),
+                ("R", "reset"),
+                ("a", "add"),
+                ("n", "login"),
+                ("r", "remove"),
+                ("u", "used/left"),
+                ("t", "eta/utc"),
+                ("o", "sort"),
+                ("Esc", "back"),
+                ("q", "quit"),
+            ],
+        ),
+        // Stats overlay: navigation + window cycle + back, regardless of
+        // attach mode. `w` toggles the heatmap window (issue #23).
+        Overlay::Stats => (
+            Some("stats"),
+            vec![
+                ("g/Esc", "back"),
+                ("↑/k ↓/j", "model"),
+                ("PgUp/PgDn", "page"),
+                ("w", "window"),
+                ("q", "quit"),
+            ],
+        ),
+        // Usage overlay (usage-stats): granularity cycle + scroll + back.
+        Overlay::Usage => (
+            Some("usage"),
+            vec![
+                ("g", "hour/day/month"),
+                ("↑/k ↓/j", "bucket"),
+                ("U/Esc", "back"),
+                ("q", "quit"),
+            ],
+        ),
+        // Logs overlay: full-screen tail; l/Esc back.
+        Overlay::Logs => (Some("logs"), vec![("l/Esc", "back"), ("q", "quit")]),
+        Overlay::Perf => (
+            Some("perf"),
+            vec![
+                ("d", "span"),
+                ("←/h →/l", "day"),
+                ("↑/k ↓/j", "series"),
+                ("p/Esc", "back"),
+                ("q", "quit"),
+            ],
+        ),
+        Overlay::Misc => (Some("misc"), vec![("?/Esc", "back"), ("q", "quit")]),
+        Overlay::Config => (
+            Some("config"),
+            vec![
+                ("↑/k ↓/j", "move"),
+                ("Enter/click", "edit"),
+                ("c/Esc", "back"),
+                ("q", "quit"),
+            ],
+        ),
+        // Keys overlay (multi-tenant #22): read-only; mutations live in
+        // the CLI (`llmux key …`).
+        Overlay::Keys => (
+            Some("keys"),
+            vec![
+                ("w", "window"),
+                ("f", "models"),
+                ("↑/↓ PgUp/PgDn Home/End", "scroll"),
+                ("r", "refresh"),
+                ("K/Esc", "back"),
+                ("q", "quit"),
+            ],
+        ),
+        // Sessions overlay (issue #34): navigation + back.
+        Overlay::Sessions => (
+            Some("sessions"),
+            vec![
+                ("s/Esc", "back"),
+                ("↑/k ↓/j", "session"),
+                ("PgUp/PgDn", "page"),
+                ("q", "quit"),
+            ],
+        ),
+    }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // Status messages quote account names ("switched to a@x.com") — mask any
     // embedded email under the email-anonymous setting.
@@ -10823,12 +11064,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
         Style::new().fg(Color::Yellow),
     ));
-    let key = |k: &'static str| {
-        Span::styled(k, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-    };
-    // Attach mode disables the config-mutation keys (a/r/R act on the server
-    // host's config); the keybar shows what is actually available.
-    let attached = chrome.attach.is_some();
     let keybar = match chrome.mode {
         // Config-editor prompts render their own inline hint line inside the
         // overlay; the keybar mirrors the essentials.
@@ -10857,173 +11092,37 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
         // While a Mode interaction is pending it owns the keybar regardless of
         // which overlay summoned it (the interactions run within Accounts).
-        Mode::Normal => match chrome.overlay {
-            // MAIN: the tab bar owns surface navigation by click (UI-3 U6),
-            // so the per-overlay summon keys are no longer advertised here
-            // (UI-4 V4 — the `a`/`g`/`l`/`s`/`?`/`c` BINDINGS still work).
-            // The `f`/`m`/`e` codex toggles are likewise covered by the
-            // clickable group-settings bar (U9/U10), so their hint is gone
-            // too (UI-4 V7).
-            Overlay::None => {
-                let mut hints: Vec<(&'static str, &'static str)> = vec![("q", "quit")];
-                hints.push(if attached {
-                    ("R", "disabled (attached)")
-                } else {
-                    ("R", "reload")
-                });
-                hints.extend([
-                    ("u", "used/left"),
-                    ("t", "eta/utc"),
-                    ("o", "sort"),
-                    ("S", "sched"),
-                    ("↑↓", "scroll"),
-                ]);
-                // The fold (`z`) is advertised only while it is on: the
-                // bar that `z` turns off.
-                if chrome.fold_exhausted {
-                    hints.push(("z", "fold"));
-                }
-                keybar(None, &hints, area.width)
-            }
-            // Accounts overlay: the issue #3/#4 affordances. a (add) and r
-            // (remove) act on the DAEMON via the control endpoints, so they are
-            // live in attach mode too.
-            // `f` (refresh usage) and `R` (redeem ONE reset) are the .prd/16
-            // controls. `R` is deliberately the SHIFTED key next to `r`
-            // remove: a redemption spends something upstream, so it must not
-            // share a keystroke with anything else.
-            Overlay::Accounts => keybar(
-                Some("accounts"),
-                &[
-                    ("s", "switch"),
-                    ("f", "refresh"),
-                    ("R", "reset"),
-                    ("a", "add"),
-                    ("n", "login"),
-                    ("r", "remove"),
-                    ("u", "used/left"),
-                    ("t", "eta/utc"),
-                    ("o", "sort"),
-                    ("Esc", "back"),
-                    ("q", "quit"),
-                ],
-                area.width,
-            ),
-            // Stats overlay: navigation + window cycle + back, regardless of
-            // attach mode. `w` toggles the heatmap window (issue #23).
-            Overlay::Stats => keybar(
-                Some("stats"),
-                &[
-                    ("g/Esc", "back"),
-                    ("↑/k ↓/j", "model"),
-                    ("PgUp/PgDn", "page"),
-                    ("w", "window"),
-                    ("q", "quit"),
-                ],
-                area.width,
-            ),
-            // Usage overlay (usage-stats): granularity cycle + scroll + back.
-            Overlay::Usage => keybar(
-                Some("usage"),
-                &[
-                    ("g", "hour/day/month"),
-                    ("↑/k ↓/j", "bucket"),
-                    ("U/Esc", "back"),
-                    ("q", "quit"),
-                ],
-                area.width,
-            ),
-            // Logs overlay: full-screen tail; l/Esc back.
-            Overlay::Logs => keybar(
-                Some("logs"),
-                &[("l/Esc", "back"), ("q", "quit")],
-                area.width,
-            ),
-            Overlay::Perf => keybar(
-                Some("perf"),
-                &[
-                    ("d", "span"),
-                    ("←/h →/l", "day"),
-                    ("↑/k ↓/j", "series"),
-                    ("p/Esc", "back"),
-                    ("q", "quit"),
-                ],
-                area.width,
-            ),
-            Overlay::Misc => keybar(
-                Some("misc"),
-                &[("?/Esc", "back"), ("q", "quit")],
-                area.width,
-            ),
-            Overlay::Config => keybar(
-                Some("config"),
-                &[("c/Esc", "back"), ("q", "quit")],
-                area.width,
-            ),
-            // Keys overlay (multi-tenant #22): read-only; mutations live in
-            // the CLI (`llmux key …`).
-            Overlay::Keys => keybar(
-                Some("keys"),
-                &[
-                    ("w", "window"),
-                    ("f", "models"),
-                    ("↑/↓ PgUp/PgDn Home/End", "scroll"),
-                    ("r", "refresh"),
-                    ("K/Esc", "back"),
-                    ("q", "quit"),
-                ],
-                area.width,
-            ),
-            // Sessions overlay (issue #34): navigation + back.
-            Overlay::Sessions => keybar(
-                Some("sessions"),
-                &[
-                    ("s/Esc", "back"),
-                    ("↑/k ↓/j", "session"),
-                    ("PgUp/PgDn", "page"),
-                    ("q", "quit"),
-                ],
-                area.width,
-            ),
-        },
-        Mode::Select { .. } => keybar(
-            None,
-            &[
-                ("↑/k ↓/j", "move"),
-                ("Enter", "switch"),
-                ("p", "pause"),
-                ("L", "limits"),
-                ("n", "new login"),
-                ("Esc", "cancel"),
-            ],
-            area.width,
-        ),
+        Mode::Normal => {
+            let (title, hints) = overlay_hints(chrome.overlay, chrome, false);
+            keybar(title, &hints, area.width)
+        }
+        Mode::Select { .. } => keybar(None, &SELECT_KEYS, area.width),
         // The typed key is shown ONLY as a masked width — never the raw
         // characters (AGENTS.md credential rule).
-        Mode::EditLimits { .. } => Line::from(vec![
-            Span::raw(" limits (5h,7d,fbl %): "),
-            Span::styled(
-                format!("{}▏", chrome.limits_input),
-                Style::new().fg(Color::Cyan),
-            ),
-            Span::raw("  "),
-            key("Enter"),
-            Span::raw(" apply  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
-        Mode::AddKey => Line::from(vec![
-            Span::raw(" add account — key: "),
-            Span::styled(
-                "•".repeat(chrome.add_input_len),
-                Style::new().fg(Color::Cyan),
-            ),
-            Span::raw("  "),
-            key("Enter"),
-            Span::raw(" add  "),
-            key("Esc"),
-            Span::raw(" cancel"),
-        ]),
+        Mode::EditLimits { .. } => keybar_after(
+            vec![
+                Span::raw(" limits (5h,7d,fbl %): "),
+                Span::styled(
+                    format!("{}▏", chrome.limits_input),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::raw("  "),
+            ],
+            &[("Enter", "apply"), ("Esc", "cancel")],
+            area.width,
+        ),
+        Mode::AddKey => keybar_after(
+            vec![
+                Span::raw(" add account — key: "),
+                Span::styled(
+                    "•".repeat(chrome.add_input_len),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::raw("  "),
+            ],
+            &[("Enter", "add"), ("Esc", "cancel")],
+            area.width,
+        ),
         Mode::ContextMenu { .. } => keybar(
             None,
             &[
@@ -11993,6 +12092,100 @@ mod tests {
         assert!(frame.contains("ONE"), "{frame}");
         let keybar = rows[rows.len() - 1].clone();
         assert!(keybar.contains('y'), "confirm key advertised: {keybar}");
+    }
+
+    /// The `?` help is built from the footer's own tables: in attach mode it
+    /// says `R disabled (attached)` like the footer — it used to say
+    /// `R reload` — and a grid that does not fit counts what it hides.
+    #[test]
+    fn help_lists_the_same_keys_as_the_footer_in_attach_mode() {
+        let view = usage_control_view();
+        let chrome = chrome_attach(Overlay::Misc);
+        let text = render_rows(&view, &chrome, 179, 43).join("\n");
+        assert!(!text.contains("reload"), "{text}");
+        for overlay in [
+            Overlay::None,
+            Overlay::Accounts,
+            Overlay::Config,
+            Overlay::Keys,
+        ] {
+            for (keys, label) in overlay_hints(overlay, &chrome, true).1 {
+                assert!(text.contains(label), "{keys} {label} missing:\n{text}");
+            }
+        }
+        // MAIN's footer and the help agree on R.
+        let main = render_rows(&view, &chrome_attach(Overlay::None), 179, 43);
+        assert!(main[main.len() - 1].contains("R disabled (attached)"));
+        assert!(text.contains("disabled (attached)"), "{text}");
+        // Nothing is dropped silently at 80x24: the grid counts what it hides,
+        // and the daemon facts keep their rows.
+        let small = render_rows(&view, &chrome, 80, 24).join("\n");
+        assert!(small.contains("… +"), "{small}");
+        assert!(small.contains("accounts 2 · raw-io"), "{small}");
+    }
+
+    /// The hand-built prompts are fitted like every other bar: on a narrow
+    /// terminal they drop whole hints and count them instead of being cut.
+    #[test]
+    fn prompts_drop_whole_hints_on_a_narrow_footer() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::EditLimits { idx: 0 };
+        chrome.limits_input = "80,90".into();
+        let wide = render_rows(&view, &chrome, 80, 24);
+        let bar = wide[wide.len() - 1].clone();
+        assert!(
+            bar.contains("80,90▏") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
+            "{bar}"
+        );
+        let narrow = render_rows(&view, &chrome, 40, 24);
+        let bar = narrow[narrow.len() - 1].clone();
+        assert!(bar.contains("80,90▏"), "{bar}");
+        assert!(bar.contains("… +"), "{bar}");
+        assert!(
+            !bar.contains("Enter a ") && !bar.trim_end().ends_with("Ente"),
+            "{bar}"
+        );
+
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::AddKey;
+        chrome.add_input_len = 30;
+        let bar = render_rows(&view, &chrome, 56, 24).pop().expect("footer");
+        assert!(bar.contains(&"•".repeat(30)), "masked width kept: {bar}");
+        assert!(bar.contains("… +"), "{bar}");
+    }
+
+    /// The raw viewer's legend sits on its bottom border above the footer and
+    /// drops whole hints at 80 columns (it was a ~100-cell line cut on both
+    /// sides, and under the footer at 24 rows).
+    #[test]
+    fn raw_viewer_legend_drops_whole_hints_at_80_columns() {
+        let view = usage_control_view();
+        let entry = completed_request(7_000, Some("claude"), Some("claude-opus-4-8"), 1, 1, 200);
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.raw_modal = Some(super::super::RawModal {
+            key: key_of(&entry),
+            id: 1,
+            generation: 1,
+            title: "raw".into(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: None,
+            state: super::super::RawModalState::Failed("gone".into()),
+        });
+        let rows = render_rows(&view, &chrome, 80, 24);
+        let legend = rows
+            .iter()
+            .find(|r| r.contains("switch") && r.contains('└'))
+            .unwrap_or_else(|| panic!("legend row:\n{}", rows.join("\n")));
+        assert!(legend.contains("←→/tab switch"), "{legend}");
+        assert!(legend.contains("… +"), "{legend}");
+        assert!(
+            legend.contains("esc close"),
+            "the close key stays: {legend}"
+        );
     }
 
     /// Under `NO_COLOR` the frame loop strips every colour; the gate's marked
