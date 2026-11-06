@@ -239,6 +239,16 @@ impl LoginKind {
         LoginKind::Gemini,
     ];
 
+    /// How the sign-in runs, beside the label in the picker.
+    pub(crate) fn flow(self) -> &'static str {
+        match self {
+            LoginKind::Anthropic | LoginKind::Codex => "browser sign-in",
+            LoginKind::Grok => "device code: a URL and a code to enter",
+            LoginKind::OpenRouter => "browser sign-in, mints an sk-or-v1 key",
+            LoginKind::Gemini => "browser sign-in; terms-of-service note first",
+        }
+    }
+
     /// One-line label for the picker + status line.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -1651,17 +1661,11 @@ impl App {
         if self.overlay == Overlay::Config && self.mode == Mode::Normal {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
-                    self.config_cursor = self.config_cursor.saturating_sub(1);
+                    self.on_key_config(KeyCode::Up, view);
                     return true;
                 }
                 MouseEventKind::ScrollDown => {
-                    let rows = view
-                        .map(|v| {
-                            let chrome = self.chrome();
-                            ui::config_row_count(v, &chrome)
-                        })
-                        .unwrap_or(0);
-                    self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+                    self.on_key_config(KeyCode::Down, view);
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2781,22 +2785,28 @@ impl App {
     }
 
     /// Key handling for the Config overlay (`c`, config-editor v1): arrows
-    /// move the cursor, Enter activates the row (toggle / cycle / edit
-    /// prompt), `c`/`Esc` closes.
+    /// (and `j`/`k`, PgUp/PgDn, Home/End) move the cursor over the editable
+    /// rows — read-only rows are skipped — and stop at the ends; Enter
+    /// activates the row (toggle / cycle / edit prompt), `c`/`Esc` closes.
     fn on_key_config(&mut self, code: KeyCode, view: Option<&DashboardView>) {
-        let rows = view.map(|v| {
-            let chrome = self.chrome();
-            ui::config_row_count(v, &chrome)
-        });
-        let rows = rows.unwrap_or(0);
+        let code = match code {
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('j') => KeyCode::Down,
+            code => code,
+        };
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') | KeyCode::Esc => self.overlay = Overlay::None,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.config_cursor = self.config_cursor.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.config_cursor = (self.config_cursor + 1).min(rows.saturating_sub(1));
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
+                if let (Some(view), Some(key)) = (view, key_input(code)) {
+                    let chrome = self.chrome();
+                    self.config_cursor = ui::config_cursor_after(view, &chrome, key);
+                }
             }
             KeyCode::Enter => {
                 let action = view.and_then(|v| {
@@ -4186,7 +4196,9 @@ impl App {
         if can_open_browser() {
             self.mode = Mode::NewLogin { idx: 0 };
             self.set_status(
-                "new login: ↑↓ pick provider, Enter to open the browser, Esc to cancel".into(),
+                "new login: 1-5 or ↑↓ + Enter picks the provider and opens the browser, Esc \
+                 cancels"
+                    .into(),
             );
         } else {
             self.mode = Mode::Normal;
@@ -4194,31 +4206,52 @@ impl App {
         }
     }
 
-    /// Key handling for `Mode::NewLogin` — the provider picker. Up/down move
-    /// the cursor; Enter queues the chosen login for the event loop (which
-    /// suspends the TUI, runs the browser flow, then re-inits); Esc cancels.
+    /// Key handling for `Mode::NewLogin` — the provider picker
+    /// ([`ui::login_list`]). The arrows (and `j`/`k`, PgUp/PgDn, Home/End)
+    /// move the cursor and stop at the ends; a digit `1`–`5` or Enter queues
+    /// that login for the event loop (which suspends the TUI, runs the
+    /// browser flow, then re-inits); any other key cancels.
     fn on_key_new_login(&mut self, code: KeyCode, idx: usize) {
+        use twolab_tui::scroll::ListAction;
+        use twolab_tui::select_list::Outcome;
         let len = LoginKind::ALL.len();
         let idx = idx.min(len - 1);
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+        let code = match code {
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('j') => KeyCode::Down,
+            code => code,
+        };
+        let mut list = ui::login_list(idx);
+        let outcome = key_input(code).map(|key| {
+            if ListAction::from_key(key).is_some() {
+                // Movement never cancels, and never wraps past an end.
+                let wrapped = match code {
+                    KeyCode::Up => idx == 0,
+                    KeyCode::Down => idx + 1 == len,
+                    _ => false,
+                };
+                if !wrapped {
+                    list.key(key);
+                }
+                Outcome::Changed
+            } else {
+                list.key(key)
+            }
+        });
+        match outcome {
+            Some(Outcome::Changed) => {
                 self.mode = Mode::NewLogin {
-                    idx: idx.saturating_sub(1),
+                    idx: list.selected().unwrap_or(idx).min(len - 1),
                 };
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.mode = Mode::NewLogin {
-                    idx: (idx + 1).min(len - 1),
-                };
-            }
-            KeyCode::Enter => {
-                let kind = LoginKind::ALL[idx];
+            Some(Outcome::Accepted(i)) => {
+                let kind = LoginKind::ALL[i.min(len - 1)];
                 self.pending_login = Some(kind);
                 self.mode = Mode::Normal;
                 self.set_status(format!("opening browser for {}…", kind.label()));
             }
             // Any other key cancels.
-            _ => {
+            Some(Outcome::Cancelled | Outcome::Ignored) | None => {
                 self.mode = Mode::Normal;
                 self.set_status("new login cancelled".into());
             }
@@ -6302,6 +6335,55 @@ mod tests {
         app.mode = Mode::NewLogin { idx: 4 };
         app.on_key_new_login(KeyCode::Enter, 4);
         assert_eq!(app.take_pending_login(), Some(LoginKind::Gemini));
+    }
+
+    /// The picker is a select list: a digit picks its provider at once, and
+    /// any key that is not a picker key still cancels.
+    #[test]
+    fn new_login_picker_digits_pick_and_other_keys_cancel() {
+        let mut app = remote_app();
+        app.mode = Mode::NewLogin { idx: 0 };
+        app.on_key_new_login(KeyCode::Char('4'), 0);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.take_pending_login(), Some(LoginKind::OpenRouter));
+
+        app.mode = Mode::NewLogin { idx: 2 };
+        app.on_key_new_login(KeyCode::Char('j'), 2);
+        assert_eq!(app.mode, Mode::NewLogin { idx: 3 }, "j moves down");
+        app.on_key_new_login(KeyCode::End, 3);
+        assert_eq!(app.mode, Mode::NewLogin { idx: 4 }, "End: last provider");
+        app.on_key_new_login(KeyCode::Char('x'), 4);
+        assert_eq!(app.mode, Mode::Normal, "any other key cancels");
+        assert_eq!(app.take_pending_login(), None);
+    }
+
+    /// The config cursor moves over editable rows only (read-only rows are
+    /// the list's disabled rows) and stops at both ends.
+    #[test]
+    fn config_cursor_skips_read_only_rows_and_stops_at_the_ends() {
+        let view = control_view();
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        let chrome = app.chrome();
+        let editable: Vec<usize> = (0..60)
+            .filter(|&i| ui::config_row_action(&view, &chrome, i).is_some())
+            .collect();
+        // Rows 5 and 6 (per-account limits, paused accounts) are read-only.
+        assert!(!editable.contains(&5) && !editable.contains(&6));
+        app.config_cursor = 4;
+        app.on_key_config(KeyCode::Down, Some(&view));
+        assert_eq!(app.config_cursor, 7, "Down skips the read-only rows");
+        app.on_key_config(KeyCode::Char('k'), Some(&view));
+        assert_eq!(app.config_cursor, 4, "k skips them going up");
+        app.on_key_config(KeyCode::Home, Some(&view));
+        assert_eq!(app.config_cursor, editable[0]);
+        app.on_key_config(KeyCode::Up, Some(&view));
+        assert_eq!(app.config_cursor, editable[0], "Up stops at the top");
+        app.on_key_config(KeyCode::End, Some(&view));
+        let last = *editable.last().expect("editable rows");
+        assert_eq!(app.config_cursor, last);
+        app.on_key_config(KeyCode::Down, Some(&view));
+        assert_eq!(app.config_cursor, last, "Down stops at the bottom");
     }
 
     #[test]
