@@ -387,15 +387,23 @@ pub(crate) fn draw(
     // shares the same top edge: right under the tab bar, banner-aware.
     let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
     let mut usage_scope = None;
+    // An overlay covers MAIN's click targets under it before it records
+    // its own on top.
+    if chrome.overlay != Overlay::None {
+        if let Some(main) = hits.as_mut() {
+            main.hits
+                .push(overlay_area, ClickTarget::Surface(Surface::Overlay));
+        }
+    }
     match chrome.overlay {
         Overlay::None => {}
         // The overlay draws the SAME accounts table as MAIN over the top of
-        // it, so its row rects replace MAIN's as this frame's click targets
+        // it, so its row rects cover MAIN's as this frame's click targets
         // (.prd/19 rule 6 — a row click must work on both surfaces).
         Overlay::Accounts => {
             let rows = draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome);
-            if let Some(hits) = hits.as_mut() {
-                hits.account_rows = rows;
+            if let Some(main) = hits.as_mut() {
+                main.hits.extend(rows);
             }
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
@@ -670,7 +678,25 @@ fn draw_main(
             pane_top: middle_area.y,
         });
     }
-    let settings = draw_group_settings(frame, groups_area, view);
+    // The click targets in paint order: each pane's own, then the borders
+    // between them (the whole row), then the settings bar.
+    let mut map = Hits::new();
+    map.extend(tabs);
+    map.extend(account_rows);
+    map.extend(
+        models_strip
+            .into_iter()
+            .map(|h| (h.rect, ClickTarget::StripEntry(h.index))),
+    );
+    map.extend(separators.into_iter().map(|sep| {
+        let row = Rect {
+            y: sep.y,
+            height: 1,
+            ..area
+        };
+        (row, ClickTarget::Separator(sep))
+    }));
+    map.extend(draw_group_settings(frame, groups_area, view));
     // The context menu (UI-3 U11) draws last so it floats over every pane.
     // Its bounds stop above the footer, which `draw` paints over everything.
     let menu_bounds = Rect {
@@ -682,15 +708,11 @@ fn draw_main(
         .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
         .map(|anchor| draw_context_menu(frame, menu_bounds, view, ctx, chrome, anchor));
     *hits = Some(MainChrome {
+        hits: map,
         activity,
-        tabs,
-        separators,
-        account_rows,
-        models_strip,
         menu,
         sessions_table: None,
         config_rows: Vec::new(),
-        settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal: None,
         account_modal: None,
@@ -716,7 +738,11 @@ fn draw_main(
 /// and `+N` says how many went. The click rects come from
 /// `StatusBar::hits`, so a click lands on the value that is drawn there,
 /// measured in cells (a wide model name included).
-fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+fn draw_group_settings(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+) -> Vec<(Rect, ClickTarget)> {
     use twolab_tui::status_bar::{Segment, StatusBar};
     if area.height == 0 {
         return Vec::new();
@@ -753,10 +779,10 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
                 .min(rect.right());
             if let Some(action) = *action {
                 if right > x {
-                    hits.push(SettingHit {
-                        area: Rect::new(x, rect.y, right - x, 1),
-                        action,
-                    });
+                    hits.push((
+                        Rect::new(x, rect.y, right - x, 1),
+                        ClickTarget::Setting(action),
+                    ));
                 }
             }
             x = right;
@@ -859,7 +885,7 @@ fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
 /// tabs are the mouse-native mirror of `a`/`g`/`l`/`s`/`?`/`c`.
 /// Draw the tab strip; returns the click targets and the cells left free at
 /// the right end (after any `N›` scroll marker) for the header tail.
-fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, usize) {
+fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<(Rect, ClickTarget)>, usize) {
     // The documented hint rule (operational-reference "Tab shortcut hints"):
     // at 140 columns or more, MAIN shows every tab's key; inside an overlay
     // only `[Esc] dashboard` keeps one (overlay keys mean other things there).
@@ -881,10 +907,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, us
     let hits = layout
         .hits
         .into_iter()
-        .map(|h| TabHit {
-            area: h.rect,
-            overlay: TABS[h.index].1,
-        })
+        .map(|h| (h.rect, ClickTarget::Tab(TABS[h.index].1)))
         .collect();
     (hits, layout.room)
 }
@@ -917,7 +940,7 @@ fn draw_accounts_overlay(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     // `v`: the compact list — a title row and a row per account.
@@ -5936,7 +5959,7 @@ fn draw_accounts(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     let layout = table_layout(view, ctx, area.width);
     draw_accounts_with(frame, area, view, ctx, chrome, &Fold::Off, &layout)
 }
@@ -5956,7 +5979,7 @@ fn draw_accounts_with(
     chrome: &Chrome,
     fold_state: &Fold,
     layout: &TableLayout,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     let snapshot = &view.snapshot;
     let fold = fold_state.plan();
     let table: Vec<usize> = (0..ctx.order.len())
@@ -6080,18 +6103,18 @@ fn draw_accounts_with(
     // border/title + header row), one line high, full table width, and maps
     // to its account's display position. Rows clipped by the pane height are
     // not clickable.
-    let mut hits: Vec<AccountRowHit> = table
+    let mut hits: Vec<(Rect, ClickTarget)> = table
         .iter()
         .enumerate()
         .filter(|(row, _)| area.y as usize + 2 + row < area.bottom() as usize)
-        .map(|(row, &pos)| AccountRowHit {
-            area: Rect {
+        .map(|(row, &pos)| {
+            let rect = Rect {
                 x: area.x,
                 y: area.y + 2 + row as u16,
                 width: area.width,
                 height: 1,
-            },
-            display_idx: pos,
+            };
+            (rect, ClickTarget::AccountRow(pos))
         })
         .collect();
     hits.extend(fold_hits);
@@ -6247,7 +6270,7 @@ fn draw_accounts_compact(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Vec<AccountRowHit> {
+) -> Vec<(Rect, ClickTarget)> {
     use twolab_tui::agent_list::{AgentItem, AgentList, AgentListState, AgentState, Sort, Tally};
     let snapshot = &view.snapshot;
     let params = &view.select_params;
@@ -6399,10 +6422,7 @@ fn draw_accounts_compact(
                     cell.set_symbol(glyph);
                 }
             }
-            hits.push(AccountRowHit {
-                area: r,
-                display_idx: pos,
-            });
+            hits.push((r, ClickTarget::AccountRow(pos)));
         }
     }
     hits
@@ -6891,7 +6911,7 @@ fn draw_fold(
     area: Rect,
     top: u16,
     fold: &FoldPlan,
-) -> (Vec<AccountRowHit>, usize) {
+) -> (Vec<(Rect, ClickTarget)>, usize) {
     let block = Rect {
         y: top,
         height: area.bottom().saturating_sub(top),
@@ -6904,10 +6924,7 @@ fn draw_fold(
     let hits = drawn
         .hits
         .iter()
-        .map(|hit| AccountRowHit {
-            area: hit.rect,
-            display_idx: fold.members[hit.index],
-        })
+        .map(|hit| (hit.rect, ClickTarget::AccountRow(fold.members[hit.index])))
         .collect();
     (hits, drawn.hidden)
 }
@@ -8826,23 +8843,6 @@ pub(crate) struct SessionsChrome {
     pub start: usize,
 }
 
-/// One clickable tab label's rendered rect (UI-3 U6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TabHit {
-    pub area: Rect,
-    pub overlay: Overlay,
-}
-
-/// Pure hit-test: which tab, if any, does the click at absolute `(col, row)`
-/// land on?
-pub(crate) fn hit_test_tabs(tabs: &[TabHit], col: u16, row: u16) -> Option<Overlay> {
-    tabs.iter()
-        .find(|t| {
-            row >= t.area.y && row < t.area.bottom() && col >= t.area.x && col < t.area.right()
-        })
-        .map(|t| t.overlay)
-}
-
 /// Minimum drag-set pane height (top border + one content row) and a sanity
 /// ceiling (UI-3 U7/U8) — the layout solver squeezes overflow anyway, this
 /// just keeps the override numbers honest.
@@ -8866,15 +8866,6 @@ pub(crate) struct SeparatorHit {
     pub pane_top: u16,
 }
 
-/// One accounts-table row's rendered rect + its DISPLAY index (selection
-/// order — the same index the switch/pause/limits/remove flows take).
-/// Right-click target map (UI-3 U11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AccountRowHit {
-    pub area: Rect,
-    pub display_idx: usize,
-}
-
 /// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
 /// its segment cycles the setting to its next value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8886,29 +8877,56 @@ pub(crate) enum SettingAction {
     GrokEffort,
 }
 
-/// One clickable segment of the group-settings bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SettingHit {
-    pub area: Rect,
-    pub action: SettingAction,
+/// What a click can land on (the hit module): every clickable thing a
+/// frame drew, recorded in one [`Hits`] map while it draws. Surfaces push in
+/// paint order, so where rects overlap the one drawn last — the one on top
+/// — wins by construction: a modal over a row, a menu item over a row, the
+/// `🔍 input` line over its entry's block. The mouse handler asks the map
+/// once and matches on the answer; a new widget brings its rects by pushing
+/// them here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClickTarget {
+    /// Drawn over what is beneath, with nothing clickable at this spot: a
+    /// click here never reaches the targets under it.
+    Surface(Surface),
+    /// A tab label (UI-3 U6): opens that surface.
+    Tab(Overlay),
+    /// A pane's top border row (UI-3 U7/U8): a press starts a drag that
+    /// resizes the pane above it. The whole row, every column.
+    Separator(SeparatorHit),
+    /// An accounts row — a table row, a fold entry or a compact entry — at
+    /// its DISPLAY index (selection order, the index the switch / pause /
+    /// limits / remove flows take). Left-click opens the account modal,
+    /// right-click the context menu (UI-3 U11).
+    AccountRow(usize),
+    /// A models-strip entry (packed entry or table row), `index` into
+    /// `model_usage`: opens the model in `stats`.
+    StripEntry(usize),
+    /// A value on the group-settings bar (UI-3 U9/U10): rotates it.
+    Setting(SettingAction),
 }
 
-/// Everything MAIN rendered this frame that the mouse can hit (UI-3 U5): the
-/// activity panel's rows plus the tab bar, the drag separators, the accounts
-/// rows (right-click), the group-settings bar, and the open context menu.
-/// Threaded back to the runtime the same way `ActivityChrome` alone used to
-/// be.
+/// A surface drawn over what came before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// A summoned overlay, over MAIN.
+    Overlay,
+}
+
+/// One frame's click targets, topmost last; see [`ClickTarget`].
+pub(crate) type Hits = twolab_tui::hit::HitMap<ClickTarget>;
+
+/// Everything a frame rendered that the mouse and the keys act on (UI-3
+/// U5): the click targets of every surface in one [`Hits`] map, plus the
+/// layout state the handlers need beyond "what is under the pointer" —
+/// scroll positions, scrollbar maths, the field's width. Built fresh by
+/// every `draw`, so nothing outlives the frame that drew it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MainChrome {
+    /// Every click target this frame drew, in paint order.
+    pub hits: Hits,
     pub activity: ActivityChrome,
-    pub tabs: Vec<TabHit>,
-    pub separators: Vec<SeparatorHit>,
-    pub account_rows: Vec<AccountRowHit>,
-    /// The models strip's click targets this frame: one per drawn model
-    /// (packed entry or table row), `index` into `model_usage`.
-    pub models_strip: Vec<packed_grid::GridHit>,
     pub menu: Option<twolab_tui::menu::MenuLayout>,
-    pub settings: Vec<SettingHit>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
     /// select): the data-row rect + the index of its first visible session.
     pub sessions_table: Option<SessionsChrome>,
@@ -12079,6 +12097,56 @@ mod tests {
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashMap};
     use twolab_tui::composer::{ComposerState, Mask};
+
+    /// The targets of one kind a click can still reach, in paint order:
+    /// `pick` names the kind (account rows, tabs, …). One covered at its
+    /// first cell by a later surface (an overlay, a modal) is left out.
+    fn reachable<U>(hits: &Hits, pick: impl Fn(&ClickTarget) -> Option<U>) -> Vec<(Rect, U)> {
+        hits.iter()
+            .filter(|&(rect, target)| hits.hit(rect.x, rect.y) == Some((rect, target)))
+            .filter_map(|(rect, target)| pick(target).map(|u| (rect, u)))
+            .collect()
+    }
+
+    /// The account rows a click reaches this frame: rect and display index.
+    fn account_rows(main: &MainChrome) -> Vec<(Rect, usize)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::AccountRow(i) => Some(*i),
+            _ => None,
+        })
+    }
+
+    fn separators(main: &MainChrome) -> Vec<SeparatorHit> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::Separator(sep) => Some(*sep),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(_, sep)| sep)
+        .collect()
+    }
+
+    fn settings(main: &MainChrome) -> Vec<(Rect, SettingAction)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::Setting(action) => Some(*action),
+            _ => None,
+        })
+    }
+
+    /// The map `targets` make when pushed in order.
+    fn map_of(targets: &[(Rect, ClickTarget)]) -> Hits {
+        let mut map = Hits::new();
+        map.extend(targets.iter().cloned());
+        map
+    }
+
+    /// The tab under `(col, row)`, if a tab is what is there.
+    fn tab_at(hits: &Hits, col: u16, row: u16) -> Option<Overlay> {
+        match hits.hit_test(col, row) {
+            Some(ClickTarget::Tab(overlay)) => Some(*overlay),
+            _ => None,
+        }
+    }
 
     fn model_row(group: &str, model: &str, tokens_in: u64, tokens_out: u64) -> ModelUsageDoc {
         ModelUsageDoc {
@@ -18280,12 +18348,13 @@ mod tests {
                 format!("{expected_header:<width$}", width = width as usize)
             );
             assert_eq!(tabs.len(), 10, "one hit target per tab");
-            for (hit, (label, x, overlay)) in tabs.iter().zip(expected_tabs) {
-                assert_eq!(hit.overlay, *overlay);
-                assert_eq!(hit.area, Rect::new(*x, 1, label.len() as u16, 1));
-                assert!(hit.area.right() <= width, "{label} must not be clipped");
-                for col in hit.area.x..hit.area.right() {
-                    assert_eq!(hit_test_tabs(&tabs, col, 1), Some(*overlay), "{label}");
+            let map = map_of(&tabs);
+            for ((area, target), (label, x, overlay)) in tabs.iter().zip(expected_tabs) {
+                assert_eq!(*target, ClickTarget::Tab(*overlay));
+                assert_eq!(*area, Rect::new(*x, 1, label.len() as u16, 1));
+                assert!(area.right() <= width, "{label} must not be clipped");
+                for col in area.x..area.right() {
+                    assert_eq!(tab_at(&map, col, 1), Some(*overlay), "{label}");
                     let cell = &buffer[(col, 1)];
                     assert_eq!(cell.fg, Color::Cyan, "{label}");
                     assert_eq!(
@@ -18300,11 +18369,11 @@ mod tests {
                     .iter()
                     .any(|(label, x, _)| col >= *x && col < *x + label.len() as u16)
                 {
-                    assert_eq!(hit_test_tabs(&tabs, col, 1), None, "separator/padding");
+                    assert_eq!(tab_at(&map, col, 1), None, "separator/padding");
                 }
                 for row in [0, 2] {
                     assert_eq!(buffer[(col, row)].symbol(), " ", "one-row strip");
-                    assert_eq!(hit_test_tabs(&tabs, col, row), None);
+                    assert_eq!(tab_at(&map, col, row), None);
                 }
             }
         }
@@ -18403,31 +18472,29 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let tabs = hits.expect("layout").tabs;
+        let map = hits.expect("layout").hits;
+        let tabs = reachable(&map, |t| match t {
+            ClickTarget::Tab(overlay) => Some(*overlay),
+            _ => None,
+        });
         assert_eq!(tabs.len(), TABS.len(), "one hit target per tab");
-        for (hit, (label, overlay)) in tabs.iter().zip(TABS) {
-            assert_eq!(hit.overlay, *overlay);
-            assert_eq!(hit.area.width as usize, label.chars().count());
+        for ((area, tab), (label, overlay)) in tabs.iter().zip(TABS) {
+            assert_eq!(tab, overlay);
+            assert_eq!(area.width as usize, label.chars().count());
             // A click anywhere on the label maps to its overlay.
+            assert_eq!(tab_at(&map, area.x, area.y), Some(*overlay), "{label}");
             assert_eq!(
-                hit_test_tabs(&tabs, hit.area.x, hit.area.y),
-                Some(*overlay),
-                "{label}"
-            );
-            assert_eq!(
-                hit_test_tabs(&tabs, hit.area.right() - 1, hit.area.y),
+                tab_at(&map, area.right() - 1, area.y),
                 Some(*overlay),
                 "{label} right edge"
             );
         }
         // The separator between the first two labels maps to nothing.
-        let gap_x = tabs[0].area.right() + 1;
-        assert_eq!(hit_test_tabs(&tabs, gap_x, tabs[0].area.y), None);
+        let (first, _) = tabs[0];
+        let gap_x = first.right() + 1;
+        assert_eq!(tab_at(&map, gap_x, first.y), None);
         // A different row maps to nothing.
-        assert_eq!(
-            hit_test_tabs(&tabs, tabs[0].area.x, tabs[0].area.y + 1),
-            None
-        );
+        assert_eq!(tab_at(&map, first.x, first.y + 1), None);
     }
 
     #[test]
@@ -18714,8 +18781,8 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let settings = hits.expect("layout").settings;
-        let actions: Vec<SettingAction> = settings.iter().map(|h| h.action).collect();
+        let settings = settings(&hits.expect("layout"));
+        let actions: Vec<SettingAction> = settings.iter().map(|&(_, action)| action).collect();
         assert!(actions.contains(&SettingAction::SchedMode));
         assert!(actions.contains(&SettingAction::CodexModel));
         assert!(actions.contains(&SettingAction::CodexEffort));
@@ -18744,10 +18811,10 @@ mod tests {
             let buf = render_buffer(&view, &chrome, w, 43);
             let bar = row_of(&rows, " sched ");
             let frame = rows[bar].clone();
-            for hit in &hits.settings {
-                assert_eq!(usize::from(hit.area.y), bar, "{frame}");
-                let drawn = cells_of(&buf, hit.area);
-                let want = match hit.action {
+            for (area, action) in settings(&hits) {
+                assert_eq!(usize::from(area.y), bar, "{frame}");
+                let drawn = cells_of(&buf, area);
+                let want = match action {
                     SettingAction::SchedMode => view.select_params.mode.label().to_string(),
                     SettingAction::CodexModel => "模型-一二".into(),
                     SettingAction::CodexEffort => "bypass".into(),
@@ -18759,16 +18826,19 @@ mod tests {
                     drawn.replace(' ', ""),
                     want,
                     "{:?} at {w}:\n{frame}",
-                    hit.action
+                    action
                 );
                 assert_eq!(
-                    usize::from(hit.area.width),
+                    usize::from(area.width),
                     cells::width(&want),
                     "{:?} rect is the value's cells at {w}:\n{frame}",
-                    hit.action
+                    action
                 );
             }
-            let actions: Vec<SettingAction> = hits.settings.iter().map(|h| h.action).collect();
+            let actions: Vec<SettingAction> = settings(&hits)
+                .into_iter()
+                .map(|(_, action)| action)
+                .collect();
             match w {
                 179 => {
                     assert!(frame.contains("claude 14 acc") && frame.contains("gemini 1 acc"));
@@ -21348,7 +21418,14 @@ mod tests {
                 ..chrome
             };
             let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
-            (view, rows, hits.models_strip)
+            let entries: Vec<packed_grid::GridHit> = reachable(&hits.hits, |t| match t {
+                ClickTarget::StripEntry(index) => Some(*index),
+                _ => None,
+            })
+            .into_iter()
+            .map(|(rect, index)| packed_grid::GridHit { rect, index })
+            .collect();
+            (view, rows, entries)
         };
         let (view, rows, quiet) = strip(0);
         let frame = rows.join("\n");
@@ -21948,13 +22025,13 @@ mod tests {
         for (h, visible) in [(43u16, 21usize), (30, 8)] {
             let (rows, hits) = render_with_hits(&view, &chrome, 179, h);
             let frame = rows.join("\n");
-            assert_eq!(hits.account_rows.len(), visible, "{frame}");
+            assert_eq!(account_rows(&hits).len(), visible, "{frame}");
             let accounts = row_of(&rows, " accounts · sort ");
-            for (pos, hit) in hits.account_rows.iter().enumerate() {
-                assert_eq!(usize::from(hit.area.y), accounts + 2 + pos);
-                assert_eq!(hit.display_idx, pos);
+            for (pos, (area, display_idx)) in account_rows(&hits).into_iter().enumerate() {
+                assert_eq!(usize::from(area.y), accounts + 2 + pos);
+                assert_eq!(display_idx, pos);
             }
-            let ys: Vec<(u16, PaneId)> = hits.separators.iter().map(|s| (s.y, s.pane)).collect();
+            let ys: Vec<(u16, PaneId)> = separators(&hits).iter().map(|s| (s.y, s.pane)).collect();
             assert_eq!(
                 ys,
                 vec![
@@ -23543,11 +23620,10 @@ mod tests {
             let fold = fold_at(view, &ctx, chrome, w);
             let plan = fold.plan()?;
             let (rows, hits) = render_with_hits(view, chrome, w, 80);
-            let starts: Vec<(usize, u16)> = hits
-                .account_rows
-                .iter()
-                .filter(|h| plan.members.contains(&h.display_idx))
-                .map(|h| (h.display_idx, h.area.x))
+            let starts: Vec<(usize, u16)> = account_rows(&hits)
+                .into_iter()
+                .filter(|(_, idx)| plan.members.contains(idx))
+                .map(|(area, idx)| (idx, area.x))
                 .collect();
             println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
             let columns = plan.grid.plan(w).expect("the plan's width").columns;
@@ -23666,15 +23742,16 @@ mod tests {
         let frame = rows.join("\n");
         let accounts = row_of(&rows, " accounts · sort ");
         let band = row_of(&rows, " scheduler · poller ");
+        let sep = separators(&hits)[0];
         assert_eq!(
-            (hits.separators[0].y, hits.separators[0].pane_top),
+            (sep.y, sep.pane_top),
             (band as u16, accounts as u16),
             "{frame}"
         );
         let click = |id: &str, column: u16, row: u16| {
             let mut app = fold_app();
             app.fold_exhausted = true;
-            app.account_row_chrome = hits.account_rows.clone();
+            app.hits = hits.hits.clone();
             let down = MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column,
@@ -23702,7 +23779,7 @@ mod tests {
             click(&live_id(n), x, y as u16);
         }
         // Every hit maps a visible account once.
-        let mut seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        let mut seen: Vec<usize> = account_rows(&hits).into_iter().map(|(_, i)| i).collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..21).collect::<Vec<_>>(), "{frame}");
     }
@@ -24021,7 +24098,7 @@ mod tests {
         // Every account is on screen exactly once, in the table's order.
         let ctx = frame_ctx(&view, &chrome);
         let (_, hits) = render_with_hits(&view, &chrome, 80, 30);
-        let seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        let seen: Vec<usize> = account_rows(&hits).into_iter().map(|(_, i)| i).collect();
         assert_eq!(seen, (0..ctx.order.len()).collect::<Vec<_>>(), "{frame}");
 
         let rows = render_rows(&view, &chrome, 179, 30);
@@ -24096,9 +24173,9 @@ mod tests {
     fn compact_entry_clicks_open_the_same_account_as_its_table_row() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let (view, chrome) = compact_view();
-        let press = |hits: &[AccountRowHit], button: MouseButton, column: u16, row: u16| {
+        let press = |hits: &Hits, button: MouseButton, column: u16, row: u16| {
             let mut app = fold_app();
-            app.account_row_chrome = hits.to_vec();
+            app.hits = hits.clone();
             let down = MouseEvent {
                 kind: MouseEventKind::Down(button),
                 column,
@@ -24114,19 +24191,19 @@ mod tests {
         for n in [1usize, 7, 10] {
             let row = accounts + 1 + (n + 1) % 2;
             let x = col_of(&rows[row], &fold_name(n)) + 1;
-            let app = press(&hits.account_rows, MouseButton::Left, x, row as u16);
+            let app = press(&hits.hits, MouseButton::Left, x, row as u16);
             assert_eq!(
                 app.account_modal.as_ref().map(|m| m.account.clone()),
                 Some(live_id(n)),
                 "#{n}:\n{frame}"
             );
-            let app = press(&hits.account_rows, MouseButton::Right, x, row as u16);
+            let app = press(&hits.hits, MouseButton::Right, x, row as u16);
             assert_eq!(app.menu_account, Some(live_id(n)), "#{n}:\n{frame}");
         }
         // The table row of #7 at 179x43 opens the same account.
         let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
         let y = row_of(&rows, &format!(" 7  {}", fold_name(7)));
-        let app = press(&hits.account_rows, MouseButton::Left, 10, y as u16);
+        let app = press(&hits.hits, MouseButton::Left, 10, y as u16);
         assert_eq!(
             app.account_modal.as_ref().map(|m| m.account.clone()),
             Some(live_id(7))
