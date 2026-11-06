@@ -867,9 +867,15 @@ fn modal_key(state: &mut ModalState, code: KeyCode) -> bool {
 
 /// A mouse event on an open text modal: the wheel scrolls `step` rows, a
 /// press on the scrollbar jumps there or grabs the thumb, a drag moves it,
-/// and a press on `esc close` closes the modal (`true`). Every event is
-/// swallowed, so nothing reaches the rows beneath.
-fn modal_mouse(state: &mut ModalState, mouse: &crossterm::event::MouseEvent, step: isize) -> bool {
+/// and a press on `esc close` closes the modal (`true`). `target` is what
+/// the last frame drew under the pointer. Every event is swallowed, so
+/// nothing reaches the rows beneath.
+fn modal_mouse(
+    state: &mut ModalState,
+    mouse: &crossterm::event::MouseEvent,
+    target: Option<&ui::ClickTarget>,
+    step: isize,
+) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             state.scroll_by(-step);
@@ -877,9 +883,14 @@ fn modal_mouse(state: &mut ModalState, mouse: &crossterm::event::MouseEvent, ste
         MouseEventKind::ScrollDown => {
             state.scroll_by(step);
         }
-        MouseEventKind::Down(MouseButton::Left) => {
-            return state.press(mouse.column, mouse.row) == ModalOutcome::Closed;
-        }
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            Some(ui::ClickTarget::ModalClose) => return true,
+            Some(ui::ClickTarget::ModalScrollbar) => {
+                state.press(mouse.column, mouse.row);
+            }
+            // Anywhere else: swallowed, and a thumb still held is let go.
+            _ => state.release(),
+        },
         MouseEventKind::Drag(MouseButton::Left) => {
             state.drag(mouse.column, mouse.row);
         }
@@ -1183,9 +1194,9 @@ struct App {
     /// (`None`: nothing overflows), and the press-drag-release on it.
     table_scroll: Option<ui::TableScroll>,
     table_drag: twolab_tui::scrollbar::ScrollbarDrag,
-    /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
-    /// payload-tab rects + top-right action buttons. Same record/read cycle
-    /// as `hits`; empty while the modal is closed.
+    /// The raw viewer's layout from the LAST rendered frame (UI-8): its
+    /// scroll clamp, page size and body scrollbar (its tabs and buttons are
+    /// in `hits`). Same record/read cycle as `hits`; empty while closed.
     raw_chrome: ui::RawModalChrome,
     /// A press-drag-release on the raw viewer's body scrollbar.
     raw_drag: twolab_tui::scrollbar::ScrollbarDrag,
@@ -1197,8 +1208,6 @@ struct App {
     perf_days: u64,
     perf_cursor: usize,
     perf_day_off: Option<u64>,
-    /// The rendered context menu's hit layout (UI-3 U11), when open.
-    menu_chrome: Option<twolab_tui::menu::MenuLayout>,
     /// Anchor cell of the open context menu (col, row).
     menu_anchor: Option<(u16, u16)>,
     /// The REAL account id the open context menu targets, captured at open
@@ -1399,7 +1408,6 @@ impl App {
             perf_days: 14,
             perf_cursor: 0,
             perf_day_off: None,
-            menu_chrome: None,
             menu_anchor: None,
             menu_account: None,
             limits_from_menu: false,
@@ -1969,7 +1977,7 @@ impl App {
         // closes it, and every other click is swallowed so it can't reach a
         // row beneath the modal.
         if let Some(modal) = self.input_modal.as_mut() {
-            if modal_mouse(&mut modal.state, &mouse, 1) {
+            if modal_mouse(&mut modal.state, &mouse, target, 1) {
                 self.input_modal = None;
             }
             return true;
@@ -1978,43 +1986,32 @@ impl App {
         // adds clickable payload tabs + the top-right action buttons, and the
         // body's scrollbar takes a press and a drag.
         if self.raw_modal.is_some() {
-            let hit = |r: &ratatui::layout::Rect| {
-                mouse.column >= r.x
-                    && mouse.column < r.x + r.width
-                    && mouse.row >= r.y
-                    && mouse.row < r.y + r.height
-            };
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let button = self
-                        .raw_chrome
-                        .buttons
-                        .iter()
-                        .find(|(_, r)| hit(r))
-                        .map(|&(b, _)| b);
-                    let tab = self
-                        .raw_chrome
-                        .tabs
-                        .iter()
-                        .find(|(_, r)| hit(r))
-                        .map(|&(i, _)| i);
-                    let bar = self.raw_chrome.bar;
-                    if let Some(btn) = button {
-                        self.raw_modal_action(btn);
-                    } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
-                        modal.tab = idx;
-                        modal.scroll = 0;
-                    } else if let (Some(bar), Some(modal)) = (bar, self.raw_modal.as_mut()) {
-                        // The body's scrollbar: a press on the track jumps,
-                        // one on the thumb grabs it for the drag below.
-                        if let Some(top) =
-                            self.raw_drag
-                                .press(bar.pos, bar.track, mouse.column, mouse.row)
-                        {
-                            modal.scroll = top;
+                MouseEventKind::Down(MouseButton::Left) => match target {
+                    Some(&ui::ClickTarget::RawButton(btn)) => self.raw_modal_action(btn),
+                    Some(&ui::ClickTarget::RawTab(idx)) => {
+                        if let Some(modal) = self.raw_modal.as_mut() {
+                            modal.tab = idx;
+                            modal.scroll = 0;
                         }
                     }
-                }
+                    // The body's scrollbar: a press on the track jumps, one
+                    // on the thumb grabs it for the drag below.
+                    Some(ui::ClickTarget::RawScrollbar) => {
+                        if let (Some(bar), Some(modal)) =
+                            (self.raw_chrome.bar, self.raw_modal.as_mut())
+                        {
+                            if let Some(top) =
+                                self.raw_drag
+                                    .press(bar.pos, bar.track, mouse.column, mouse.row)
+                            {
+                                modal.scroll = top;
+                            }
+                        }
+                    }
+                    // Anywhere else: swallowed, and a thumb still held is let go.
+                    _ => self.raw_drag.release(),
+                },
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let (Some(bar), Some(modal)) = (self.raw_chrome.bar, self.raw_modal.as_mut())
                     {
@@ -2045,7 +2042,7 @@ impl App {
         // every other event is swallowed so a click can't reach the row
         // beneath it.
         if let Some(modal) = self.account_modal.as_mut() {
-            if modal_mouse(&mut modal.state, &mouse, 3) {
+            if modal_mouse(&mut modal.state, &mouse, target, 3) {
                 self.account_modal = None;
             }
             return true;
@@ -2176,13 +2173,12 @@ impl App {
                 mouse.kind,
                 MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
             ) {
-                let menu = self.menu_chrome.as_ref();
-                match menu.and_then(|m| m.hit(mouse.column, mouse.row)) {
-                    Some(item) => self.run_menu_item(idx, item, view),
+                match target {
+                    Some(&ui::ClickTarget::MenuItem(item)) => self.run_menu_item(idx, item, view),
                     // A dim (cannot-run) item or the border: nothing runs,
                     // the menu stays.
-                    None if menu.is_some_and(|m| m.contains(mouse.column, mouse.row)) => {}
-                    None => self.close_menu(),
+                    Some(ui::ClickTarget::Surface(ui::Surface::Menu)) => {}
+                    _ => self.close_menu(),
                 }
                 return true;
             }
@@ -6564,7 +6560,6 @@ async fn event_loop(
             app.hits = main.hits;
             app.table_scroll = main.table_scroll;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
-            app.menu_chrome = main.menu;
             // The open text field's window, as drawn.
             app.track_field(main.field_width);
             // The Logs pager clamps a held offset itself; one at (or past)
@@ -7549,15 +7544,15 @@ mod tests {
         let mut app = remote_app();
         app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
-        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 10,
                 y: 6,
                 width: 14,
                 height: 5,
             },
-            ..Default::default()
-        });
+            ui::ClickTarget::Surface(ui::Surface::Menu),
+        );
         let lclick_outside = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 70,
@@ -7644,21 +7639,17 @@ mod tests {
             width: 14,
             height: 1,
         };
-        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 9,
                 y: 6,
                 width: 16,
                 height: 6,
             },
-            items: (1..4)
-                .map(|index| twolab_tui::menu::MenuHit {
-                    rect: rect(7 + index as u16),
-                    index,
-                })
-                .collect(),
-            ..Default::default()
-        });
+            ui::ClickTarget::Surface(ui::Surface::Menu),
+        );
+        app.hits
+            .extend((1..4).map(|index| (rect(7 + index as u16), ui::ClickTarget::MenuItem(index))));
         let lclick = |row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 12,
@@ -7986,6 +7977,7 @@ mod tests {
             modal.state.layout.pos = ScrollPos::of(60, 20, 0);
             modal.state.layout.track = Some(rect(70, 4, 1, 20));
             modal.state.layout.close = Some(rect(60, 2, 9, 1));
+            ui::push_modal(&mut app.hits, rect(0, 0, 80, 26), &modal.state.layout);
             app.account_modal = Some(modal);
         };
         let click = |col, row| mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -9214,7 +9206,11 @@ mod tests {
             Some(raw.max_scroll),
             "End clamps to the last row"
         );
-        let (index, rect) = raw.tabs[1];
+        let index = 1;
+        let rect = app
+            .hits
+            .area_of(&ui::ClickTarget::RawTab(index))
+            .expect("the Response tab drawn");
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
             None,
