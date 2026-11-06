@@ -12,8 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Table, Wrap,
+    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 use twolab_tui::spinner::SpinnerKind;
@@ -4555,8 +4554,9 @@ pub(crate) struct RawContent {
 pub(crate) struct RawTabContent {
     pub label: &'static str,
     pub lines: Vec<Line<'static>>,
-    /// Widest line in display cells — the horizontal scroll bound.
-    pub width: u16,
+    /// Whether a line is longer than [`RAW_LONG_LINE`] bytes: those are
+    /// wrapped once per width by the viewer itself, not every frame.
+    pub long_lines: bool,
     /// The raw body verbatim — the `copy` / `save` payload.
     pub body_text: String,
     /// `copy as curl` for this tab's SIDE of the exchange: client tabs carry
@@ -4611,28 +4611,33 @@ fn curl_command(
     out
 }
 
-/// Assemble one [`RawTabContent`], measuring the widest line for the
-/// horizontal scroll bound.
+/// Assemble one [`RawTabContent`], noting whether any line is too long to
+/// wrap on every frame.
 fn raw_tab(
     label: &'static str,
     lines: Vec<Line<'static>>,
     body_text: String,
     curl: String,
 ) -> RawTabContent {
-    let width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let long_lines = lines.iter().any(|l| line_bytes(l) > RAW_LONG_LINE);
     RawTabContent {
         label,
         lines,
-        width: u16::try_from(width).unwrap_or(u16::MAX),
+        long_lines,
         body_text,
         curl,
     }
 }
 
-/// Hard wrap applied to raw body lines at build time (cells are clipped by the
-/// Paragraph anyway; the wrap bounds the cost of cloning the VISIBLE slice per
-/// frame — a truncated non-JSON stream body can be one single 8 MiB line).
-const RAW_LINE_WRAP: usize = 2048;
+/// A raw-viewer line longer than this many bytes is wrapped once per width
+/// by the viewer ([`raw_long_lines`]), not by `JsonView` on every frame: the
+/// widget wraps a whole line to draw any of its rows, and a truncated stream
+/// body or a base64 image can be one 8 MiB line (≈ 230 ms a frame).
+const RAW_LONG_LINE: usize = 16 * 1024;
+
+fn line_bytes(line: &Line) -> usize {
+    line.spans.iter().map(|s| s.content.len()).sum()
+}
 
 /// Section header line (`── request headers ──` style) for the raw viewer.
 fn raw_section(title: &str) -> Line<'static> {
@@ -4686,68 +4691,151 @@ const RAW_JSON_STYLES: twolab_tui::json_view::JsonStyles = twolab_tui::json_view
     punct: Style::new().fg(Color::DarkGray),
 };
 
-/// Hard-wrap a single logical line into `RAW_LINE_WRAP`-char chunks on char
-/// boundaries (continuation chunks lose highlighting context by design — they
-/// only occur on machine-generated monster lines).
-fn wrap_raw_line(line: &str) -> Vec<&str> {
-    if line.len() <= RAW_LINE_WRAP {
-        return vec![line];
-    }
-    let mut chunks = Vec::new();
-    let mut rest = line;
-    while rest.len() > RAW_LINE_WRAP {
-        let mut end = RAW_LINE_WRAP;
-        while end > 0 && !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == 0 {
-            break; // pathological; emit whole remainder below
-        }
-        chunks.push(&rest[..end]);
-        rest = &rest[end..];
-    }
-    chunks.push(rest);
-    chunks
-}
-
-/// Render a captured body as styled lines. A body that parses as ONE JSON
-/// document is pretty-printed and highlighted (the CDT "preview" view). An
-/// SSE / plain-text body keeps its own lines; `data: {json}` SSE lines get
-/// their payload highlighted inline. Anything else renders plain.
+/// Render a captured body as styled lines, one per source line (the viewer
+/// wraps them at its width). A body that parses as ONE JSON document is
+/// pretty-printed and highlighted (the CDT "preview" view). An SSE /
+/// plain-text body keeps its own lines; `data: {json}` SSE lines get their
+/// payload highlighted inline. Anything else renders plain.
 pub(crate) fn raw_body_lines(body: &str) -> Vec<Line<'static>> {
     if body.is_empty() {
         return vec![Line::from(Span::styled("(empty body)", dim()))];
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-            return pretty
-                .lines()
-                .flat_map(|l| {
-                    wrap_raw_line(l)
-                        .into_iter()
-                        .map(highlight_json_line)
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            return pretty.lines().map(highlight_json_line).collect();
         }
     }
     body.lines()
-        .flat_map(|line| {
-            wrap_raw_line(line)
-                .into_iter()
-                .map(|chunk| {
-                    if let Some(rest) = chunk.strip_prefix("data: ") {
-                        if serde_json::from_str::<serde_json::Value>(rest).is_ok() {
-                            let mut spans = vec![Span::styled("data: ".to_string(), dim())];
-                            spans.extend(highlight_json_line(rest).spans);
-                            return Line::from(spans);
-                        }
-                    }
-                    Line::from(Span::raw(chunk.to_string()))
-                })
-                .collect::<Vec<_>>()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("data: ") {
+                if serde_json::from_str::<serde_json::Value>(rest).is_ok() {
+                    let mut spans = vec![Span::styled("data: ".to_string(), dim())];
+                    spans.extend(highlight_json_line(rest).spans);
+                    return Line::from(spans);
+                }
+            }
+            Line::from(Span::raw(line.to_string()))
         })
         .collect()
+}
+
+/// The raw viewer's body cache, kept across frames for the opened modal:
+/// `JsonView`'s measured rows and, on a tab with [`RAW_LONG_LINE`]s, those
+/// lines wrapped once at the width. `Chrome` is cloned every frame, so the
+/// cache sits behind a shared lock that the frame drawing the modal fills;
+/// a new modal starts a new one. Two handles always compare equal: what a
+/// cache has measured is not part of the modal's state.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RawBodyView(std::sync::Arc<std::sync::Mutex<RawBodyCache>>);
+
+impl PartialEq for RawBodyView {
+    fn eq(&self, _: &RawBodyView) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RawBodyCache {
+    state: twolab_tui::json_view::JsonViewState,
+    long: Option<RawLongLines>,
+}
+
+/// A tab's lines with every [`RAW_LONG_LINE`] wrapped at one width.
+#[derive(Debug)]
+struct RawLongLines {
+    /// (body generation, width) the rows were wrapped for.
+    key: (u64, usize),
+    lines: Vec<Line<'static>>,
+    /// Per wrapped source line: its first display line, its rows, and the
+    /// rows added by the wrapped lines before it.
+    splits: Vec<(usize, usize, usize)>,
+}
+
+impl RawLongLines {
+    /// The source line a display line belongs to (0-based).
+    fn source(&self, display: usize) -> usize {
+        let k = self
+            .splits
+            .partition_point(|&(start, _, _)| start <= display);
+        match k.checked_sub(1).map(|i| self.splits[i]) {
+            None => display,
+            Some((start, rows, before)) if display < start + rows => start - before,
+            Some((_, rows, before)) => display - before - (rows - 1),
+        }
+    }
+
+    /// Rows added by wrapping: display lines minus source lines.
+    fn added(&self) -> usize {
+        self.splits
+            .last()
+            .map_or(0, |&(_, rows, before)| before + rows - 1)
+    }
+}
+
+/// `lines` with every line over [`RAW_LONG_LINE`] bytes wrapped at `width`
+/// — the rows `JsonView` would draw for it (continuation rows hang under the
+/// line's indent), so only their count differs from the source.
+fn raw_long_lines(lines: &[Line<'static>], width: usize, key: (u64, usize)) -> RawLongLines {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut splits = Vec::new();
+    let mut added = 0;
+    for line in lines {
+        if line_bytes(line) <= RAW_LONG_LINE {
+            out.push(line.clone());
+            continue;
+        }
+        let rows = wrap_ascii(line, width)
+            .unwrap_or_else(|| twolab_tui::json_view::wrap_line(line, width));
+        splits.push((out.len(), rows.len(), added));
+        added += rows.len().saturating_sub(1);
+        out.extend(rows);
+    }
+    RawLongLines {
+        key,
+        lines: out,
+        splits,
+    }
+}
+
+/// [`twolab_tui::json_view::wrap_line`] for a line of printable ASCII (one
+/// cell per byte), by slicing instead of walking graphemes — an 8 MiB base64
+/// string wraps in milliseconds. `None` for any other line.
+fn wrap_ascii(line: &Line<'static>, width: usize) -> Option<Vec<Line<'static>>> {
+    let printable = |s: &Span| s.content.bytes().all(|b| (0x20..0x7f).contains(&b));
+    if !line.spans.iter().all(printable) {
+        return None;
+    }
+    let width = width.max(1);
+    let lead = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.bytes())
+        .take_while(|&b| b == b' ')
+        .count();
+    let hang = lead.min(width / 2);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut col = 0;
+    for span in &line.spans {
+        let mut rest = span.content.as_ref();
+        while !rest.is_empty() {
+            if col == width {
+                rows.push(Line::from(std::mem::take(&mut row)));
+                if hang > 0 {
+                    row.push(Span::raw(" ".repeat(hang)));
+                }
+                col = hang;
+            }
+            let take = rest.len().min(width - col);
+            row.push(Span::styled(rest[..take].to_string(), span.style));
+            rest = &rest[take..];
+            col += take;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(Line::from(row));
+    }
+    Some(rows)
 }
 
 /// General-metadata lines for the raw viewer's Request tab, built at OPEN time
@@ -4937,17 +5025,10 @@ pub(crate) fn raw_content_from_record(
     }
 }
 
-/// Draw the raw request/response viewer (UI-7/UI-8): a near-full-screen modal
-/// with a payload tab bar (2 or 4 tabs), top-right action buttons, the
-/// prebuilt content scrolled by whole lines both ways, and proportional
-/// scrollbars on the right + bottom edges. Returns the frame's
-/// [`RawModalChrome`] (scroll clamps + click rects) so the runtime can clamp
-/// offsets and route clicks.
 /// The raw viewer's keys (its bottom-border legend; the `?` help lists them).
-const RAW_KEYS: [(&str, &str); 9] = [
+const RAW_KEYS: [(&str, &str); 8] = [
     ("←→/tab", "switch"),
     ("↑↓", "scroll"),
-    ("H/L", "pan"),
     ("c", "copy"),
     ("C", "curl"),
     ("a", "copy all"),
@@ -4956,6 +5037,14 @@ const RAW_KEYS: [(&str, &str); 9] = [
     ("esc", "close"),
 ];
 
+/// Draw the raw request/response viewer (UI-7/UI-8): a near-full-screen modal
+/// with a payload tab strip (2 or 4 tabs, the library `Tabs` the main row
+/// uses), top-right action buttons, and the active tab's lines — the general
+/// and header sections as plain lines, then the body — in a twolab-tui
+/// `JsonView`: wrapped at the width, `lines a–b of n` below, a scrollbar that
+/// can be dragged when it overflows. Returns the frame's [`RawModalChrome`]
+/// (scroll clamp, page, scrollbar and click rects) so the runtime can clamp
+/// the offset and route keys and clicks.
 fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
     let mut area = centered_rect(frame.area(), 94, 92);
     // Its bottom border carries the key legend: keep it above the two footer
@@ -5061,13 +5150,14 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
         frame.render_widget(Paragraph::new(Line::from(spans)), row_area);
     }
 
-    // Content viewport: tab bar (row 0) + spacer, right column + bottom row
-    // reserved for the scrollbars.
+    // Content viewport: under the tab strip (row 0) and a spacer; the
+    // JsonView keeps its last row for `lines a–b of n` and its right column
+    // for the scrollbar when the lines overflow.
     let viewport = Rect {
         x: inner.x,
         y: inner.y + 2,
-        width: inner.width.saturating_sub(1),
-        height: inner.height.saturating_sub(3),
+        width: inner.width,
+        height: inner.height.saturating_sub(2),
     };
     let content = match &modal.state {
         RawModalState::Loading => {
@@ -5097,94 +5187,115 @@ fn draw_raw_modal(frame: &mut Frame, modal: &RawModal) -> RawModalChrome {
         RawModalState::Ready(content) => content,
     };
 
-    // Tab bar: one hit rect per label, active tab inverted.
+    // Tab strip: the library `Tabs` with the main row's look; one hit rect
+    // per label as drawn, measured in cells.
     let active = modal.tab.min(content.tabs.len().saturating_sub(1));
-    let mut tab_spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    let mut x = inner.x + 1;
-    for (i, t) in content.tabs.iter().enumerate() {
-        let w = t.label.len() as u16 + 2;
-        chrome.tabs.push((
-            i,
-            Rect {
-                x,
-                y: inner.y,
-                width: w,
-                height: 1,
-            },
-        ));
-        tab_spans.push(if i == active {
-            Span::styled(
-                format!(" {} ", t.label),
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!(" {} ", t.label), dim())
-        });
-        tab_spans.push(Span::raw(" "));
-        x += w + 1;
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(tab_spans)),
-        Rect { height: 1, ..inner },
-    );
+    let strip = twolab_tui::tabs::Tabs::new(
+        content
+            .tabs
+            .iter()
+            .map(|t| twolab_tui::tabs::Tab::new(t.label)),
+    )
+    .active(active)
+    .theme(twolab_tui::Theme::ansi())
+    .hints(twolab_tui::tabs::Hints::Off);
+    let layout = strip.render_layout(Rect { height: 1, ..inner }, frame.buffer_mut());
+    chrome.tabs = layout.hits.iter().map(|h| (h.index, h.rect)).collect();
 
     if viewport.height == 0 || viewport.width == 0 {
         return chrome;
     }
-    let tab = &content.tabs[active];
-    let lines = &tab.lines;
-    let max_v = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_sub(viewport.height);
-    let max_h = tab.width.saturating_sub(viewport.width);
-    chrome.max_scroll = (max_v, max_h);
-    let scroll = usize::from(modal.scroll.min(max_v));
-    let hscroll = modal.hscroll.min(max_h);
-    let visible: Vec<Line<'static>> = lines
-        .iter()
-        .skip(scroll)
-        .take(usize::from(viewport.height))
-        .cloned()
-        .collect();
-    frame.render_widget(Paragraph::new(visible).scroll((0, hscroll)), viewport);
-
-    // Proportional scrollbars (UI-8): right edge = vertical, bottom =
-    // horizontal. Rendered only when the content overflows that axis.
-    if max_v > 0 {
-        let mut state =
-            ScrollbarState::new(usize::from(max_v)).position(usize::from(modal.scroll.min(max_v)));
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(dim())
-                .thumb_style(Style::new().fg(Color::Cyan)),
-            Rect {
-                x: inner.right().saturating_sub(1),
-                y: viewport.y,
-                width: 1,
-                height: viewport.height,
-            },
-            &mut state,
-        );
-    }
-    if max_h > 0 {
-        let mut state = ScrollbarState::new(usize::from(max_h)).position(usize::from(hscroll));
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-                .style(dim())
-                .thumb_style(Style::new().fg(Color::Cyan)),
-            Rect {
-                x: viewport.x,
-                y: inner.bottom().saturating_sub(1),
-                width: viewport.width,
-                height: 1,
-            },
-            &mut state,
-        );
-    }
+    let Some(tab) = content.tabs.get(active) else {
+        return chrome;
+    };
+    draw_raw_body(frame, viewport, modal, active, tab, &mut chrome);
     chrome
+}
+
+/// The active tab's lines in a `JsonView` over `viewport`, with its cache
+/// (row starts, long lines wrapped at this width) kept on the modal. The
+/// widget's ratatui scrollbar is drawn over with the library scrollbar the
+/// tables use, so the thumb drawn is the thumb a press or drag acts on.
+fn draw_raw_body(
+    frame: &mut Frame,
+    viewport: Rect,
+    modal: &RawModal,
+    active: usize,
+    tab: &RawTabContent,
+    chrome: &mut RawModalChrome,
+) {
+    use ratatui::widgets::StatefulWidget;
+    use twolab_tui::json_view::JsonView;
+    use twolab_tui::scrollbar::{ScrollPos, Scrollbar};
+
+    let mut cache = modal.view.0.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = &mut *cache;
+    // Long lines are wrapped here at the width the view draws them at once
+    // it scrolls (one column for the scrollbar) — they always overflow.
+    let wrap_w = usize::from(viewport.width.saturating_sub(1)).max(1);
+    let body = modal.generation.wrapping_mul(8).wrapping_add(active as u64);
+    let long = if tab.long_lines {
+        let key = (body, wrap_w);
+        if cache.long.as_ref().is_none_or(|l| l.key != key) {
+            cache.long = Some(raw_long_lines(&tab.lines, wrap_w, key));
+        }
+        cache.long.as_ref()
+    } else {
+        None
+    };
+    // One generation per body (and per wrap width when long lines are
+    // wrapped here): a tab switch or a new record re-measures.
+    let generation = body
+        .wrapping_mul(1 << 16)
+        .wrapping_add(long.map_or(0, |_| wrap_w as u64));
+    cache.state.set_generation(generation);
+    cache.state.scroll = modal.scroll;
+    let lines = long.map_or(tab.lines.as_slice(), |l| l.lines.as_slice());
+    let view = JsonView::new(lines).hints(false).theme(KEYBAR_THEME);
+    (&view).render(viewport, frame.buffer_mut(), &mut cache.state);
+
+    let max = cache.state.max_scroll().unwrap_or(0);
+    let view_h = usize::from(viewport.height.saturating_sub(1)).max(1);
+    chrome.max_scroll = max;
+    chrome.page = view_h.saturating_sub(1).max(1);
+    if max > 0 && viewport.width >= 2 && viewport.height >= 2 {
+        let pos = ScrollPos::new(cache.state.scroll, max, view_h);
+        let track = Rect {
+            x: viewport.right() - 1,
+            width: 1,
+            height: viewport.height - 1,
+            ..viewport
+        };
+        frame.render_widget(Scrollbar::new(pos).theme(KEYBAR_THEME), track);
+        chrome.bar = Some(TableScroll { pos, track });
+    }
+    // With long lines wrapped here the widget counted display lines; say the
+    // position in the body's own lines instead.
+    if let (Some(long), Some((first, last, n))) = (long, cache.state.shown()) {
+        if viewport.height >= 2 {
+            let n = n - long.added();
+            let at = if max == 0 {
+                format!("{n} lines")
+            } else {
+                format!(
+                    "lines {}–{} of {n}",
+                    long.source(first - 1) + 1,
+                    long.source(last - 1) + 1
+                )
+            };
+            let row = Rect {
+                y: viewport.bottom() - 1,
+                height: 1,
+                ..viewport
+            };
+            frame.render_widget(Clear, row);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(at, KEYBAR_THEME.secondary())))
+                    .right_aligned(),
+                row,
+            );
+        }
+    }
 }
 
 /// Attach-mode pre-first-document screen: identity + a "connecting…" /
@@ -8532,8 +8643,13 @@ pub(crate) struct MainChrome {
 /// are mouse targets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RawModalChrome {
-    /// Largest valid (vertical, horizontal) scroll for the ACTIVE tab.
-    pub max_scroll: (u16, u16),
+    /// Largest valid scroll (in wrapped rows) for the ACTIVE tab.
+    pub max_scroll: usize,
+    /// Rows a PgUp/PgDn moves: the view's height less one.
+    pub page: usize,
+    /// The body's scrollbar when its lines overflow: a press on the track
+    /// jumps, a drag on the thumb scrolls.
+    pub bar: Option<TableScroll>,
     /// One rect per rendered tab label, with the tab index it selects.
     pub tabs: Vec<(usize, Rect)>,
     /// One rect per rendered action button.
@@ -12677,7 +12793,7 @@ mod tests {
             title: "raw".into(),
             tab: 0,
             scroll: 0,
-            hscroll: 0,
+            view: Default::default(),
             spin: 0,
             flash: None,
             state: super::super::RawModalState::Failed("gone".into()),
@@ -15000,6 +15116,193 @@ mod tests {
         );
     }
 
+    /// A raw viewer over a Ready record for the frame tests: a JSON request
+    /// whose `content` string is `len` bytes long, and a short response.
+    fn raw_modal_over(len: usize) -> super::super::RawModal {
+        let body = format!(
+            r#"{{"model":"claude-opus-4-8","messages":[{{"role":"user","content":"{}"}}],"stream":true}}"#,
+            "ab".repeat(len / 2)
+        );
+        let record = crate::proxy::raw_io::RawIoRecord::new(
+            7,
+            0,
+            Some("claude".into()),
+            None,
+            None,
+            Some(200),
+            body.as_bytes(),
+            br#"{"id":"msg_1","type":"message"}"#,
+            16 << 20,
+            Some(vec![("content-type".into(), "application/json".into())]),
+            None,
+            None,
+        );
+        let general = RawGeneral {
+            lines: vec![
+                raw_section("general"),
+                Line::from("request     POST /v1/messages"),
+            ],
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            base_url: "http://localhost:3456".into(),
+        };
+        super::super::RawModal {
+            key: ActivityKey {
+                at_ms: 0,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                status: 200,
+            },
+            id: 7,
+            generation: 1,
+            title: "🔍 raw — POST /v1/messages".into(),
+            tab: 0,
+            scroll: 0,
+            view: Default::default(),
+            spin: 0,
+            flash: None,
+            state: super::super::RawModalState::Ready(std::sync::Arc::new(
+                raw_content_from_record(general, &record),
+            )),
+        }
+    }
+
+    /// The cells `x..x + w` of a frame row (one symbol per cell).
+    fn row_cells(row: &str, x: u16, w: u16) -> String {
+        row.chars()
+            .skip(usize::from(x))
+            .take(usize::from(w))
+            .collect()
+    }
+
+    /// Batch 2 raw viewer: Request/Response on the library tab strip (the
+    /// main row's divider and weight, click rects measured in cells over the
+    /// labels as drawn), and the lines in a JsonView — the general and header
+    /// sections plain, then the body, whose long string wraps at the width
+    /// under its indent instead of running off the edge, `lines a–b of n`
+    /// below and a scrollbar while it overflows — at 80×24 and 179×43.
+    #[test]
+    fn raw_viewer_tabs_and_wrapped_body_at_80x24_and_179x43() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.raw_modal = Some(raw_modal_over(400));
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let raw = hits.raw_modal.expect("the raw viewer drew");
+            assert_eq!(raw.tabs.len(), 2, "{w}x{h}:\n{frame}");
+            for (i, label) in ["Request", "Response"].into_iter().enumerate() {
+                let (index, rect) = raw.tabs[i];
+                assert_eq!(index, i);
+                let row = &rows[usize::from(rect.y)];
+                assert_eq!(row_cells(row, rect.x, rect.width), label, "{w}x{h}: {row}");
+            }
+            let strip = &rows[usize::from(raw.tabs[0].1.y)];
+            assert!(strip.contains("Request │ Response"), "{w}x{h}: {strip}");
+            let at = rows
+                .iter()
+                .position(|r| r.contains("\"content\": \"abab"))
+                .unwrap_or_else(|| panic!("{w}x{h}:\n{frame}"));
+            assert!(
+                rows[at + 1].contains("│      abababab"),
+                "{w}x{h}: the string wraps under its indent:\n{frame}"
+            );
+            assert!(
+                frame.contains("content-type: application/json"),
+                "headers kept"
+            );
+            assert!(
+                frame.contains("── general ──"),
+                "general kept before the body"
+            );
+        }
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let raw = hits.raw_modal.expect("drawn");
+        let bar = raw.bar.expect("17 lines overflow 80x24");
+        assert!(frame.contains("lines 1–11 of 17"), "{frame}");
+        let edge =
+            |rows: &[String], y: u16| rows[usize::from(y)].chars().nth(usize::from(bar.track.x));
+        assert_eq!(edge(&rows, bar.track.y), Some('▐'), "{frame}");
+        assert_eq!(raw.max_scroll, bar.pos.max);
+        let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+        assert!(rows.join("\n").contains("17 lines"), "all of it fits");
+        assert_eq!(
+            hits.raw_modal.and_then(|r| r.bar),
+            None,
+            "no bar when it fits"
+        );
+
+        // Scrolled to the end: the last line and the thumb at the bottom.
+        chrome.raw_modal.as_mut().expect("open").scroll = usize::MAX;
+        let (rows, _) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        assert!(
+            frame.contains("of 17") && frame.contains("–17 of 17"),
+            "{frame}"
+        );
+        assert_eq!(edge(&rows, bar.track.bottom() - 1), Some('▐'), "{frame}");
+
+        // Under NO_COLOR the active tab still reads by weight.
+        chrome.raw_modal.as_mut().expect("open").scroll = 0;
+        let mut buf = render_buffer(&view, &chrome, 80, 24);
+        twolab_tui::theme::decolor(&mut buf);
+        let (_, req) = raw.tabs[0];
+        let (_, resp) = raw.tabs[1];
+        assert!(buf[(req.x, req.y)].modifier.contains(Modifier::BOLD));
+        assert!(!buf[(resp.x, resp.y)].modifier.contains(Modifier::BOLD));
+    }
+
+    /// An 8 MiB string is one source line: the viewer wraps it once at the
+    /// width (kept across frames) and the footer counts the body's own
+    /// lines, not the wrapped rows; a frame inside it draws only its rows.
+    #[test]
+    fn raw_viewer_wraps_an_8_mib_line_once_and_counts_source_lines() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.raw_modal = Some(raw_modal_over(8 << 20));
+        let first = std::time::Instant::now();
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let first = first.elapsed();
+        let raw = hits.raw_modal.expect("drawn");
+        assert!(raw.max_scroll > 100_000, "the string wraps to many rows");
+        assert!(
+            rows.join("\n").contains("lines 1–11 of 17"),
+            "{}",
+            rows.join("\n")
+        );
+        let cached = |chrome: &Chrome| {
+            let cache = chrome
+                .raw_modal
+                .as_ref()
+                .expect("open")
+                .view
+                .0
+                .lock()
+                .expect("lock");
+            cache.long.as_ref().map(|l| (l.key, l.lines.as_ptr()))
+        };
+        let before = cached(&chrome).expect("long lines wrapped at the width");
+
+        chrome.raw_modal.as_mut().expect("open").scroll = raw.max_scroll / 2;
+        let again = std::time::Instant::now();
+        let (rows, _) = render_with_hits(&view, &chrome, 80, 24);
+        let again = again.elapsed();
+        let frame = rows.join("\n");
+        assert!(
+            frame.contains("lines 11–11 of 17"),
+            "inside the long line:\n{frame}"
+        );
+        assert!(frame.contains("ababababab"), "{frame}");
+        assert_eq!(cached(&chrome), Some(before), "not wrapped again");
+        // Generous for a debug build on a busy machine: the first frame wraps
+        // 8 MiB once; the next draws 20 rows.
+        assert!(
+            again < std::time::Duration::from_millis(500),
+            "{again:?} (first {first:?})"
+        );
+    }
+
     #[test]
     fn raw_content_builds_four_tabs_for_translated_exchanges(/* UI-8 */) {
         let general = || RawGeneral {
@@ -15062,8 +15365,8 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&four.record_json).expect("save-all payload is valid JSON");
         assert_eq!(parsed["id"].as_u64(), Some(7));
-        // Every tab measured its widest line for the horizontal scroll bound.
-        assert!(four.tabs.iter().all(|t| t.width > 0));
+        // No line here is long enough to need wrapping ahead of the frame.
+        assert!(four.tabs.iter().all(|t| !t.long_lines));
     }
 
     #[test]
@@ -15145,18 +15448,52 @@ mod tests {
         );
     }
 
+    /// A monster line stays ONE source line (it was cut into 2048-byte
+    /// chunks, each a line of its own); the viewer wraps it at its width.
+    /// Wrapped ahead of the frame, an ASCII line gets exactly the rows
+    /// `JsonView` would give it — continuation rows hang under its indent —
+    /// and anything else goes through the library's own wrap.
     #[test]
-    fn wrap_raw_line_bounds_monster_lines_on_char_boundaries(/* UI-7 */) {
-        let big = "x".repeat(RAW_LINE_WRAP * 2 + 10);
-        let chunks = wrap_raw_line(&big);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|c| c.len() <= RAW_LINE_WRAP));
-        // Multi-byte chars are never split mid-scalar.
-        let uni = "€".repeat(RAW_LINE_WRAP);
-        for chunk in wrap_raw_line(&uni) {
-            assert!(chunk.len() <= RAW_LINE_WRAP);
-            assert!(chunk.chars().all(|c| c == '€'), "no torn scalars");
+    fn raw_monster_lines_stay_one_line_and_wrap_like_json_view(/* UI-7 */) {
+        let big = "x".repeat(RAW_LONG_LINE * 2 + 10);
+        let lines = raw_body_lines(&big);
+        assert_eq!(lines.len(), 1, "one source line");
+        let tab = raw_tab("Request", lines, big.clone(), String::new());
+        assert!(tab.long_lines);
+
+        let indented = Line::from(vec![
+            Span::styled("    \"data\": \"", Style::new().fg(Color::Cyan)),
+            Span::styled("ab".repeat(70), Style::new().fg(Color::Green)),
+            Span::raw("\","),
+        ]);
+        for width in [1usize, 7, 37, 80] {
+            assert_eq!(
+                wrap_ascii(&indented, width),
+                Some(twolab_tui::json_view::wrap_line(&indented, width)),
+                "width {width}"
+            );
         }
+        let uni = Line::from("€".repeat(50));
+        assert_eq!(
+            wrap_ascii(&uni, 10),
+            None,
+            "not ASCII: the library wraps it"
+        );
+
+        // Display lines map back to source lines for the footer.
+        let lines = vec![
+            Line::from("head"),
+            Line::from("y".repeat(RAW_LONG_LINE + 1)),
+            Line::from("tail"),
+        ];
+        let long = raw_long_lines(&lines, 100, (1, 100));
+        let rows = (RAW_LONG_LINE + 1).div_ceil(100);
+        assert_eq!(long.lines.len(), 2 + rows);
+        assert_eq!(long.added(), rows - 1);
+        assert_eq!(long.source(0), 0);
+        assert_eq!(long.source(1), 1);
+        assert_eq!(long.source(rows), 1, "the long line's last row");
+        assert_eq!(long.source(rows + 1), 2, "the line after it");
     }
 
     #[test]

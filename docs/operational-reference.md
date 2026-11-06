@@ -721,17 +721,26 @@ from a day that is already archived answers "in the DAY archive — run
   for gemini) → `Upstream Resp` (the provider's
   verbatim reply before conversion) → `Response` (what the client
   received). A byte-identity Anthropic passthrough shows the classic 2 tabs
-  (client and upstream exchange are the same bytes). Click a tab or walk
-  with `←`/`→`/`Tab`/`h`/`l`.
+  (client and upstream exchange are the same bytes). The tabs sit on the
+  same strip as the dashboard's tab row (`Request │ Response`, the active
+  one bold); click a tab or walk with `←`/`→`/`Tab`/`h`/`l`.
 For Claude-through-Codex, the `claude-agent-sdk` upstream legs record the Messages
 bridge transport, not the SDK’s private HTTP bytes; only the original client
 request is a replayable HTTP request. Raw capture is enabled by default and follows
 the configured size/redaction limits.
 
-- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, and the
-  wheel scroll vertically; `H`/`L` (or a horizontal wheel) pan sideways.
-  Proportional scrollbars render on the right and bottom edges when the
-  content overflows.
+- **Body.** The general and header sections come first as plain lines,
+  then the body — one JSON document pretty-printed and coloured, an SSE
+  stream line by line. Long lines (a base64 image, a minified stream) wrap
+  at the modal's width with continuation rows under their indent, so
+  nothing runs off the right edge and nothing pans sideways; the bottom
+  row says `lines 12–40 of 213` (or `17 lines` when it all fits), counted
+  in the body's own lines. An 8 MiB line is wrapped once per width, so
+  scrolling through it stays fast.
+- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn` (the view's height),
+  `Home`/`End`, and the wheel scroll. When the lines overflow, a scrollbar
+  on the right edge shows where you are: click its track to jump, drag
+  its thumb to scroll.
 - **Action buttons** (top-right, click or key): `copy` (`c`) puts the
   active tab's raw body on the system clipboard; `copy as curl` (`C`)
   reconstructs a replayable curl for that tab's side of the exchange
