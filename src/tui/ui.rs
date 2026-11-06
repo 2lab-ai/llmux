@@ -99,8 +99,110 @@ const HEATMAP_MAX_ROWS: usize = 8;
 /// Width of the heatmap's token-intensity mini-bar.
 const HEATMAP_BAR_WIDTH: usize = 12;
 
+/// Every colour the dashboard draws, in one place. Drawing code names a
+/// [`THEME`] field for what a colour MEANS — `ok`/`warn`/`crit` for how far
+/// into the red a value is, `run`/`wait`/`done`/`fail` for the state of a
+/// request or an account, `accent` for "look here", `muted` for the quiet
+/// parts — or, when a hue tells one thing from its peers rather than how it
+/// is doing (a provider, a chart series, a kind of message), one of the
+/// categorical consts below. No `Color::` literal lives outside this module
+/// (`colour_literals_live_only_in_the_palette` fails on one). Under
+/// `NO_COLOR` the frame loop's `decolor` pass strips all of them; meaning
+/// that must survive it is carried by weight and glyphs.
+mod palette {
+    use ratatui::style::Color;
+
+    /// The dashboard's one theme: llmux's own spans and every twolab-tui
+    /// widget (key bars, confirm gates, pickers, meters) draw with it. ANSI
+    /// colours, so the terminal's palette decides the hues, with labels
+    /// (`text_secondary`) in the terminal's default foreground — as before
+    /// the move to KeyHints — because ANSI grey labels are near-invisible on
+    /// a light-background terminal. Its `selected()` is reverse video, which
+    /// reads with and without colour ([`super::selected_style`]).
+    pub(super) const THEME: twolab_tui::Theme = twolab_tui::Theme {
+        text_secondary: Color::Reset,
+        ..twolab_tui::Theme::ansi()
+    };
+
+    /// The theme both trend charts draw with (tokens per day, perf t/s). The
+    /// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank,
+    /// so this carries the hues the charts always had — magenta, cyan,
+    /// yellow, green, distinct on dark terminals. Under `NO_COLOR` the charts
+    /// draw with [`twolab_tui::Theme::mono`] instead ([`super::chart_theme`]),
+    /// where a glyph at every sample (`* + x o`, also in the legend) tells
+    /// the series apart.
+    pub(super) const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
+        accent: Color::Magenta,
+        wait: Color::Cyan,
+        done: Color::Yellow,
+        fail: Color::Green,
+        ..THEME
+    };
+
+    // Backend groups: one hue per provider, the same in the tables, the
+    // activity log, the in-flight spinners and the settings bar — it says
+    // which provider, never how it is doing.
+    /// The claude group.
+    pub(super) const CLAUDE: Color = Color::Magenta;
+    /// The codex group.
+    pub(super) const CODEX: Color = Color::Cyan;
+    /// The grok group.
+    pub(super) const GROK: Color = Color::Yellow;
+    /// The gemini group.
+    pub(super) const GEMINI: Color = Color::LightBlue;
+    /// The openrouter group.
+    pub(super) const OPENROUTER: Color = Color::Green;
+    /// Truecolor anchor of the claude family's headline-model gradient (the
+    /// `tui_gradient.claude` default; magenta's family).
+    pub(super) const CLAUDE_GRADIENT_BASE: (u8, u8, u8) = (255, 121, 198);
+    /// Truecolor anchor of the codex family's headline-model gradient (the
+    /// `tui_gradient.codex` default; cyan's family).
+    pub(super) const CODEX_GRADIENT_BASE: (u8, u8, u8) = (86, 220, 220);
+
+    // Effort badges in the activity log: each high effort its own static hue.
+    /// `xhigh`: light red, apart from every group hue and from `crit`.
+    pub(super) const EFFORT_XHIGH: Color = Color::LightRed;
+    /// `max` with the effects off (the rainbow marquee's still form).
+    pub(super) const EFFORT_MAX: Color = Color::LightMagenta;
+
+    // Message kinds in the activity log.
+    /// The mechanical control turns (`compact`, `summary`, `recap`): a quiet
+    /// hue that still reads apart from the dim noise kinds.
+    pub(super) const KIND_CONTROL: Color = Color::Blue;
+    /// `subagent` / `sdk` turns (drawn dim over it).
+    pub(super) const KIND_SUBAGENT: Color = Color::Cyan;
+
+    /// Background of an activity row that came in on the OpenAI endpoint: the
+    /// endpoint origin, told apart from the model's provider (AGENTS.md
+    /// "preserve endpoint origin").
+    pub(super) const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
+    /// The raw viewer's JSON keywords (`true`/`false`/`null`): the magenta
+    /// its users know (twolab-tui's default would be `run`).
+    pub(super) const JSON_KEYWORD: Color = Color::Magenta;
+    /// The expanded activity row's total cost: money green, the one figure
+    /// of the cost line that is a total.
+    pub(super) const COST_TOTAL: Color = Color::Green;
+    /// An active upstream event on the banner row: a hue no account state
+    /// uses, so the event never reads as a status.
+    pub(super) const EVENT: Color = Color::Magenta;
+    /// The header's `attached` marker: this dashboard draws another process's
+    /// daemon — a fact about the session, not a status.
+    pub(super) const ATTACHED: Color = Color::Magenta;
+}
+use palette::{CHART_THEME, THEME};
+
 fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().fg(THEME.muted)
+}
+
+/// The one style of a selected row or item. llmux draws it on the cursor
+/// row of its own tables (accounts, models, sessions, perf); the twolab-tui
+/// widgets draw theirs with the same [`THEME`]`.selected()` — the compact
+/// list's focus, the fold's and the strip's cursor entry, the config, login
+/// and keys pickers, the menu. Reverse video on the ANSI theme: it needs no
+/// colour, so it reads the same under `NO_COLOR`.
+fn selected_style() -> Style {
+    THEME.selected()
 }
 
 thread_local! {
@@ -215,7 +317,7 @@ fn rule_fill(n: usize) -> String {
 fn share_bar(value: u64, max: u64, width: usize) -> twolab_tui::mini_bar::MiniBar {
     twolab_tui::mini_bar::MiniBar::new(value as f64, max as f64)
         .width(u16::try_from(width).unwrap_or(u16::MAX))
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
 }
 
 /// `text` clipped with `…` to at most `max` display cells (twolab-tui
@@ -237,9 +339,9 @@ fn pad_cells_left(text: &str, width: usize) -> String {
 
 fn level_color(level: GaugeLevel) -> Color {
     match level {
-        GaugeLevel::Green => Color::Green,
-        GaugeLevel::Yellow => Color::Yellow,
-        GaugeLevel::Red => Color::Red,
+        GaugeLevel::Green => THEME.ok,
+        GaugeLevel::Yellow => THEME.warn,
+        GaugeLevel::Red => THEME.crit,
     }
 }
 
@@ -269,9 +371,7 @@ const COST_COL_WIDTH: u16 =
 /// [`twolab_tui::ledger::Tier::Detail`] row (a per-model line under a total)
 /// is one tier dimmer throughout.
 fn cost_amount(usd: Option<f64>, tier: twolab_tui::ledger::Tier) -> twolab_tui::ledger::Amount {
-    twolab_tui::ledger::Amount::new(usd)
-        .tier(tier)
-        .theme(KEYBAR_THEME)
+    twolab_tui::ledger::Amount::new(usd).tier(tier).theme(THEME)
 }
 
 /// Everything a row/pane needs that is derived once per frame.
@@ -533,18 +633,18 @@ fn event_banner_line(
     Some(Line::from(vec![
         Span::styled(
             event.content.clone(),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::new().fg(palette::EVENT).add_modifier(Modifier::BOLD),
         ),
         sep.clone(),
         Span::styled("until ", dim()),
         Span::styled(
             format::month_day_hm(to, offset),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(THEME.accent),
         ),
         sep,
         Span::styled(
             format!("{} left", format::remaining_hms(remaining)),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.warn).add_modifier(Modifier::BOLD),
         ),
     ]))
 }
@@ -722,7 +822,7 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
         return Vec::new();
     }
     let groups = settings_groups(view);
-    let bar = StatusBar::new(KEYBAR_THEME)
+    let bar = StatusBar::new(THEME)
         .style(dim())
         .separator("  │  ")
         .count_dropped(true)
@@ -777,7 +877,7 @@ struct SettingsGroup {
 /// each backend group that is present.
 fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
     let clickable = Style::new()
-        .fg(Color::Cyan)
+        .fg(THEME.accent)
         .add_modifier(Modifier::UNDERLINED);
     let plain = |text: String, style: Style| (Span::styled(text, style), None);
     let click = |text: String, action: SettingAction| (Span::styled(text, clickable), Some(action));
@@ -875,7 +975,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, us
     let active_i = TABS.iter().position(|(_, o)| *o == active).unwrap_or(0);
     let strip = twolab_tui::tabs::Tabs::new(tabs)
         .active(active_i)
-        .theme(twolab_tui::Theme::ansi())
+        .theme(THEME)
         .hints(twolab_tui::tabs::Hints::Bracket);
     let layout = strip.render_layout(area, frame.buffer_mut());
     let hits = layout
@@ -934,7 +1034,7 @@ fn draw_accounts_overlay(
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, detail_area, " detail ");
         frame.render_widget(empty, body);
@@ -1011,20 +1111,6 @@ const DAILY_CHART_HEIGHT: u16 = 13;
 /// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
 /// overlay — UI-3 U14 period selection).
 pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
-
-/// The theme both trend charts draw with (tokens per day, perf t/s). The
-/// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank, so
-/// this carries the hues the charts always had — magenta, cyan, yellow,
-/// green, distinct on dark terminals. Under `NO_COLOR` the charts draw with
-/// [`twolab_tui::Theme::mono`] instead ([`chart_theme`]), where a glyph at
-/// every sample (`* + x o`, also in the legend) tells the series apart.
-const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
-    accent: Color::Magenta,
-    wait: Color::Cyan,
-    done: Color::Yellow,
-    fail: Color::Green,
-    ..KEYBAR_THEME
-};
 
 /// [`CHART_THEME`], or mono under `NO_COLOR` — the frame loop's `decolor`
 /// pass alone would leave four identical lines.
@@ -1131,12 +1217,12 @@ fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
         .take(CLIENT_PANEL_ROWS)
         .map(|c| {
             let ok_err = Line::from(vec![
-                Span::styled(format::human_count(c.ok), Style::new().fg(Color::Green)),
+                Span::styled(format::human_count(c.ok), Style::new().fg(THEME.done)),
                 Span::raw("/"),
                 Span::styled(
                     format::human_count(c.errors),
                     if c.errors > 0 {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(THEME.fail)
                     } else {
                         dim()
                     },
@@ -1221,10 +1307,7 @@ fn draw_usage_overlay(
         } else {
             "no buckets in this granularity's window — `g` switches granularity"
         };
-        let empty = Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::new().fg(Color::Yellow),
-        )));
+        let empty = Paragraph::new(Line::from(Span::styled(hint, Style::new().fg(THEME.warn))));
         let body = section(
             frame,
             area,
@@ -1457,16 +1540,16 @@ const USAGE_COST_COL_WIDTH: u16 = (1 + USAGE_COST_INT_WIDTH as u16) + 1 + 4 + 2;
 ///   legible), dollar-plus amounts keep 2 — the point column never moves.
 fn usage_cost_cell(cost: Option<f64>, tier: UsageCostTier, marker: &str) -> Cell<'static> {
     let (int_style, frac_style) = match tier {
-        UsageCostTier::Total => (Style::new(), Style::new().fg(Color::DarkGray)),
+        UsageCostTier::Total => (Style::new(), Style::new().fg(THEME.muted)),
         UsageCostTier::Detail => (
-            Style::new().fg(Color::DarkGray),
-            Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::new().fg(THEME.muted),
+            Style::new().fg(THEME.muted).add_modifier(Modifier::DIM),
         ),
     };
     // The `$` sign sits at the QUIETEST tier — never louder than the
     // fraction (on Detail rows the fraction is already at the floor, so
     // they share it).
-    let sign_style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM);
+    let sign_style = Style::new().fg(THEME.muted).add_modifier(Modifier::DIM);
     // No rate known — or an INVALID amount (negative / non-finite, reachable
     // through a pathological config `pricing` override) — renders as the
     // explicit dash: invalid data must never dress up as a credible $0
@@ -1556,7 +1639,7 @@ fn draw_table_scrollbar(
 ) -> Option<TableScroll> {
     twolab_tui::scrollbar::thumb(pos, track)?;
     frame.render_widget(
-        twolab_tui::scrollbar::Scrollbar::new(pos).theme(KEYBAR_THEME),
+        twolab_tui::scrollbar::Scrollbar::new(pos).theme(THEME),
         track,
     );
     Some(TableScroll { pos, track })
@@ -1633,7 +1716,7 @@ pub(crate) fn logs_pager(
     };
     let mut pager = Pager::new(title, lines)
         .hints(false)
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .scroll_to(scroll.unwrap_or(usize::MAX));
     pager.set_selection(selection);
     pager
@@ -1661,7 +1744,7 @@ fn draw_sessions_overlay(
     // stay visible (with the loading title) until the first fresh partial lands.
     if chrome.sessions_loading && chrome.sessions.is_empty() {
         let glyph = SpinnerKind::Braille.glyph(loading_spin(chrome.frame, chrome.motion));
-        let mut spans = vec![Span::styled(format!("{glyph} "), KEYBAR_THEME.accent())];
+        let mut spans = vec![Span::styled(format!("{glyph} "), THEME.accent())];
         spans.extend(loading_label(
             "loading sessions…",
             Style::new(),
@@ -1676,7 +1759,7 @@ fn draw_sessions_overlay(
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no sessions yet — enable raw-io capture and send requests through the proxy",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, area, " sessions ");
         frame.render_widget(empty, body);
@@ -1724,8 +1807,8 @@ fn draw_sessions_table(
         .map(|(i, s)| {
             let idx = start + i;
             let conf_color = match s.confidence {
-                crate::session::Confidence::High => Color::Green,
-                crate::session::Confidence::Low => Color::DarkGray,
+                crate::session::Confidence::High => THEME.ok,
+                crate::session::Confidence::Low => THEME.muted,
             };
             // Honest per-session output rate: Σtimed output / Σrecorded
             // request duration (never tokens over the wall-clock span —
@@ -1755,7 +1838,7 @@ fn draw_sessions_table(
             ];
             let row = Row::new(cells);
             if idx == cursor {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
+                row.style(selected_style())
             } else {
                 row
             }
@@ -1853,7 +1936,7 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
             Span::styled(
                 s.confidence.label(),
                 match s.confidence {
-                    crate::session::Confidence::High => Style::new().fg(Color::Green),
+                    crate::session::Confidence::High => Style::new().fg(THEME.ok),
                     crate::session::Confidence::Low => dim(),
                 },
             ),
@@ -2102,7 +2185,7 @@ fn draw_perf_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no perf data yet — collecting starts with this daemon version (metric v1); \
              send requests through the proxy",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, area, " perf ");
         frame.render_widget(empty, body);
@@ -2292,11 +2375,11 @@ fn draw_perf_health(
                     };
                     let err = a.err_pct();
                     let err_style = if err >= 10.0 {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(THEME.crit)
                     } else if err > 0.0 {
-                        Style::new().fg(Color::Yellow)
+                        Style::new().fg(THEME.warn)
                     } else {
-                        Style::new().fg(Color::Green)
+                        Style::new().fg(THEME.ok)
                     };
                     // Confidence is judged PER CELL on the stat's own sample
                     // count (e2e → tps_n, est → measured_n) — never on the
@@ -2379,7 +2462,7 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
             Cell::from(format!("{coverage:>7}")),
         ]);
         if idx == cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
+            row.style(selected_style())
         } else {
             row
         }
@@ -2455,9 +2538,9 @@ impl KeyState {
 
     fn color(self) -> Color {
         match self {
-            Self::Active => Color::Green,
-            Self::Suspended => Color::Yellow,
-            Self::Revoked => Color::Red,
+            Self::Active => THEME.ok,
+            Self::Suspended => THEME.wait,
+            Self::Revoked => THEME.fail,
         }
     }
 }
@@ -2751,7 +2834,7 @@ fn draw_keys_overlay(
             Line::default(),
             Line::from(Span::styled(
                 format!("  keys usage unavailable: {err}"),
-                Style::new().fg(Color::Red),
+                Style::new().fg(THEME.fail),
             )),
             Line::from("  press r to retry · w to change the window · K/Esc to go back"),
         ])
@@ -2896,7 +2979,7 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
     let Some(picker) = &panel.picker else {
         return;
     };
-    let mut list = picker.list.clone().theme(KEYBAR_THEME);
+    let mut list = picker.list.clone().theme(THEME);
     list = if picker.filtering {
         list.placeholder("type to filter by name")
     } else {
@@ -2970,7 +3053,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
     // The build and daemon facts on a fact table: two columns when the pane
     // holds them — the build on the left, the daemon on the right — figures
     // right-aligned on their last digit, `—` for a size not measured yet.
-    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+    let facts = FactTable::new(THEME).max_columns(2).facts([
         Fact::new("llmux", view.display_version()),
         Fact::new("daemon pid", view.pid.to_string()),
         Fact::new("port", view.port.to_string()),
@@ -2981,7 +3064,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         Fact::maybe("activity log", bytes(f.activity_log_bytes)),
     ]);
     // A path, not a figure: its own row under the table.
-    let config = FactTable::new(KEYBAR_THEME).fact(Fact::maybe("config", view.config_path.clone()));
+    let config = FactTable::new(THEME).fact(Fact::maybe("config", view.config_path.clone()));
     let inner = section(frame, area, " misc — keys · build · daemon ");
     // The facts keep their rows at the bottom (a blank row, the table, the
     // config path); the key grid takes the rest and, when it does not fit,
@@ -2993,10 +3076,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         height: inner.height - facts_h,
         ..inner
     };
-    frame.render_widget(
-        KeyHelp::new(help_groups(chrome)).theme(KEYBAR_THEME),
-        help_area,
-    );
+    frame.render_widget(KeyHelp::new(help_groups(chrome)).theme(THEME), help_area);
     let [_, table_area, config_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -3607,7 +3687,7 @@ fn config_list(
         .row_display(RowDisplay::SingleLine)
         .max_rows(max_rows)
         .footer(Line::styled(CFG_LEGEND, dim()))
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     select_at(&mut list, rest);
     list
 }
@@ -3784,7 +3864,7 @@ fn draw_config_overlay(
         let width = room
             .saturating_sub(cells::width(&hint) as u16)
             .max(FIELD_MIN.min(room));
-        let mut spans = vec![Span::styled(lead, Style::new().fg(Color::Cyan))];
+        let mut spans = vec![Span::styled(lead, Style::new().fg(THEME.accent))];
         spans.extend(field_line(&chrome.field, "", width).spans);
         spans.push(Span::styled(hint, dim()));
         frame.render_widget(
@@ -3889,7 +3969,7 @@ fn draw_context_menu(
     let menu = Menu::new(account_menu_items(target.ok().flatten()))
         .title(name)
         .anchor(anchor.0, anchor.1)
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let mut state = MenuState {
         selected: item,
         ..MenuState::default()
@@ -3980,7 +4060,7 @@ fn draw_input_modal(
         .body(body)
         .footer(modal_scroll_hints())
         .fit_content(PopupSize::Percent(80), PopupSize::Percent(80))
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let mut state = modal.state.clone();
     let area = frame.area();
     Some(popup.render(area, frame.buffer_mut(), &mut state))
@@ -4031,7 +4111,7 @@ impl ModalRow {
 fn modal_rows_lines(rows: Vec<ModalRow>, width: u16) -> Vec<Line<'static>> {
     use twolab_tui::status_card::StatusCard;
     const INDENT: usize = 1;
-    let mut card = StatusCard::new().indent(INDENT).theme(KEYBAR_THEME);
+    let mut card = StatusCard::new().indent(INDENT).theme(THEME);
     for row in &rows {
         card = match row {
             ModalRow::Field(label, value) => card.field(label.clone(), value.clone()),
@@ -4615,7 +4695,7 @@ fn draw_account_modal(
             .body(body)
             .footer(modal_scroll_hints())
             .fit_content(PopupSize::Percent(80), PopupSize::Percent(85))
-            .theme(KEYBAR_THEME)
+            .theme(THEME)
     };
     let area = frame.area();
     // The window cards lay out at the body's width, which the body decides:
@@ -4752,16 +4832,14 @@ fn line_bytes(line: &Line) -> usize {
 fn raw_section(title: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!("── {title} ──"),
-        Style::new()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
+        Style::new().fg(THEME.muted).add_modifier(Modifier::BOLD),
     ))
 }
 
 /// One `name: value` header line (name cyan, value plain — CDT's palette).
 fn raw_header_line(name: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{name}: "), Style::new().fg(Color::Cyan)),
+        Span::styled(format!("{name}: "), Style::new().fg(THEME.accent)),
         Span::raw(value.to_string()),
     ])
 }
@@ -4793,11 +4871,11 @@ fn highlight_json_line(line: &str) -> Line<'static> {
 /// The raw viewer's JSON colours (keys cyan, strings green, numbers yellow,
 /// keywords magenta, punctuation dim), fed to twolab-tui's highlighter.
 const RAW_JSON_STYLES: twolab_tui::json_view::JsonStyles = twolab_tui::json_view::JsonStyles {
-    key: Style::new().fg(Color::Cyan),
-    string: Style::new().fg(Color::Green),
-    number: Style::new().fg(Color::Yellow),
-    keyword: Style::new().fg(Color::Magenta),
-    punct: Style::new().fg(Color::DarkGray),
+    key: Style::new().fg(THEME.accent),
+    string: Style::new().fg(THEME.done),
+    number: Style::new().fg(THEME.warn),
+    keyword: Style::new().fg(palette::JSON_KEYWORD),
+    punct: Style::new().fg(THEME.muted),
 };
 
 /// Render a captured body as styled lines, one per source line (the viewer
@@ -4971,14 +5049,14 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
     };
     let field = |label: &str, value: String| {
         Line::from(vec![
-            Span::styled(format!("{label:<12}"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{label:<12}"), Style::new().fg(THEME.accent)),
             Span::raw(value),
         ])
     };
     let status_color = if *status < 400 {
-        Color::Green
+        THEME.done
     } else {
-        Color::Red
+        THEME.fail
     };
     let model_label = match (group.as_deref(), model.as_deref()) {
         (Some(g), Some(m)) => format!("{g} {m}"),
@@ -4999,7 +5077,7 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
         raw_section("general"),
         field("request", format!("{method} {path}")),
         Line::from(vec![
-            Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{:<12}", "status"), Style::new().fg(THEME.accent)),
             Span::styled(status.to_string(), Style::new().fg(status_color)),
             Span::styled(
                 format!("  ·  {} elapsed", format::elapsed_secs(*duration)),
@@ -5098,7 +5176,7 @@ pub(crate) fn raw_content_from_record(
     // Last tab: the response llmux delivered to Claude Code.
     let mut lines = vec![raw_section("response")];
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<12}", "status"), Style::new().fg(Color::Cyan)),
+        Span::styled(format!("{:<12}", "status"), Style::new().fg(THEME.accent)),
         Span::raw(
             record
                 .status
@@ -5264,7 +5342,7 @@ fn draw_raw_modal(
             ));
             spans.push(Span::styled(
                 format!(" {} ", btn.label()),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(THEME.accent),
             ));
             x += w;
         }
@@ -5282,7 +5360,7 @@ fn draw_raw_modal(
     };
     let content = match &modal.state {
         RawModalState::Loading => {
-            let wait = Style::new().fg(KEYBAR_THEME.wait);
+            let wait = Style::new().fg(THEME.wait);
             let glyph = SpinnerKind::Braille.glyph(loading_spin(modal.spin, motion));
             let mut spans = vec![Span::styled(format!(" {glyph} "), wait)];
             spans.extend(loading_label(
@@ -5298,7 +5376,7 @@ fn draw_raw_modal(
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" {msg}"),
-                    Style::new().fg(Color::Red),
+                    Style::new().fg(THEME.fail),
                 )))
                 .wrap(Wrap { trim: false }),
                 viewport,
@@ -5318,7 +5396,7 @@ fn draw_raw_modal(
             .map(|t| twolab_tui::tabs::Tab::new(t.label)),
     )
     .active(active)
-    .theme(twolab_tui::Theme::ansi())
+    .theme(THEME)
     .hints(twolab_tui::tabs::Hints::Off);
     let layout = strip.render_layout(Rect { height: 1, ..inner }, frame.buffer_mut());
     chrome.tabs = layout.hits.iter().map(|h| (h.index, h.rect)).collect();
@@ -5372,7 +5450,7 @@ fn draw_raw_body(
     cache.state.set_generation(generation);
     cache.state.scroll = modal.scroll;
     let lines = long.map_or(tab.lines.as_slice(), |l| l.lines.as_slice());
-    let view = JsonView::new(lines).hints(false).theme(KEYBAR_THEME);
+    let view = JsonView::new(lines).hints(false).theme(THEME);
     (&view).render(viewport, frame.buffer_mut(), &mut cache.state);
 
     let max = cache.state.max_scroll().unwrap_or(0);
@@ -5387,7 +5465,7 @@ fn draw_raw_body(
             height: viewport.height - 1,
             ..viewport
         };
-        frame.render_widget(Scrollbar::new(pos).theme(KEYBAR_THEME), track);
+        frame.render_widget(Scrollbar::new(pos).theme(THEME), track);
         chrome.bar = Some(TableScroll { pos, track });
     }
     // With long lines wrapped here the widget counted display lines; say the
@@ -5411,8 +5489,7 @@ fn draw_raw_body(
             };
             frame.render_widget(Clear, row);
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(at, KEYBAR_THEME.secondary())))
-                    .right_aligned(),
+                Paragraph::new(Line::from(Span::styled(at, THEME.secondary()))).right_aligned(),
                 row,
             );
         }
@@ -5437,7 +5514,7 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
     let mut header = vec![
         Span::styled(
             " llmux ",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(crate::build_info::version_with_build(), dim()),
     ];
@@ -5455,7 +5532,7 @@ fn draw_connecting(frame: &mut Frame, chrome: &Chrome) {
         .no_interrupt()
         .inline("q quit");
     frame.render_widget(
-        working.at(chrome.clock, KEYBAR_THEME.with_motion(chrome.motion)),
+        working.at(chrome.clock, THEME.with_motion(chrome.motion)),
         Rect {
             x: body_area.x.saturating_add(1),
             width: body_area.width.saturating_sub(1),
@@ -5481,12 +5558,14 @@ fn attach_spans(chrome: &Chrome) -> Vec<Span<'static>> {
     if attach.connected {
         vec![Span::styled(
             format!(" attached → pid {pid} "),
-            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(palette::ATTACHED)
+                .add_modifier(Modifier::BOLD),
         )]
     } else {
         vec![Span::styled(
             format!(" reconnecting → pid {pid}… "),
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.fail).add_modifier(Modifier::BOLD),
         )]
     }
 }
@@ -5531,7 +5610,9 @@ fn header_tail_spans(
         Some(attach) if attach.connected && attach.pid == Some(view.pid) => {
             spans.push(Span::styled(
                 " attached ",
-                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(palette::ATTACHED)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         _ => spans.extend(attach_spans(chrome)),
@@ -5580,7 +5661,7 @@ const HEADER_GAP: &str = "  ";
 
 /// The header's segments as twolab-tui `StatusBar` lays them out.
 fn header_bar(segments: Vec<twolab_tui::status_bar::Segment>) -> twolab_tui::status_bar::StatusBar {
-    twolab_tui::status_bar::StatusBar::new(KEYBAR_THEME)
+    twolab_tui::status_bar::StatusBar::new(THEME)
         .style(dim())
         .separator(HEADER_SEPARATOR)
         .segments(segments)
@@ -5661,9 +5742,9 @@ fn header_verdict_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'stat
     // a no-truecolor panel. Identity (version/port/pid/up) compresses right.
     let verdict = triage::health_verdict(view, now);
     let (tag, color) = match verdict.level() {
-        VerdictLevel::Ok => ("[OK]", Color::Green),
-        VerdictLevel::Warn => ("[WARN]", Color::Yellow),
-        VerdictLevel::Fail => ("[FAIL]", Color::Red),
+        VerdictLevel::Ok => ("[OK]", THEME.ok),
+        VerdictLevel::Warn => ("[WARN]", THEME.warn),
+        VerdictLevel::Fail => ("[FAIL]", THEME.crit),
     };
     let mut spans = vec![Span::styled(
         format!(" {tag} "),
@@ -5994,7 +6075,7 @@ fn draw_accounts_with(
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         frame.render_widget(empty, body);
         return Vec::new();
@@ -6008,7 +6089,7 @@ fn draw_accounts_with(
             layout.bar_width,
         );
         if cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
+            row.style(selected_style())
         } else {
             row
         }
@@ -6301,7 +6382,7 @@ fn draw_accounts_compact(
     let mut tally = Tally::new(items.iter().map(|i| i.state))
         .glyphs(true)
         .empty("no accounts")
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     // A slot two llmux states share names both (`spent+cooling`); a slot
     // that holds only `spent` or only `paused` shows that state's glyph.
     let mut glyph_swaps: Vec<(char, &'static str)> = Vec::new();
@@ -6389,7 +6470,7 @@ fn draw_accounts_compact(
             .words(col_w >= natural)
             .frame(ctx.frame)
             .empty("no accounts")
-            .theme(KEYBAR_THEME);
+            .theme(THEME);
         let mut state = AgentListState::new();
         frame.render_stateful_widget(&list, rect, &mut state);
         for &(i, r) in &state.layout().items {
@@ -6465,11 +6546,11 @@ fn account_row_parts(
             (lead, false) => format!("{lead} "),
         };
         let style = if urgent {
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::new().fg(THEME.crit).add_modifier(Modifier::BOLD)
         } else if cursor {
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(THEME.accent)
         } else if is_current {
-            Style::new().fg(Color::Green)
+            Style::new().fg(THEME.ok)
         } else {
             Style::new()
         };
@@ -6863,7 +6944,7 @@ fn fold_plan(
     )
     .headers(headers)
     .cursor(members.iter().position(|&pos| selected == Some(pos)))
-    .theme(KEYBAR_THEME);
+    .theme(THEME);
     let Some(GridPlan { per_line, .. }) = grid.plan(width) else {
         return Fold::TooNarrow;
     };
@@ -6936,7 +7017,7 @@ fn status_span(
             };
             Span::styled(
                 format!("{glyph} active"),
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(format!("{} ready", SpinnerKind::Drift.glyph(frame)), dim())
@@ -6954,7 +7035,7 @@ fn status_span(
             .unwrap_or_default();
         return Span::styled(
             format!("{} {left}", SpinnerKind::Clock.glyph(frame)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.wait),
         );
     }
     let text = select::blocking_reason(account, reason, params, now);
@@ -6963,20 +7044,20 @@ fn status_span(
     let (glyph, style) = match reason {
         IneligibleReason::AuthUnhealthy => (
             None,
-            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.fail).add_modifier(Modifier::BOLD),
         ),
-        IneligibleReason::Paused => (None, Style::new().fg(Color::Yellow)),
+        IneligibleReason::Paused => (None, Style::new().fg(THEME.wait)),
         IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
             Some(SpinnerKind::Breathe.glyph(frame)),
-            Style::new().fg(Color::Red),
+            Style::new().fg(THEME.crit),
         ),
         IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown => (
             Some(SpinnerKind::Clock.glyph(frame)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.wait),
         ),
         IneligibleReason::FableWeeklyExhausted => (
             Some(SpinnerKind::Breathe.glyph(frame)),
-            Style::new().fg(Color::Red),
+            Style::new().fg(THEME.crit),
         ),
         IneligibleReason::UsageStale => (Some(SpinnerKind::Drift.glyph(frame)), dim()),
     };
@@ -6995,7 +7076,7 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     } else {
         Span::styled(
             in_flight.to_string(),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
         )
     }
 }
@@ -7031,7 +7112,7 @@ fn quota_meter(
     let meter = Meter::new(used)
         .thresholds(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT)
         .fill(fill)
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let meter = if absolute {
         meter.resets_at(window.resets_at, now, 0)
     } else {
@@ -7066,7 +7147,7 @@ fn quota_cell_line(meter: &Meter, bar_width: usize) -> Line<'static> {
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
         cells::pad(&meter.label_text(), QUOTA_LABEL_WIDTH, cells::Align::Right),
-        KEYBAR_THEME.level(meter.current_level()),
+        THEME.level(meter.current_level()),
     ));
     line
 }
@@ -7137,7 +7218,7 @@ impl GaugeParts {
         match self {
             GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
             GaugeParts::Bar { meter, marker } => {
-                let style = KEYBAR_THEME.level(meter.current_level());
+                let style = THEME.level(meter.current_level());
                 let (text, bold) = meter.bar_text();
                 let (head, _) = cells::take_cells(&text, bold);
                 let tail = &text[head.len()..];
@@ -8108,7 +8189,7 @@ fn summary_parts(view: &DashboardView, ctx: &FrameCtx) -> SummaryParts {
     if groups_present.is_empty() {
         lines.push(Line::from(vec![
             label("current"),
-            Span::styled("(none)", Style::new().fg(Color::Red)),
+            Span::styled("(none)", Style::new().fg(THEME.crit)),
         ]));
         band_head.extend(lines.iter().cloned());
     }
@@ -8204,13 +8285,13 @@ fn summary_totals_spans(totals: super::activity::Totals) -> Vec<Span<'static>> {
         Span::raw(format!("{} req · ", format::human_count(totals.requests))),
         Span::styled(
             format!("{} ok", format::human_count(totals.ok)),
-            Style::new().fg(Color::Green),
+            Style::new().fg(THEME.done),
         ),
         Span::raw(" / "),
         Span::styled(
             format!("{} err", format::human_count(totals.errors)),
             if totals.errors > 0 {
-                Style::new().fg(Color::Red)
+                Style::new().fg(THEME.fail)
             } else {
                 dim()
             },
@@ -8256,14 +8337,14 @@ fn summary_current_line(
         Some(current) => {
             spans.push(Span::styled(
                 current,
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD),
             ));
             if let Some((from, why, ago)) = switch {
                 let from = from.map(|f| format!("{f} → ")).unwrap_or_default();
                 spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
             }
         }
-        None => spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
+        None => spans.push(Span::styled("(none)", Style::new().fg(THEME.crit))),
     }
     Line::from(spans)
 }
@@ -8312,7 +8393,7 @@ fn summary_mode_line(mode: crate::config::SchedulerMode) -> Line<'static> {
         Span::styled(
             mode.label().to_string(),
             if mode == crate::config::SchedulerMode::RoundRobin {
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             },
@@ -8330,7 +8411,7 @@ fn summary_load_line(rpm_5m: f64, in_flight: u64) -> Line<'static> {
 
 fn summary_codex_line(model: &str, fast: bool, effort: &str) -> Line<'static> {
     let fast_style = if fast {
-        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD)
     } else {
         dim()
     };
@@ -8622,7 +8703,7 @@ fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'
     if let Some(plan) = plan {
         spans.push(Span::styled(
             format!(" · {plan}"),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(THEME.accent),
         ));
     }
     spans
@@ -8705,13 +8786,13 @@ fn token_detail_spans(
             } else {
                 vec![Span::styled(
                     format!("{head} · refresh due"),
-                    Style::new().fg(Color::Yellow),
+                    Style::new().fg(THEME.warn),
                 )]
             }
         }
         Err(_) => vec![Span::styled(
             "expired — refresh overdue".to_string(),
-            Style::new().fg(Color::Red),
+            Style::new().fg(THEME.crit),
         )],
     };
     let refreshed = match account.last_refresh_ms {
@@ -9244,27 +9325,20 @@ fn draw_activity(
         for request in in_flight.iter().rev().take(capacity) {
             let elapsed = now.duration_since(request.started_at).unwrap_or_default();
             // Working spinner differs by backend group: Claude gets the braille
-            // orbit (magenta), Codex a quarter-block orbit (cyan) — the same
-            // colors as the group labels — so you can tell what's running where
-            // at a glance. Pre-routing rows (no account yet) are a dim braille.
-            let (glyph, color) = match request.account.as_deref().and_then(|a| group_of(view, a)) {
-                Some(BackendGroup::Codex) => (SpinnerKind::Block.glyph(anim_frame), Color::Cyan),
-                Some(BackendGroup::Claude) => {
-                    (SpinnerKind::Braille.glyph(anim_frame), Color::Magenta)
-                }
-                Some(BackendGroup::Grok) => (SpinnerKind::Block.glyph(anim_frame), Color::Yellow),
-                Some(BackendGroup::OpenRouter) => {
-                    (SpinnerKind::Block.glyph(anim_frame), Color::Green)
-                }
-                Some(BackendGroup::Gemini) => {
-                    (SpinnerKind::Block.glyph(anim_frame), Color::LightBlue)
-                }
-                None => (SpinnerKind::Braille.glyph(anim_frame), Color::DarkGray),
+            // orbit, every other group a quarter-block orbit, each in its group
+            // label's colour ([`group_color`]) — so you can tell what's running
+            // where at a glance. Pre-routing rows (no account yet) are a dim
+            // braille.
+            let group = request.account.as_deref().and_then(|a| group_of(view, a));
+            let glyph = match group {
+                Some(BackendGroup::Claude) | None => SpinnerKind::Braille.glyph(anim_frame),
+                Some(_) => SpinnerKind::Block.glyph(anim_frame),
             };
+            let spinner = group_color(group.map(BackendGroup::as_str));
             let mut spans = vec![
                 // Mirror the completed row's stamp spacing (`▸ HH:MM:SS  `):
                 // spinner+2 spaces so the following `kind` column lines up.
-                Span::styled(format!(" {glyph} "), Style::new().fg(color)),
+                Span::styled(format!(" {glyph} "), spinner),
                 Span::styled(
                     format!("{}  ", format::clock_hms_utc(request.started_at)),
                     dim(),
@@ -9287,7 +9361,7 @@ fn draw_activity(
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(THEME.accent),
             ));
             // `[model effort]` badge while in flight (issue #2, 2a): filled at
             // routing time (req11) with the same per-request values the finish
@@ -9518,7 +9592,7 @@ fn draw_activity(
     let openai_rows: Vec<u16> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.style.bg == Some(OPENAI_ACTIVITY_BG))
+        .filter(|(_, line)| line.style.bg == Some(palette::OPENAI_ACTIVITY_BG))
         .map(|(index, _)| body_top.saturating_add(index as u16))
         .filter(|y| *y < area.bottom())
         .collect();
@@ -9527,17 +9601,15 @@ fn draw_activity(
     for y in openai_rows {
         frame.buffer_mut().set_style(
             Rect::new(area.x, y, area.width, 1),
-            Style::new().bg(OPENAI_ACTIVITY_BG),
+            Style::new().bg(palette::OPENAI_ACTIVITY_BG),
         );
     }
     ActivityChrome { area, hits }
 }
 
-const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
-
 fn endpoint_line(line: Line<'static>, endpoint: crate::tui::Endpoint) -> Line<'static> {
     match endpoint {
-        crate::tui::Endpoint::OpenAi => line.style(Style::new().bg(OPENAI_ACTIVITY_BG)),
+        crate::tui::Endpoint::OpenAi => line.style(Style::new().bg(palette::OPENAI_ACTIVITY_BG)),
         crate::tui::Endpoint::Anthropic => line,
     }
 }
@@ -9626,7 +9698,7 @@ fn folded_run_line(
         " {} → (",
         pad_cells(&account, ACTIVITY_EMAIL_W)
     )));
-    spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
+    spans.push(Span::styled("all 2xx", Style::new().fg(THEME.done)));
     spans.push(Span::raw(")"));
     endpoint_line(Line::from(spans), *endpoint)
 }
@@ -9685,9 +9757,9 @@ fn completed_line(
                 .map(|a| row_account_name(a, mask, abbrev))
                 .unwrap_or_else(|| "?".to_string());
             let status_style = if *status < 400 {
-                Style::new().fg(Color::Green)
+                Style::new().fg(THEME.done)
             } else {
-                Style::new().fg(Color::Red)
+                Style::new().fg(THEME.fail)
             };
             // method+path intentionally NOT on the collapsed row (Z
             // 2026-07-15 "쓸데 없는 데이터"): it is constant noise
@@ -9732,7 +9804,7 @@ fn completed_line(
                 .unwrap_or_default();
             spans.push(Span::styled(
                 format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(THEME.accent),
             ));
             spans.extend(cells::pad_spans(
                 activity_meta_spans(
@@ -9765,7 +9837,7 @@ fn completed_line(
             if cost_usd.is_some_and(|usd| usd >= 1.0) {
                 spans.push(Span::styled(
                     cost_cell,
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::new().fg(THEME.warn).add_modifier(Modifier::BOLD),
                 ));
             } else {
                 spans.push(Span::raw(cost_cell));
@@ -9797,7 +9869,7 @@ fn completed_line(
         CompletedBody::Note { text, error } => {
             let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
             let style = if *error {
-                Style::new().fg(Color::Red)
+                Style::new().fg(THEME.fail)
             } else {
                 Style::new()
             };
@@ -9900,9 +9972,9 @@ fn completed_detail_lines(
             .unwrap_or_else(|| "?".to_string()),
     ));
     let status_color = if *status < 400 {
-        Color::Green
+        THEME.done
     } else {
-        Color::Red
+        THEME.fail
     };
     lines.push(Line::from(vec![
         Span::styled("       status  ", dim()),
@@ -10004,7 +10076,10 @@ fn completed_detail_lines(
                     format_cost(cost_cr),
                     format_cost(cost_cc),
                 )),
-                Span::styled(format_cost(cost_total), Style::new().fg(Color::Green)),
+                Span::styled(
+                    format_cost(cost_total),
+                    Style::new().fg(palette::COST_TOTAL),
+                ),
             ]));
         }
         None => lines.push(indent("tokens", "—".to_string())),
@@ -10096,23 +10171,27 @@ fn group_of(view: &DashboardView, account: &str) -> Option<BackendGroup> {
 /// (compact/title/suggest/count/…) stay dim so user rows dominate the eye.
 fn kind_style(kind: &str) -> Style {
     match kind {
-        "user" => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-        "security" => Style::new().fg(Color::Yellow),
-        "compact" | "summary" | "recap" => Style::new().fg(Color::Blue),
-        "subagent" | "sdk" => Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        "user" => THEME.text().add_modifier(Modifier::BOLD),
+        "security" => Style::new().fg(THEME.warn),
+        "compact" | "summary" | "recap" => Style::new().fg(palette::KIND_CONTROL),
+        "subagent" | "sdk" => Style::new()
+            .fg(palette::KIND_SUBAGENT)
+            .add_modifier(Modifier::DIM),
         _ => dim(),
     }
 }
 
 /// Color a backend-group label: codex = cyan, claude = magenta, grok =
-/// yellow, gemini = light blue, unknown = gray. Shared by the account table
-/// (req5) and the activity log (req7) so the group reads the same everywhere.
+/// yellow, openrouter = green, gemini = light blue, unknown = gray. Shared by
+/// the account table (req5), the activity log (req7) and its in-flight
+/// spinners so the group reads the same everywhere.
 fn group_color(group: Option<&str>) -> Style {
     match group {
-        Some("codex") => Style::new().fg(Color::Cyan),
-        Some("claude") => Style::new().fg(Color::Magenta),
-        Some("grok") => Style::new().fg(Color::Yellow),
-        Some("gemini") => Style::new().fg(Color::LightBlue),
+        Some("codex") => Style::new().fg(palette::CODEX),
+        Some("claude") => Style::new().fg(palette::CLAUDE),
+        Some("grok") => Style::new().fg(palette::GROK),
+        Some("openrouter") => Style::new().fg(palette::OPENROUTER),
+        Some("gemini") => Style::new().fg(palette::GEMINI),
         _ => dim(),
     }
 }
@@ -10158,11 +10237,6 @@ fn gradient_rainbow(frame: usize, char_idx: usize, speed: f32) -> Color {
     gt::rainbow(gt::phase(char_idx, gradient_t(frame), speed), gt::LUMA)
 }
 
-/// Solid-gradient base colors per headline family: truecolor anchors of the
-/// groups' ANSI families (claude = magenta, codex = cyan).
-const CLAUDE_GRADIENT_BASE: (u8, u8, u8) = (255, 121, 198);
-const CODEX_GRADIENT_BASE: (u8, u8, u8) = (86, 220, 220);
-
 /// Render-ready gradient tuning (UI-8), resolved ONCE per document from
 /// config `tui_gradient` at view-build time: hex colors parsed (unparseable →
 /// built-in base), speed sanitized (non-finite/non-positive → 1.0). `Copy` —
@@ -10187,8 +10261,8 @@ impl GradientCfg {
         };
         Self {
             speed,
-            claude: parse_hex_color(&cfg.claude).unwrap_or(CLAUDE_GRADIENT_BASE),
-            codex: parse_hex_color(&cfg.codex).unwrap_or(CODEX_GRADIENT_BASE),
+            claude: parse_hex_color(&cfg.claude).unwrap_or(palette::CLAUDE_GRADIENT_BASE),
+            codex: parse_hex_color(&cfg.codex).unwrap_or(palette::CODEX_GRADIENT_BASE),
             max_effort: cfg.max_effort.as_deref().and_then(parse_hex_color),
         }
     }
@@ -10256,9 +10330,9 @@ fn model_name_spans(
 }
 
 /// Render the effort token with its per-level styling (TUI UI-6 item 6):
-/// `xhigh` → a static [`Color::LightRed`] bold (distinct, animation-free);
+/// `xhigh` → a static [`palette::EFFORT_XHIGH`] (light red) bold (distinct, animation-free);
 /// `max` → the rainbow marquee when `effects_on`, else a static
-/// [`Color::LightMagenta`] bold; every other effort inherits the group color.
+/// [`palette::EFFORT_MAX`] (light magenta) bold; every other effort inherits the group color.
 /// The concatenated span text is always exactly `effort`.
 fn effort_spans(
     group: Option<&str>,
@@ -10271,7 +10345,7 @@ fn effort_spans(
         "xhigh" => vec![Span::styled(
             effort.to_string(),
             Style::new()
-                .fg(Color::LightRed)
+                .fg(palette::EFFORT_XHIGH)
                 .add_modifier(Modifier::BOLD),
         )],
         // Config `tui_gradient.max_effort` swaps the rainbow for a solid
@@ -10287,7 +10361,7 @@ fn effort_spans(
         "max" => vec![Span::styled(
             effort.to_string(),
             Style::new()
-                .fg(Color::LightMagenta)
+                .fg(palette::EFFORT_MAX)
                 .add_modifier(Modifier::BOLD),
         )],
         _ => vec![Span::styled(effort.to_string(), group_color(group))],
@@ -10374,9 +10448,9 @@ fn log_line(line: &LogLine, mask: bool) -> Line<'static> {
     use tracing::Level;
 
     let (label, style) = if line.level == Level::ERROR {
-        ("ERROR", Style::new().fg(Color::Red))
+        ("ERROR", Style::new().fg(THEME.crit))
     } else if line.level == Level::WARN {
-        (" WARN", Style::new().fg(Color::Yellow))
+        (" WARN", Style::new().fg(THEME.warn))
     } else if line.level == Level::INFO {
         (" INFO", Style::new())
     } else if line.level == Level::DEBUG {
@@ -10481,7 +10555,7 @@ fn model_active_marker(m: &ModelUsageDoc, now: SystemTime, frame: usize) -> Span
         };
         Span::styled(format!(" {glyph}"), group_color(Some(m.group.as_str())))
     } else if model_is_recent(m.last_used_ms, now) {
-        Span::styled(" ●", Style::new().fg(Color::Green))
+        Span::styled(" ●", Style::new().fg(THEME.ok))
     } else {
         Span::raw("  ")
     }
@@ -10712,7 +10786,7 @@ fn draw_models_strip_packed(
     section(frame, area, &title);
     let grid = PackedGrid::new(strip_entries(view, shown, ctx.now, ctx.frame))
         .min_per_line(2)
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     let inner = Rect {
         x: area.x.saturating_add(STRIP_MARGIN),
         y: area.y.saturating_add(1),
@@ -10875,7 +10949,7 @@ fn draw_models_full(
     if view.model_usage.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no model usage yet — send a request through the proxy",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         let body = section(frame, area, " models ");
         frame.render_widget(empty, body);
@@ -10922,12 +10996,12 @@ fn draw_models_table(
             let (group_cell, name_cell) =
                 model_name_cells(m, active, ctx.frame, view.tui_effects, view.gradient);
             let ok_err = Line::from(vec![
-                Span::styled(format::human_count(m.ok), Style::new().fg(Color::Green)),
+                Span::styled(format::human_count(m.ok), Style::new().fg(THEME.done)),
                 Span::raw("/"),
                 Span::styled(
                     format::human_count(m.errors),
                     if m.errors > 0 {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(THEME.fail)
                     } else {
                         dim()
                     },
@@ -10955,7 +11029,7 @@ fn draw_models_table(
             cells.push(Cell::from(in_flight_span(m.in_flight)));
             let row = Row::new(cells);
             if idx == cursor {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
+                row.style(selected_style())
             } else {
                 row
             }
@@ -11056,7 +11130,7 @@ fn draw_model_detail(
             } else {
                 String::new()
             },
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(THEME.accent),
         ),
     ]));
     // The counts on a fact table: requests and cost on the left, the four
@@ -11064,11 +11138,11 @@ fn draw_model_detail(
     // is too narrow), each figure right-aligned on its last digit. A cache
     // class the upstream never reported, or a cost no rate prices, is `—` —
     // never a made-up 0 (req9).
-    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+    let facts = FactTable::new(THEME).max_columns(2).facts([
         Fact::new("requests", format::human_count(m.requests)),
-        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(Color::Green)),
+        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(THEME.done)),
         Fact::new("errors", format::human_count(m.errors)).style(if m.errors > 0 {
-            Style::new().fg(Color::Red)
+            Style::new().fg(THEME.fail)
         } else {
             dim()
         }),
@@ -11170,7 +11244,7 @@ fn draw_heatmap(
     if total == 0 {
         lines.push(Line::from(Span::styled(
             " no windowed activity yet",
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(THEME.warn),
         )));
         frame.render_widget(Paragraph::new(lines), body);
         return;
@@ -11266,7 +11340,7 @@ fn keybar_after(
     let room = width.saturating_sub(cells::spans_width(&lead) as u16);
     let bar = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
         .no_more()
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .line(room);
     let mut spans = lead;
     spans.extend(bar.spans);
@@ -11305,7 +11379,7 @@ fn field_line(
     let mut state = field.clone();
     twolab_tui::composer::Composer::new()
         .placeholder(placeholder)
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .line(&mut state, width)
 }
 
@@ -11326,7 +11400,7 @@ fn field_bar(
     let natural = |hints: &[(&'static str, &'static str)]| {
         let line = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
             .no_more()
-            .theme(KEYBAR_THEME)
+            .theme(THEME)
             .line(u16::MAX);
         cells::spans_width(&line.spans) as u16
     };
@@ -11349,17 +11423,6 @@ fn field_bar(
     (keybar_after(lead, hints, width), field_w)
 }
 
-/// The theme every twolab-tui widget on the dashboard draws with (key bars,
-/// confirm gates, pickers): ANSI colours with labels in the terminal's
-/// default foreground (as before the move to KeyHints) — ANSI grey labels
-/// would be near-invisible on a light-background terminal. Under `NO_COLOR`
-/// the frame loop's `decolor` pass strips the colours; what the widgets mark
-/// with weight (a bold marked option, a reversed cursor row) survives it.
-const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
-    text_secondary: Color::Reset,
-    ..twolab_tui::Theme::ansi()
-};
-
 /// A loading label (sessions, the keys title, the raw viewer) on twolab-tui's
 /// shimmer, `age` after it appeared: still for 600 ms — a load that ends
 /// sooner never sweeps — then a band passes across it every 4 s. On the
@@ -11374,7 +11437,7 @@ fn loading_label(
 ) -> Vec<Span<'static>> {
     twolab_tui::shimmer::Shimmer::new(label)
         .style(style)
-        .spans_at(age, &KEYBAR_THEME.with_motion(motion))
+        .spans_at(age, &THEME.with_motion(motion))
 }
 
 /// The spinner frame beside a loading label: `frame`, or the first glyph held
@@ -11427,7 +11490,7 @@ fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<Ga
                 ("Cancel", "n · Esc · Enter · any other key".into()),
             ],
             marked: ACCOUNT_GATE_MARK,
-            color: Color::Red,
+            color: THEME.crit,
         }),
         Mode::ConfirmReset { idx } => {
             let target = account(idx);
@@ -11493,7 +11556,7 @@ fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<Ga
                 question,
                 options,
                 marked: ACCOUNT_GATE_MARK,
-                color: Color::Yellow,
+                color: THEME.warn,
             })
         }
         Mode::ConfigConfirm { .. } => Some(GateCard {
@@ -11504,7 +11567,7 @@ fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<Ga
                 ("Cancel", "n · Esc".to_string()),
             ],
             marked: chrome.confirm_choice.min(1),
-            color: Color::Yellow,
+            color: THEME.warn,
         }),
         _ => None,
     }
@@ -11535,7 +11598,7 @@ fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &C
     .no_other()
     // The footer row under the card carries the keys (fitted like every bar).
     .hints(false)
-    .theme(KEYBAR_THEME);
+    .theme(THEME);
     let mut state = ChoiceState::at(gate.marked);
     // A gate taller than the room windows its options (`⋯ N more`) instead
     // of cutting them.
@@ -11617,7 +11680,7 @@ pub(crate) fn login_list(idx: usize) -> twolab_tui::select_list::SelectList {
             "the sign-in runs in this client; the account is injected into the daemon",
             dim(),
         ))
-        .theme(KEYBAR_THEME);
+        .theme(THEME);
     select_at(&mut list, idx);
     list
 }
@@ -11632,7 +11695,7 @@ fn draw_login_picker(frame: &mut Frame, chrome: &Chrome) {
     };
     let list = login_list(idx);
     let body = list.desired_height(card_width(frame.area()).saturating_sub(2));
-    if let Some(inner) = footer_card(frame, body, "new login", Color::Cyan) {
+    if let Some(inner) = footer_card(frame, body, "new login", THEME.accent) {
         frame.render_widget(&list, inner);
     }
 }
@@ -11878,7 +11941,7 @@ fn copy_mode_banner(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         cells::pad(text, usize::from(width), cells::Align::Left),
         Style::new()
-            .fg(KEYBAR_THEME.accent)
+            .fg(THEME.accent)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
     ))
 }
@@ -11894,11 +11957,11 @@ fn outcome_spans(outcome: twolab_tui::banner::Outcome, text: &str) -> Vec<Span<'
     let mut spans = vec![
         Span::styled(
             kind.glyph(),
-            kind.style(&KEYBAR_THEME).add_modifier(Modifier::BOLD),
+            kind.style(&THEME).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
     ];
-    if let Some(line) = Flash::new(outcome, text).theme(KEYBAR_THEME).line() {
+    if let Some(line) = Flash::new(outcome, text).theme(THEME).line() {
         spans.extend(line.spans);
     }
     spans
@@ -11947,7 +12010,7 @@ fn draw_toasts(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         .anchor(Anchor::TopRight)
         .queued(chrome.toasts.waiting())
         .dropped(chrome.toasts.dropped())
-        .theme(KEYBAR_THEME)
+        .theme(THEME)
         .render(area, frame.buffer_mut());
 }
 
@@ -13412,7 +13475,7 @@ mod tests {
             .level(level)
             .text(text, bold)
             .label(false)
-            .theme(KEYBAR_THEME);
+            .theme(THEME);
         match marker {
             Some(glyph) => meter.marker(glyph),
             None => meter,
@@ -15587,7 +15650,7 @@ mod tests {
             let mid = assert_loading_label_shimmers("loading raw record…", at);
             let (cells, _) = label_cells(&mid, "loading raw record…");
             assert!(
-                cells.iter().all(|c| c.fg == KEYBAR_THEME.wait),
+                cells.iter().all(|c| c.fg == THEME.wait),
                 "{w}x{h}: the band keeps the wait colour: {cells:?}"
             );
         }
@@ -15922,9 +15985,8 @@ mod tests {
         let on1 = model_name_spans(Some("claude"), "fable-5", 8, true, GradientCfg::default());
         assert!(on0.len() > 1, "gradient splits the name per char");
         assert!(
-            on0.iter()
-                .enumerate()
-                .all(|(i, s)| s.style.fg == Some(gradient_solid(CLAUDE_GRADIENT_BASE, 0, i, 1.0))),
+            on0.iter().enumerate().all(|(i, s)| s.style.fg
+                == Some(gradient_solid(palette::CLAUDE_GRADIENT_BASE, 0, i, 1.0))),
             "fable-5 uses the solid claude/magenta gradient (herdr 단색 mode)"
         );
         assert_ne!(fg(&on0), fg(&on1), "gradient drifts with the frame");
@@ -15947,7 +16009,8 @@ mod tests {
         assert!(codex
             .iter()
             .enumerate()
-            .all(|(i, s)| s.style.fg == Some(gradient_solid(CODEX_GRADIENT_BASE, 0, i, 1.0))));
+            .all(|(i, s)| s.style.fg
+                == Some(gradient_solid(palette::CODEX_GRADIENT_BASE, 0, i, 1.0))));
         // Effects OFF: a single static bold group-colored span.
         let off = model_name_spans(Some("claude"), "fable-5", 0, false, GradientCfg::default());
         assert_eq!(off.len(), 1);
@@ -15981,15 +16044,20 @@ mod tests {
                 max_effort: Some("".into()),
             });
             assert_eq!(cfg.speed, 1.0, "speed {bad_speed} sanitized");
-            assert_eq!(cfg.claude, CLAUDE_GRADIENT_BASE);
-            assert_eq!(cfg.codex, CODEX_GRADIENT_BASE);
+            assert_eq!(cfg.claude, palette::CLAUDE_GRADIENT_BASE);
+            assert_eq!(cfg.codex, palette::CODEX_GRADIENT_BASE);
             assert_eq!(cfg.max_effort, None);
         }
         // Defaults: speed 1.0, the built-in anchors, rainbow kept.
         let def = GradientCfg::default();
         assert_eq!(
             (def.speed, def.claude, def.codex, def.max_effort),
-            (1.0, CLAUDE_GRADIENT_BASE, CODEX_GRADIENT_BASE, None)
+            (
+                1.0,
+                palette::CLAUDE_GRADIENT_BASE,
+                palette::CODEX_GRADIENT_BASE,
+                None
+            )
         );
     }
 
@@ -20796,7 +20864,11 @@ mod tests {
             .unwrap();
         for y in 1..openai_hit.y_start + openai_hit.height {
             for x in 0..160 {
-                assert_eq!(buffer[(x, y)].bg, OPENAI_ACTIVITY_BG, "cell ({x},{y})");
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    palette::OPENAI_ACTIVITY_BG,
+                    "cell ({x},{y})"
+                );
             }
         }
         let anthropic_y = openai_hit.y_start + openai_hit.height;
@@ -20805,10 +20877,9 @@ mod tests {
             Color::Reset,
             "Anthropic endpoint routed to Codex keeps original background"
         );
-        let red_status = buffer
-            .content()
-            .iter()
-            .any(|c| c.symbol() == "5" && c.fg == Color::Red && c.bg == OPENAI_ACTIVITY_BG);
+        let red_status = buffer.content().iter().any(|c| {
+            c.symbol() == "5" && c.fg == Color::Red && c.bg == palette::OPENAI_ACTIVITY_BG
+        });
         assert!(red_status, "error foreground remains red on dark gray");
         for y in 0..=anthropic_y {
             let text: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
@@ -20842,7 +20913,7 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         for x in 0..160 {
-            assert_eq!(buffer[(x, 1)].bg, OPENAI_ACTIVITY_BG);
+            assert_eq!(buffer[(x, 1)].bg, palette::OPENAI_ACTIVITY_BG);
         }
         let text: String = (0..160).map(|x| buffer[(x, 1)].symbol()).collect();
         assert!(text.contains("3×"), "{text}");
@@ -22727,6 +22798,10 @@ mod tests {
     /// together: the two touch different rows (the four rule rows vs the
     /// strip's two packed lines), so the merged frame carries both changes
     /// and nothing else (previous digest 8_543_463_821_239_879_891).
+    /// Not re-pinned when every colour in the drawing code moved to the
+    /// palette (theme sweep, 2026-11-06): each literal became the `THEME`
+    /// field that holds the same named ANSI colour (or a palette const of
+    /// the same hue), so the frame is identical, text and styles.
     const FOLD_OFF_179X43_DIGEST: u64 = 17_866_181_982_027_554_185;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
@@ -22742,6 +22817,262 @@ mod tests {
         assert_eq!(
             hash, FOLD_OFF_179X43_DIGEST,
             "fold-OFF frame changed:\n{frame}"
+        );
+    }
+
+    /// The theme sweep's guard: every colour the dashboard draws comes from
+    /// `mod palette` — a field of the dashboard [`THEME`] or a named
+    /// categorical hue. A `Color::` literal, or a second colour theme
+    /// (`Theme::ansi()`, `dark()`, `light()`; `mono()` is `NO_COLOR`'s), in
+    /// the non-test part of any TUI source (comments aside) fails here, with
+    /// its lines — the palette module in this file is the one exception.
+    #[test]
+    fn colour_literals_live_only_in_the_palette() {
+        let sources = [
+            ("ui.rs", include_str!("ui.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("activity.rs", include_str!("activity.rs")),
+            ("clip.rs", include_str!("clip.rs")),
+            ("event.rs", include_str!("event.rs")),
+            ("format.rs", include_str!("format.rs")),
+            ("logs.rs", include_str!("logs.rs")),
+            ("triage.rs", include_str!("triage.rs")),
+            ("view.rs", include_str!("view.rs")),
+        ];
+        let mut stray = Vec::new();
+        for (name, src) in sources {
+            let lines: Vec<&str> = src.lines().collect();
+            let tests = lines
+                .iter()
+                .position(|l| *l == "mod tests {")
+                .unwrap_or(lines.len());
+            // The palette: from `mod palette {` to its closing brace.
+            let palette = match lines.iter().position(|l| *l == "mod palette {") {
+                Some(open) => {
+                    let close = open
+                        + lines[open..]
+                            .iter()
+                            .position(|l| *l == "}")
+                            .expect("palette end");
+                    assert!(close < tests, "the palette sits before the tests");
+                    open..close + 1
+                }
+                None => 0..0,
+            };
+            assert_eq!(
+                name == "ui.rs",
+                !palette.is_empty(),
+                "the palette is in ui.rs"
+            );
+            stray.extend(
+                lines[..tests]
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !palette.contains(i))
+                    .filter(|(_, l)| !l.trim_start().starts_with("//"))
+                    .filter(|(_, l)| {
+                        l.contains("Color::")
+                            || ["Theme::ansi(", "Theme::dark(", "Theme::light("]
+                                .iter()
+                                .any(|t| l.contains(t))
+                    })
+                    .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim())),
+            );
+        }
+        assert!(
+            stray.is_empty(),
+            "colours outside `mod palette` — name the THEME field (or add a palette \
+             const with its reason):\n{}",
+            stray.join("\n")
+        );
+    }
+
+    /// Two hues the theme sweep fixed. A running request's spinner wears
+    /// its group label's colour for every group: the spinner kept its own
+    /// hue table, where openrouter was green while `group_color` drew the
+    /// openrouter label dim, like an unknown group. And a `user` turn's
+    /// kind tag is the terminal's default foreground in bold, as its doc
+    /// always said — it was ANSI white, near-invisible on a light terminal.
+    #[test]
+    fn running_spinners_wear_their_group_colour_and_user_tags_the_default_text() {
+        use crate::routing::BackendGroup;
+        let (mut view, _) = crowded_view();
+        let now = SystemTime::now();
+        view.in_flight = BackendGroup::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &group)| {
+                let account = view
+                    .snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.group == group)
+                    .expect("an account per group");
+                InFlight {
+                    id: i as u64 + 1,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
+                    account: Some(account.id.0.clone()),
+                    group: Some(group.as_str().into()),
+                    model: Some("m".into()),
+                    effort: None,
+                    fast: false,
+                    kind: Some("user".into()),
+                    user_id: None,
+                    tenant: None,
+                    excerpt: None,
+                    client_name: None,
+                    started_at: now,
+                }
+            })
+            .collect();
+        let chrome = chrome_overlay(Overlay::None);
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).expect("terminal");
+        let buf = terminal
+            .draw(|f| {
+                draw_activity(f, f.area(), &view, &chrome, now);
+            })
+            .expect("draw")
+            .buffer
+            .clone();
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        // Newest first: the rows run Gemini … Claude.
+        for (y, group) in (1u16..).zip(BackendGroup::ALL.iter().rev()) {
+            let label = group_color(Some(group.as_str()));
+            assert!(
+                label.fg.is_some_and(|fg| fg != THEME.muted),
+                "{group:?} has a hue of its own: {label:?}"
+            );
+            assert_eq!(
+                Some(buf[(1, y)].fg),
+                label.fg,
+                "{group:?} spinner, row {y}:\n{text}"
+            );
+            let x = rows[usize::from(y)]
+                .find("user")
+                .map(|b| cells::width(&rows[usize::from(y)][..b]) as u16)
+                .unwrap_or_else(|| panic!("kind tag, row {y}:\n{text}"));
+            for dx in 0..4 {
+                let cell = &buf[(x + dx, y)];
+                assert_eq!(cell.fg, Color::Reset, "user tag, row {y}:\n{text}");
+                assert!(cell.modifier.contains(Modifier::BOLD), "{text}");
+            }
+        }
+    }
+
+    /// One selected style: the cursor row of llmux's own tables (the
+    /// accounts table on MAIN, the models table on the stats tab) and the
+    /// focus a twolab-tui widget draws (the compact account list) all wear
+    /// [`selected_style`] — reverse video with no colour of its own, so it
+    /// reads the same under `NO_COLOR` — and the rows around them do not.
+    #[test]
+    fn a_selection_wears_the_one_selected_style_on_every_surface() {
+        let sel = selected_style();
+        assert_eq!(sel, THEME.selected(), "the widgets' selection too");
+        assert!(sel.add_modifier.contains(Modifier::REVERSED), "{sel:?}");
+        assert_eq!((sel.fg, sel.bg), (None, None), "no colour of its own");
+        let wears = |buf: &ratatui::buffer::Buffer, x: u16, y: usize| {
+            buf[(x, y as u16)].modifier.contains(sel.add_modifier)
+        };
+        // The cell where `needle` starts on `row`.
+        let at = |row: &str, needle: &str| {
+            let byte = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+            cells::width(&row[..byte]) as u16
+        };
+
+        // MAIN's accounts table: the `>` row, from the marker through the
+        // name, and not the row under it.
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let ctx = frame_ctx(&view, &chrome);
+        let second = view.snapshot.accounts[ctx.order[1]].id.0.clone();
+        let chrome = cursor_on(&view, &chrome, &second);
+        let buf = render_buffer(&view, &chrome, 179, 43);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with('>'))
+            .unwrap_or_else(|| panic!("{text}"));
+        for x in 0..12 {
+            assert!(wears(&buf, x, y), "accounts cursor row, cell {x}:\n{text}");
+            assert!(!wears(&buf, x, y - 1), "the row above, cell {x}:\n{text}");
+            assert!(!wears(&buf, x, y + 1), "the row below, cell {x}:\n{text}");
+        }
+
+        // The stats tab's models table: the cursor's row, not the other.
+        let view = view_with(vec![
+            model_row("codex", "gpt-5.5", 700, 300),
+            model_row("claude", "claude-sonnet-4-5", 100, 50),
+        ]);
+        let chrome = Chrome {
+            model_cursor: 1,
+            ..chrome_overlay(Overlay::Stats)
+        };
+        let buf = render_buffer(&view, &chrome, 160, 30);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let other = row_of(&rows, "gpt-5.5");
+        let x = at(&rows[other], "gpt-5.5");
+        let cursor = rows
+            .iter()
+            .position(|r| r.find("sonnet").is_some_and(|_| at(r, "sonnet") <= x + 7))
+            .unwrap_or_else(|| panic!("{text}"));
+        let name = at(&rows[cursor], "sonnet");
+        for dx in 0..6 {
+            assert!(wears(&buf, name + dx, cursor), "models cursor row:\n{text}");
+            assert!(!wears(&buf, x + dx, other), "models other row:\n{text}");
+        }
+
+        // The compact account list (twolab-tui `agent_list`, drawn with
+        // THEME): its focused entry, not the next.
+        let (view, _) = compact_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            mode: Mode::Select { idx: 0 },
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let buf = render_buffer(&view, &chrome, 40, 14);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let y = row_of(&rows, "›✗");
+        let x = at(&rows[y], "›✗");
+        for dx in 0..6 {
+            assert!(wears(&buf, x + dx, y), "compact focus:\n{text}");
+            assert!(!wears(&buf, x + dx, y + 1), "compact next entry:\n{text}");
+        }
+
+        // And no selection is built by hand: outside the copy-mode banner
+        // (a banner, not a selection) the drawing code never reverses a
+        // style itself.
+        let src = include_str!("ui.rs");
+        let code = &src[..src.find("\nmod tests {").expect("tests module")];
+        let banner = code
+            .find("\nfn copy_mode_banner(")
+            .expect("copy_mode_banner");
+        let banner = banner..banner + code[banner..].find("\n}\n").expect("its end");
+        let mut offset = 0;
+        let mut by_hand = Vec::new();
+        for (i, line) in code.split('\n').enumerate() {
+            if line.contains("Modifier::REVERSED")
+                && !line.trim_start().starts_with("//")
+                && !banner.contains(&offset)
+            {
+                by_hand.push(format!("ui.rs:{}: {}", i + 1, line.trim()));
+            }
+            offset += line.len() + 1;
+        }
+        assert!(
+            by_hand.is_empty(),
+            "a selection drawn by hand — use selected_style():\n{}",
+            by_hand.join("\n")
         );
     }
 
