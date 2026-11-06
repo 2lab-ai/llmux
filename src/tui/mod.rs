@@ -65,14 +65,15 @@ fn no_color() -> bool {
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::style::{Attribute, ResetColor, SetAttribute};
 use crossterm::terminal::{enable_raw_mode, Clear, ClearType, EnterAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
+use twolab_tui::composer::{ComposerEvent, ComposerState, Mask};
 use twolab_tui::modal::{ModalOutcome, ModalState};
 use twolab_tui::scrollbar::ScrollPos;
 
@@ -267,9 +268,9 @@ impl LoginKind {
 /// add-account key entry (`a`) vs. the remove confirmation (`r`) vs. the
 /// new-login provider picker (`n`).
 ///
-/// Deliberately `Copy` (no owned buffer inside): the add-account input text
-/// lives in [`App::add_input`] so the masked render never has to clone a
-/// secret through this enum.
+/// Deliberately `Copy` (no owned buffer inside): the text of the open field
+/// (API key, limits, config value) lives in [`App::field`], a twolab-tui
+/// composer, so no secret ever travels through this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Normal,
@@ -278,7 +279,8 @@ pub(crate) enum Mode {
         idx: usize,
     },
     /// Entering an API key for a new account (the `a` key). The typed text is
-    /// held in [`App::add_input`] and rendered masked.
+    /// held in [`App::field`], a masked composer: drawn as `∙` glyphs, read
+    /// only by `take_secret` on Enter.
     AddKey,
     /// Confirming a destructive account removal (the `r` key). `idx` is the
     /// display row being removed; the name is resolved at confirm time.
@@ -298,7 +300,7 @@ pub(crate) enum Mode {
         idx: usize,
     },
     /// Editing per-account ceiling overrides for the switcher's highlighted
-    /// row (`L`). The typed text lives in [`App::add_input`]; format
+    /// row (`L`). The typed text lives in [`App::field`]; format
     /// `5h,7d,fbl` percents, empty = back to the global ceilings.
     EditLimits {
         idx: usize,
@@ -311,7 +313,7 @@ pub(crate) enum Mode {
         item: usize,
     },
     /// Typing a new value for a config-editor row (config-editor v1). The
-    /// buffer lives in [`App::config_input`] (Mode stays `Copy`).
+    /// value lives in [`App::field`] (Mode stays `Copy`).
     ConfigEdit {
         action: ui::ConfigAction,
     },
@@ -621,9 +623,11 @@ pub(crate) struct Chrome {
     pub config_saved: std::collections::HashMap<ui::ConfigAction, String>,
     /// `Some` in attach mode.
     pub attach: Option<Attach>,
-    /// Number of characters typed so far in `Mode::AddKey` — the footer shows
-    /// a masked prompt (`••••`) of this width, never the raw key.
-    pub add_input_len: usize,
+    /// The open text field (`Mode::AddKey` / `EditLimits` / `ConfigEdit`; an
+    /// empty composer otherwise): the footer and the config prompt draw it
+    /// with twolab-tui's composer. In `AddKey` it is masked — the renderer
+    /// can only draw `∙` glyphs, and `text()` reads empty — never the key.
+    pub field: twolab_tui::composer::ComposerState,
     /// Session-local `u`-key override of the quota-gauge fill direction;
     /// `None` = the config default carried on the view applies.
     pub quota_display_override: Option<crate::config::QuotaDisplay>,
@@ -632,9 +636,6 @@ pub(crate) struct Chrome {
     /// `z`-key session toggle: MAIN packs the accounts whose 7d window is
     /// over its ceiling into a text block under the table (off by default).
     pub fold_exhausted: bool,
-    /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
-    /// Rendered raw in the footer (percent ceilings are not secrets).
-    pub limits_input: String,
     /// Drag-set pane heights (UI-3 U7/U8); `None` entries keep the automatic
     /// layout.
     pub pane_heights: PaneHeights,
@@ -1089,7 +1090,8 @@ struct App {
     /// of the accounts table — name (default) or the scheduler's next-pick
     /// order. Session-local, never persisted to config.
     account_sort: triage::AccountSort,
-    /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
+    /// Config-editor cursor + the confirm gate's question (Mode::ConfigConfirm;
+    /// the value being typed is [`Self::field`]).
     config_cursor: usize,
     config_input: String,
     /// The marked option of the config confirm gate ([`Chrome::confirm_choice`]).
@@ -1101,10 +1103,18 @@ struct App {
     config_saved: std::collections::HashMap<ui::ConfigAction, String>,
     /// The raw display value of the request parked in `config_pending`.
     config_pending_value: Option<String>,
-    /// API-key buffer for `Mode::AddKey`. Held outside `Mode` so the enum
-    /// stays `Copy` and the secret is owned in exactly one place; cleared on
-    /// submit/cancel. Never rendered raw — the footer shows a masked width.
-    add_input: String,
+    /// The text field of the open prompt — the API key (`Mode::AddKey`,
+    /// masked), the per-account limits (`Mode::EditLimits`) or a config value
+    /// (`Mode::ConfigEdit`): a one-line twolab-tui composer with a caret
+    /// (←/→, Home/End), mid-value edits, Ctrl+U / Ctrl+K / Ctrl+W cuts that
+    /// Ctrl+Y puts back, and pastes. Held outside `Mode` so the enum stays
+    /// `Copy`; replaced on open, submit and cancel. The masked key comes out
+    /// only through `take_secret` — `text()`, `take()` and `Debug` hide it,
+    /// and the frame draws `∙` glyphs.
+    field: twolab_tui::composer::ComposerState,
+    /// Cells the open field was drawn in last frame: its window follows the
+    /// caret from there (see [`Self::track_field`]).
+    field_width: u16,
     /// New browser login queued by the `n` picker, performed by the event loop
     /// (the OAuth flow is async AND needs the raw terminal back — the loop
     /// suspends the TUI, runs the flow, then re-inits). Held on `App` (not
@@ -1241,7 +1251,8 @@ impl App {
             config_pending: None,
             config_pending_value: None,
             config_saved: Default::default(),
-            add_input: String::new(),
+            field: Default::default(),
+            field_width: 0,
             pending_login: None,
             quota_display_override: None,
             usage_gran: activity::UsageGran::default(),
@@ -1465,7 +1476,13 @@ impl App {
             confirm_choice: self.confirm_choice,
             reset_held: self.pending_redemption.clone(),
             config_saved: self.config_saved.clone(),
-            add_input_len: self.add_input.chars().count(),
+            // Only while a field is open; a masked clone hides its text
+            // the same way the original does.
+            field: if self.field_open() {
+                self.field.clone()
+            } else {
+                Default::default()
+            },
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
             fold_exhausted: self.fold_exhausted,
@@ -1487,11 +1504,6 @@ impl App {
                 m
             }),
             account_modal: self.account_modal.clone(),
-            limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
-                self.add_input.clone()
-            } else {
-                String::new()
-            },
             status_line: self.status_line().map(str::to_string),
             attach: match &self.backend {
                 Backend::Local(_) => None,
@@ -1660,15 +1672,15 @@ impl App {
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
         match self.mode {
             Mode::Select { idx } => return self.on_key_select(key.code, idx, view),
-            Mode::EditLimits { idx } => return self.on_key_edit_limits(key.code, idx, view),
-            Mode::AddKey => return self.on_key_add(key.code),
+            Mode::EditLimits { idx } => return self.on_key_edit_limits(key, idx, view),
+            Mode::AddKey => return self.on_key_add(key),
             Mode::ConfirmRemove { idx } => return self.on_key_confirm_remove(key.code, idx, view),
             Mode::ConfirmReset { idx } => return self.on_key_confirm_reset(key.code, idx, view),
             Mode::NewLogin { idx } => return self.on_key_new_login(key.code, idx),
             Mode::ContextMenu { idx, item } => {
                 return self.on_key_context_menu(key.code, idx, item, view)
             }
-            Mode::ConfigEdit { action } => return self.on_key_config_edit(key.code, action, view),
+            Mode::ConfigEdit { action } => return self.on_key_config_edit(key, action, view),
             Mode::ConfigConfirm { action } => {
                 return self.on_key_config_confirm(key.code, action, view)
             }
@@ -3050,8 +3062,9 @@ impl App {
             _ => {}
         }
         if action.input_hint().is_some() {
-            // Prefill with the current value where that is cheap to read.
-            self.config_input = view
+            // Prefill with the current value where that is cheap to read;
+            // the caret starts at its end.
+            let current = view
                 .map(|v| {
                     let f = &v.config_facts;
                     let p = &v.select_params;
@@ -3073,6 +3086,7 @@ impl App {
                     }
                 })
                 .unwrap_or_default();
+            self.field = ComposerState::with_text(&current).single_line();
             self.mode = Mode::ConfigEdit { action };
             return;
         }
@@ -3165,24 +3179,23 @@ impl App {
         Some(req)
     }
 
-    /// Keys while typing a config value (Mode::ConfigEdit).
+    /// Keys while typing a config value (Mode::ConfigEdit): Enter parses and
+    /// applies (or opens the confirm gate), Esc cancels, every other key
+    /// edits the field ([`Self::edit_field`]).
     fn on_key_config_edit(
         &mut self,
-        code: KeyCode,
+        key: KeyEvent,
         action: ui::ConfigAction,
         view: Option<&DashboardView>,
     ) {
-        match code {
+        match key.code {
             KeyCode::Esc => {
-                self.config_input.clear();
+                self.close_field();
                 self.mode = Mode::Normal;
             }
-            KeyCode::Backspace => {
-                self.config_input.pop();
-            }
-            KeyCode::Char(ch) => self.config_input.push(ch),
             KeyCode::Enter => {
-                let raw = std::mem::take(&mut self.config_input);
+                let raw = self.field.take();
+                self.close_field();
                 self.mode = Mode::Normal;
                 match parse_config_input(action, raw.trim(), view) {
                     Err(err) => self.set_status(format!("config: {err}")),
@@ -3223,7 +3236,9 @@ impl App {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                self.edit_field(key, |_| true);
+            }
         }
     }
 
@@ -3701,7 +3716,7 @@ impl App {
             // mode (local: in-process config update + pool reload; remote:
             // POST /llmux/add-account).
             KeyCode::Char('a') => {
-                self.add_input.clear();
+                self.field = ComposerState::new().masked(Mask::default());
                 self.mode = Mode::AddKey;
                 self.set_status(
                     "add account: paste an Anthropic API key, Enter to add, Esc to cancel".into(),
@@ -4187,7 +4202,7 @@ impl App {
             return;
         };
         let fmt = |v: Option<f64>| v.map_or("global".to_string(), |v| format!("{:.0}%", v * 100.0));
-        self.add_input.clear();
+        self.field = ComposerState::new().single_line();
         self.mode = Mode::EditLimits { idx };
         self.set_status(format!(
             "limits for {} — enter `5h,7d,fbl` percents (now {}, {}, {}); empty = global; Enter apply, Esc cancel",
@@ -4198,43 +4213,36 @@ impl App {
         ));
     }
 
-    /// Key handling for `Mode::EditLimits`: plain text entry (digits, `,`,
-    /// `.`, space), Enter parses + applies, Esc cancels back to the switcher.
-    fn on_key_edit_limits(&mut self, code: KeyCode, idx: usize, view: Option<&DashboardView>) {
-        match code {
-            KeyCode::Char(c) if c.is_ascii_digit() || c == ',' || c == '.' || c == ' ' => {
-                self.add_input.push(c);
-            }
-            KeyCode::Backspace => {
-                self.add_input.pop();
-            }
+    /// Key handling for `Mode::EditLimits`: a text field that takes digits,
+    /// `,`, `.` and spaces (typed or pasted) and edits like every field
+    /// ([`Self::edit_field`]); Enter parses + applies, Esc cancels back to
+    /// the switcher.
+    fn on_key_edit_limits(&mut self, key: KeyEvent, idx: usize, view: Option<&DashboardView>) {
+        match key.code {
             KeyCode::Esc => {
-                self.add_input.clear();
+                self.close_field();
                 self.mode = if std::mem::take(&mut self.limits_from_menu) {
                     Mode::Normal
                 } else {
                     Mode::Select { idx }
                 };
             }
-            KeyCode::Enter => {
-                let raw = std::mem::take(&mut self.add_input);
-                match parse_limits_input(&raw) {
-                    Ok(limits) => {
-                        self.apply_limits_selected(idx, view, limits);
-                        self.mode = if std::mem::take(&mut self.limits_from_menu) {
-                            Mode::Normal
-                        } else {
-                            Mode::Select { idx }
-                        };
-                    }
-                    Err(err) => {
-                        // Keep editing — restore the text so it can be fixed.
-                        self.add_input = raw;
-                        self.set_status(err);
-                    }
+            KeyCode::Enter => match parse_limits_input(self.field.text()) {
+                Ok(limits) => {
+                    self.close_field();
+                    self.apply_limits_selected(idx, view, limits);
+                    self.mode = if std::mem::take(&mut self.limits_from_menu) {
+                        Mode::Normal
+                    } else {
+                        Mode::Select { idx }
+                    };
                 }
+                // Keep editing — the text stays so it can be fixed.
+                Err(err) => self.set_status(err),
+            },
+            _ => {
+                self.edit_field(key, limits_char);
             }
-            _ => {}
         }
     }
 
@@ -4477,35 +4485,106 @@ impl App {
         self.pending_login.take()
     }
 
-    /// Key handling for `Mode::AddKey` — typing the new account's API key.
-    /// Printable chars append to the buffer; Backspace deletes; Enter submits;
-    /// Esc cancels. The buffer is never rendered raw (the footer shows a masked
-    /// width via [`Chrome::add_input_len`]).
-    fn on_key_add(&mut self, code: KeyCode) {
-        match code {
+    /// A text field is open: the API key, the limits or a config value.
+    fn field_open(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::AddKey | Mode::EditLimits { .. } | Mode::ConfigEdit { .. }
+        )
+    }
+
+    /// An editing key for the open field (twolab-tui composer, one line):
+    /// ←/→ and Home/End (Ctrl+A/E) move the caret, Ctrl+←/→ by word;
+    /// typing and Backspace/Delete edit at the caret; Ctrl+U / Ctrl+K /
+    /// Ctrl+W cut to the start, to the end, the word before, and Ctrl+Y puts
+    /// the cut back. A typed character `accept` refuses is dropped.
+    fn edit_field(&mut self, key: KeyEvent, accept: impl Fn(char) -> bool) -> ComposerEvent {
+        let Some(input) = key_event_input(&key) else {
+            return ComposerEvent::Ignored;
+        };
+        if input.typed().is_some_and(|c| !accept(c)) {
+            return ComposerEvent::Ignored;
+        }
+        match self.field.key(input, self.field_width) {
+            // Enter is answered by the prompt's own handler before this; a
+            // field never submits by itself.
+            ComposerEvent::Submitted(text) => {
+                self.field.set_text(&text);
+                ComposerEvent::Ignored
+            }
+            ev => ev,
+        }
+    }
+
+    /// Empty the field (and its kill buffer: a cut piece of a key must not
+    /// outlive the prompt).
+    fn close_field(&mut self) {
+        self.field = ComposerState::default();
+    }
+
+    /// Text pasted into the terminal (bracketed paste). An open field takes
+    /// it whole at the caret — line breaks become spaces (dropped from a
+    /// key), the limits field keeps only the characters it accepts. Anywhere
+    /// else the paste is typed key by key, as it was before bracketed paste
+    /// was turned on. Returns whether anything changed.
+    fn on_paste(&mut self, text: &str, view: Option<&DashboardView>) -> bool {
+        match self.mode {
+            Mode::AddKey | Mode::ConfigEdit { .. } => self.field.insert_str(text),
+            Mode::EditLimits { .. } => {
+                let kept: String = text.chars().filter(|&c| limits_char(c)).collect();
+                self.field.insert_str(&kept)
+            }
+            _ => {
+                for c in text.chars() {
+                    let code = match c {
+                        '\r' | '\n' => KeyCode::Enter,
+                        '\t' => KeyCode::Tab,
+                        c if c.is_control() => continue,
+                        c => KeyCode::Char(c),
+                    };
+                    self.on_key(KeyEvent::new(code, KeyModifiers::NONE), view);
+                }
+                !text.is_empty()
+            }
+        }
+    }
+
+    /// Move the open field's window as the last frame drew it (`width`
+    /// cells), so the next frame scrolls it only as far as the caret needs —
+    /// the composer keeps that window in its state.
+    fn track_field(&mut self, width: Option<u16>) {
+        let Some(width) = width.filter(|_| self.field_open()) else {
+            return;
+        };
+        self.field_width = width;
+        let _ = twolab_tui::composer::Composer::new().line(&mut self.field, width);
+    }
+
+    /// Key handling for `Mode::AddKey` — typing the new account's API key in
+    /// a masked field: Enter submits, Esc cancels, every other key edits
+    /// ([`Self::edit_field`]; control characters are never inserted). The
+    /// field is never drawn raw — the footer shows one `∙` per character.
+    fn on_key_add(&mut self, key: KeyEvent) {
+        match key.code {
             KeyCode::Esc => {
-                self.add_input.clear();
+                self.close_field();
                 self.mode = Mode::Normal;
                 self.set_status("add account cancelled".into());
             }
             KeyCode::Enter => self.submit_add(),
-            KeyCode::Backspace => {
-                self.add_input.pop();
+            _ => {
+                self.edit_field(key, |c| !c.is_control());
             }
-            // Guard against accidental control chars; only printable input.
-            KeyCode::Char(c) if !c.is_control() => {
-                self.add_input.push(c);
-            }
-            _ => {}
         }
     }
 
     /// Submit the typed API key: add the account in-process (local) or queue a
-    /// `POST /llmux/add-account` (remote). The buffer is cleared either way so
-    /// the secret does not linger in memory longer than necessary.
+    /// `POST /llmux/add-account` (remote). `take_secret` — the one way out of
+    /// the masked field — empties it and its kill buffer, so the secret does
+    /// not linger in memory longer than necessary.
     fn submit_add(&mut self) {
-        let api_key = self.add_input.trim().to_string();
-        self.add_input.clear();
+        let api_key = self.field.take_secret().trim().to_string();
+        self.close_field();
         self.mode = Mode::Normal;
         if api_key.is_empty() {
             self.set_status("add account cancelled: empty key".into());
@@ -5160,6 +5239,23 @@ fn key_input(code: KeyCode) -> Option<twolab_tui::KeyInput> {
     Some(twolab_tui::KeyInput::new(key))
 }
 
+/// [`key_input`] with the key's Ctrl / Alt / Shift — what a text field needs
+/// for Ctrl+U, Ctrl+W, Ctrl+Y and Ctrl+←/→.
+fn key_event_input(key: &KeyEvent) -> Option<twolab_tui::KeyInput> {
+    let mut input = key_input(key.code)?;
+    input.mods = twolab_tui::Mods {
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    };
+    Some(input)
+}
+
+/// What the limits field takes: `5h,7d,fbl` percents or fractions.
+fn limits_char(c: char) -> bool {
+    c.is_ascii_digit() || c == ',' || c == '.' || c == ' '
+}
+
 /// What a key does on a two-option confirm gate (option 1 confirms, option 2
 /// cancels — the card drawn by `ui::draw_gate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5533,7 +5629,14 @@ fn init_terminal() -> std::io::Result<ratatui::DefaultTerminal> {
         Clear(ClearType::All),
         EnableMouseCapture
     )
-    .and_then(|()| ratatui::Terminal::new(CrosstermBackend::new(std::io::stdout())))
+    .and_then(|()| {
+        // A paste arrives whole (`Event::Paste`): a text field takes it at
+        // the caret as one edit, and a line break in a pasted key does not
+        // submit half of it. Best effort — a terminal without bracketed
+        // paste types the paste key by key, as before.
+        let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+        ratatui::Terminal::new(CrosstermBackend::new(std::io::stdout()))
+    })
     .inspect_err(|_| restore_terminal())
 }
 
@@ -5574,6 +5677,7 @@ fn restore_terminal() {
     }
     let _ = crossterm::execute!(
         std::io::stdout(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         crossterm::cursor::Show
     );
@@ -5899,6 +6003,8 @@ async fn event_loop(
             app.account_row_chrome = main.account_rows;
             app.menu_chrome = main.menu;
             app.setting_chrome = main.settings;
+            // The open text field's window, as drawn.
+            app.track_field(main.field_width);
             // The Logs pager clamps a held offset itself; one at (or past)
             // the bottom follows the tail again.
             if let Some(pos) = main.logs {
@@ -5979,6 +6085,12 @@ fn apply_event(
         Event::Mouse(mouse) => {
             let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
             if app.on_mouse(mouse, view.as_ref()) {
+                *dirty = true;
+            }
+        }
+        Event::Paste(text) => {
+            let view = view.get_or_insert_with(|| app.view(SystemTime::now()));
+            if app.on_paste(&text, view.as_ref()) {
                 *dirty = true;
             }
         }
@@ -7385,8 +7497,8 @@ mod tests {
         app.mode = Mode::ConfigEdit {
             action: ui::ConfigAction::Ceiling5h,
         };
-        app.config_input = "0".into();
-        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, None);
+        app.field = ComposerState::with_text("0").single_line();
+        app.on_key_config_edit(press(KeyCode::Enter), ui::ConfigAction::Ceiling5h, None);
         assert!(
             matches!(app.mode, Mode::ConfigConfirm { .. }),
             "ceiling→0 needs confirm"
@@ -7395,8 +7507,8 @@ mod tests {
         app.mode = Mode::ConfigEdit {
             action: ui::ConfigAction::Ceiling5h,
         };
-        app.config_input = "80".into();
-        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, None);
+        app.field = ComposerState::with_text("80").single_line();
+        app.on_key_config_edit(press(KeyCode::Enter), ui::ConfigAction::Ceiling5h, None);
         assert_eq!(app.mode, Mode::Normal, "a normal percent applies directly");
     }
 
@@ -8233,7 +8345,7 @@ mod tests {
             Overlay::Accounts,
             "overlay stays open over Mode"
         );
-        app.on_key_add(KeyCode::Esc); // cancel back to Normal
+        app.on_key_add(press(KeyCode::Esc)); // cancel back to Normal
         assert_eq!(app.mode, Mode::Normal);
 
         app.on_key_accounts(KeyCode::Char('r'), Some(&view));
@@ -8255,7 +8367,207 @@ mod tests {
         // A printable char goes to the key buffer, not the overlay handler.
         app.on_key(press(KeyCode::Char('x')), None);
         assert_eq!(app.mode, Mode::AddKey);
-        assert_eq!(app.add_input, "x");
+        assert_eq!(app.field.take_secret(), "x");
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_text(app: &mut App, view: &DashboardView, text: &str) {
+        for c in text.chars() {
+            app.on_key(press(KeyCode::Char(c)), Some(view));
+        }
+    }
+
+    /// Draw a frame as the runtime loop does, writing the open field's
+    /// window back so the next frame scrolls from where this one drew.
+    fn render_tracked(app: &mut App, view: &DashboardView, w: u16, h: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        let chrome = app.chrome();
+        let mut hits = None;
+        terminal
+            .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
+            .expect("draw");
+        app.track_field(hits.unwrap_or_default().field_width);
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The add-key field is a masked composer: typing, a paste, caret moves,
+    /// mid-value edits and Ctrl+U/K/W/Y all edit the real key, and no frame
+    /// at 80×24 or 179×43 ever shows a piece of it — only `∙` glyphs. The key
+    /// comes out once, through `take_secret`, on Enter.
+    #[test]
+    fn api_key_never_appears_in_any_rendered_frame() {
+        const KEY: &str = "sk-ant-api03-Q7zXv9Lm2Wq8Rt5Yp3Kj";
+        let view = stats_view_with_account();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key(press(KeyCode::Char('a')), Some(&view));
+        assert_eq!(app.mode, Mode::AddKey);
+        let mut frames: Vec<String> = Vec::new();
+        // Both sizes; the index of the 80×24 frame.
+        fn snap(app: &mut App, view: &DashboardView, frames: &mut Vec<String>) -> usize {
+            for (w, h) in [(80, 24), (179, 43)] {
+                frames.push(render_tracked(app, view, w, h));
+            }
+            frames.len() - 2
+        }
+
+        type_text(&mut app, &view, &KEY[..21]);
+        snap(&mut app, &view, &mut frames);
+        // A paste lands whole; its line break neither submits nor types.
+        assert!(app.on_paste(&format!("{}\n", &KEY[21..]), Some(&view)));
+        assert_eq!(app.mode, Mode::AddKey);
+        let at = snap(&mut app, &view, &mut frames);
+        assert!(
+            frames[at].contains('‹'),
+            "a long key scrolls: {}",
+            frames[at]
+        );
+        // Home: the window goes to the start, more of the key to the right.
+        app.on_key(press(KeyCode::Home), Some(&view));
+        let at = snap(&mut app, &view, &mut frames);
+        assert!(frames[at].contains('›'), "{}", frames[at]);
+        // A mid-value edit, then undone.
+        app.on_key(press(KeyCode::End), Some(&view));
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Left), Some(&view));
+        }
+        type_text(&mut app, &view, "ZZ");
+        snap(&mut app, &view, &mut frames);
+        app.on_key(press(KeyCode::Backspace), Some(&view));
+        app.on_key(press(KeyCode::Backspace), Some(&view));
+        // Ctrl+U cuts to the start (it used to type a `u`), Ctrl+Y puts it back.
+        app.on_key(ctrl('u'), Some(&view));
+        snap(&mut app, &view, &mut frames);
+        app.on_key(ctrl('y'), Some(&view));
+        // Ctrl+K cuts to the end; Ctrl+W the word before the caret.
+        app.on_key(ctrl('k'), Some(&view));
+        app.on_key(ctrl('y'), Some(&view));
+        app.on_key(ctrl('w'), Some(&view));
+        assert!(app.field.is_empty(), "the key is one word");
+        snap(&mut app, &view, &mut frames);
+        app.on_key(ctrl('y'), Some(&view));
+        snap(&mut app, &view, &mut frames);
+
+        let chrome = app.chrome();
+        assert_eq!(chrome.field.text(), "", "the frame's copy reads empty");
+        assert!(!format!("{:?}", chrome.field).contains(&KEY[..8]));
+        for frame in &frames {
+            // The field is drawn: glyphs, or the placeholder once emptied.
+            assert!(
+                frame.contains('∙') || frame.contains("paste an API key"),
+                "{frame}"
+            );
+            for piece in KEY.as_bytes().windows(5) {
+                let piece = std::str::from_utf8(piece).expect("ascii");
+                assert!(!frame.contains(piece), "{piece:?} rendered:\n{frame}");
+            }
+        }
+
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.field.is_empty());
+        match &app.backend {
+            Backend::Remote(remote) => assert_eq!(remote.pending_add.as_deref(), Some(KEY)),
+            Backend::Local(_) => unreachable!("remote app"),
+        }
+    }
+
+    /// The limits field edits at the caret, takes only what a ceiling can
+    /// be (typed or pasted), keeps the text on a parse error, and applies
+    /// through the same `parse_limits_input` as before.
+    #[test]
+    fn limits_field_edits_at_the_caret_and_keeps_its_validation() {
+        let view = stats_view_with_account();
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.mode = Mode::Select { idx: 0 };
+        app.on_key(press(KeyCode::Char('L')), Some(&view));
+        assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
+        type_text(&mut app, &view, "8090x");
+        assert_eq!(app.field.text(), "8090", "a letter is refused");
+        app.on_key(press(KeyCode::Left), Some(&view));
+        app.on_key(press(KeyCode::Left), Some(&view));
+        type_text(&mut app, &view, ",");
+        assert_eq!(app.field.text(), "80,90");
+        app.on_key(press(KeyCode::End), Some(&view));
+        assert!(app.on_paste(",9x5\n", Some(&view)));
+        assert_eq!(app.field.text(), "80,90,95", "the paste keeps what fits");
+        let frame = render_tracked(&mut app, &view, 80, 24);
+        assert!(frame.contains("limits (5h,7d,fbl %) ❯ 80,90,95"), "{frame}");
+        // Home + Ctrl+K cuts it all, Ctrl+Y puts it back.
+        app.on_key(press(KeyCode::Home), Some(&view));
+        app.on_key(ctrl('k'), Some(&view));
+        assert_eq!(app.field.text(), "");
+        app.on_key(ctrl('y'), Some(&view));
+        assert_eq!(app.field.text(), "80,90,95");
+        // An out-of-range value: an error, and the text stays to be fixed.
+        app.on_key(press(KeyCode::Home), Some(&view));
+        type_text(&mut app, &view, "1");
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
+        assert_eq!(app.field.text(), "180,90,95");
+        app.on_key(press(KeyCode::Home), Some(&view));
+        app.on_key(press(KeyCode::Delete), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::Select { idx: 0 });
+        assert!(app.field.is_empty());
+        match &app.backend {
+            Backend::Remote(remote) => {
+                let (name, limits) = remote.pending_limits.clone().expect("queued");
+                assert_eq!(name, "claude:me@example.com");
+                assert_eq!(limits.five_hour_max, Some(0.80));
+                assert_eq!(limits.seven_day_max, Some(0.90));
+                assert_eq!(limits.fable_weekly_max, Some(0.95));
+            }
+            Backend::Local(_) => unreachable!("remote app"),
+        }
+        // Outside a field a paste is typed key by key, as before.
+        app.mode = Mode::Normal;
+        app.overlay = Overlay::None;
+        assert!(app.on_paste("a", Some(&view)));
+        assert_eq!(app.overlay, Overlay::Accounts);
+    }
+
+    /// A config value edits mid-value: the field opens on the current value
+    /// with the caret at its end, ←/Backspace edit inside it, and Enter
+    /// applies what the field holds through the unchanged parse/confirm flow.
+    #[test]
+    fn config_value_edits_mid_value() {
+        let mut view = stats_view_with_account();
+        view.select_params.five_hour_max = 0.9;
+        let mut app = remote_app();
+        app.overlay = Overlay::Config;
+        app.activate_config_action(ui::ConfigAction::Ceiling5h, Some(&view));
+        assert_eq!(
+            app.mode,
+            Mode::ConfigEdit {
+                action: ui::ConfigAction::Ceiling5h
+            }
+        );
+        assert_eq!(app.field.text(), "90");
+        app.on_key(press(KeyCode::Left), Some(&view));
+        app.on_key(press(KeyCode::Backspace), Some(&view));
+        type_text(&mut app, &view, "7");
+        assert_eq!(app.field.text(), "70");
+        let frame = render_tracked(&mut app, &view, 80, 24);
+        assert!(frame.contains("edit ❯ 70"), "{frame}");
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(app.mode, Mode::Normal, "a normal percent applies directly");
+        match &app.backend {
+            Backend::Remote(remote) => {
+                let (req, _) = remote.pending_settings.as_ref().expect("queued");
+                assert_eq!(req.five_hour_max, Some(0.7));
+            }
+            Backend::Local(_) => unreachable!("remote app"),
+        }
     }
 
     #[test]
@@ -9749,8 +10061,12 @@ mod tests {
         app.mode = Mode::ConfigEdit {
             action: ui::ConfigAction::Ceiling5h,
         };
-        app.config_input = "0".into();
-        app.on_key_config_edit(KeyCode::Enter, ui::ConfigAction::Ceiling5h, Some(&view));
+        app.field = ComposerState::with_text("0").single_line();
+        app.on_key_config_edit(
+            press(KeyCode::Enter),
+            ui::ConfigAction::Ceiling5h,
+            Some(&view),
+        );
         assert_eq!(app.confirm_choice, 0);
         let p = (view.select_params.five_hour_max * 100.0).round();
         let frame = render_app(&app, &view, 80, 24);
