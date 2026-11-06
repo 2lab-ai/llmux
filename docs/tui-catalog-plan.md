@@ -79,7 +79,8 @@ catalog (27 + herdr) ─┬─ #231 move onto twolab-tui ... text · spinner · 
 - `Theme::selected()` is not `const`.
 - `HitMap` has no `FromIterator`.
 - menu, modal, tabs and packed_grid return their own hit lists instead of pushing into a `HitMap`.
-- Toasts record no click surface, so a click on a toast reaches the row under it.
+- `ToastStack::render` returns each toast's rect but no id, so llmux maps the stack's index back to the queue's
+  `entries()` to record a toast as a click target (a click takes it down; it no longer reaches the row under it).
 
 ## Evidence
 
