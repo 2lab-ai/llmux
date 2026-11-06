@@ -182,8 +182,54 @@ fn headless_login_hint(remote: bool) -> String {
 const RENDER_TICK: Duration = Duration::from_millis(120);
 /// Remote poll cadence for `GET /llmux/dashboard`.
 const FETCH_TICK: Duration = Duration::from_secs(1);
-/// How long a transient status-line message stays on screen.
-const STATUS_TTL: Duration = Duration::from_secs(5);
+/// How long a transient status-line message stays on screen — twolab-tui's
+/// flash lifetime, which the raw viewer's action flash shares (it was 3 s).
+const STATUS_TTL: Duration = twolab_tui::banner::FLASH_TTL;
+
+/// One status message and how it went. The outcome is drawn as a glyph and a
+/// word (`✓ ok`, `! warn`, `✗ fail` — twolab-tui `Flash`), so a failure never
+/// reads like a success without colour. `lines` are the facts behind a
+/// summary, one per failed account: a message that carries them is shown as
+/// a toast card that can be read line by line, instead of the one-row flash
+/// that cut them at the terminal's edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusMsg {
+    pub outcome: twolab_tui::banner::Outcome,
+    pub text: String,
+    pub lines: Vec<String>,
+}
+
+impl StatusMsg {
+    pub(crate) fn new(outcome: twolab_tui::banner::Outcome, text: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            text: text.into(),
+            lines: Vec::new(),
+        }
+    }
+
+    /// It worked — or, for `…` messages, it was accepted and is under way.
+    pub(crate) fn ok(text: impl Into<String>) -> Self {
+        Self::new(twolab_tui::banner::Outcome::Ok, text)
+    }
+
+    /// Nothing happened, or it worked only in part: cancelled, refused
+    /// before trying, saved but not live yet, a stale read on a success.
+    pub(crate) fn warn(text: impl Into<String>) -> Self {
+        Self::new(twolab_tui::banner::Outcome::Warn, text)
+    }
+
+    /// It failed.
+    pub(crate) fn fail(text: impl Into<String>) -> Self {
+        Self::new(twolab_tui::banner::Outcome::Fail, text)
+    }
+
+    /// The facts behind the summary, one per line (shown as a toast).
+    pub(crate) fn with_lines(mut self, lines: Vec<String>) -> Self {
+        self.lines = lines;
+        self
+    }
+}
 
 /// Last committed account switch, persisted for the scheduler pane (the
 /// activity ring forgets; the WHY line must not).
@@ -563,7 +609,15 @@ pub(crate) struct Chrome {
     pub mode: Mode,
     /// Which summoned surface (if any) is drawn over MAIN this frame (issue #5).
     pub overlay: Overlay,
-    pub status_line: Option<String>,
+    /// The live status message (the app drops it once [`STATUS_TTL`] has
+    /// passed), drawn on the footer's status row with its outcome.
+    pub status_line: Option<StatusMsg>,
+    /// Status messages with several facts, as toast cards (twolab-tui
+    /// `ToastQueue`); what is up is decided at [`Chrome::clock`].
+    pub toasts: twolab_tui::toast::ToastQueue,
+    /// The dashboard's own clock this frame: time since it started. The draw
+    /// reads no clock; toasts (and anything that ages) go by this.
+    pub clock: Duration,
     /// Activity-log scroll offset: number of newest completed entries skipped
     /// (0 = live tail). Lets the panel page through the full history (req6).
     pub activity_scroll: usize,
@@ -792,9 +846,11 @@ pub(crate) struct RawModal {
     pub hscroll: u16,
     /// Animation frame for the Loading spinner (advances with the shared tick).
     pub spin: usize,
-    /// Action feedback ("copied … → pbcopy" / "saved → …"), shown in place of
-    /// the key legend until it expires (drawn ~3 s).
-    pub flash: Option<(String, std::time::Instant)>,
+    /// Action feedback ("copied … → pbcopy" / "saved → …") with its outcome
+    /// and when it was set, shown in place of the key legend. The app drops
+    /// it from the frame's chrome once [`STATUS_TTL`] has passed, so the draw
+    /// never reads a clock.
+    pub flash: Option<(StatusMsg, Instant)>,
     pub state: RawModalState,
 }
 
@@ -836,7 +892,7 @@ struct ClipReq {
 /// Outcome of a background export, delivered on the clip channel.
 struct ClipResult {
     generation: u64,
-    message: String,
+    message: StatusMsg,
 }
 
 /// A usage-control operation queued by a key and executed OFF the event loop
@@ -879,8 +935,8 @@ pub(crate) struct PendingRedemption {
 
 /// Outcome of a background control operation.
 struct ControlResult {
-    /// Operator-facing status line.
-    message: String,
+    /// Operator-facing status message, with its outcome.
+    message: StatusMsg,
     /// A redemption to hold (uncertain outcome / a conflicting pending id the
     /// daemon reported), replacing whatever the client held.
     hold: Option<PendingRedemption>,
@@ -974,7 +1030,14 @@ struct App {
     /// Monotonic frame counter driving the spinner.
     frame: usize,
     should_quit: bool,
-    status: Option<(String, Instant)>,
+    /// The last status message and when it was set (it shows for
+    /// [`STATUS_TTL`]).
+    status: Option<(StatusMsg, Instant)>,
+    /// When the dashboard started: the origin of its own clock
+    /// ([`Chrome::clock`]), which the toast queue keeps time by.
+    started: Instant,
+    /// Status messages with several facts, shown as toast cards.
+    toasts: twolab_tui::toast::ToastQueue,
     /// Which summoned overlay is open over MAIN (issue #5): `a`→Accounts,
     /// `g`→Stats, `l`→Logs, `Esc`→None. MAIN renders every frame regardless.
     overlay: Overlay,
@@ -1198,6 +1261,8 @@ impl App {
             frame: 0,
             should_quit: false,
             status: None,
+            started: Instant::now(),
+            toasts: twolab_tui::toast::ToastQueue::new(),
             overlay: Overlay::None,
             activity_scroll: 0,
             last_top_key: None,
@@ -1444,6 +1509,14 @@ impl App {
     }
 
     fn chrome(&self) -> Chrome {
+        self.chrome_at(Instant::now())
+    }
+
+    /// The frame's chrome at `now`, the one clock reading of the frame:
+    /// expired messages are dropped here and every age is measured from it,
+    /// so nothing the draw sees depends on when the draw runs.
+    fn chrome_at(&self, now: Instant) -> Chrome {
+        let live = |at: &Instant| now.saturating_duration_since(*at) < STATUS_TTL;
         Chrome {
             frame: self.frame,
             mode: self.mode,
@@ -1484,6 +1557,7 @@ impl App {
             // the stored modal itself never needs a per-tick mutation).
             raw_modal: self.raw_modal.clone().map(|mut m| {
                 m.spin = self.frame;
+                m.flash = m.flash.filter(|(_, at)| live(at));
                 m
             }),
             account_modal: self.account_modal.clone(),
@@ -1492,7 +1566,13 @@ impl App {
             } else {
                 String::new()
             },
-            status_line: self.status_line().map(str::to_string),
+            status_line: self
+                .status
+                .as_ref()
+                .filter(|(_, at)| live(at))
+                .map(|(msg, _)| msg.clone()),
+            toasts: self.toasts.clone(),
+            clock: self.clock_at(now),
             attach: match &self.backend {
                 Backend::Local(_) => None,
                 Backend::Remote(remote) => Some(Attach {
@@ -1503,16 +1583,36 @@ impl App {
         }
     }
 
-    /// Active status-line message, if it hasn't expired.
+    /// Active status-line text, if it hasn't expired.
+    #[cfg(test)]
     fn status_line(&self) -> Option<&str> {
         self.status
             .as_ref()
             .filter(|(_, since)| since.elapsed() < STATUS_TTL)
-            .map(|(text, _)| text.as_str())
+            .map(|(msg, _)| msg.text.as_str())
     }
 
-    fn set_status(&mut self, text: String) {
-        self.status = Some((text, Instant::now()));
+    /// The dashboard's own clock at `now`: time since it started.
+    fn clock_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started)
+    }
+
+    /// Show a status message. A short one is the footer's one-row flash; one
+    /// that carries several facts (a multi-account refresh with failures) is
+    /// a toast card instead, one line per fact, and the footer row gives way
+    /// to it. A newer card replaces the one up rather than queueing behind.
+    fn set_status(&mut self, msg: StatusMsg) {
+        let now = Instant::now();
+        if msg.lines.is_empty() {
+            self.status = Some((msg, now));
+            return;
+        }
+        self.status = None;
+        let toast = twolab_tui::toast::Toast::new(msg.outcome.into(), msg.text)
+            .lines(msg.lines)
+            .key("status");
+        let clock = self.clock_at(now);
+        self.toasts.push(toast, clock);
     }
 
     fn apply_fetch(&mut self, msg: FetchMsg) {
@@ -1540,13 +1640,14 @@ impl App {
     /// never sent.
     fn queue_control(&mut self, op: ControlOp, pending_status: String) -> bool {
         if self.control_inflight || self.pending_control.is_some() {
-            self.set_status(
-                "a usage-control operation is already running — wait for it to finish".into(),
-            );
+            self.set_status(StatusMsg::warn(
+                "a usage-control operation is already running — wait for it to finish",
+            ));
             return false;
         }
         self.pending_control = Some(op);
-        self.set_status(pending_status);
+        // Accepted and under way: the outcome replaces it when it lands.
+        self.set_status(StatusMsg::ok(pending_status));
         true
     }
 
@@ -2258,10 +2359,7 @@ impl App {
         let generation = modal.generation;
         let id = modal.id;
         let RawModalState::Ready(content) = &modal.state else {
-            modal.flash = Some((
-                "raw record not loaded yet".to_string(),
-                std::time::Instant::now(),
-            ));
+            modal.flash = Some((StatusMsg::warn("raw record not loaded yet"), Instant::now()));
             return;
         };
         let Some(tab) = content
@@ -2296,12 +2394,12 @@ impl App {
             // Bounded: a wedged/slow exporter with a spamming user must not
             // grow the queue without limit. Reject the newest with feedback.
             modal.flash = Some((
-                "export busy — try again in a moment".to_string(),
-                std::time::Instant::now(),
+                StatusMsg::warn("export busy — try again in a moment"),
+                Instant::now(),
             ));
             return;
         }
-        modal.flash = Some(("working…".to_string(), std::time::Instant::now()));
+        modal.flash = Some((StatusMsg::ok("working…"), Instant::now()));
         self.pending_clip.push_back(ClipReq {
             generation,
             button: btn,
@@ -2337,7 +2435,7 @@ impl App {
     fn apply_clip_result(&mut self, result: ClipResult) {
         if let Some(modal) = self.raw_modal.as_mut() {
             if modal.generation == result.generation {
-                modal.flash = Some((result.message, std::time::Instant::now()));
+                modal.flash = Some((result.message, Instant::now()));
             }
         }
     }
@@ -2366,21 +2464,21 @@ impl App {
                     format!("llmux-raw-{id}-{label}")
                 };
                 match clip::save(&stem, ext, &payload) {
-                    Ok(path) => match button {
+                    Ok(path) => StatusMsg::ok(match button {
                         ui::RawButton::SaveAll => format!("saved record → {path}"),
                         _ => format!("saved → {path}"),
-                    },
-                    Err(err) => err,
+                    }),
+                    Err(err) => StatusMsg::fail(err),
                 }
             } else {
                 let n = payload.len();
                 match clip::copy(&payload) {
-                    Ok(dest) => match button {
+                    Ok(dest) => StatusMsg::ok(match button {
                         ui::RawButton::CopyCurl => format!("copied curl ({n} bytes) → {dest}"),
                         ui::RawButton::CopyAll => format!("copied all {n} bytes → {dest}"),
                         _ => format!("copied {n} bytes → {dest}"),
-                    },
-                    Err(err) => err,
+                    }),
+                    Err(err) => StatusMsg::fail(err),
                 }
             };
             let _ = tx.blocking_send(ClipResult {
@@ -2728,7 +2826,9 @@ impl App {
                 {
                     Some(pos) => pos,
                     None => {
-                        self.set_status(format!("{name} is gone — menu action cancelled"));
+                        self.set_status(StatusMsg::warn(format!(
+                            "{name} is gone — menu action cancelled"
+                        )));
                         return;
                     }
                 }
@@ -3091,7 +3191,7 @@ impl App {
         // Toggle actions: build the request from the CURRENT view value.
         let req = self.toggle_settings_request(action, view);
         let Some(req) = req else {
-            return self.set_status("config: value unavailable".into());
+            return self.set_status(StatusMsg::fail("config: value unavailable"));
         };
         if action.needs_confirm() {
             self.open_config_confirm(action, &req, view);
@@ -3185,7 +3285,7 @@ impl App {
                 let raw = std::mem::take(&mut self.config_input);
                 self.mode = Mode::Normal;
                 match parse_config_input(action, raw.trim(), view) {
-                    Err(err) => self.set_status(format!("config: {err}")),
+                    Err(err) => self.set_status(StatusMsg::fail(format!("config: {err}"))),
                     Ok(req) => {
                         // Blast-radius confirms: endpoint changes always; a
                         // ceiling driven to 0 (locks scheduling out); a
@@ -3256,7 +3356,7 @@ impl App {
                 self.config_pending = None;
                 self.config_pending_value = None;
                 self.mode = Mode::Normal;
-                self.set_status("config: cancelled".into());
+                self.set_status(StatusMsg::warn("config: cancelled"));
             }
             GateAnswer::Moved(choice) => self.confirm_choice = choice,
             GateAnswer::Ignored => {}
@@ -3293,11 +3393,11 @@ impl App {
                     }
                     self.set_status(settings_status(&applied, &restart));
                 }
-                Err(err) => self.set_status(format!("config: {err}")),
+                Err(err) => self.set_status(StatusMsg::fail(format!("config: {err}"))),
             },
             Backend::Remote(remote) => {
                 remote.pending_settings = Some((req, origin));
-                self.set_status("config: applying…".into());
+                self.set_status(StatusMsg::ok("config: applying…"));
             }
         }
     }
@@ -3357,14 +3457,15 @@ impl App {
                                 .collect::<Vec<_>>(),
                         )
                     }
-                    Ok(_) => "config change failed: daemon reported ok=false".into(),
-                    Err(_) => "config: accepted by daemon, but the ack was unreadable — \
-                               verify the value in the config tab (nothing assumed)"
-                        .into(),
+                    Ok(_) => StatusMsg::fail("config change failed: daemon reported ok=false"),
+                    Err(_) => StatusMsg::warn(
+                        "config: accepted by daemon, but the ack was unreadable — verify the \
+                         value in the config tab (nothing assumed)",
+                    ),
                 }
             }
-            Ok(response) => format!("config change failed: {}", response.status()),
-            Err(err) => format!("config change failed: {err}"),
+            Ok(response) => StatusMsg::fail(format!("config change failed: {}", response.status())),
+            Err(err) => StatusMsg::fail(format!("config change failed: {err}")),
         };
         self.set_status(message);
     }
@@ -3572,12 +3673,16 @@ impl App {
         };
         match &mut self.backend {
             Backend::Local(state) => match state.set_scheduler_mode(next) {
-                Ok(mode) => self.set_status(format!("scheduler mode: {}", mode.label())),
-                Err(err) => self.set_status(format!("scheduler mode change failed: {err}")),
+                Ok(mode) => {
+                    self.set_status(StatusMsg::ok(format!("scheduler mode: {}", mode.label())))
+                }
+                Err(err) => self.set_status(StatusMsg::fail(format!(
+                    "scheduler mode change failed: {err}"
+                ))),
             },
             Backend::Remote(remote) => {
                 remote.pending_mode = Some(next);
-                self.set_status(format!("scheduler mode → {}…", next.label()));
+                self.set_status(StatusMsg::ok(format!("scheduler mode → {}…", next.label())));
             }
         }
     }
@@ -3604,10 +3709,13 @@ impl App {
         }
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                format!("scheduler mode: {}", mode.label())
+                StatusMsg::ok(format!("scheduler mode: {}", mode.label()))
             }
-            Ok(response) => format!("scheduler mode change failed: {}", response.status()),
-            Err(err) => format!("scheduler mode change failed: {err}"),
+            Ok(response) => StatusMsg::fail(format!(
+                "scheduler mode change failed: {}",
+                response.status()
+            )),
+            Err(err) => StatusMsg::fail(format!("scheduler mode change failed: {err}")),
         };
         self.set_status(message);
     }
@@ -3615,28 +3723,22 @@ impl App {
     /// Flip the quota bars between reset countdown and absolute UTC stamp.
     fn toggle_reset_display(&mut self) {
         self.reset_absolute = !self.reset_absolute;
-        self.set_status(
-            if self.reset_absolute {
-                "reset shown as absolute time (UTC)"
-            } else {
-                "reset shown as countdown"
-            }
-            .into(),
-        );
+        self.set_status(StatusMsg::ok(if self.reset_absolute {
+            "reset shown as absolute time (UTC)"
+        } else {
+            "reset shown as countdown"
+        }));
     }
 
     /// Flip MAIN's fold of the accounts whose 7d window is over its ceiling
     /// (session-local, like `t`/`u`/`o`; off until the first press).
     fn toggle_fold_exhausted(&mut self) {
         self.fold_exhausted = !self.fold_exhausted;
-        self.set_status(
-            if self.fold_exhausted {
-                "fold on"
-            } else {
-                "fold off"
-            }
-            .into(),
-        );
+        self.set_status(StatusMsg::ok(if self.fold_exhausted {
+            "fold on"
+        } else {
+            "fold off"
+        }));
     }
 
     /// Flip the accounts table's WITHIN-GROUP order between account name and
@@ -3644,7 +3746,10 @@ impl App {
     /// session-local, like `t`/`u`.
     fn toggle_account_sort(&mut self) {
         self.account_sort = self.account_sort.toggle();
-        self.set_status(format!("accounts sorted by {}", self.account_sort.label()));
+        self.set_status(StatusMsg::ok(format!(
+            "accounts sorted by {}",
+            self.account_sort.label()
+        )));
     }
 
     /// Flip the quota-gauge fill direction between used% and remaining%
@@ -3661,13 +3766,10 @@ impl App {
             QuotaDisplay::Remaining => QuotaDisplay::Used,
         };
         self.quota_display_override = Some(next);
-        self.set_status(
-            match next {
-                QuotaDisplay::Used => "quota gauges fill: used%",
-                QuotaDisplay::Remaining => "quota gauges fill: remaining%",
-            }
-            .into(),
-        );
+        self.set_status(StatusMsg::ok(match next {
+            QuotaDisplay::Used => "quota gauges fill: used%",
+            QuotaDisplay::Remaining => "quota gauges fill: remaining%",
+        }));
     }
 
     /// Key handling for the Accounts overlay (`a`). Houses the issue #3/#4
@@ -3692,7 +3794,7 @@ impl App {
             KeyCode::Char('s') => {
                 let accounts = view.map_or(0, |v| v.snapshot.accounts.len());
                 if accounts == 0 {
-                    self.set_status("no accounts to switch between".into());
+                    self.set_status(StatusMsg::warn("no accounts to switch between"));
                 } else {
                     self.mode = Mode::Select { idx: 0 };
                 }
@@ -3703,16 +3805,16 @@ impl App {
             KeyCode::Char('a') => {
                 self.add_input.clear();
                 self.mode = Mode::AddKey;
-                self.set_status(
-                    "add account: paste an Anthropic API key, Enter to add, Esc to cancel".into(),
-                );
+                self.set_status(StatusMsg::ok(
+                    "add account: paste an Anthropic API key, Enter to add, Esc to cancel",
+                ));
             }
             // Remove the selected account (issue #3): a destructive delete, so
             // it opens a confirm step (y/N) — never a silent delete.
             KeyCode::Char('r') => {
                 let len = view.map_or(0, |v| v.snapshot.accounts.len());
                 if len == 0 {
-                    self.set_status("no accounts to remove".into());
+                    self.set_status(StatusMsg::warn("no accounts to remove"));
                 } else {
                     self.mode = Mode::ConfirmRemove { idx: 0 };
                 }
@@ -3758,11 +3860,10 @@ impl App {
                 .iter()
                 .position(|&i| view::has_usage_controls(view.snapshot.accounts[i].credential_kind))
         }) else {
-            self.set_status(
+            self.set_status(StatusMsg::warn(
                 "reset: no codex or claude account (rate-limit resets are a ChatGPT/Codex \
-                 or Claude subscription entitlement)"
-                    .into(),
-            );
+                 or Claude subscription entitlement)",
+            ));
             return;
         };
         self.mode = Mode::ConfirmReset { idx: pos };
@@ -3785,18 +3886,18 @@ impl App {
             .filter(|p| p.account == account)
         {
             let request_id = pending.request_id.clone();
-            self.set_status(format!(
+            self.set_status(StatusMsg::warn(format!(
                 "{account} has an UNRESOLVED redemption (request id {request_id}) — y retries \
                  THAT id, Esc closes this dialog (it does not abandon the redemption)"
-            ));
+            )));
             return;
         }
         let control = view.usage_control(&account);
-        self.set_status(reset_confirm_status(
+        self.set_status(StatusMsg::warn(reset_confirm_status(
             &account,
             control.and_then(|c| c.available_resets),
             control.and_then(|c| c.applicable_resets),
-        ));
+        )));
     }
 
     /// Key handling for `Mode::ConfirmReset`: arrows pick the account, `1` /
@@ -3835,13 +3936,13 @@ impl App {
             // Any other key (Esc/n/2/Enter/q/…) closes the dialog only.
             _ => {
                 self.mode = Mode::Normal;
-                self.set_status(match self.pending_redemption.as_ref() {
+                self.set_status(StatusMsg::warn(match self.pending_redemption.as_ref() {
                     Some(pending) => format!(
                         "closed — {} still has an unresolved redemption (request id {})",
                         pending.account, pending.request_id
                     ),
                     None => "reset cancelled — nothing was spent".to_string(),
-                });
+                }));
             }
         }
     }
@@ -3856,11 +3957,11 @@ impl App {
             return;
         };
         if !view::has_usage_controls(target.credential_kind) {
-            self.set_status(format!(
+            self.set_status(StatusMsg::warn(format!(
                 "reset: {} is a {} account — rate-limit resets are a Codex or Claude \
                  subscription entitlement",
                 target.id, target.credential_kind
-            ));
+            )));
             return;
         }
         let account = target.id.0.clone();
@@ -3943,7 +4044,7 @@ impl App {
             self.overlay = Overlay::Stats;
             self.model_cursor = 0;
         } else {
-            self.set_status("models: no model usage yet".into());
+            self.set_status(StatusMsg::warn("models: no model usage yet"));
         }
     }
 
@@ -3958,7 +4059,9 @@ impl App {
                 c.fast = !c.fast;
                 self.set_codex(c);
             }
-            None => self.set_status("codex: no codex account (run `llmux login --codex`)".into()),
+            None => self.set_status(StatusMsg::warn(
+                "codex: no codex account (run `llmux login --codex`)",
+            )),
         }
     }
 
@@ -3972,7 +4075,7 @@ impl App {
             c.model = CODEX_MODELS[next].to_string();
             self.set_codex(c);
         } else {
-            self.set_status("codex: no codex account".into());
+            self.set_status(StatusMsg::warn("codex: no codex account"));
         }
     }
 
@@ -3988,7 +4091,7 @@ impl App {
             c.effort = (!e.is_empty()).then(|| e.to_string());
             self.set_codex(c);
         } else {
-            self.set_status("codex: no codex account".into());
+            self.set_status(StatusMsg::warn("codex: no codex account"));
         }
     }
 
@@ -3998,7 +4101,7 @@ impl App {
     fn cycle_grok_effort(&mut self, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         if !view.grok.available {
-            self.set_status("grok: no grok account".into());
+            self.set_status(StatusMsg::warn("grok: no grok account"));
             return;
         }
         let cur = view.grok.effort.as_deref().unwrap_or("");
@@ -4013,24 +4116,26 @@ impl App {
             Backend::Local(state) => {
                 // Persist FIRST (config-editor contract) — see set_codex.
                 if state.config_path.is_none() {
-                    return self.set_status("grok change failed: persistence unavailable".into());
+                    return self.set_status(StatusMsg::fail(
+                        "grok change failed: persistence unavailable",
+                    ));
                 }
                 if let Some(path) = &state.config_path {
                     if let Err(err) = crate::config::update_path(path, |c| {
                         c.grok.reasoning_effort = effort.clone();
                     }) {
-                        self.set_status(format!("grok change failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("grok change failed: {err}")));
                         return;
                     }
                 }
                 let mut shape = state.grok.shape();
                 shape.effort = effort.clone();
                 state.grok.set_shape(shape);
-                self.set_status(format!("grok effort: {label}"));
+                self.set_status(StatusMsg::ok(format!("grok effort: {label}")));
             }
             Backend::Remote(remote) => {
                 remote.pending_grok = Some(effort);
-                self.set_status(format!("grok effort → {label}…"));
+                self.set_status(StatusMsg::ok(format!("grok effort → {label}…")));
             }
         }
     }
@@ -4057,9 +4162,13 @@ impl App {
             request = request.header("x-api-key", key);
         }
         let message = match request.send().await {
-            Ok(response) if response.status().is_success() => format!("grok effort: {label}"),
-            Ok(response) => format!("grok effort change failed: {}", response.status()),
-            Err(err) => format!("grok effort change failed: {err}"),
+            Ok(response) if response.status().is_success() => {
+                StatusMsg::ok(format!("grok effort: {label}"))
+            }
+            Ok(response) => {
+                StatusMsg::fail(format!("grok effort change failed: {}", response.status()))
+            }
+            Err(err) => StatusMsg::fail(format!("grok effort change failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4073,7 +4182,9 @@ impl App {
                 // leaves the live shape untouched and reports the error —
                 // live-then-persist would let disk and runtime diverge.
                 if state.config_path.is_none() {
-                    return self.set_status("codex change failed: persistence unavailable".into());
+                    return self.set_status(StatusMsg::fail(
+                        "codex change failed: persistence unavailable",
+                    ));
                 }
                 if let Some(path) = &state.config_path {
                     if let Err(err) = crate::config::update_path(path, |c| {
@@ -4081,7 +4192,7 @@ impl App {
                         c.codex.fast = new.fast;
                         c.codex.reasoning_effort = new.effort.clone();
                     }) {
-                        self.set_status(format!("codex change failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("codex change failed: {err}")));
                         return;
                     }
                 }
@@ -4095,11 +4206,14 @@ impl App {
                     fast: new.fast,
                     effort: new.effort.clone(),
                 });
-                self.set_status(codex_status_line(&new));
+                self.set_status(StatusMsg::ok(codex_status_line(&new)));
             }
             Backend::Remote(remote) => {
                 remote.pending_codex = Some(new.clone());
-                self.set_status(format!("applying {}…", codex_status_line(&new)));
+                self.set_status(StatusMsg::ok(format!(
+                    "applying {}…",
+                    codex_status_line(&new)
+                )));
             }
         }
     }
@@ -4133,9 +4247,11 @@ impl App {
         }
         let verb = if paused { "paused" } else { "resumed" };
         let message = match request.send().await {
-            Ok(response) if response.status().is_success() => format!("{verb} {account}"),
-            Ok(response) => format!("pause change failed: {}", response.status()),
-            Err(err) => format!("pause change failed: {err}"),
+            Ok(response) if response.status().is_success() => {
+                StatusMsg::ok(format!("{verb} {account}"))
+            }
+            Ok(response) => StatusMsg::fail(format!("pause change failed: {}", response.status())),
+            Err(err) => StatusMsg::fail(format!("pause change failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4168,10 +4284,10 @@ impl App {
         }
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                format!("limits updated for {account}")
+                StatusMsg::ok(format!("limits updated for {account}"))
             }
-            Ok(response) => format!("limits change failed: {}", response.status()),
-            Err(err) => format!("limits change failed: {err}"),
+            Ok(response) => StatusMsg::fail(format!("limits change failed: {}", response.status())),
+            Err(err) => StatusMsg::fail(format!("limits change failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4189,13 +4305,13 @@ impl App {
         let fmt = |v: Option<f64>| v.map_or("global".to_string(), |v| format!("{:.0}%", v * 100.0));
         self.add_input.clear();
         self.mode = Mode::EditLimits { idx };
-        self.set_status(format!(
+        self.set_status(StatusMsg::ok(format!(
             "limits for {} — enter `5h,7d,fbl` percents (now {}, {}, {}); empty = global; Enter apply, Esc cancel",
             target.id,
             fmt(target.limits.five_hour_max),
             fmt(target.limits.seven_day_max),
             fmt(target.limits.fable_weekly_max),
-        ));
+        )));
     }
 
     /// Key handling for `Mode::EditLimits`: plain text entry (digits, `,`,
@@ -4230,7 +4346,7 @@ impl App {
                     Err(err) => {
                         // Keep editing — restore the text so it can be fixed.
                         self.add_input = raw;
-                        self.set_status(err);
+                        self.set_status(StatusMsg::fail(err));
                     }
                 }
             }
@@ -4255,13 +4371,15 @@ impl App {
         let name = target.id.0.clone();
         match &mut self.backend {
             Backend::Local(state) => match state.set_account_limits(&name, limits) {
-                Ok(true) => self.set_status(format!("limits updated for {name}")),
-                Ok(false) => self.set_status(format!("account {name} not found")),
-                Err(err) => self.set_status(format!("limits change failed: {err}")),
+                Ok(true) => self.set_status(StatusMsg::ok(format!("limits updated for {name}"))),
+                Ok(false) => self.set_status(StatusMsg::fail(format!("account {name} not found"))),
+                Err(err) => {
+                    self.set_status(StatusMsg::fail(format!("limits change failed: {err}")))
+                }
             },
             Backend::Remote(remote) => {
                 remote.pending_limits = Some((name.clone(), limits));
-                self.set_status(format!("updating limits for {name}…"));
+                self.set_status(StatusMsg::ok(format!("updating limits for {name}…")));
             }
         }
     }
@@ -4283,17 +4401,21 @@ impl App {
             Backend::Local(state) => {
                 let verb = if next { "paused" } else { "resumed" };
                 match state.set_account_paused(&name, next) {
-                    Ok(true) => self.set_status(format!("{verb} {name}")),
-                    Ok(false) => self.set_status(format!("account {name} not found")),
-                    Err(err) => self.set_status(format!("pause change failed: {err}")),
+                    Ok(true) => self.set_status(StatusMsg::ok(format!("{verb} {name}"))),
+                    Ok(false) => {
+                        self.set_status(StatusMsg::fail(format!("account {name} not found")))
+                    }
+                    Err(err) => {
+                        self.set_status(StatusMsg::fail(format!("pause change failed: {err}")))
+                    }
                 }
             }
             Backend::Remote(remote) => {
                 remote.pending_pause = Some((name.clone(), next));
-                self.set_status(format!(
+                self.set_status(StatusMsg::ok(format!(
                     "{} {name}…",
                     if next { "pausing" } else { "resuming" }
-                ));
+                )));
             }
         }
     }
@@ -4313,9 +4435,11 @@ impl App {
             request = request.header("x-api-key", key);
         }
         let message = match request.send().await {
-            Ok(response) if response.status().is_success() => codex_status_line(&new),
-            Ok(response) => format!("codex change failed: {}", response.status()),
-            Err(err) => format!("codex change failed: {err}"),
+            Ok(response) if response.status().is_success() => {
+                StatusMsg::ok(codex_status_line(&new))
+            }
+            Ok(response) => StatusMsg::fail(format!("codex change failed: {}", response.status())),
+            Err(err) => StatusMsg::fail(format!("codex change failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4410,14 +4534,13 @@ impl App {
     fn open_new_login(&mut self) {
         if can_open_browser() {
             self.mode = Mode::NewLogin { idx: 0 };
-            self.set_status(
+            self.set_status(StatusMsg::ok(
                 "new login: 1-5 or ↑↓ + Enter picks the provider and opens the browser, Esc \
-                 cancels"
-                    .into(),
-            );
+                 cancels",
+            ));
         } else {
             self.mode = Mode::Normal;
-            self.set_status(headless_login_hint(self.is_remote()));
+            self.set_status(StatusMsg::warn(headless_login_hint(self.is_remote())));
         }
     }
 
@@ -4463,12 +4586,15 @@ impl App {
                 let kind = LoginKind::ALL[i.min(len - 1)];
                 self.pending_login = Some(kind);
                 self.mode = Mode::Normal;
-                self.set_status(format!("opening browser for {}…", kind.label()));
+                self.set_status(StatusMsg::ok(format!(
+                    "opening browser for {}…",
+                    kind.label()
+                )));
             }
             // Any other key cancels.
             Some(Outcome::Cancelled | Outcome::Ignored) | None => {
                 self.mode = Mode::Normal;
-                self.set_status("new login cancelled".into());
+                self.set_status(StatusMsg::warn("new login cancelled"));
             }
         }
     }
@@ -4486,7 +4612,7 @@ impl App {
             KeyCode::Esc => {
                 self.add_input.clear();
                 self.mode = Mode::Normal;
-                self.set_status("add account cancelled".into());
+                self.set_status(StatusMsg::warn("add account cancelled"));
             }
             KeyCode::Enter => self.submit_add(),
             KeyCode::Backspace => {
@@ -4508,21 +4634,21 @@ impl App {
         self.add_input.clear();
         self.mode = Mode::Normal;
         if api_key.is_empty() {
-            self.set_status("add account cancelled: empty key".into());
+            self.set_status(StatusMsg::warn("add account cancelled: empty key"));
             return;
         }
         match &mut self.backend {
             Backend::Local(state) => match state.add_apikey_account(None, &api_key) {
                 // Status echoes the assigned NAME only — never the key.
-                Ok((name, outcome)) => self.set_status(add_account_status(
+                Ok((name, outcome)) => self.set_status(StatusMsg::ok(add_account_status(
                     &name,
                     matches!(outcome, crate::config::Upsert::Added),
-                )),
-                Err(err) => self.set_status(format!("add account failed: {err}")),
+                ))),
+                Err(err) => self.set_status(StatusMsg::fail(format!("add account failed: {err}"))),
             },
             Backend::Remote(remote) => {
                 remote.pending_add = Some(api_key);
-                self.set_status("adding account…".into());
+                self.set_status(StatusMsg::ok("adding account…"));
             }
         }
     }
@@ -4556,7 +4682,7 @@ impl App {
             // Any other key (Esc/n/2/Enter/q/…) cancels — delete is never silent.
             _ => {
                 self.mode = Mode::Normal;
-                self.set_status("remove cancelled".into());
+                self.set_status(StatusMsg::warn("remove cancelled"));
             }
         }
     }
@@ -4574,13 +4700,13 @@ impl App {
         let name = target.id.0.clone();
         match &mut self.backend {
             Backend::Local(state) => match state.remove_account(&name) {
-                Ok(true) => self.set_status(format!("removed account {name}")),
-                Ok(false) => self.set_status(format!("account {name} not found")),
-                Err(err) => self.set_status(format!("remove failed: {err}")),
+                Ok(true) => self.set_status(StatusMsg::ok(format!("removed account {name}"))),
+                Ok(false) => self.set_status(StatusMsg::fail(format!("account {name} not found"))),
+                Err(err) => self.set_status(StatusMsg::fail(format!("remove failed: {err}"))),
             },
             Backend::Remote(remote) => {
                 remote.pending_remove = Some(name.clone());
-                self.set_status(format!("removing {name}…"));
+                self.set_status(StatusMsg::ok(format!("removing {name}…")));
             }
         }
     }
@@ -4625,10 +4751,10 @@ impl App {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| "account".into());
-                add_account_status(&name, response_added(&body))
+                StatusMsg::ok(add_account_status(&name, response_added(&body)))
             }
-            Ok(response) => format!("add account failed: {}", response.status()),
-            Err(err) => format!("add account failed: {err}"),
+            Ok(response) => StatusMsg::fail(format!("add account failed: {}", response.status())),
+            Err(err) => StatusMsg::fail(format!("add account failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4647,7 +4773,9 @@ impl App {
             request = request.header("x-api-key", key);
         }
         let message = match request.send().await {
-            Ok(response) if response.status().is_success() => format!("removed account {name}"),
+            Ok(response) if response.status().is_success() => {
+                StatusMsg::ok(format!("removed account {name}"))
+            }
             Ok(response) => {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
@@ -4655,9 +4783,9 @@ impl App {
                     .ok()
                     .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
                     .unwrap_or_else(|| status.to_string());
-                format!("remove {name} failed: {detail}")
+                StatusMsg::fail(format!("remove {name} failed: {detail}"))
             }
-            Err(err) => format!("remove {name} failed: {err}"),
+            Err(err) => StatusMsg::fail(format!("remove {name} failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4689,7 +4817,7 @@ impl App {
                 match crate::cli::login::oauth_login_to_account(&client, &upstream).await {
                     Ok(account) => account,
                     Err(err) => {
-                        self.set_status(format!("login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("login failed: {err}")));
                         return;
                     }
                 }
@@ -4702,7 +4830,7 @@ impl App {
                 match crate::auth::codex::login_codex_interactive(&client, &token_url).await {
                     Ok(account) => account,
                     Err(err) => {
-                        self.set_status(format!("codex login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("codex login failed: {err}")));
                         return;
                     }
                 }
@@ -4720,7 +4848,7 @@ impl App {
                 let discovery = match crate::auth::grok::discover(&grok_client).await {
                     Ok(discovery) => discovery,
                     Err(err) => {
-                        self.set_status(format!("grok login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("grok login failed: {err}")));
                         return;
                     }
                 };
@@ -4728,7 +4856,7 @@ impl App {
                     match crate::auth::grok::request_device_code(&grok_client, &discovery).await {
                         Ok(device) => device,
                         Err(err) => {
-                            self.set_status(format!("grok login failed: {err}"));
+                            self.set_status(StatusMsg::fail(format!("grok login failed: {err}")));
                             return;
                         }
                     };
@@ -4745,14 +4873,14 @@ impl App {
                 {
                     Ok(bundle) => bundle,
                     Err(err) => {
-                        self.set_status(format!("grok login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("grok login failed: {err}")));
                         return;
                     }
                 };
                 match crate::auth::grok::account_from_bundle(&bundle, &discovery.token_endpoint) {
                     Ok(account) => account,
                     Err(err) => {
-                        self.set_status(format!("grok login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("grok login failed: {err}")));
                         return;
                     }
                 }
@@ -4765,9 +4893,9 @@ impl App {
                 let api_key = match crate::auth::openrouter::login_interactive(&client).await {
                     Ok(api_key) => api_key,
                     Err(err) => {
-                        self.set_status(format!(
+                        self.set_status(StatusMsg::fail(format!(
                             "openrouter login failed: {err} — try `llmux login --openrouter --paste`"
-                        ));
+                        )));
                         return;
                     }
                 };
@@ -4811,7 +4939,7 @@ impl App {
                 let oauth = match gemini.oauth_client() {
                     Ok(oauth) => oauth,
                     Err(err) => {
-                        self.set_status(format!("gemini login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("gemini login failed: {err}")));
                         return;
                     }
                 };
@@ -4827,7 +4955,7 @@ impl App {
                 {
                     Ok(account) => account,
                     Err(err) => {
-                        self.set_status(format!("gemini login failed: {err}"));
+                        self.set_status(StatusMsg::fail(format!("gemini login failed: {err}")));
                         return;
                     }
                 }
@@ -4837,11 +4965,13 @@ impl App {
         // Inject: in-process locally, or relay to the daemon when attached.
         match &mut self.backend {
             Backend::Local(state) => match state.inject_account(account) {
-                Ok((name, outcome)) => self.set_status(login_status(
+                Ok((name, outcome)) => self.set_status(StatusMsg::ok(login_status(
                     &name,
                     matches!(outcome, crate::config::Upsert::Added),
-                )),
-                Err(err) => self.set_status(format!("login persist failed: {err}")),
+                ))),
+                Err(err) => {
+                    self.set_status(StatusMsg::fail(format!("login persist failed: {err}")))
+                }
             },
             Backend::Remote(_) => self.perform_remote_inject(account).await,
         }
@@ -4873,7 +5003,7 @@ impl App {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| account.name.clone());
-                login_status(&name, response_added(&body))
+                StatusMsg::ok(login_status(&name, response_added(&body)))
             }
             Ok(response) => {
                 let status = response.status();
@@ -4882,9 +5012,9 @@ impl App {
                     .ok()
                     .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
                     .unwrap_or_else(|| status.to_string());
-                format!("login inject failed: {detail}")
+                StatusMsg::fail(format!("login inject failed: {detail}"))
             }
-            Err(err) => format!("login inject failed: {err}"),
+            Err(err) => StatusMsg::fail(format!("login inject failed: {err}")),
         };
         self.set_status(message);
     }
@@ -4902,14 +5032,14 @@ impl App {
                     state.pool.reload_accounts(&config.accounts);
                     let msg = format!("config reloaded: {n} account(s)");
                     state.hub.push_note(msg.clone(), false, now);
-                    self.set_status(msg);
+                    self.set_status(StatusMsg::ok(msg));
                 }
-                Err(err) => self.set_status(format!("reload failed: {err}")),
+                Err(err) => self.set_status(StatusMsg::fail(format!("reload failed: {err}"))),
             },
             Backend::Remote(_) => {
-                self.set_status(
-                    "reload: local mode only — restart applies on the server host".into(),
-                );
+                self.set_status(StatusMsg::warn(
+                    "reload: local mode only — restart applies on the server host",
+                ));
             }
         }
     }
@@ -4978,10 +5108,13 @@ fn accounts_entry_refresh_due(view: &DashboardView, now: SystemTime) -> bool {
         })
 }
 
-/// Status line for a completed refresh: how many accounts were refreshed, the
+/// Status for a completed refresh: how many accounts were refreshed, the
 /// reset inventory when it is known, and EVERY failure. A partial failure is
-/// never summarized into a green.
-fn refresh_message(response: &crate::proxy::usage_controls::RefreshResponse) -> String {
+/// never summarized into a green: any failed account makes it a `fail`. With
+/// several accounts the failures are the message's lines — one per account,
+/// shown as a toast card — instead of one row joined with ` · ` that the
+/// terminal's edge cut off.
+fn refresh_message(response: &crate::proxy::usage_controls::RefreshResponse) -> StatusMsg {
     let failures: Vec<String> = response
         .results
         .iter()
@@ -4999,7 +5132,7 @@ fn refresh_message(response: &crate::proxy::usage_controls::RefreshResponse) -> 
         // One account: name its inventory; many: the count is the signal.
         if let [only] = &response.results[..] {
             let control = only.usage_control.as_ref();
-            return format!(
+            return StatusMsg::ok(format!(
                 "refreshed {} · resets {}",
                 only.account,
                 match control.and_then(|c| c.available_resets) {
@@ -5009,25 +5142,34 @@ fn refresh_message(response: &crate::proxy::usage_controls::RefreshResponse) -> 
                         None => format!("{owned} owned · applicable unknown"),
                     },
                 }
-            );
+            ));
         }
-        return format!("refreshed {ok} account(s)");
+        return StatusMsg::ok(format!("refreshed {ok} account(s)"));
     }
-    format!(
-        "refresh: {ok} ok, {} FAILED — {}",
-        failures.len(),
-        failures.join(" · ")
-    )
+    let head = format!("refresh: {ok} ok, {} FAILED", failures.len());
+    if response.results.len() == 1 {
+        return StatusMsg::fail(format!("{head} — {}", failures.join(" · ")));
+    }
+    StatusMsg::fail(head).with_lines(failures)
 }
 
-/// Status line for a terminal redemption outcome. The four codes stay
-/// distinct, and a failed follow-up read is appended as a warning on a
-/// SUCCESS — never turned into a retryable failure.
+/// Status for a terminal redemption outcome. The codes stay distinct, and a
+/// failed follow-up read is appended as a warning on a SUCCESS — never turned
+/// into a retryable failure. Outcome: a redemption is `ok` (a `warn` once a
+/// note or a stale read rides on it); a replay or nothing to reset spent
+/// nothing and is a `warn`; no credit or a cooldown is a `fail` — the reset
+/// the operator asked for did not happen.
 fn consume_message(
     account: &str,
     response: &crate::proxy::usage_controls::ConsumeResponse,
-) -> String {
+) -> StatusMsg {
     use crate::auth::codex_usage::ResetOutcome;
+    use twolab_tui::banner::Outcome;
+    let mut outcome = match response.outcome {
+        ResetOutcome::Reset => Outcome::Ok,
+        ResetOutcome::AlreadyRedeemed | ResetOutcome::NothingToReset => Outcome::Warn,
+        ResetOutcome::NoCredit | ResetOutcome::Cooldown => Outcome::Fail,
+    };
     let head = match response.outcome {
         ResetOutcome::Reset => format!(
             "reset redeemed for {account} ({} window(s))",
@@ -5047,6 +5189,10 @@ fn consume_message(
         }
     };
     let mut text = format!("{head} · request id {}", response.request_id);
+    let noted = response.applicability_warning.is_some() || response.refresh_warning.is_some();
+    if noted && outcome == Outcome::Ok {
+        outcome = Outcome::Warn;
+    }
     if let Some(warning) = &response.applicability_warning {
         text.push_str(&format!(" · note: {warning}"));
     }
@@ -5055,7 +5201,7 @@ fn consume_message(
             " · WARNING (stale read, redemption stands): {warning}"
         ));
     }
-    text
+    StatusMsg::new(outcome, text)
 }
 
 /// Turn a TERMINAL consume response into a client outcome.
@@ -5076,10 +5222,18 @@ fn consume_result(
         .as_ref()
         .and_then(|control| control.pending_request_id.clone());
     match still_pending {
+        // A success whose receipt is still open is at most a warning.
         Some(request_id) => ControlResult {
-            message: format!(
-                "{message} · the daemon still reports this redemption as pending — it was NOT \
-                 re-spent; only request id {request_id} may be repeated"
+            message: StatusMsg::new(
+                match message.outcome {
+                    twolab_tui::banner::Outcome::Ok => twolab_tui::banner::Outcome::Warn,
+                    other => other,
+                },
+                format!(
+                    "{} · the daemon still reports this redemption as pending — it was NOT \
+                     re-spent; only request id {request_id} may be repeated",
+                    message.text
+                ),
             ),
             hold: Some(PendingRedemption {
                 account: account.to_string(),
@@ -5096,14 +5250,17 @@ fn consume_result(
     }
 }
 
-/// Status line for a manual switch. The pre-switch refresh warning is shown
+/// Status for a manual switch. The pre-switch refresh warning is shown
 /// SEPARATELY from the switch result — a stale read never reads as a failed
-/// switch, and a successful switch never hides it.
-fn switch_message(response: &crate::proxy::usage_controls::SwitchResponse) -> String {
+/// switch (it is a `warn`, not a `fail`), and a successful switch never
+/// hides it.
+fn switch_message(response: &crate::proxy::usage_controls::SwitchResponse) -> StatusMsg {
     let head = format!("switched to {} (manual)", response.current);
     match &response.refresh_warning {
-        Some(warning) => format!("{head} · WARNING: usage refresh failed — {warning}"),
-        None => head,
+        Some(warning) => StatusMsg::warn(format!(
+            "{head} · WARNING: usage refresh failed — {warning}"
+        )),
+        None => StatusMsg::ok(head),
     }
 }
 
@@ -5205,10 +5362,10 @@ fn control_error_result(
     use crate::proxy::usage_controls::UsageControlError as E;
     match err {
         E::Uncertain { request_id, .. } => ControlResult {
-            message: format!(
+            message: StatusMsg::fail(format!(
                 "{account}: redemption outcome UNCERTAIN — {err}. Press R again to retry the \
                  SAME id ({request_id}); a new one could spend a second reset"
-            ),
+            )),
             hold: Some(PendingRedemption {
                 account: account.to_string(),
                 request_id: request_id.clone(),
@@ -5221,7 +5378,7 @@ fn control_error_result(
             credit_id,
             ..
         } => ControlResult {
-            message: format!("{account}: {err}"),
+            message: StatusMsg::warn(format!("{account}: {err}")),
             hold: Some(PendingRedemption {
                 account: account.to_string(),
                 request_id: request_id.clone(),
@@ -5231,7 +5388,7 @@ fn control_error_result(
         },
         // Everything else refused before spending anything.
         other => ControlResult {
-            message: format!("{account}: {other}"),
+            message: StatusMsg::fail(format!("{account}: {other}")),
             hold: None,
             resolved: None,
         },
@@ -5249,7 +5406,7 @@ async fn run_control_local(state: &crate::proxy::server::AppState, op: ControlOp
                 resolved: None,
             },
             Err(err) => ControlResult {
-                message: format!("refresh failed: {err}"),
+                message: StatusMsg::fail(format!("refresh failed: {err}")),
                 hold: None,
                 resolved: None,
             },
@@ -5277,7 +5434,7 @@ async fn run_control_local(state: &crate::proxy::server::AppState, op: ControlOp
                 resolved: None,
             },
             Err(err) => ControlResult {
-                message: format!("switch to {account} failed: {err}"),
+                message: StatusMsg::fail(format!("switch to {account} failed: {err}")),
                 hold: None,
                 resolved: None,
             },
@@ -5312,7 +5469,10 @@ async fn run_control_remote(
                     let text = response.text().await.unwrap_or_default();
                     if !status.is_success() {
                         return ControlResult {
-                            message: format!("refresh failed: {}", http_error_text(status, &text)),
+                            message: StatusMsg::fail(format!(
+                                "refresh failed: {}",
+                                http_error_text(status, &text)
+                            )),
                             hold: None,
                             resolved: None,
                         };
@@ -5324,14 +5484,16 @@ async fn run_control_remote(
                             resolved: None,
                         },
                         Err(err) => ControlResult {
-                            message: format!("refresh: unreadable response ({err})"),
+                            message: StatusMsg::fail(format!(
+                                "refresh: unreadable response ({err})"
+                            )),
                             hold: None,
                             resolved: None,
                         },
                     }
                 }
                 Err(err) => ControlResult {
-                    message: format!("refresh failed: {err}"),
+                    message: StatusMsg::fail(format!("refresh failed: {err}")),
                     hold: None,
                     resolved: None,
                 },
@@ -5361,11 +5523,11 @@ async fn run_control_remote(
                             // A 2xx we cannot read is UNCERTAIN: the
                             // redemption may have happened. Keep the key.
                             Err(err) => ControlResult {
-                                message: format!(
+                                message: StatusMsg::fail(format!(
                                     "{account}: redemption outcome UNCERTAIN — unreadable \
                                      response ({err}). Press R again to retry the SAME id \
                                      ({request_id})"
-                                ),
+                                )),
                                 hold: Some(PendingRedemption {
                                     account,
                                     request_id,
@@ -5379,10 +5541,10 @@ async fn run_control_remote(
                 }
                 // A transport failure is uncertain by definition.
                 Err(err) => ControlResult {
-                    message: format!(
+                    message: StatusMsg::fail(format!(
                         "{account}: redemption outcome UNCERTAIN — {err}. Press R again to \
                          retry the SAME id ({request_id})"
-                    ),
+                    )),
                     hold: Some(PendingRedemption {
                         account,
                         request_id,
@@ -5402,17 +5564,17 @@ async fn run_control_remote(
                     let text = response.text().await.unwrap_or_default();
                     if !status.is_success() {
                         return ControlResult {
-                            message: format!(
+                            message: StatusMsg::fail(format!(
                                 "switch to {account} failed: {}",
                                 http_error_text(status, &text)
-                            ),
+                            )),
                             hold: None,
                             resolved: None,
                         };
                     }
                     let message = match serde_json::from_str(&text) {
                         Ok(parsed) => switch_message(&parsed),
-                        Err(_) => format!("switched to {account} (manual)"),
+                        Err(_) => StatusMsg::ok(format!("switched to {account} (manual)")),
                     };
                     ControlResult {
                         message,
@@ -5421,7 +5583,7 @@ async fn run_control_remote(
                     }
                 }
                 Err(err) => ControlResult {
-                    message: format!("switch to {account} failed: {err}"),
+                    message: StatusMsg::fail(format!("switch to {account} failed: {err}")),
                     hold: None,
                     resolved: None,
                 },
@@ -5456,7 +5618,9 @@ fn remote_consume_error(
                 .map(str::to_string)
                 .or(credit_id);
             ControlResult {
-                message: format!("{account}: {message} — press R again to retry THAT id"),
+                message: StatusMsg::warn(format!(
+                    "{account}: {message} — press R again to retry THAT id"
+                )),
                 hold: Some(PendingRedemption {
                     account: account.to_string(),
                     request_id: pending,
@@ -5471,10 +5635,10 @@ fn remote_consume_error(
                 .unwrap_or(&request_id)
                 .to_string();
             ControlResult {
-                message: format!(
+                message: StatusMsg::fail(format!(
                     "{account}: redemption outcome UNCERTAIN — {message}. Press R again to \
                      retry the SAME id ({id})"
-                ),
+                )),
                 hold: Some(PendingRedemption {
                     account: account.to_string(),
                     request_id: id,
@@ -5484,7 +5648,7 @@ fn remote_consume_error(
             }
         }
         _ => ControlResult {
-            message: format!("{account}: redemption refused — {message}"),
+            message: StatusMsg::fail(format!("{account}: redemption refused — {message}")),
             hold: None,
             resolved: None,
         },
@@ -5873,7 +6037,12 @@ async fn event_loop(
             if let Some(view) = view.as_ref() {
                 app.preserve_scroll_on_new_activity(view);
             }
-            let chrome = app.chrome();
+            // One clock reading per frame: waiting toasts move up at it and
+            // every age on screen is measured from it.
+            let now = Instant::now();
+            let clock = app.clock_at(now);
+            app.toasts.tick(clock);
+            let chrome = app.chrome_at(now);
             // Capture the activity panel's hit-test layout from this frame so a
             // left-click in the next input drain maps to the right entry.
             let mut hits = None;
@@ -6250,19 +6419,23 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
 /// taken as a fraction, so `0.9` and `90` mean the same ceiling.
 /// Human status line for a settings apply: live fields vs restart-required —
 /// a wrote-but-needs-restart change must never read as applied (contract C6).
-fn settings_status(applied: &[&str], restart: &[&str]) -> String {
+///
+/// Outcome: `ok` only when everything is live; a value that waits for a
+/// restart is a `warn` (saved, not applied), and so is a change that changed
+/// nothing.
+fn settings_status(applied: &[&str], restart: &[&str]) -> StatusMsg {
     match (applied.is_empty(), restart.is_empty()) {
-        (false, true) => format!("config: applied live — {}", applied.join(", ")),
-        (true, false) => format!(
+        (false, true) => StatusMsg::ok(format!("config: applied live — {}", applied.join(", "))),
+        (true, false) => StatusMsg::warn(format!(
             "config: saved — takes effect on daemon restart ({})",
             restart.join(", ")
-        ),
-        (false, false) => format!(
+        )),
+        (false, false) => StatusMsg::warn(format!(
             "config: {} applied live; {} on restart",
             applied.join(", "),
             restart.join(", ")
-        ),
-        (true, true) => "config: no change".into(),
+        )),
+        (true, true) => StatusMsg::warn("config: no change"),
     }
 }
 
@@ -7432,7 +7605,7 @@ mod tests {
     async fn attach_settings_round_trip(
         status_line: &'static str,
         body: &'static str,
-    ) -> (App, String) {
+    ) -> (App, StatusMsg) {
         let mut app = remote_app();
         let base = one_shot_settings_daemon(status_line, body).await;
         if let Backend::Remote(remote) = &mut app.backend {
@@ -7453,8 +7626,8 @@ mod tests {
         let status = app
             .status
             .as_ref()
-            .map(|(t, _)| t.clone())
-            .unwrap_or_default();
+            .map(|(msg, _)| msg.clone())
+            .expect("the round trip reports a status");
         (app, status)
     }
 
@@ -7478,9 +7651,11 @@ mod tests {
             "restart-required origin is noted for the config tab"
         );
         assert!(
-            status.contains("applied live") && status.contains("restart"),
+            status.text.contains("applied live") && status.text.contains("restart"),
             "status reports the honest applied/restart split: {status:?}"
         );
+        // Saved but not live yet is a warning, never a plain success.
+        assert_eq!(status.outcome, twolab_tui::banner::Outcome::Warn);
     }
 
     /// Attach round-trip, ok=false 2xx: NOTHING local moves.
@@ -7497,7 +7672,8 @@ mod tests {
             Some(&"stale-from-last-time".to_string()),
             "pending-restart note untouched"
         );
-        assert!(status.contains("ok=false"), "status: {status:?}");
+        assert!(status.text.contains("ok=false"), "status: {status:?}");
+        assert_eq!(status.outcome, twolab_tui::banner::Outcome::Fail);
     }
 
     /// Attach round-trip, malformed 2xx (`{}` fails the typed parse): the
@@ -7511,7 +7687,11 @@ mod tests {
             Some(&"stale-from-last-time".to_string()),
             "pending-restart note untouched"
         );
-        assert!(status.contains("nothing assumed"), "status: {status:?}");
+        assert!(
+            status.text.contains("nothing assumed"),
+            "status: {status:?}"
+        );
+        assert_eq!(status.outcome, twolab_tui::banner::Outcome::Warn);
     }
 
     /// Attach round-trip, HTTP error statuses: reported, nothing mutated.
@@ -7527,9 +7707,10 @@ mod tests {
                 "pending-restart note untouched"
             );
             assert!(
-                status.contains("config change failed"),
+                status.text.contains("config change failed"),
                 "status for {status_line}: {status:?}"
             );
+            assert_eq!(status.outcome, twolab_tui::banner::Outcome::Fail);
         }
     }
 
@@ -8549,17 +8730,17 @@ mod tests {
         // A stale export result (older generation) never flashes.
         app.apply_clip_result(ClipResult {
             generation: 8,
-            message: "stale".into(),
+            message: StatusMsg::ok("stale"),
         });
         assert!(app.raw_modal.as_ref().unwrap().flash.is_none());
         // The requesting generation's result flashes.
         app.apply_clip_result(ClipResult {
             generation: 9,
-            message: "copied 4 bytes → pbcopy".into(),
+            message: StatusMsg::ok("copied 4 bytes → pbcopy"),
         });
         assert_eq!(
             app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
-            "copied 4 bytes → pbcopy"
+            StatusMsg::ok("copied 4 bytes → pbcopy")
         );
     }
 
@@ -8711,7 +8892,7 @@ mod tests {
         );
         assert_eq!(
             app.raw_modal.as_ref().unwrap().flash.as_ref().unwrap().0,
-            "export busy — try again in a moment",
+            StatusMsg::warn("export busy — try again in a moment"),
             "overflow rejected with feedback, not silently dropped"
         );
     }
@@ -9899,8 +10080,18 @@ mod tests {
             Some("01RID".into()),
             "the safe retry identity is kept"
         );
-        assert!(result.message.contains("redeemed"), "{}", result.message);
-        assert!(result.message.contains("01RID"), "{}", result.message);
+        assert!(
+            result.message.text.contains("redeemed"),
+            "{:?}",
+            result.message
+        );
+        assert!(
+            result.message.text.contains("01RID"),
+            "{:?}",
+            result.message
+        );
+        // A success whose receipt is still open is a warning, not a plain ok.
+        assert_eq!(result.message.outcome, twolab_tui::banner::Outcome::Warn);
 
         // The normal terminal case still resolves.
         let clean: crate::proxy::usage_controls::ConsumeResponse =
@@ -9954,7 +10145,7 @@ mod tests {
         let mut app = remote_app();
         app.control_inflight = true;
         app.apply_control_result(ControlResult {
-            message: "uncertain".into(),
+            message: StatusMsg::fail("uncertain"),
             hold: Some(PendingRedemption {
                 account: "codex:c@x.com".into(),
                 request_id: "01RID".into(),
@@ -9972,7 +10163,7 @@ mod tests {
 
         // A terminal outcome for ANOTHER account leaves it held.
         app.apply_control_result(ControlResult {
-            message: "done".into(),
+            message: StatusMsg::ok("done"),
             hold: None,
             resolved: Some("claude:a@x.com".into()),
         });
@@ -9980,7 +10171,7 @@ mod tests {
 
         // A terminal outcome for THIS account releases it.
         app.apply_control_result(ControlResult {
-            message: "done".into(),
+            message: StatusMsg::ok("done"),
             hold: None,
             resolved: Some("codex:c@x.com".into()),
         });
@@ -9988,13 +10179,15 @@ mod tests {
     }
 
     /// Status lines: a partial refresh failure is never summarized into a
-    /// green, the four redemption outcomes stay distinct, a post-success
-    /// stale read is a warning ON a success, and a switch shows its refresh
-    /// warning separately from the switch result.
+    /// green — its outcome is `fail` and every failed account keeps its own
+    /// line —, the redemption outcomes stay distinct in text and outcome, a
+    /// post-success stale read is a warning ON a success, and a switch shows
+    /// its refresh warning separately from the switch result.
     #[test]
     fn control_status_lines_never_flatten_failures_into_success() {
         use crate::auth::codex_usage::ResetOutcome;
         use crate::proxy::usage_controls::{ConsumeResponse, RefreshResponse, SwitchResponse};
+        use twolab_tui::banner::Outcome;
 
         // Built through serde, not struct literals: these are the daemon's
         // wire types, and pinning their exact field SET here would break on
@@ -10010,9 +10203,29 @@ mod tests {
         }))
         .expect("refresh response");
         let message = refresh_message(&response);
-        assert!(message.contains("FAILED"), "{message}");
-        assert!(message.contains("claude:a@x.com"), "{message}");
-        assert!(message.contains("upstream 502"), "{message}");
+        assert_eq!(message.outcome, Outcome::Fail, "{message:?}");
+        assert!(message.text.contains("1 ok, 1 FAILED"), "{message:?}");
+        assert_eq!(
+            message.lines,
+            vec!["claude:a@x.com: upstream 502".to_string()],
+            "the failure is its own line, account and error: {message:?}"
+        );
+        // A single-account failure stays one line, the error in it.
+        let lone: RefreshResponse = serde_json::from_value(serde_json::json!({
+            "ok": false,
+            "results": [
+                { "account": "claude:a@x.com", "ok": false, "provider": "oauth",
+                  "error": "upstream 502" },
+            ],
+        }))
+        .expect("refresh response");
+        let lone = refresh_message(&lone);
+        assert_eq!(lone.outcome, Outcome::Fail);
+        assert!(lone.lines.is_empty(), "{lone:?}");
+        assert!(
+            lone.text.contains("claude:a@x.com") && lone.text.contains("upstream 502"),
+            "{lone:?}"
+        );
 
         // Single-account success names the inventory it observed.
         let one: RefreshResponse = serde_json::from_value(serde_json::json!({
@@ -10024,8 +10237,9 @@ mod tests {
         }))
         .expect("refresh response");
         let message = refresh_message(&one);
-        assert!(message.contains("3 owned"), "{message}");
-        assert!(message.contains("0 applicable now"), "{message}");
+        assert_eq!(message.outcome, Outcome::Ok);
+        assert!(message.text.contains("3 owned"), "{message:?}");
+        assert!(message.text.contains("0 applicable now"), "{message:?}");
 
         let consume = |outcome: ResetOutcome, refresh_warning: Option<&str>| {
             serde_json::from_value::<ConsumeResponse>(serde_json::json!({
@@ -10034,23 +10248,32 @@ mod tests {
             }))
             .expect("consume response")
         };
-        assert!(consume_message("c", &consume(ResetOutcome::Reset, None)).contains("redeemed"));
-        assert!(
-            consume_message("c", &consume(ResetOutcome::AlreadyRedeemed, None))
-                .contains("no second reset")
-        );
-        assert!(
-            consume_message("c", &consume(ResetOutcome::NothingToReset, None))
-                .contains("nothing to reset")
-        );
-        assert!(consume_message("c", &consume(ResetOutcome::NoCredit, None))
-            .contains("no reset credit"));
+        for (outcome, text, expected) in [
+            (ResetOutcome::Reset, "redeemed", Outcome::Ok),
+            (
+                ResetOutcome::AlreadyRedeemed,
+                "no second reset",
+                Outcome::Warn,
+            ),
+            (
+                ResetOutcome::NothingToReset,
+                "nothing to reset",
+                Outcome::Warn,
+            ),
+            (ResetOutcome::NoCredit, "no reset credit", Outcome::Fail),
+            (ResetOutcome::Cooldown, "cooldown", Outcome::Fail),
+        ] {
+            let message = consume_message("c", &consume(outcome, None));
+            assert!(message.text.contains(text), "{message:?}");
+            assert_eq!(message.outcome, expected, "{message:?}");
+        }
         // A failed follow-up read rides on the SUCCESS, not instead of it.
         let stale = consume_message("c", &consume(ResetOutcome::Reset, Some("read failed")));
         assert!(
-            stale.contains("redeemed") && stale.contains("WARNING"),
-            "{stale}"
+            stale.text.contains("redeemed") && stale.text.contains("WARNING"),
+            "{stale:?}"
         );
+        assert_eq!(stale.outcome, Outcome::Warn, "{stale:?}");
 
         let switched = switch_message(
             &serde_json::from_value::<SwitchResponse>(serde_json::json!({
@@ -10059,9 +10282,120 @@ mod tests {
             }))
             .expect("switch response"),
         );
-        assert!(switched.contains("switched to"), "{switched}");
-        assert!(switched.contains("WARNING"), "{switched}");
-        assert!(switched.contains("usage read timed out"), "{switched}");
+        assert!(switched.text.contains("switched to"), "{switched:?}");
+        assert!(switched.text.contains("WARNING"), "{switched:?}");
+        assert!(
+            switched.text.contains("usage read timed out"),
+            "{switched:?}"
+        );
+        // The switch happened: a warning, not a failure.
+        assert_eq!(switched.outcome, Outcome::Warn, "{switched:?}");
+    }
+
+    /// A refresh of several accounts with failures is a toast card with
+    /// every failed account on its own line (it was one status row joined
+    /// with ` · `, cut at 80 columns and gone after 5 s): the outcome's word
+    /// in the border, `+N more` past four lines, the footer row left free —
+    /// and the card goes after its 8 s on the dashboard's own clock.
+    #[test]
+    fn refresh_failures_are_a_toast_with_a_line_per_account() {
+        use crate::proxy::usage_controls::RefreshResponse;
+        let view = control_view();
+        let mut app = remote_app();
+        let mut results = vec![serde_json::json!({
+            "account": "codex:c@x.com", "ok": true, "provider": "codex",
+        })];
+        results.extend((2..=6).map(|n| {
+            serde_json::json!({
+                "account": format!("claude:a{n}@x.com"), "ok": false,
+                "provider": "oauth", "error": format!("upstream 50{n}"),
+            })
+        }));
+        let response: RefreshResponse =
+            serde_json::from_value(serde_json::json!({ "ok": false, "results": results }))
+                .expect("refresh response");
+        app.control_inflight = true;
+        app.apply_control_result(ControlResult {
+            message: refresh_message(&response),
+            hold: None,
+            resolved: None,
+        });
+        assert_eq!(
+            app.status_line(),
+            None,
+            "the footer row gives way to the card"
+        );
+        for (w, h) in [(80, 24), (179, 43)] {
+            let frame = render_app(&app, &view, w, h);
+            let rows: Vec<&str> = frame.lines().collect();
+            assert!(
+                rows.iter().any(|r| r.contains("┌ fail ")),
+                "the outcome's word in the border:\n{frame}"
+            );
+            assert!(frame.contains("✗ refresh: 1 ok, 5 FAILED"), "{frame}");
+            for n in 2..=4 {
+                let line = format!("claude:a{n}@x.com: upstream 50{n}");
+                assert!(
+                    rows.iter().any(|r| r.contains(&line)),
+                    "{line} on its own line:\n{frame}"
+                );
+            }
+            assert!(frame.contains("+2 more"), "{frame}");
+            assert!(!frame.contains("claude:a6@x.com"), "{frame}");
+        }
+        // Past the failure's 8 s the card is gone; the draw only sees the
+        // clock the chrome carries.
+        let later = app.chrome_at(app.started + Duration::from_secs(9));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|frame| ui::draw(frame, Some(&view), &later, &mut hits))
+            .expect("draw");
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(!text.contains("FAILED"), "{text}");
+    }
+
+    /// The raw viewer's action flash says how it went and is aged by the
+    /// app's clock when the frame's chrome is built: the draw no longer reads
+    /// `Instant::now()`, and the flash lives as long as the status row's.
+    #[test]
+    fn raw_flash_carries_its_outcome_and_ages_on_the_app_clock() {
+        let view = control_view();
+        let mut app = remote_app();
+        let key = seed_one_hit(&mut app);
+        let now = Instant::now();
+        app.raw_modal = Some(RawModal {
+            key,
+            id: 7,
+            generation: 1,
+            title: "raw".into(),
+            tab: 0,
+            scroll: 0,
+            hscroll: 0,
+            spin: 0,
+            flash: Some((StatusMsg::fail("clipboard tool not found"), now)),
+            state: RawModalState::Failed("gone".into()),
+        });
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("✗ fail clipboard tool not found"), "{frame}");
+        // Still there just before the status TTL, gone at it.
+        let before = app.chrome_at(now + STATUS_TTL - Duration::from_millis(1));
+        assert!(before
+            .raw_modal
+            .as_ref()
+            .and_then(|m| m.flash.as_ref())
+            .is_some());
+        let after = app.chrome_at(now + STATUS_TTL);
+        assert!(after
+            .raw_modal
+            .as_ref()
+            .and_then(|m| m.flash.as_ref())
+            .is_none());
+        app.raw_modal.as_mut().expect("modal").flash =
+            Some((StatusMsg::ok("copied 4 bytes → pbcopy"), now));
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("✓ ok   copied 4 bytes → pbcopy"), "{frame}");
     }
 
     /// A daemon error that carries an id (uncertain / pending) is held for an
@@ -10082,10 +10416,11 @@ mod tests {
             Some("01RID".into())
         );
         assert!(
-            uncertain.message.contains("UNCERTAIN"),
-            "{}",
+            uncertain.message.text.contains("UNCERTAIN"),
+            "{:?}",
             uncertain.message
         );
+        assert_eq!(uncertain.message.outcome, twolab_tui::banner::Outcome::Fail);
 
         let pending = control_error_result(
             "codex:c@x.com",

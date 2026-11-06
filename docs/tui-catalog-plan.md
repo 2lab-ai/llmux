@@ -37,8 +37,8 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | scrollbar | herdr | tables and modals scroll with no scrollbar; the raw viewer's bars cannot be dragged | a thumb that shows where you are and can be dragged | 2 |
 | tabs (raw viewer) | llmux | Request/Response tabs measured in bytes | same look and click behaviour as the main tab row | 2 |
 | json_view (raw body) | llmux | bodies chunked at 2048 bytes and panned with H/L | wrapped at the width, `lines 12–40 of 213`, still fast on 8 MiB bodies (row heights cached per width) | 2 |
-| toast | herdr | status messages are one row, cut at 80 columns, replaced by the next one and gone after 5 s | messages stack in a corner card with ok/warn/fail glyphs; a multi-account refresh result can be read line by line | 3 |
-| banner (Flash) | llmux | every status message is yellow, failures included | ok, warn and fail look different, also under `NO_COLOR` | 3 |
+| toast | herdr | status messages are one row, cut at 80 columns, replaced by the next one and gone after 5 s | messages stack in a corner card with ok/warn/fail glyphs; a multi-account refresh result can be read line by line | done |
+| banner (Flash) | llmux | every status message is yellow, failures included | ok, warn and fail look different, also under `NO_COLOR` | done |
 | format | llmux | the models table shows `243578.5` for 243.6 billion tokens (unit clipped) | `243.6G`; `999_999` reads `1.0M` | 3 |
 | ledger | llmux | cost columns cut digits (`$112293.0`) | amounts line up on the decimal point and keep their cents | 3 |
 | menu | llmux | the right-click menu covers the clicked row near the bottom; items show no keys | opens above the row when there is no room below, shows each item's key, marks delete as destructive | 3 |

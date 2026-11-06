@@ -59,6 +59,20 @@ dashboard draws no colour at all: every cell keeps your terminal's default
 colours, bold, dim, reversed and underline stay, and text that would be red
 (errors, failures, a nearly spent window) is bold instead.
 
+The status line (the row above the key bar) shows the last message for
+5 seconds, led by how it went: `✓ ok` (it worked, or it was accepted and is
+under way — `switching to …`), `! warn` (nothing happened or only part of it:
+cancelled, refused before trying, saved but live only after a restart, a
+stale read riding on a success) or `✗ fail`. The glyph and the word say it
+without colour too; under `NO_COLOR` a failure is also bold. A message wider
+than the terminal ends in `…`. A refresh of several accounts with failures
+(`f` in the accounts tab) is not squeezed into that row: it opens a card in
+the top-right corner, under the tab row — `fail` in its border,
+`✗ refresh: 1 ok, 5 FAILED`, then one line per failed account with its error
+and `+N more` past four lines. The card stays for 8 seconds (5 for a
+warning); a newer card replaces it, and at 64 columns or fewer it is a
+one-row banner instead.
+
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
   and column header). Activity takes every row that is left, and at least 4
@@ -740,7 +754,8 @@ the configured size/redaction limits.
   `save all` (`S`) write the body / the whole record JSON to `~/Downloads`
   (timestamped). Clipboard uses `pbcopy`/`wl-copy`/`xclip`/`xsel` when
   available, falling back to the OSC 52 terminal escape; the outcome
-  flashes on the modal's hint line. Inside tmux or GNU screen the OSC 52
+  flashes on the modal's hint line for 5 seconds (it was 3), led by
+  `✓ ok`, `! warn` or `✗ fail` like the status line. Inside tmux or GNU screen the OSC 52
   escape is wrapped in the multiplexer's passthrough so it reaches your
   terminal (tmux 3.3 or later also needs `set -g allow-passthrough on`).
 - `Esc`/`q`/`Enter` closes. Records written by a daemon predating a field
