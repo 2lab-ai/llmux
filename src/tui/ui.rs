@@ -6484,12 +6484,14 @@ fn draw_accounts_compact(
         };
         // The words only when every entry keeps its whole name beside its
         // word; else the glyph says the state and the name gets the room.
+        // `LLMUX_REDUCED_MOTION` holds the active spinner still, like
+        // every other spinner on the dashboard.
         let list = AgentList::new(&items[from..to])
             .sort(Sort::Given)
             .words(col_w >= natural)
-            .frame(ctx.frame)
+            .frame(loading_spin(ctx.frame, chrome.motion))
             .empty("no accounts")
-            .theme(THEME);
+            .theme(THEME.with_motion(chrome.motion));
         let mut state = AgentListState::new();
         frame.render_stateful_widget(&list, rect, &mut state);
         for &(i, r) in &state.layout().items {
@@ -24686,6 +24688,34 @@ mod tests {
             title.contains(" · ◌ 10 spent · ⠋ 2 active · ◦ 8 ok · ǁ 1 paused "),
             "{title}"
         );
+    }
+
+    /// The active account's spinner turns with the frame in the compact
+    /// list, and holds its first glyph under reduced motion
+    /// (`LLMUX_REDUCED_MOTION`), as every other spinner does.
+    #[test]
+    fn compact_list_spinner_holds_still_under_reduced_motion() {
+        let (view, _) = compact_view();
+        let name = fold_name(13);
+        let entry = |motion, frame| {
+            let chrome = Chrome {
+                compact_accounts: true,
+                motion,
+                frame,
+                ..chrome_overlay(Overlay::Accounts)
+            };
+            let rows = render_rows(&view, &chrome, 80, 30);
+            let row = &rows[row_of(&rows, &name)];
+            let at = usize::from(col_of(row, &name));
+            row.chars().nth(at - 2).expect("glyph")
+        };
+        let full = twolab_tui::Motion::Full;
+        assert_eq!(entry(full, 0), '⠋');
+        assert_ne!(entry(full, 3), '⠋', "it turns with the frame");
+        let reduced = twolab_tui::Motion::Reduced;
+        for frame in [0, 3, 7] {
+            assert_eq!(entry(reduced, frame), '⠋', "frame {frame} holds still");
+        }
     }
 
     /// The switcher's cursor is the list's focus: `›` and the selected
