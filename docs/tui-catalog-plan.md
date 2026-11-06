@@ -57,7 +57,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
 | agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a narrow account sidebar with a state glyph per account; needs a layout decision first | later |
-| pager selection (copy mode) | herdr | mouse capture blocks the terminal's own selection | drag to select and copy an email or an error; needs a mouse-capture design first | later |
+| pager selection (copy mode) | herdr | mouse capture blocks the terminal's own selection | `v` releases the mouse for the terminal's selection under a banner (screen held still, `v`/Esc return); a drag in the Logs pager selects and copies through the clipboard/OSC52 path with a status confirmation | done |
 | fact_table | fx | model drill-down facts as free text | figures aligned on the last digit; no problem reported today | later |
 | completion_menu | fx | no typed command line | — | not applicable |
 | diff_view | fx | config edits are single values; prompts already show old → new | — | not applicable |

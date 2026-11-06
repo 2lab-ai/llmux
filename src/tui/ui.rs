@@ -302,6 +302,7 @@ pub(crate) fn draw(
             let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
             if let Some(hits) = hits.as_mut() {
                 hits.logs = Some(pos);
+                hits.logs_area = Some(overlay_area);
             }
         }
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
@@ -563,6 +564,7 @@ fn draw_main(
         input_modal: None,
         account_modal: None,
         logs: None,
+        logs_area: None,
         table_scroll: None,
         raw_modal: None,
     });
@@ -1379,12 +1381,6 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
-/// Logs overlay (`l`): the whole log ring in a twolab-tui
-/// [`Pager`](twolab_tui::pager::Pager) — long lines wrap, `~` past the end,
-/// the bottom rule says how far down the view is (`NN%`). It follows new
-/// lines while `chrome.logs_scroll` is `None` (the bottom) and holds still
-/// once scrolled back. Returns where it drew, so the runtime can turn the
-/// next key or wheel step into a row offset.
 /// A table's scrollbar as one frame drew it (keys, sessions, usage): where
 /// the rows are and the one-column track a press or drag acts on. Only
 /// reported while the rows overflow, so `None` means there is nothing to drag.
@@ -1423,16 +1419,46 @@ fn draw_table_scrollbar(
     Some(TableScroll { pos, track })
 }
 
+/// Logs overlay (`l`): the whole log ring in a twolab-tui
+/// [`Pager`](twolab_tui::pager::Pager) — long lines wrap, `~` past the end,
+/// the bottom rule says how far down the view is (`NN%`). It follows new
+/// lines while `chrome.logs_scroll` is `None` (the bottom) and holds still
+/// once scrolled back; a drag-selected stretch is drawn reversed. Returns
+/// where it drew, so the runtime can turn the next key or wheel step into a
+/// row offset.
 fn draw_logs_overlay(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     chrome: &Chrome,
 ) -> twolab_tui::scrollbar::ScrollPos {
-    use twolab_tui::pager::Pager;
     use twolab_tui::scrollbar::ScrollPos;
 
     frame.render_widget(Clear, area);
+    let pager = logs_pager(view, chrome.logs_scroll, chrome.logs_selection);
+    frame.render_widget(&pager, area);
+    // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
+    let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
+    let view_h = area.height.saturating_sub(chrome_rows) as usize;
+    ScrollPos::of(
+        pager.content_height(area.width),
+        view_h,
+        pager.scroll_offset(),
+    )
+}
+
+/// The Logs overlay's pager over this frame's log ring — the one build the
+/// draw and the mouse share, so a drag lands on the cells the person saw.
+/// `scroll` is `chrome.logs_scroll` (`None` follows the tail); `selection`
+/// is the drag-selected stretch, drawn reversed (it shows under `NO_COLOR`
+/// too). A pager held for a selection says so in its title.
+pub(crate) fn logs_pager(
+    view: &DashboardView,
+    scroll: Option<usize>,
+    selection: Option<twolab_tui::pager::Selection>,
+) -> twolab_tui::pager::Pager {
+    use twolab_tui::pager::Pager;
+
     let lines: Vec<Line<'static>> = if view.logs.is_empty() {
         // Say so instead of a blank pane (the same in attach mode, where the
         // lines come from the daemon's document).
@@ -1455,24 +1481,19 @@ fn draw_logs_overlay(
     } else {
         format!("{n} lines")
     };
-    let title = match chrome.logs_scroll {
+    let selecting = selection.is_some_and(|s| s.is_visible());
+    let title = match scroll {
         _ if n == 0 => "logs".to_string(),
         None => format!("logs · {count} · following"),
+        Some(_) if selecting => format!("logs · {count} · held for the selection — End follows"),
         Some(_) => format!("logs · {count} · scrolled back — End follows"),
     };
-    let pager = Pager::new(title, lines)
+    let mut pager = Pager::new(title, lines)
         .hints(false)
         .theme(KEYBAR_THEME)
-        .scroll_to(chrome.logs_scroll.unwrap_or(usize::MAX));
-    frame.render_widget(&pager, area);
-    // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
-    let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
-    let view_h = area.height.saturating_sub(chrome_rows) as usize;
-    ScrollPos::of(
-        pager.content_height(area.width),
-        view_h,
-        pager.scroll_offset(),
-    )
+        .scroll_to(scroll.unwrap_or(usize::MAX));
+    pager.set_selection(selection);
+    pager
 }
 
 /// Sessions overlay (`s`, issue #34): the persisted raw-io log folded by
@@ -8628,6 +8649,9 @@ pub(crate) struct MainChrome {
     /// Where the Logs overlay's pager drew this frame (`None`: not open), so
     /// a scroll key or wheel step moves from what is on screen.
     pub logs: Option<twolab_tui::scrollbar::ScrollPos>,
+    /// The rect the Logs pager drew in this frame: the mouse paints the same
+    /// pager there off-screen so a drag selects the cells on screen.
+    pub logs_area: Option<Rect>,
     /// The open keys, sessions or usage table's scrollbar this frame, when
     /// its rows overflow: a press on the track jumps, a drag moves the thumb.
     pub table_scroll: Option<TableScroll>,
@@ -11367,6 +11391,7 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("o", "sort"),
                 ("S", "sched"),
                 ("↑↓", "scroll"),
+                ("v", "copy mode"),
             ]);
             // The fold (`z`) is advertised only while it is on: the
             // bar that `z` turns off.
@@ -11421,7 +11446,8 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("q", "quit"),
             ],
         ),
-        // Logs overlay: the log ring in a pager; End follows new lines.
+        // Logs overlay: the log ring in a pager; End follows new lines, a
+        // drag selects and copies.
         Overlay::Logs => (
             Some("logs"),
             vec![
@@ -11429,6 +11455,8 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
                 ("↑/k ↓/j", "scroll"),
                 ("PgUp/PgDn", "page"),
                 ("Home/End", "top/follow"),
+                ("drag", "copy"),
+                ("v", "copy mode"),
                 ("q", "quit"),
             ],
         ),
@@ -11478,6 +11506,26 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
     }
 }
 
+/// The footer's key-bar row in copy mode (`v`): one reversed bar in the
+/// accent colour, so it reads as a banner with or without colour, naming
+/// what happened and the way back. Too narrow for the sentence, it says only
+/// the way back rather than losing it off the right edge.
+fn copy_mode_banner(width: u16) -> Line<'static> {
+    const FULL: &str = " copy mode — mouse released for selecting; press v/Esc to return";
+    const SHORT: &str = " copy mode — v/Esc to return";
+    let text = if cells::width(FULL) <= usize::from(width) {
+        FULL
+    } else {
+        SHORT
+    };
+    Line::from(Span::styled(
+        cells::pad(text, usize::from(width), cells::Align::Left),
+        Style::new()
+            .fg(KEYBAR_THEME.accent)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    ))
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // Status messages quote account names ("switched to a@x.com") — mask any
     // embedded email under the email-anonymous setting.
@@ -11489,6 +11537,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         Style::new().fg(Color::Yellow),
     ));
     let keybar = match chrome.mode {
+        // Copy mode (`v`) owns the bar over every surface and prompt: the
+        // mouse is the terminal's now, and this row says so and how to get
+        // it back. The status row above keeps its message — it may be the
+        // very text being selected.
+        _ if chrome.copy_mode => copy_mode_banner(area.width),
         // Config-editor prompts render their own inline hint line inside the
         // overlay; the keybar mirrors the essentials.
         Mode::ConfigEdit { .. } => keybar(
@@ -13191,6 +13244,8 @@ mod tests {
             usage_gran: Default::default(),
             usage_scroll: 0,
             logs_scroll: None,
+            logs_selection: None,
+            copy_mode: false,
             input_modal: None,
             raw_modal: None,
             account_modal: None,
@@ -14160,7 +14215,7 @@ mod tests {
         for (overlay, keybar) in [
             (
                 Overlay::None,
-                " q quit  R reload  u used/left  t eta/utc  o sort  S sched  ↑↓ scroll",
+                " q quit  R reload  u used/left  t eta/utc  o sort  S sched  ↑↓ scroll  v copy mode",
             ),
             (
                 Overlay::Stats,
@@ -14168,7 +14223,7 @@ mod tests {
             ),
             (
                 Overlay::Logs,
-                " logs — l/Esc back  ↑/k ↓/j scroll  PgUp/PgDn page  Home/End top/follow  q quit",
+                " logs — l/Esc back  ↑/k ↓/j scroll  PgUp/PgDn page  Home/End top/follow  drag copy  v copy mode  q quit",
             ),
         ] {
             let mut chrome = chrome_overlay(overlay);
@@ -14496,6 +14551,73 @@ mod tests {
         let pos = hits.and_then(|h| h.logs).expect("logs position reported");
         assert_eq!((pos.top, pos.viewport), (0, 18));
         assert_eq!(pos.max, 103 - 18, "101 lines, the long one on 3 rows");
+    }
+
+    /// Copy mode (`v`) at 80x24 and 179x43, on MAIN and over the Logs
+    /// pager: the key-bar row is the banner — reversed across the row, so it
+    /// reads under `NO_COLOR` too — and the status row above keeps its
+    /// message (it may be what is being selected). Too narrow for the
+    /// sentence, the banner keeps the way back.
+    #[test]
+    fn copy_mode_banner_replaces_the_key_bar_and_keeps_the_status_row() {
+        let view = view_with(Vec::new());
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            for overlay in [Overlay::None, Overlay::Logs] {
+                let mut chrome = chrome_overlay(overlay);
+                chrome.copy_mode = true;
+                chrome.status_line = Some("refresh failed: retry later".into());
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+                let mut hits = None;
+                terminal
+                    .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+                    .expect("draw");
+                let buf = terminal.backend().buffer().clone();
+                let row = |y: u16| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>();
+                assert_eq!(
+                    row(h - 1).trim_end(),
+                    " copy mode — mouse released for selecting; press v/Esc to return",
+                    "{w}x{h} {overlay:?}"
+                );
+                assert_eq!(row(h - 2).trim_end(), " refresh failed: retry later");
+                assert!(
+                    (0..w).all(|x| buf[(x, h - 1)].modifier.contains(Modifier::REVERSED)),
+                    "the whole row is the banner"
+                );
+            }
+        }
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.copy_mode = true;
+        let rows = render_rows(&view, &chrome, 50, 24);
+        assert_eq!(rows[23].trim_end(), " copy mode — v/Esc to return");
+    }
+
+    /// A drag selection in the Logs pager is drawn reversed on exactly the
+    /// selected cells, and the title says the pager is held for it.
+    #[test]
+    fn logs_selection_is_drawn_reversed_and_the_title_says_held() {
+        let mut view = view_with(Vec::new());
+        view.logs = log_lines(5);
+        let mut chrome = chrome_overlay(Overlay::Logs);
+        chrome.logs_scroll = Some(0);
+        chrome.logs_selection = Some(twolab_tui::pager::Selection::range((1, 7), (1, 18)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        assert!(
+            row(2).contains("logs · 5 lines · held for the selection — End follows"),
+            "{}",
+            row(2)
+        );
+        assert_eq!(row(4).trim_end(), "  INFO log line 001");
+        let reversed: Vec<u16> = (0..80)
+            .filter(|&x| buf[(x, 4)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(reversed, (7..=18).collect::<Vec<_>>(), "`log line 001`");
+        assert!((0..80).all(|x| !buf[(x, 3)].modifier.contains(Modifier::REVERSED)));
     }
 
     /// Sessions overlay (issue #34): renders the folded session list with the
@@ -21272,7 +21394,11 @@ mod tests {
     /// each entry two cells wider), dollars in the default colour over dim
     /// cents and a dim `$` instead of all green; every other cell unchanged
     /// (previous digest 7_483_902_083_238_678_069).
-    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
+    /// Re-pinned the same day for copy mode: MAIN's key bar gains
+    /// `v copy mode` after `↑↓ scroll` (the bottom row's text and its key
+    /// cell's Cyan bold run); every other row unchanged (previous digest
+    /// 11_040_274_043_730_846_167).
+    const FOLD_OFF_179X43_DIGEST: u64 = 1_132_186_687_096_627_264;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -21714,7 +21840,9 @@ mod tests {
         // The band follows the block; activity gains three rows.
         assert_eq!(row_of(&rows, " scheduler · poller "), head + 6, "{frame}");
         assert!(
-            rows[42].trim_end().ends_with("↑↓ scroll  z fold"),
+            rows[42]
+                .trim_end()
+                .ends_with("↑↓ scroll  v copy mode  z fold"),
             "{frame}"
         );
         let off = render_rows(&view, &fold_off(&chrome), 179, 43);
