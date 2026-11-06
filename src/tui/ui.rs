@@ -305,6 +305,10 @@ pub(crate) fn draw(
         }
     }
 
+    // A confirm gate (remove / reset / config) stands on the footer, over
+    // whichever surface opened it.
+    draw_gate(frame, view, &ctx, chrome);
+
     // The footer keybar is part of the chrome and reflects the active overlay /
     // mode; drawn last so it sits above everything.
     let footer_area = Rect {
@@ -3137,6 +3141,19 @@ pub(crate) fn config_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
     config_rows(view, chrome).len()
 }
 
+/// What the editor shows as the value of `action`'s row — the "old" side of
+/// the confirm gate's `old → new`.
+pub(crate) fn config_row_value(
+    view: &DashboardView,
+    chrome: &Chrome,
+    action: ConfigAction,
+) -> Option<String> {
+    config_rows(view, chrome)
+        .into_iter()
+        .find(|r| r.action == Some(action))
+        .map(|r| r.value)
+}
+
 /// The action on config row `idx`, if that row is editable.
 pub(crate) fn config_row_action(
     view: &DashboardView,
@@ -3275,26 +3292,16 @@ fn draw_config_overlay(
             }
         }
     }
-    // Edit / confirm prompt line (config-editor v1).
-    match chrome.mode {
-        Mode::ConfigEdit { action } => {
-            let hint = action.input_hint().unwrap_or("");
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::styled(" edit ", Style::new().fg(Color::Cyan)),
-                Span::raw(format!("{}▏", chrome.config_input)),
-                Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
-            ]));
-        }
-        Mode::ConfigConfirm { .. } => {
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::styled(" confirm ", Style::new().fg(Color::Yellow)),
-                Span::raw(chrome.config_input.clone()),
-                Span::styled("   (y apply · n/Esc cancel)", dim()),
-            ]));
-        }
-        _ => {}
+    // Edit prompt line (config-editor v1). The confirm gate is the card
+    // above the footer (`draw_gate`).
+    if let Mode::ConfigEdit { action } = chrome.mode {
+        let hint = action.input_hint().unwrap_or("");
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled(" edit ", Style::new().fg(Color::Cyan)),
+            Span::raw(format!("{}▏", chrome.config_input)),
+            Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
+        ]));
     }
     let block = Block::new()
         .borders(Borders::TOP)
@@ -10392,7 +10399,7 @@ fn keybar(
             "quit" => 9,
             "back" | "cancel" | "close" => 8,
             // The prompt's own action outlasts navigation.
-            _ if k == "Enter" || k == "y" => 7,
+            _ if k == "Enter" || k == "y" || k.ends_with("/y") => 7,
             _ => 5,
         };
         // `R disabled (attached)`: the key exists, does nothing here — dim.
@@ -10408,13 +10415,197 @@ fn keybar(
     Line::from(spans)
 }
 
-/// The key bar's theme: ANSI colours with labels in the terminal's default
-/// foreground (as before the move to KeyHints) — ANSI grey labels would be
-/// near-invisible on a light-background terminal.
+/// The theme every twolab-tui widget on the dashboard draws with (key bars,
+/// confirm gates, pickers): ANSI colours with labels in the terminal's
+/// default foreground (as before the move to KeyHints) — ANSI grey labels
+/// would be near-invisible on a light-background terminal. Under `NO_COLOR`
+/// the frame loop's `decolor` pass strips the colours; what the widgets mark
+/// with weight (a bold marked option, a reversed cursor row) survives it.
 const KEYBAR_THEME: twolab_tui::Theme = twolab_tui::Theme {
     text_secondary: Color::Reset,
     ..twolab_tui::Theme::ansi()
 };
+
+/// The option an account gate (remove / reset) keeps marked: Cancel, so
+/// Enter — like every key but `1` / `y` — never deletes or spends anything.
+pub(crate) const ACCOUNT_GATE_MARK: usize = 1;
+
+/// A two-option confirm gate as the card above the footer draws it
+/// (twolab-tui `choice_form`). The question names its subject — the account,
+/// or the setting old → new — for as long as the gate is open, not only for
+/// the status line's five seconds; option 1 confirms, option 2 cancels.
+struct GateCard {
+    title: &'static str,
+    question: String,
+    options: [(&'static str, String); 2],
+    marked: usize,
+    color: Color,
+}
+
+/// The gate `chrome.mode` has open, if any.
+fn gate_card(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<GateCard> {
+    // The cursor indexes DISPLAY rows — the same order the key handlers
+    // resolve at confirm time.
+    let account = |idx: usize| {
+        ctx.order
+            .get(idx)
+            .and_then(|&i| view.snapshot.accounts.get(i))
+    };
+    let name = |a: Option<&AccountSnapshot>| {
+        a.map_or_else(|| "?".to_string(), |a| masked_name(&a.id.0, ctx.mask))
+    };
+    match chrome.mode {
+        Mode::ConfirmRemove { idx } => Some(GateCard {
+            title: "remove account",
+            question: format!(
+                "Remove {} from the pool?\nIt stops serving requests and is deleted from the \
+                 config; a new login adds it back.",
+                name(account(idx))
+            ),
+            options: [
+                ("Remove the account", "y".into()),
+                ("Cancel", "n · Esc · Enter · any other key".into()),
+            ],
+            marked: ACCOUNT_GATE_MARK,
+            color: Color::Red,
+        }),
+        Mode::ConfirmReset { idx } => {
+            let target = account(idx);
+            let who = name(target);
+            let held = chrome
+                .reset_held
+                .as_ref()
+                .filter(|p| target.is_some_and(|a| a.id.0 == p.account));
+            let (question, options) = if let Some(held) = held {
+                (
+                    format!(
+                        "{who} has an UNRESOLVED redemption (request id {}).\nRetrying sends \
+                         THAT id again — a new id could spend a second reset.",
+                        held.request_id
+                    ),
+                    [
+                        (
+                            "Retry the held redemption",
+                            "y · same request id".to_string(),
+                        ),
+                        (
+                            "Close",
+                            "n · Esc · Enter — the redemption stays held".to_string(),
+                        ),
+                    ],
+                )
+            } else if let Some(a) =
+                target.filter(|a| !super::view::has_usage_controls(a.credential_kind))
+            {
+                (
+                    format!(
+                        "{who} is a {} account — rate-limit resets are a Codex or Claude \
+                         subscription entitlement.\nMove to a Codex or Claude row with ↑↓.",
+                        a.credential_kind
+                    ),
+                    [
+                        (
+                            "Redeem one reset",
+                            "y · refused for this account".to_string(),
+                        ),
+                        ("Cancel", "n · Esc · Enter".to_string()),
+                    ],
+                )
+            } else {
+                let control = target.and_then(|a| view.usage_control(&a.id.0));
+                (
+                    format!(
+                        "Redeem ONE rate-limit reset for {who}? ({})\nThis spends a reset \
+                         upstream and cannot be undone.",
+                        super::reset_inventory(
+                            control.and_then(|c| c.available_resets),
+                            control.and_then(|c| c.applicable_resets),
+                        )
+                    ),
+                    [
+                        ("Redeem one reset", "y · spends it upstream".to_string()),
+                        ("Cancel", "n · Esc · Enter — nothing is spent".to_string()),
+                    ],
+                )
+            };
+            Some(GateCard {
+                title: "redeem a reset",
+                question,
+                options,
+                marked: ACCOUNT_GATE_MARK,
+                color: Color::Yellow,
+            })
+        }
+        Mode::ConfigConfirm { .. } => Some(GateCard {
+            title: "confirm config change",
+            question: chrome.config_input.clone(),
+            options: [
+                ("Apply", "y".to_string()),
+                ("Cancel", "n · Esc".to_string()),
+            ],
+            marked: chrome.confirm_choice.min(1),
+            color: Color::Yellow,
+        }),
+        _ => None,
+    }
+}
+
+/// Widest a gate card gets (cells, borders included).
+const GATE_MAX_WIDTH: u16 = 100;
+
+/// Draw the open confirm gate as a card standing on the footer: up to
+/// [`GATE_MAX_WIDTH`] wide,
+/// as tall as its question needs, over whatever surface summoned it (the
+/// accounts table, MAIN, the config editor) — the layout underneath does not
+/// move while the gate is open.
+fn draw_gate(frame: &mut Frame, view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) {
+    use twolab_tui::choice_form::{ChoiceForm, ChoiceOption, ChoiceState};
+    let Some(gate) = gate_card(view, ctx, chrome) else {
+        return;
+    };
+    let full = frame.area();
+    // A card, not a sheet: on a wide terminal the surface beside it stays in
+    // view.
+    let width = full.width.min(GATE_MAX_WIDTH);
+    let [(yes, yes_keys), (no, no_keys)] = gate.options;
+    let form = ChoiceForm::new(
+        gate.question,
+        [
+            ChoiceOption::new(yes).description(yes_keys),
+            ChoiceOption::new(no).description(no_keys),
+        ],
+    )
+    .no_other()
+    // The footer row under the card carries the keys (fitted like every bar).
+    .hints(false)
+    .theme(KEYBAR_THEME);
+    let mut state = ChoiceState::at(gate.marked);
+    // Leave the header + tab rows and the two footer rows uncovered; a gate
+    // taller than that windows its options (`⋯ N more`) instead of cutting.
+    let room = full.height.saturating_sub(4);
+    let height = form
+        .height(&state, width.saturating_sub(2))
+        .saturating_add(2)
+        .min(room);
+    if height < 3 {
+        return;
+    }
+    let area = Rect {
+        x: full.x,
+        y: full.bottom().saturating_sub(2 + height),
+        width,
+        height,
+    };
+    let style = Style::new().fg(gate.color);
+    let block = Block::bordered().border_style(style).title(Span::styled(
+        format!(" {} ", gate.title),
+        style.add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_stateful_widget(&form, inner, &mut state);
+}
 
 fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
     // Status messages quote account names ("switched to a@x.com") — mask any
@@ -10440,9 +10631,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             &[("Enter", "apply"), ("Esc", "cancel")],
             area.width,
         ),
+        // The gate card above names the setting and its old → new value.
         Mode::ConfigConfirm { .. } => keybar(
             Some("confirm"),
-            &[("y", "apply"), ("n/Esc", "cancel")],
+            &[
+                ("1/y", "apply"),
+                ("2/n/Esc", "cancel"),
+                ("↑↓", "mark"),
+                (
+                    "Enter",
+                    if chrome.confirm_choice == 0 {
+                        "apply"
+                    } else {
+                        "cancel"
+                    },
+                ),
+            ],
             area.width,
         ),
         // While a Mode interaction is pending it owns the keybar regardless of
@@ -10623,28 +10827,29 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             ],
             area.width,
         ),
-        Mode::ConfirmRemove { .. } => Line::from(vec![
-            Span::raw(" "),
-            key("↑/k ↓/j"),
-            Span::raw(" pick  "),
-            Span::styled("remove selected? ", Style::new().fg(Color::Red)),
-            key("y"),
-            Span::raw(" confirm  "),
-            key("Esc/n"),
-            Span::raw(" cancel"),
-        ]),
+        // The gate card above names the account for as long as it is open;
+        // this bar lists the keys. Every other key cancels.
+        Mode::ConfirmRemove { .. } => keybar(
+            Some("remove"),
+            &[
+                ("1/y", "remove"),
+                ("2/n/Esc", "cancel"),
+                ("↑/k ↓/j", "account"),
+            ],
+            area.width,
+        ),
         // Redemption confirm (.prd/16): the SUBJECT (which account, one
-        // reset) is on the status line above; this bar is just the gate.
-        Mode::ConfirmReset { .. } => Line::from(vec![
-            Span::raw(" "),
-            key("↑/k ↓/j"),
-            Span::raw(" pick codex account  "),
-            Span::styled("redeem ONE reset? ", Style::new().fg(Color::Yellow)),
-            key("y"),
-            Span::raw(" confirm  "),
-            key("Esc/n"),
-            Span::raw(" cancel"),
-        ]),
+        // reset, the inventory) is on the gate card above, not only on the
+        // status line, which expires.
+        Mode::ConfirmReset { .. } => keybar(
+            Some("reset"),
+            &[
+                ("1/y", "redeem"),
+                ("2/n/Esc", "cancel"),
+                ("↑/k ↓/j", "account"),
+            ],
+            area.width,
+        ),
         Mode::NewLogin { idx } => {
             // Provider picker: the cursor row is shown highlighted; Enter
             // opens the browser for that provider.
@@ -11597,6 +11802,38 @@ mod tests {
         assert!(keybar.contains('y'), "confirm key advertised: {keybar}");
     }
 
+    /// Under `NO_COLOR` the frame loop strips every colour; the gate's marked
+    /// choice must still read as marked — bold label and the `❯` — while the
+    /// other choice stays plain.
+    #[test]
+    fn gate_mark_survives_no_color() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::ConfirmRemove { idx: 0 };
+        let mut buf = render_buffer(&view, &chrome, 80, 24);
+        twolab_tui::theme::decolor(&mut buf);
+        let row_with = |needle: &str| {
+            (0..24u16)
+                .find(|&y| {
+                    (0..80u16)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .expect(needle)
+        };
+        let bold_at = |y: u16, needle: &str| {
+            let line: String = (0..80u16).map(|x| buf[(x, y)].symbol()).collect();
+            let col = cells::width(&line[..line.find(needle).expect(needle)]) as u16;
+            buf[(col, y)].modifier.contains(Modifier::BOLD)
+        };
+        let marked = row_with("2) Cancel");
+        assert_eq!(marked, row_with("❯"), "the marked choice carries the mark");
+        assert!(bold_at(marked, "Cancel"), "and is bold");
+        let other = row_with("1) Remove the account");
+        assert!(!bold_at(other, "Remove the account"), "the other is plain");
+    }
+
     #[test]
     fn row_account_name_strips_group_prefix_and_abbreviates_domain() {
         let abbrev = crate::config::default_domain_abbrev();
@@ -11964,6 +12201,8 @@ mod tests {
             account_sort: Default::default(),
             config_cursor: 0,
             config_input: String::new(),
+            confirm_choice: 0,
+            reset_held: None,
             config_saved: Default::default(),
             add_input_len: 0,
             quota_display_override: None,
