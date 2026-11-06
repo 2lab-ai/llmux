@@ -1179,14 +1179,10 @@ struct App {
     /// hit module): replaced after each `draw`, so a click never maps onto
     /// an older layout. The mouse handler asks it once per event.
     hits: ui::Hits,
-    /// Sessions table hit layout from the last frame (mouse row select).
-    sessions_chrome: Option<ui::SessionsChrome>,
     /// The open keys / sessions / usage table's scrollbar from the last frame
     /// (`None`: nothing overflows), and the press-drag-release on it.
     table_scroll: Option<ui::TableScroll>,
     table_drag: twolab_tui::scrollbar::ScrollbarDrag,
-    /// Config-editor value-cell hits from the last frame.
-    config_chrome: Vec<ui::ConfigHit>,
     /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
     /// payload-tab rects + top-right action buttons. Same record/read cycle
     /// as `hits`; empty while the modal is closed.
@@ -1394,10 +1390,8 @@ impl App {
             history_loading: false,
             history_tx: None,
             hits: ui::Hits::new(),
-            sessions_chrome: None,
             table_scroll: None,
             table_drag: Default::default(),
-            config_chrome: Vec::new(),
             raw_chrome: ui::RawModalChrome::default(),
             raw_drag: Default::default(),
             pane_heights: PaneHeights::default(),
@@ -2078,7 +2072,7 @@ impl App {
                 self.scroll_logs_to(|pos| Some(pos.top.saturating_add_signed(step).min(pos.max)));
                 return true;
             }
-            if let Some(changed) = self.logs_select_mouse(&mouse, view) {
+            if let Some(changed) = self.logs_select_mouse(&mouse, target, view) {
                 return changed;
             }
         }
@@ -2092,7 +2086,7 @@ impl App {
         ) && self.mode == Mode::Normal
             && self.keys.picker.is_none()
         {
-            if let Some(changed) = self.table_scrollbar_mouse(&mouse, view) {
+            if let Some(changed) = self.table_scrollbar_mouse(&mouse, target, view) {
                 return changed;
             }
         }
@@ -2143,18 +2137,9 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(hit) = self
-                        .config_chrome
-                        .iter()
-                        .find(|h| {
-                            mouse.row == h.area.y
-                                && mouse.column >= h.area.x
-                                && mouse.column < h.area.right()
-                        })
-                        .copied()
-                    {
-                        self.config_cursor = hit.row;
-                        self.activate_config_action(hit.action, view);
+                    if let Some(&ui::ClickTarget::ConfigRow { row, action }) = target {
+                        self.config_cursor = row;
+                        self.activate_config_action(action, view);
                         return true;
                     }
                 }
@@ -2174,19 +2159,11 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(t) = self.sessions_chrome {
-                        let r = t.rows;
-                        if mouse.row >= r.y
-                            && mouse.row < r.bottom()
-                            && mouse.column >= r.x
-                            && mouse.column < r.right()
-                        {
-                            let idx = t.start + (mouse.row - r.y) as usize;
-                            if idx < self.sessions.len() {
-                                self.session_cursor = idx;
-                            }
-                            return true;
+                    if let Some(&ui::ClickTarget::SessionsRow(idx)) = target {
+                        if idx < self.sessions.len() {
+                            self.session_cursor = idx;
                         }
+                        return true;
                     }
                 }
                 _ => {}
@@ -2368,17 +2345,24 @@ impl App {
     }
 
     /// A mouse event on the open table's scrollbar (keys, sessions, usage).
-    /// `Some(changed)` when the scrollbar took it — a press on the track, a
-    /// drag while the thumb is held, the release that ends it; `None` lets
-    /// the event through to the table's own clicks and wheel.
+    /// `Some(changed)` when the scrollbar took it — a press on the track
+    /// (`target`, what the last frame drew under the pointer), a drag while
+    /// the thumb is held, the release that ends it; `None` lets the event
+    /// through to the table's own clicks and wheel.
     fn table_scrollbar_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
+        target: Option<&ui::ClickTarget>,
         view: Option<&DashboardView>,
     ) -> Option<bool> {
         let top = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let bar = self.table_scroll?;
+                if target != Some(&ui::ClickTarget::TableScrollbar) {
+                    // A press anywhere else lets go of a thumb still held.
+                    self.table_drag.release();
+                    return None;
+                }
                 let top = self
                     .table_drag
                     .press(bar.pos, bar.track, mouse.column, mouse.row)?;
@@ -3055,11 +3039,14 @@ impl App {
     /// off-screen at the rect it drew in last, so its mouse methods map the
     /// pointer onto the cells the person saw. Once the drag shows a
     /// selection the view holds still (new lines must not scroll it out from
-    /// under the pointer); a drag past the top or bottom edge scrolls.
+    /// under the pointer); a drag past the top or bottom edge scrolls. A
+    /// press off the pager (`target`: what the last frame drew under the
+    /// pointer) clears the selection, as one on its border does.
     /// `None`: not a left-button event, or no pager on screen.
     fn logs_select_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
+        target: Option<&ui::ClickTarget>,
         view: Option<&DashboardView>,
     ) -> Option<bool> {
         let (area, view) = (self.logs_area?, view?);
@@ -3071,6 +3058,11 @@ impl App {
                 | MouseEventKind::Up(MouseButton::Left)
         ) {
             return None;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && target != Some(&ui::ClickTarget::LogsPager)
+        {
+            return Some(self.logs_sel.take().is_some());
         }
         let before = (self.logs_sel, self.logs_scroll);
         let mut pager = ui::logs_pager(view, self.logs_scroll, self.logs_sel);
@@ -6570,9 +6562,7 @@ async fn event_loop(
             })?;
             let main = hits.unwrap_or_default();
             app.hits = main.hits;
-            app.sessions_chrome = main.sessions_table;
             app.table_scroll = main.table_scroll;
-            app.config_chrome = main.config_rows;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
             app.menu_chrome = main.menu;
             // The open text field's window, as drawn.
@@ -9026,7 +9016,7 @@ mod tests {
             .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
             .expect("draw");
         let main = hits.unwrap_or_default();
-        app.sessions_chrome = main.sessions_table;
+        app.hits = main.hits;
         app.table_scroll = main.table_scroll;
         app.logs_area = main.logs_area;
         if let Some(pos) = main.logs {
@@ -9040,6 +9030,16 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    /// Where the last frame drew the sessions table's data rows: the rows'
+    /// click targets together.
+    fn sessions_rows(hits: &ui::Hits) -> ratatui::layout::Rect {
+        hits.iter()
+            .filter(|(_, target)| matches!(target, ui::ClickTarget::SessionsRow(_)))
+            .map(|(rect, _)| rect)
+            .reduce(|a, b| a.union(b))
+            .expect("rows drawn")
     }
 
     fn left(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
@@ -9254,7 +9254,7 @@ mod tests {
         draw_and_adopt(&mut app, &view, 80, 24);
         let bar = app.table_scroll.expect("60 sessions overflow");
         let page = bar.pos.viewport;
-        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        let rows_hit = sessions_rows(&app.hits);
         assert!(
             rows_hit.right() <= bar.track.x,
             "the bar's column is not a row"
@@ -9276,7 +9276,7 @@ mod tests {
         );
 
         // A row click still selects that row, not the bar.
-        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        let rows_hit = sessions_rows(&app.hits);
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), 5, rows_hit.y),
             Some(&view),
