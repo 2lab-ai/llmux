@@ -50,7 +50,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | composer | fx + herdr | add-key and config edits only append or delete at the end | caret moves, mid-value edits, Ctrl+U/Ctrl+Y; the API key stays masked in every render | 3 |
 | text, spinner, gradient_text, osc52 | llmux, Codex | done in PR #231 | — | done |
 | key_hints (main bar), tabs (main row), json_view (highlighter), theme (decolor) | | done in PR #231 | — | done |
-| meter | llmux | the original of the crate's meter | no visible change; moving it re-pins the 179×43 frame digest for every account row | later |
+| meter | llmux | the original of the crate's meter | the same bars (the 179×43 frame digest is unchanged); the cursor row's bar keeps its fill visible; under `t` a stamp beside a state glyph shows its date instead of losing a digit | done |
 | packed_grid | llmux | the original, twice (fold and models strip) | one packer and click rects per strip entry; largest digest change | later |
 | rule | fx | 28 section rules drawn as block borders | only differs on CJK-wide terminals; needs a host setting first | later |
 | shimmer | Codex | loading labels are plain text | cosmetic | later |

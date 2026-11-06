@@ -196,7 +196,12 @@ is no `5h` column: no provider reports a 5h window any more (the scheduler's
 
 The time inside a weekly gauge is its reset countdown, shown bare and
 centered (`7d 10h`, or the absolute stamp under `t`); the header's `RESET`
-names it. Cold or unavailable cells show no reset time. The `rst` column
+names it. A value that is not fresh carries its state glyph (`○` cold, `◑`
+stale, `!` poll-degraded) in the bar's last cell; in the narrowest bar the
+absolute stamp then shows its date only (`07/07`) rather than a time with
+its last digit cut. On the cursor row the bar's empty part is drawn
+without the row highlight, so the fill stays visible. Cold or unavailable
+cells show no reset time. The `rst` column
 described below counts **reset credits/grants owned**; it is not a
 countdown.
 
