@@ -515,6 +515,12 @@ pub(crate) fn draw(
             main.hits.push(overlay_area, ClickTarget::LogsPager);
             main.logs = Some(pos);
             main.logs_area = Some(overlay_area);
+            main.logs_lines = Some(
+                chrome
+                    .logs_frozen
+                    .clone()
+                    .unwrap_or_else(|| view.logs.as_slice().into()),
+            );
         }
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, main),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
@@ -9161,6 +9167,10 @@ pub(crate) struct MainChrome {
     /// The rect the Logs pager drew in this frame: the mouse paints the same
     /// pager there off-screen so a drag selects the cells on screen.
     pub logs_area: Option<Rect>,
+    /// The log lines the pager drew this frame — what a press freezes, so
+    /// the selection starts on the text that was on screen, not on a line
+    /// that arrived after the frame.
+    pub logs_lines: Option<std::sync::Arc<[crate::logging::LogLine]>>,
     /// The open keys, sessions or usage table's scrollbar this frame, when
     /// its rows overflow: a press on the track jumps, a drag moves the thumb.
     pub table_scroll: Option<TableScroll>,

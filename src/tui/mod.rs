@@ -1288,6 +1288,9 @@ struct App {
     /// The lines the Logs pager holds from a press on it until its
     /// selection is gone; see [`Chrome::logs_frozen`].
     logs_frozen: Option<std::sync::Arc<[crate::logging::LogLine]>>,
+    /// The log lines the Logs pager drew last frame (`None`: not open) —
+    /// what a press on it freezes.
+    logs_drawn: Option<std::sync::Arc<[crate::logging::LogLine]>>,
     /// Copy mode (`v`), see [`Chrome::copy_mode`]: the event loop releases
     /// mouse capture while it is on and holds the frame still, so the text
     /// under the terminal's own selection does not move.
@@ -1416,6 +1419,7 @@ impl App {
             logs_area: None,
             logs_sel: None,
             logs_frozen: None,
+            logs_drawn: None,
             copy_mode: false,
             copy_since: None,
             held_for: Duration::ZERO,
@@ -3099,9 +3103,12 @@ impl App {
             return Some(self.logs_sel.take().is_some());
         }
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
-            // The lines on screen now — already held, if a selection is up.
-            self.logs_frozen
-                .get_or_insert_with(|| view.logs.as_slice().into());
+            // The lines the last frame drew — already held, if a selection is
+            // up; a line that arrived since the frame is not on screen yet.
+            let drawn = &self.logs_drawn;
+            self.logs_frozen.get_or_insert_with(|| {
+                drawn.clone().unwrap_or_else(|| view.logs.as_slice().into())
+            });
         }
         let before = (self.logs_sel, self.logs_scroll);
         let lines = self.logs_frozen.as_deref().unwrap_or(&view.logs);
@@ -3129,6 +3136,34 @@ impl App {
             self.logs_frozen = None;
         }
         Some(changed || (self.logs_sel, self.logs_scroll) != before)
+    }
+
+    /// Take the Logs pager's record from the frame just drawn: where it drew
+    /// and from which row. The pager clamps a held offset itself; one at (or
+    /// past) the bottom follows the tail again — unless a selection holds
+    /// it. A frame without the pager (the tab was left, whichever way) lets
+    /// go of the selection and of the lines frozen for it.
+    fn adopt_logs(
+        &mut self,
+        area: Option<ratatui::layout::Rect>,
+        pos: Option<twolab_tui::scrollbar::ScrollPos>,
+        lines: Option<std::sync::Arc<[crate::logging::LogLine]>>,
+    ) {
+        self.logs_area = area;
+        self.logs_drawn = lines;
+        match pos {
+            Some(pos) => {
+                self.logs_pos = pos;
+                let selecting = self.logs_sel.is_some_and(|s| s.is_visible());
+                if !selecting && self.logs_scroll.is_some_and(|top| top >= pos.max) {
+                    self.logs_scroll = None;
+                }
+            }
+            None => {
+                self.logs_sel = None;
+                self.logs_frozen = None;
+            }
+        }
     }
 
     /// Queue the Logs selection for the clipboard on the raw viewer's export
@@ -6644,14 +6679,7 @@ async fn event_loop(
             app.track_field(main.field_width);
             // The Logs pager clamps a held offset itself; one at (or past)
             // the bottom follows the tail again — unless a selection holds it.
-            app.logs_area = main.logs_area;
-            if let Some(pos) = main.logs {
-                app.logs_pos = pos;
-                let selecting = app.logs_sel.is_some_and(|s| s.is_visible());
-                if !selecting && app.logs_scroll.is_some_and(|top| top >= pos.max) {
-                    app.logs_scroll = None;
-                }
-            }
+            app.adopt_logs(main.logs_area, main.logs, main.logs_lines.clone());
             // Reconcile the input modal (UI-6 item 3) against what the frame
             // could actually render: `Some(layout)` is where it drew (the
             // clamped scroll, the page size and scrollbar track the next key
@@ -8866,6 +8894,45 @@ mod tests {
         assert!(app.pending_clip.is_empty(), "and copies nothing");
     }
 
+    /// A line that lands between the frame and the press is not on screen
+    /// yet: the press freezes the lines that frame drew, so the selection
+    /// starts on the row under the pointer, not one line further on.
+    #[test]
+    fn logs_press_freezes_the_lines_the_last_frame_drew() {
+        let line = |i: usize| crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: format!("log line {i:03}"),
+        };
+        let mut view = stats_view_with_account();
+        view.logs = (0..5).map(line).collect();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 000", "{rows:#?}");
+        // The ring drops its oldest before the press; no frame in between.
+        view.logs.remove(0);
+        view.logs.push(line(5));
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let col = if matches!(kind, MouseEventKind::Down(_)) {
+                7
+            } else {
+                18
+            };
+            let row = if matches!(kind, MouseEventKind::Down(_)) {
+                3
+            } else {
+                4
+            };
+            app.on_mouse(left(kind, col, row), Some(&view));
+        }
+        let req = app.pending_clip.pop_front().expect("the release copies");
+        assert_eq!(req.payload, "log line 000\n  INFO log line 001");
+    }
+
     /// From the press on the Logs pager until its selection is gone, the
     /// pager holds the lines it showed at the press: a line arriving
     /// mid-drag that makes the ring drop its oldest moves nothing on screen
@@ -8936,6 +9003,18 @@ mod tests {
         );
         app.on_key_logs(KeyCode::Esc);
         assert!(app.logs_frozen.is_none());
+        // Leaving by another tab (a click on the tab row, or a key that opens
+        // another overlay) lets go of them at the next frame.
+        app.overlay = Overlay::Logs;
+        draw_and_adopt(&mut app, &view, 80, 24);
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        assert!(app.logs_frozen.is_some(), "held from the press");
+        app.open_tab(Overlay::Stats, Some(&view));
+        draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!((app.logs_sel, app.logs_frozen.is_some()), (None, false));
     }
 
     /// A drag past the bottom of the Logs pager scrolls it (3 rows per row
@@ -9339,10 +9418,7 @@ mod tests {
         let main = hits.unwrap_or_default();
         app.hits = main.hits;
         app.table_scroll = main.table_scroll;
-        app.logs_area = main.logs_area;
-        if let Some(pos) = main.logs {
-            app.logs_pos = pos;
-        }
+        app.adopt_logs(main.logs_area, main.logs, main.logs_lines.clone());
         app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
         if let (Some(modal), Some(raw)) = (app.raw_modal.as_mut(), main.raw_modal.as_ref()) {
             modal.scroll = modal.scroll.min(raw.max_scroll);

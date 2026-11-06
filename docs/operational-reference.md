@@ -76,7 +76,9 @@ the top-right corner, under the tab row — `fail` in its border,
 `✗ refresh: 1 ok, 5 FAILED`, then one line per failed account with its error
 and `+N more` past four lines. The card stays for 8 seconds (5 for a
 warning); a newer card replaces it, and at 64 columns or fewer it is a
-one-row banner instead.
+one-row banner instead. A left click on the card takes it down, and the row
+under it never gets that click; the card sits under modals, confirmation
+cards, the login picker and the footer, so it never hides a live prompt.
 
 A label that waits on a load — `loading sessions…` and then the title's
 `loading… N%` in the sessions tab, `· loading…` in the keys title,
