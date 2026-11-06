@@ -536,10 +536,15 @@ fn draw_main(
     }
     let settings = draw_group_settings(frame, groups_area, view);
     // The context menu (UI-3 U11) draws last so it floats over every pane.
+    // Its bounds stop above the footer, which `draw` paints over everything.
+    let menu_bounds = Rect {
+        height: footer_area.y.saturating_sub(area.y),
+        ..area
+    };
     let menu = chrome
         .menu_anchor
         .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
-        .map(|anchor| draw_context_menu(frame, view, ctx, chrome, anchor));
+        .map(|anchor| draw_context_menu(frame, menu_bounds, view, ctx, chrome, anchor));
     *hits = Some(MainChrome {
         activity,
         tabs,
@@ -557,7 +562,6 @@ fn draw_main(
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
-    let _ = footer_area;
 }
 
 /// The group-settings bar (UI-3 U9/U10): one bottom row showing each backend
@@ -3601,102 +3605,96 @@ fn draw_config_overlay(
     }
 }
 
-/// The right-click account context menu (UI-3 U11): a small floating list
-/// anchored at the click cell, clamped to the frame. Items mirror the key
-/// flows exactly: switch now (`Enter` in the switcher), pause/resume (`p`),
-/// set limit (`L`), delete (`r` + confirm). Returns the hit layout.
+/// What the open context menu acts on (UI-3 U11): the PINNED account id
+/// governs both what the menu says and what it runs (review R2/R3) — the
+/// account, or `Err(id)` when that account has left the pool. A vanished pin
+/// never falls back to whoever now occupies the row (execution would cancel
+/// while the menu named someone else). With no pin (keyboard-driven or test
+/// states) the display row `idx` of `order` is the target.
+pub(crate) fn menu_target<'a>(
+    view: &'a DashboardView,
+    pinned: Option<&'a str>,
+    order: &[usize],
+    idx: usize,
+) -> Result<Option<&'a AccountSnapshot>, &'a str> {
+    match pinned {
+        Some(name) => view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == name)
+            .map(Some)
+            .ok_or(name),
+        None => Ok(order.get(idx).and_then(|&i| view.snapshot.accounts.get(i))),
+    }
+}
+
+/// The context menu's entries, in the order `App::run_menu_item` runs
+/// them: switch now, pause/resume, set limit, delete — each with the key
+/// that runs the same flow in the account switcher (typed while the menu is
+/// open, it runs the item too). What cannot run is shown dim and skipped:
+/// everything when there is no account to act on, and `switch now` on a
+/// paused account (the scheduler refuses a paused target — resume it
+/// first). Delete keeps its confirm gate; here it is only marked
+/// destructive.
+pub(crate) fn account_menu_items(
+    target: Option<&AccountSnapshot>,
+) -> Vec<twolab_tui::menu::MenuItem<'static>> {
+    use twolab_tui::menu::MenuItem;
+    let none = target.is_none();
+    let paused = target.is_some_and(|a| a.paused);
+    vec![
+        MenuItem::new("switch now")
+            .key("⏎")
+            .disabled(none || paused),
+        MenuItem::new(if paused { "resume" } else { "pause" })
+            .key("p")
+            .disabled(none),
+        MenuItem::new("set limit").key("L").disabled(none),
+        MenuItem::new("delete")
+            .key("r")
+            .destructive(true)
+            .disabled(none),
+    ]
+}
+
+/// The right-click account context menu (UI-3 U11), drawn by the library's
+/// `Menu`: anchored at the click cell, it opens on the row below — or above
+/// when there is no room below, so it never covers the clicked row — inside
+/// `bounds` (MAIN above the footer, which draws over everything). Titled
+/// with the pinned account; items mirror the key flows exactly (see
+/// [`account_menu_items`]). Returns where each runnable item was drawn.
 fn draw_context_menu(
     frame: &mut Frame,
+    bounds: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
     anchor: (u16, u16),
-) -> MenuChrome {
+) -> twolab_tui::menu::MenuLayout {
+    use twolab_tui::menu::{Menu, MenuState};
     let Mode::ContextMenu { idx, item } = chrome.mode else {
-        return MenuChrome::default();
+        return twolab_tui::menu::MenuLayout::default();
     };
-    // The PINNED account id governs what the menu says — the same identity
-    // execution acts on (review R2/R3). The explicit match keeps "no pin"
-    // (index fallback — keyboard-driven/test states) distinct from "pinned
-    // account VANISHED": a vanished pin must never fall back to whoever now
-    // occupies the row (execution would cancel while the menu named someone
-    // else) — it renders as gone instead.
-    let (target, gone) = match chrome.menu_account.as_deref() {
-        Some(name) => {
-            let found = view.snapshot.accounts.iter().find(|a| a.id.0 == name);
-            (found, found.is_none().then(|| name.to_string()))
-        }
-        None => (
-            ctx.order
-                .get(idx)
-                .and_then(|&i| view.snapshot.accounts.get(i)),
-            None,
-        ),
-    };
-    let paused = target.is_some_and(|a| a.paused);
-    let name = match (&gone, target) {
-        (Some(pinned), _) => format!(
+    let target = menu_target(view, chrome.menu_account.as_deref(), &ctx.order, idx);
+    let name = match target {
+        Err(pinned) => format!(
             "{} — gone",
             row_account_name(pinned, ctx.mask, &view.domain_abbrev)
         ),
-        (None, Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
-        (None, None) => "?".into(),
+        Ok(Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
+        Ok(None) => "?".into(),
     };
-    let items: [&str; 4] = [
-        "switch now",
-        if paused { "resume" } else { "pause" },
-        "set limit",
-        "delete",
-    ];
-    let width = (items
-        .iter()
-        .map(|i| i.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(name.chars().count() + 1) as u16
-        + 4)
-    .min(frame.area().width);
-    let height = items.len() as u16 + 1; // + title border row
-    let frame_area = frame.area();
-    let x = anchor
-        .0
-        .min(frame_area.right().saturating_sub(width))
-        .max(frame_area.x);
-    let y = anchor
-        .1
-        .saturating_add(1)
-        .min(frame_area.bottom().saturating_sub(height))
-        .max(frame_area.y);
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
+    let menu = Menu::new(account_menu_items(target.ok().flatten()))
+        .title(name)
+        .anchor(anchor.0, anchor.1)
+        .theme(KEYBAR_THEME);
+    let mut state = MenuState {
+        selected: item,
+        ..MenuState::default()
     };
-    frame.render_widget(Clear, area);
-    let mut lines: Vec<Line> = Vec::with_capacity(items.len());
-    let mut rects: Vec<Rect> = Vec::with_capacity(items.len());
-    for (i, label) in items.iter().enumerate() {
-        let style = if i == item {
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::new()
-        };
-        lines.push(Line::from(Span::styled(format!(" {label} "), style)));
-        rects.push(Rect {
-            x: area.x,
-            y: area.y + 1 + i as u16,
-            width: area.width,
-            height: 1,
-        });
-    }
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(format!(" {name} "));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    MenuChrome { area, items: rects }
+    frame.render_stateful_widget(&menu, bounds, &mut state);
+    state.layout
 }
 
 /// The rect an overlay draws into. Rows left visible at the top: header + tab
@@ -8359,23 +8357,6 @@ pub(crate) struct AccountRowHit {
     pub display_idx: usize,
 }
 
-/// The rendered context menu's layout (UI-3 U11): the whole popup rect plus
-/// one row rect per item, for the click hit-test.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct MenuChrome {
-    pub area: Rect,
-    pub items: Vec<Rect>,
-}
-
-impl MenuChrome {
-    /// Which menu item a click lands on, if any.
-    pub(crate) fn hit_item(&self, col: u16, row: u16) -> Option<usize> {
-        self.items
-            .iter()
-            .position(|r| row == r.y && col >= r.x && col < r.right())
-    }
-}
-
 /// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
 /// its segment cycles the setting to its next value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8405,7 +8386,7 @@ pub(crate) struct MainChrome {
     pub tabs: Vec<TabHit>,
     pub separators: Vec<SeparatorHit>,
     pub account_rows: Vec<AccountRowHit>,
-    pub menu: Option<MenuChrome>,
+    pub menu: Option<twolab_tui::menu::MenuLayout>,
     pub settings: Vec<SettingHit>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
     /// select): the data-row rect + the index of its first visible session.
@@ -17132,6 +17113,85 @@ mod tests {
             !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
             "no fallback to the row occupant"
         );
+    }
+
+    /// Catalog `menu` (plan batch 3): right-clicked near the bottom of an
+    /// 80x24 MAIN the menu opens ABOVE the clicked row instead of covering
+    /// it; every item shows the key that runs it; delete is drawn
+    /// destructive; `switch now` on a paused account is dim and has no
+    /// click rect (the scheduler refuses a paused target).
+    #[test]
+    fn context_menu_opens_above_a_low_row_with_keys_and_states() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str, paused: bool| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            auth_failure_status: None,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![acct("claude:a@x.com", false), acct("claude:b@x.com", true)];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.mode = Mode::ContextMenu { idx: 0, item: 0 };
+        chrome.menu_account = Some("claude:b@x.com".into());
+        // Clicked two rows above the 2-row footer: no room below.
+        chrome.menu_anchor = Some((30, 20));
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let menu = hits.menu.expect("menu drawn");
+        assert!(menu.above, "opened above the clicked row:\n{frame}");
+        assert!(menu.area.bottom() <= 20, "row 20 stays visible:\n{frame}");
+        assert_eq!(menu.area.x, 30, "lines up with the click:\n{frame}");
+        let row = |label: &str| {
+            rows.iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("{label} drawn:\n{frame}"))
+        };
+        assert_eq!(
+            row("┌ b@x.com "),
+            14,
+            "titled with the pinned account:\n{frame}"
+        );
+        for (label, key) in [
+            ("switch now", "⏎"),
+            ("resume", "p"),
+            ("set limit", "L"),
+            ("delete", "r"),
+        ] {
+            let line = &rows[row(label)];
+            let after = &line[line.find(label).expect("label") + label.len()..];
+            assert_eq!(
+                after.trim_start().chars().next(),
+                Some(key.chars().next().expect("key")),
+                "{label} shows its key {key}:\n{frame}"
+            );
+        }
+        let buf = render_buffer(&view, &chrome, 80, 24);
+        let delete = row("delete") as u16;
+        assert_eq!(buf[(menu.area.x + 2, delete)].fg, Color::Red, "destructive");
+        let switch = row("switch now") as u16;
+        assert_eq!(buf[(menu.area.x + 2, switch)].fg, Color::DarkGray, "dim");
+        // The dim item has no rect; the selection settled on `resume`.
+        assert_eq!(menu.hit(menu.area.x + 2, switch), None);
+        assert_eq!(menu.hit(menu.area.x + 2, row("resume") as u16), Some(1));
+        assert_eq!(menu.hit(menu.area.x + 2, delete), Some(3));
+        let resume = row("resume") as u16;
+        assert!(buf[(menu.area.x + 2, resume)]
+            .modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
