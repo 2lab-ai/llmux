@@ -2633,14 +2633,21 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
         .max(40)
         .min(usize::from(area.width.saturating_sub(4)));
     let width = inner_w as u16 + 2;
-    let list = list.footer(keybar_after(Vec::new(), short, inner_w as u16 - 2));
+    let list = list.footer(keybar_after(
+        Vec::new(),
+        short,
+        (inner_w as u16).saturating_sub(2),
+    ));
     let height = (list.desired_height(inner_w as u16) + 2).min(area.height.saturating_sub(2));
+    // Clamped to the area: on a terminal a few cells wide the border alone
+    // is wider than the screen, and `Clear` indexes every cell it is given.
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
-    };
+    }
+    .intersection(area);
     frame.render_widget(Clear, popup);
     let block = Block::bordered().title(" models ");
     let inner = block.inner(popup);
@@ -11805,6 +11812,27 @@ mod tests {
         assert!(text.contains("[x] gpt-6-astra"), "selected:\n{text}");
         assert!(text.contains("Space toggle"), "picker legend:\n{text}");
         assert!(text.contains("1 of 2 selected"), "count:\n{text}");
+    }
+
+    /// The `f` picker on a terminal a few cells wide or tall: no underflow
+    /// in its width maths (review of #233: `inner_w as u16 - 2` at width ≤ 5)
+    /// and nothing drawn outside the screen.
+    #[test]
+    fn keys_model_picker_survives_tiny_terminals() {
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            picker: Some(crate::tui::KeysPicker::new(
+                vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+                &Default::default(),
+            )),
+            ..Default::default()
+        };
+        let chrome = keys_chrome(panel);
+        for w in 1..=12 {
+            for h in 1..=8 {
+                let _ = render(&keys_view(), &chrome, w, h);
+            }
+        }
     }
 
     /// The picker's key legend stays fully readable on a narrow terminal —
