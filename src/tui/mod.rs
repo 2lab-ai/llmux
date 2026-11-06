@@ -1175,10 +1175,6 @@ struct App {
     history_loading: bool,
     /// Sender the blocking history loader delivers on (mirrors `sessions_tx`).
     history_tx: Option<mpsc::Sender<Vec<activity::Completed>>>,
-    /// The activity panel's hit-test layout from the LAST rendered frame: the
-    /// panel rect + the clickable request rows. Recorded by the event loop after
-    /// each `draw`, read by the mouse handler to map a click to an entry.
-    activity_chrome: ui::ActivityChrome,
     /// Every click target the LAST rendered frame drew, in paint order (the
     /// hit module): replaced after each `draw`, so a click never maps onto
     /// an older layout. The mouse handler asks it once per event.
@@ -1193,7 +1189,7 @@ struct App {
     config_chrome: Vec<ui::ConfigHit>,
     /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
     /// payload-tab rects + top-right action buttons. Same record/read cycle
-    /// as `activity_chrome`; empty while the modal is closed.
+    /// as `hits`; empty while the modal is closed.
     raw_chrome: ui::RawModalChrome,
     /// A press-drag-release on the raw viewer's body scrollbar.
     raw_drag: twolab_tui::scrollbar::ScrollbarDrag,
@@ -1397,7 +1393,6 @@ impl App {
             history_take: 0,
             history_loading: false,
             history_tx: None,
-            activity_chrome: ui::ActivityChrome::default(),
             hits: ui::Hits::new(),
             sessions_chrome: None,
             table_scroll: None,
@@ -2292,7 +2287,15 @@ impl App {
                     }
                     _ => {}
                 }
-                match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
+                // An activity row or one of its detail lines: what the click
+                // means depends on where in the recorded rect it fell.
+                let click = match hit {
+                    Some((rect, ui::ClickTarget::Activity { key, kind })) => {
+                        Some(ui::activity_click(rect, key, kind, mouse.column))
+                    }
+                    _ => None,
+                };
+                match click {
                     // Clicking the `🔍 input` detail line opens the full-text
                     // modal instead of collapsing the entry (UI-6 item 3).
                     Some(ui::ActivityClick::OpenInput(key)) => {
@@ -6567,7 +6570,6 @@ async fn event_loop(
             })?;
             let main = hits.unwrap_or_default();
             app.hits = main.hits;
-            app.activity_chrome = main.activity;
             app.sessions_chrome = main.sessions_table;
             app.table_scroll = main.table_scroll;
             app.config_chrome = main.config_rows;
@@ -9932,29 +9934,35 @@ mod tests {
         }
     }
 
-    /// Seed `app.activity_chrome` with one clickable request row spanning the
-    /// given screen rows, returning its key.
+    /// Seed `app.hits` with one clickable request row on screen row 6 of an
+    /// activity panel at rows 5..15, returning its key.
     fn seed_one_hit(app: &mut App) -> activity::ActivityKey {
+        seed_hit_as(app, ui::ActivityHitKind::Entry)
+    }
+
+    /// [`seed_one_hit`] as a target of `kind` (the frame's map holds only it).
+    fn seed_hit_as(app: &mut App, kind: ui::ActivityHitKind) -> activity::ActivityKey {
         let key = activity::ActivityKey {
             at_ms: 42,
             method: "POST".into(),
             path: "/v1/messages".into(),
             status: 200,
         };
-        app.activity_chrome = ui::ActivityChrome {
-            area: ratatui::layout::Rect {
-                x: 0,
-                y: 5,
-                width: 80,
-                height: 10,
-            },
-            hits: vec![ui::ActivityHit {
-                key: key.clone(),
-                y_start: 6,
-                height: 1,
-                kind: ui::ActivityHitKind::Entry,
-            }],
+        let panel = ratatui::layout::Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 10,
         };
+        app.hits.clear();
+        app.hits.push_clipped(
+            ratatui::layout::Rect::new(panel.x, 6, panel.width, 1),
+            panel,
+            ui::ClickTarget::Activity {
+                key: key.clone(),
+                kind,
+            },
+        );
         key
     }
 
@@ -9974,8 +9982,7 @@ mod tests {
     #[test]
     fn run_header_marker_toggles_and_body_expands_only(/* UI-5, Z 2026-07-15 */) {
         let mut app = remote_app();
-        let key = seed_one_hit(&mut app);
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::RunHeader { expanded: false };
+        let key = seed_hit_as(&mut app, ui::ActivityHitKind::RunHeader { expanded: false });
         // Marker-zone click (col < RUN_MARKER_ZONE) → opens the run.
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
         assert_eq!(app.expanded_run.as_ref(), Some(&key));
@@ -9996,9 +10003,8 @@ mod tests {
     #[test]
     fn click_input_line_opens_modal_and_swallows_mouse_beneath(/* UI-6 item 3 */) {
         let mut app = remote_app();
-        let key = seed_one_hit(&mut app);
         // Make the seeded hit the 🔍 input detail line.
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::InputLine;
+        let key = seed_hit_as(&mut app, ui::ActivityHitKind::InputLine);
         // Click it → opens the modal on that key WITHOUT expanding the row.
         let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
         assert!(changed, "opening the modal warrants a redraw");
@@ -10008,7 +10014,7 @@ mod tests {
             "the input click does not expand"
         );
         // A click beneath is now swallowed: nothing toggles, the modal stays.
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::Entry;
+        seed_hit_as(&mut app, ui::ActivityHitKind::Entry);
         let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
         assert!(changed, "the modal consumes the click (redraw)");
         assert_eq!(

@@ -688,6 +688,7 @@ fn draw_main(
             .into_iter()
             .map(|h| (h.rect, ClickTarget::StripEntry(h.index))),
     );
+    map.extend(activity);
     map.extend(separators.into_iter().map(|sep| {
         let row = Rect {
             y: sep.y,
@@ -709,7 +710,6 @@ fn draw_main(
         .map(|anchor| draw_context_menu(frame, menu_bounds, view, ctx, chrome, anchor));
     *hits = Some(MainChrome {
         hits: map,
-        activity,
         menu,
         sessions_table: None,
         config_rows: Vec::new(),
@@ -8904,6 +8904,13 @@ pub(crate) enum ClickTarget {
     StripEntry(usize),
     /// A value on the group-settings bar (UI-3 U9/U10): rotates it.
     Setting(SettingAction),
+    /// A request row of the activity panel, or one of its clickable detail
+    /// lines (UI-5, UI-6 item 3, UI-7): the whole panel width, as many rows
+    /// as it drew. [`activity_click`] says what a click on it means.
+    Activity {
+        key: ActivityKey,
+        kind: ActivityHitKind,
+    },
 }
 
 /// A surface drawn over what came before it.
@@ -8925,7 +8932,6 @@ pub(crate) type Hits = twolab_tui::hit::HitMap<ClickTarget>;
 pub(crate) struct MainChrome {
     /// Every click target this frame drew, in paint order.
     pub hits: Hits,
-    pub activity: ActivityChrome,
     pub menu: Option<twolab_tui::menu::MenuLayout>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
     /// select): the data-row rect + the index of its first visible session.
@@ -9014,7 +9020,7 @@ pub(crate) enum ActivityHitKind {
         expanded: bool,
     },
     /// The `🔍 input` detail line of an expanded entry (UI-6 item 3). Its own
-    /// one-row hit, layered ABOVE the entry's block hit, so clicking exactly
+    /// one-row hit, pushed ABOVE the entry's block hit, so clicking exactly
     /// this line opens the full-text modal instead of collapsing the entry.
     InputLine,
     /// The `🔍 request` detail line of an expanded entry (UI-7): clicking it
@@ -9030,7 +9036,7 @@ pub(crate) enum ActivityHitKind {
 }
 
 /// The resolved meaning of one activity click (UI-5), returned by
-/// [`hit_test_activity`] so the mouse handler stays a dumb dispatcher.
+/// [`activity_click`] so the mouse handler stays a dumb dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ActivityClick {
     /// Toggle this entry's detail lines (single rows and run member rows).
@@ -9049,54 +9055,46 @@ pub(crate) enum ActivityClick {
     OpenRaw(ActivityKey, u64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActivityHit {
-    pub key: ActivityKey,
-    pub y_start: u16,
-    pub height: u16,
-    pub kind: ActivityHitKind,
-}
-
-/// The activity panel's rendered layout for one frame: the panel rect plus the
-/// ordered hit-targets (request rows only — notes/in-flight are not clickable).
-/// Threaded back to the runtime so a left-click can be mapped to an entry.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ActivityChrome {
-    pub area: Rect,
-    pub hits: Vec<ActivityHit>,
-}
-
 /// Width of the leading `▸`/`▾` marker zone on a folded-run header — clicks in
 /// these leftmost panel columns toggle the fold; clicks past them are body
 /// clicks (expand-only). Covers `" ▸ "` plus one slack cell.
 const RUN_MARKER_ZONE: u16 = 4;
 
-/// Pure hit-test (unit-tested): what does the click at absolute `(col, row)`
-/// mean? `None` when the click is outside the panel, on the title border, or
-/// on a non-request line. Used by the mouse handler.
-pub(crate) fn hit_test_activity(
-    chrome: &ActivityChrome,
+/// What a click at column `col` on an activity target means (unit-tested).
+/// `rect` is where the map recorded the target: a run header splits it into
+/// zones — its first [`RUN_MARKER_ZONE`] cells toggle the fold, the rest
+/// only expands. Used by the mouse handler.
+pub(crate) fn activity_click(
+    rect: Rect,
+    key: ActivityKey,
+    kind: ActivityHitKind,
     col: u16,
-    row: u16,
-) -> Option<ActivityClick> {
-    let area = chrome.area;
-    // Outside the panel rect → not ours.
-    if col < area.x || col >= area.right() || row < area.y || row >= area.bottom() {
-        return None;
-    }
-    let hit = chrome
-        .hits
-        .iter()
-        .find(|hit| row >= hit.y_start && row < hit.y_start.saturating_add(hit.height))?;
-    Some(match hit.kind {
-        ActivityHitKind::InputLine => ActivityClick::OpenInput(hit.key.clone()),
-        ActivityHitKind::RawLine { id } => ActivityClick::OpenRaw(hit.key.clone(), id),
-        ActivityHitKind::Entry => ActivityClick::Entry(hit.key.clone()),
-        ActivityHitKind::RunHeader { .. } if col < area.x.saturating_add(RUN_MARKER_ZONE) => {
-            ActivityClick::RunToggle(hit.key.clone())
+) -> ActivityClick {
+    match kind {
+        ActivityHitKind::InputLine => ActivityClick::OpenInput(key),
+        ActivityHitKind::RawLine { id } => ActivityClick::OpenRaw(key, id),
+        ActivityHitKind::Entry => ActivityClick::Entry(key),
+        ActivityHitKind::RunHeader { .. } if col < rect.x.saturating_add(RUN_MARKER_ZONE) => {
+            ActivityClick::RunToggle(key)
         }
-        ActivityHitKind::RunHeader { .. } => ActivityClick::RunExpand(hit.key.clone()),
-    })
+        ActivityHitKind::RunHeader { .. } => ActivityClick::RunExpand(key),
+    }
+}
+
+/// One activity target: `height` rows from `y`, the panel's full width,
+/// clipped to the panel (`area`) so its border rows and anything past its
+/// edge are never part of it.
+fn activity_target(
+    area: Rect,
+    y: u16,
+    height: u16,
+    key: ActivityKey,
+    kind: ActivityHitKind,
+) -> (Rect, ClickTarget) {
+    (
+        Rect::new(area.x, y, area.width, height).intersection(area),
+        ClickTarget::Activity { key, kind },
+    )
 }
 
 /// Per-frame column widths for the activity rows (Z 2026-07-15 "최대 넓이"):
@@ -9217,7 +9215,7 @@ fn draw_activity(
     view: &DashboardView,
     chrome: &Chrome,
     now: SystemTime,
-) -> ActivityChrome {
+) -> Vec<(Rect, ClickTarget)> {
     let in_flight = &view.in_flight;
     let capacity = area.height.saturating_sub(1) as usize; // top border
 
@@ -9389,7 +9387,7 @@ fn draw_activity(
     // is the only traffic allowed to group; everything else renders 1:1.
     // Scrolling walks RENDER rows (a folded run is one step of history).
     let body_top = area.y.saturating_add(1);
-    let mut hits: Vec<ActivityHit> = Vec::new();
+    let mut hits: Vec<(Rect, ClickTarget)> = Vec::new();
     for row in rows.iter().skip(scroll) {
         if lines.len() >= capacity {
             break;
@@ -9426,14 +9424,10 @@ fn draw_activity(
                 }
                 // Only request rows are clickable (notes have no key).
                 if let Some(key) = entry.activity_key() {
-                    push_raw_line_hit(&mut hits, &key, entry, row_y, height);
-                    push_input_line_hit(&mut hits, &key, entry, row_y, height);
-                    hits.push(ActivityHit {
-                        key,
-                        y_start: row_y,
-                        height,
-                        kind: ActivityHitKind::Entry,
-                    });
+                    let block = ActivityHitKind::Entry;
+                    hits.push(activity_target(area, row_y, height, key.clone(), block));
+                    push_input_line_hit(&mut hits, area, &key, entry, row_y, height);
+                    push_raw_line_hit(&mut hits, area, &key, entry, row_y, height);
                 }
             }
             ActivityRow::Run { start, len } => {
@@ -9458,12 +9452,8 @@ fn draw_activity(
                     view.gradient,
                 ));
                 if let Some(key) = key {
-                    hits.push(ActivityHit {
-                        key,
-                        y_start: row_y,
-                        height: 1,
-                        kind: ActivityHitKind::RunHeader { expanded },
-                    });
+                    let header = ActivityHitKind::RunHeader { expanded };
+                    hits.push(activity_target(area, row_y, 1, key, header));
                 }
                 if expanded {
                     for entry in run {
@@ -9500,14 +9490,11 @@ fn draw_activity(
                             }
                         }
                         if let Some(key) = entry.activity_key() {
-                            push_raw_line_hit(&mut hits, &key, entry, member_y, member_height);
-                            push_input_line_hit(&mut hits, &key, entry, member_y, member_height);
-                            hits.push(ActivityHit {
-                                key,
-                                y_start: member_y,
-                                height: member_height,
-                                kind: ActivityHitKind::Entry,
-                            });
+                            let block = ActivityHitKind::Entry;
+                            let (y, h) = (member_y, member_height);
+                            hits.push(activity_target(area, y, h, key.clone(), block));
+                            push_input_line_hit(&mut hits, area, &key, entry, y, h);
+                            push_raw_line_hit(&mut hits, area, &key, entry, y, h);
                         }
                     }
                 }
@@ -9548,7 +9535,7 @@ fn draw_activity(
             Style::new().bg(OPENAI_ACTIVITY_BG),
         );
     }
-    ActivityChrome { area, hits }
+    hits
 }
 
 const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
@@ -10050,8 +10037,8 @@ fn completed_input_line_offset(entry: &Completed) -> Option<u16> {
 /// Register the one-row `InputLine` hit for `entry`'s `🔍 input` detail line,
 /// but only when that line was actually rendered this frame (the entry is
 /// expanded AND the line was not clipped by the panel's line budget). Pushed
-/// BEFORE the caller's block-level `Entry` hit so `hit_test_activity`'s
-/// first-match resolves this exact row to "open the modal" (UI-6 item 3).
+/// AFTER the caller's block-level `Entry` hit, so it lies on top of the block
+/// in the map and this exact row resolves to "open the modal" (UI-6 item 3).
 /// `row_y` is the entry's main row; detail lines follow it, so the input line
 /// sits at `row_y + 1 + offset`, and `offset + 1 < height` (height counts the
 /// main row plus rendered detail lines) proves it is on screen.
@@ -10059,10 +10046,12 @@ fn completed_input_line_offset(entry: &Completed) -> Option<u16> {
 /// (UI-7), when the entry is expanded AND that line survived the panel's line
 /// budget. The request line is ALWAYS the first detail line (offset 0), so it
 /// sits at `row_y + 1`; `height > 1` proves at least one detail line rendered.
-/// Pushed BEFORE the block-level `Entry` hit so first-match resolves the row
-/// to "open the raw viewer" — same layering as [`push_input_line_hit`].
+/// Pushed AFTER the block-level `Entry` hit (and the input line), so the row
+/// resolves to "open the raw viewer" — same layering as
+/// [`push_input_line_hit`].
 fn push_raw_line_hit(
-    hits: &mut Vec<ActivityHit>,
+    hits: &mut Vec<(Rect, ClickTarget)>,
+    area: Rect,
     key: &ActivityKey,
     entry: &Completed,
     row_y: u16,
@@ -10070,18 +10059,21 @@ fn push_raw_line_hit(
 ) {
     if let CompletedBody::Request { id, .. } = &entry.body {
         if height > 1 {
-            hits.push(ActivityHit {
-                key: key.clone(),
-                y_start: row_y.saturating_add(1),
-                height: 1,
-                kind: ActivityHitKind::RawLine { id: *id },
-            });
+            let kind = ActivityHitKind::RawLine { id: *id };
+            hits.push(activity_target(
+                area,
+                row_y.saturating_add(1),
+                1,
+                key.clone(),
+                kind,
+            ));
         }
     }
 }
 
 fn push_input_line_hit(
-    hits: &mut Vec<ActivityHit>,
+    hits: &mut Vec<(Rect, ClickTarget)>,
+    area: Rect,
     key: &ActivityKey,
     entry: &Completed,
     row_y: u16,
@@ -10089,12 +10081,14 @@ fn push_input_line_hit(
 ) {
     if let Some(offset) = completed_input_line_offset(entry) {
         if offset + 1 < height {
-            hits.push(ActivityHit {
-                key: key.clone(),
-                y_start: row_y.saturating_add(1).saturating_add(offset),
-                height: 1,
-                kind: ActivityHitKind::InputLine,
-            });
+            let y = row_y.saturating_add(1).saturating_add(offset);
+            hits.push(activity_target(
+                area,
+                y,
+                1,
+                key.clone(),
+                ActivityHitKind::InputLine,
+            ));
         }
     }
 }
@@ -12138,6 +12132,28 @@ mod tests {
         let mut map = Hits::new();
         map.extend(targets.iter().cloned());
         map
+    }
+
+    /// What a click at `(col, row)` means if it lands on the activity panel,
+    /// resolved as the mouse handler does: the map's target and its rect.
+    fn activity_at(hits: &Hits, col: u16, row: u16) -> Option<ActivityClick> {
+        match hits.hit(col, row)? {
+            (rect, ClickTarget::Activity { key, kind }) => {
+                Some(activity_click(rect, key.clone(), *kind, col))
+            }
+            _ => None,
+        }
+    }
+
+    /// The activity targets a click reaches this frame, in paint order.
+    fn activity_targets(main: &MainChrome) -> Vec<(Rect, ActivityKey, ActivityHitKind)> {
+        reachable(&main.hits, |t| match t {
+            ClickTarget::Activity { key, kind } => Some((key.clone(), *kind)),
+            _ => None,
+        })
+        .into_iter()
+        .map(|(rect, (key, kind))| (rect, key, kind))
+        .collect()
     }
 
     /// The tab under `(col, row)`, if a tab is what is there.
@@ -16415,27 +16431,30 @@ mod tests {
         assert!(first.contains("POST /v1/messages"));
         // The hit registers on the request line's row (first detail line) and
         // resolves to OpenRaw.
+        let panel = Rect::new(0, 0, 80, 20);
         let mut hits = Vec::new();
-        push_raw_line_hit(&mut hits, &key, &entry, 5, 4);
+        push_raw_line_hit(&mut hits, panel, &key, &entry, 5, 4);
         // The hit carries the entry's activity id so the opener can pin the
         // exact row under a same-ms ActivityKey collision (MUST-FIX).
         let eid = match &entry.body {
             CompletedBody::Request { id, .. } => *id,
             _ => unreachable!("seeded a request"),
         };
-        assert_eq!(hits[0].kind, ActivityHitKind::RawLine { id: eid });
-        assert_eq!((hits[0].y_start, hits[0].height), (6, 1));
-        let chrome = ActivityChrome {
-            area: Rect::new(0, 0, 80, 20),
-            hits,
-        };
         assert_eq!(
-            hit_test_activity(&chrome, 10, 6),
+            hits[0].1,
+            ClickTarget::Activity {
+                key: key.clone(),
+                kind: ActivityHitKind::RawLine { id: eid }
+            }
+        );
+        assert_eq!((hits[0].0.y, hits[0].0.height), (6, 1));
+        assert_eq!(
+            activity_at(&map_of(&hits), 10, 6),
             Some(ActivityClick::OpenRaw(key.clone(), eid))
         );
         // A collapsed entry (height 1: no detail lines rendered) registers none.
         let mut none = Vec::new();
-        push_raw_line_hit(&mut none, &key, &entry, 5, 1);
+        push_raw_line_hit(&mut none, panel, &key, &entry, 5, 1);
         assert!(none.is_empty());
     }
 
@@ -17648,14 +17667,13 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("layout recorded").activity;
-        let input_hit = layout
-            .hits
-            .iter()
-            .find(|h| h.kind == ActivityHitKind::InputLine)
+        let main = hits.expect("layout recorded");
+        let (input_hit, _, _) = activity_targets(&main)
+            .into_iter()
+            .find(|(_, _, kind)| *kind == ActivityHitKind::InputLine)
             .expect("the 🔍 input line is its own hit target");
         assert_eq!(
-            hit_test_activity(&layout, layout.area.x + 8, input_hit.y_start),
+            activity_at(&main.hits, input_hit.x + 8, input_hit.y),
             Some(ActivityClick::OpenInput(key.clone())),
             "clicking the input line opens the modal, never collapses the row"
         );
@@ -18265,7 +18283,7 @@ mod tests {
     }
 
     #[test]
-    fn hit_test_activity_maps_row_to_entry_and_ignores_outside() {
+    fn activity_click_maps_row_to_entry_and_ignores_outside() {
         let area = Rect {
             x: 0,
             y: 10,
@@ -18286,47 +18304,37 @@ mod tests {
         };
         // Entry 1 occupies rows 11..14 (expanded: 3 rows), entry 2 is a
         // folded-run HEADER on row 14.
-        let chrome = ActivityChrome {
-            area,
-            hits: vec![
-                ActivityHit {
-                    key: k1.clone(),
-                    y_start: 11,
-                    height: 3,
-                    kind: ActivityHitKind::Entry,
-                },
-                ActivityHit {
-                    key: k2.clone(),
-                    y_start: 14,
-                    height: 1,
-                    kind: ActivityHitKind::RunHeader { expanded: false },
-                },
-            ],
-        };
+        let chrome = map_of(&[
+            activity_target(area, 11, 3, k1.clone(), ActivityHitKind::Entry),
+            activity_target(
+                area,
+                14,
+                1,
+                k2.clone(),
+                ActivityHitKind::RunHeader { expanded: false },
+            ),
+        ]);
         // Clicks within entry 1's row span (any of 11,12,13) map to k1.
         assert_eq!(
-            hit_test_activity(&chrome, 5, 11),
+            activity_at(&chrome, 5, 11),
             Some(ActivityClick::Entry(k1.clone()))
         );
-        assert_eq!(
-            hit_test_activity(&chrome, 5, 13),
-            Some(ActivityClick::Entry(k1))
-        );
+        assert_eq!(activity_at(&chrome, 5, 13), Some(ActivityClick::Entry(k1)));
         // Run header row 14: the marker zone toggles, the body expands.
         assert_eq!(
-            hit_test_activity(&chrome, RUN_MARKER_ZONE - 1, 14),
+            activity_at(&chrome, RUN_MARKER_ZONE - 1, 14),
             Some(ActivityClick::RunToggle(k2.clone()))
         );
         assert_eq!(
-            hit_test_activity(&chrome, RUN_MARKER_ZONE, 14),
+            activity_at(&chrome, RUN_MARKER_ZONE, 14),
             Some(ActivityClick::RunExpand(k2))
         );
         // The title/border row (y=10) and below the last entry map to nothing.
-        assert_eq!(hit_test_activity(&chrome, 5, 10), None);
-        assert_eq!(hit_test_activity(&chrome, 5, 15), None);
+        assert_eq!(activity_at(&chrome, 5, 10), None);
+        assert_eq!(activity_at(&chrome, 5, 15), None);
         // Outside the panel horizontally / vertically → None.
-        assert_eq!(hit_test_activity(&chrome, 99, 12), None);
-        assert_eq!(hit_test_activity(&chrome, 5, 0), None);
+        assert_eq!(activity_at(&chrome, 99, 12), None);
+        assert_eq!(activity_at(&chrome, 5, 0), None);
     }
 
     fn assert_c2a_tab_strip(
@@ -19654,12 +19662,13 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("activity layout recorded").activity;
-        assert!(!layout.hits.is_empty(), "the request row is a hit target");
-        let hit = &layout.hits[0];
+        let main = hits.expect("activity layout recorded");
+        let targets = activity_targets(&main);
+        assert!(!targets.is_empty(), "the request row is a hit target");
+        let (hit, _, _) = targets[0];
         // A click on the row's first line maps back to the same key.
         assert_eq!(
-            hit_test_activity(&layout, layout.area.x + 1, hit.y_start),
+            activity_at(&main.hits, hit.x + 1, hit.y),
             Some(ActivityClick::Entry(key.clone()))
         );
 
@@ -19691,9 +19700,9 @@ mod tests {
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
             .expect("draw");
-        let layout = hits.expect("layout").activity;
+        let main = hits.expect("layout");
         assert!(
-            layout.hits.is_empty(),
+            activity_targets(&main).is_empty(),
             "a note line is not a clickable hit target"
         );
     }
@@ -20864,19 +20873,17 @@ mod tests {
         // that skips hidden wide-glyph continuation cells by design.
         let buffer = rendered.buffer;
         let hit = hit.unwrap();
-        let openai_hit = hit
-            .hits
-            .iter()
-            .find(|h| {
-                h.key == openai.activity_key().unwrap() && matches!(h.kind, ActivityHitKind::Entry)
-            })
-            .unwrap();
-        for y in 1..openai_hit.y_start + openai_hit.height {
+        let openai_entry = ClickTarget::Activity {
+            key: openai.activity_key().unwrap(),
+            kind: ActivityHitKind::Entry,
+        };
+        let (openai_hit, _) = hit.iter().find(|(_, t)| *t == openai_entry).unwrap();
+        for y in 1..openai_hit.bottom() {
             for x in 0..160 {
                 assert_eq!(buffer[(x, y)].bg, OPENAI_ACTIVITY_BG, "cell ({x},{y})");
             }
         }
-        let anthropic_y = openai_hit.y_start + openai_hit.height;
+        let anthropic_y = openai_hit.bottom();
         assert_eq!(
             buffer[(159, anthropic_y)].bg,
             Color::Reset,
