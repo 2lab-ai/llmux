@@ -44,21 +44,21 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | menu | llmux | the right-click menu covers the clicked row near the bottom; items show no keys | opens above the row when there is no room below, shows each item's key, marks delete as destructive | done |
 | status_bar | fx | the header is cut after `llmux 0.2.26` at 80 columns; the settings bar is cut mid-segment | whole segments drop by importance; settings-bar clicks land on the segment that is drawn | done |
 | status_card | Codex | the account modal prints quota windows as `util 0.123 · eff …` | a bar per window with its reset time | 3 |
-| trend_chart | llmux | series are told apart only by colour; the tokens chart zero-fills days before history | `* + x o` per series without colour, gaps for missing days | 3 |
+| trend_chart | llmux | series are told apart only by colour; the tokens chart zero-fills days before history | `* + x o` per series without colour, gaps for missing days; tokens and perf charts on one renderer | done |
 | working | Codex | the attach screen is static yellow text | a spinner and how long it has been retrying | done |
 | mini_bar | llmux | an empty share bar when the total is zero | `—` when the share cannot be computed | 3 |
 | composer | fx + herdr | add-key and config edits only append or delete at the end | caret moves, mid-value edits, Ctrl+U/Ctrl+Y; the API key stays masked in every render | 3 |
 | text, spinner, gradient_text, osc52 | llmux, Codex | done in PR #231 | — | done |
 | key_hints (main bar), tabs (main row), json_view (highlighter), theme (decolor) | | done in PR #231 | — | done |
-| meter | llmux | the original of the crate's meter | no visible change; moving it re-pins the 179×43 frame digest for every account row | later |
-| packed_grid | llmux | the original, twice (fold and models strip) | one packer and click rects per strip entry; largest digest change | later |
+| meter | llmux | the original of the crate's meter | the same bars (the 179×43 frame digest is unchanged); the cursor row's bar keeps its fill visible; under `t` a stamp beside a state glyph shows its date instead of losing a digit | done |
+| packed_grid | llmux | the original, twice (fold and models strip) | one packer for both; a click on a strip entry opens that model in `stats`; the strip's columns stay put when a model starts or stops running; a fold cut by a short pane ends in `+N more` | done |
 | rule | fx | 28 section rules drawn as block borders | every section heading is a library rule (`── accounts ──`); with `LLMUX_AMBIGUOUS_WIDE=1` the rules draw ASCII `-` and end at the right edge on a terminal that draws `─` two cells wide | done |
 | shimmer | Codex | loading labels are plain text | a band of light passes across `loading…` while it waits (sessions, keys title, raw viewer); plain bold under reduced motion | done |
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
 | agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a narrow account sidebar with a state glyph per account; needs a layout decision first | later |
 | pager selection (copy mode) | herdr | mouse capture blocks the terminal's own selection | `v` releases the mouse for the terminal's selection under a banner (screen held still, `v`/Esc return); a drag in the Logs pager selects and copies through the clipboard/OSC52 path with a status confirmation | done |
-| fact_table | fx | model drill-down facts as free text | figures aligned on the last digit; no problem reported today | later |
+| fact_table | fx | model drill-down facts as free text | figures aligned on the last digit, two columns on a wide pane, `—` for unknown; the misc tab's build/daemon facts too | done |
 | completion_menu | fx | no typed command line | — | not applicable |
 | diff_view | fx | config edits are single values; prompts already show old → new | — | not applicable |
 | approval_card | fx | three fixed choices; llmux gates need two | choice_form covers it | not applicable |

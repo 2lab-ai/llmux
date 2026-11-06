@@ -9,14 +9,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+use twolab_tui::fact_table::{Fact, FactTable};
+use twolab_tui::meter::{Fill, Meter};
+use twolab_tui::packed_grid::{self, GridPlan, PackedGrid};
 use twolab_tui::spinner::SpinnerKind;
 use twolab_tui::text as cells;
+use twolab_tui::trend_chart::{Series, TrendChart};
+use twolab_tui::Level;
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -627,9 +629,11 @@ fn draw_main(
     draw_tabs_tail(frame, tabs_area, header_tail);
     let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
     draw_middle(frame, middle_area, view, &middle);
-    if strip_height > 0 {
-        draw_models_strip(frame, strip_area, view, ctx, now, strip);
-    }
+    let models_strip = if strip_height > 0 {
+        draw_models_strip(frame, strip_area, view, ctx, now, strip)
+    } else {
+        Vec::new()
+    };
     let activity = draw_activity(frame, activity_area, view, chrome, now);
     // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
     // pane above it. With no model strip the activity border resizes the
@@ -673,6 +677,7 @@ fn draw_main(
         tabs,
         separators,
         account_rows,
+        models_strip,
         menu,
         sessions_table: None,
         config_rows: Vec::new(),
@@ -954,7 +959,14 @@ fn draw_stats_overlay(
     ])
     .areas(area);
     if chart_height > 0 {
-        draw_daily_chart(frame, chart_area, view, ctx, chrome.chart_days);
+        draw_daily_chart(
+            frame,
+            chart_area,
+            view,
+            ctx,
+            chrome.chart_days,
+            chart_theme(),
+        );
     }
     let _ = draw_accounts(frame, table_area, view, ctx, chrome);
     // Reserve a compact per-client attribution panel (issue #32) at the bottom
@@ -977,137 +989,116 @@ fn draw_stats_overlay(
 }
 
 /// Height of the Tokens-per-Day chart slice in the Stats overlay (UI-3
-/// U14): border/title + plot rows + x-axis labels + legend line.
+/// U14): title rule + plot rows + x axis + x-axis labels + legend line.
 const DAILY_CHART_HEIGHT: u16 = 13;
 /// Day spans the Tokens-per-Day chart cycles through (`d` in the Stats
 /// overlay — UI-3 U14 period selection).
 pub(crate) const DAILY_CHART_SPANS: [u64; 4] = [7, 14, 30, 90];
-/// Max model lines plotted at once (top by window tokens); more would turn
-/// minimal into noise.
-const DAILY_CHART_SERIES: usize = 4;
-/// Line colors by rank — chosen to stay distinct on dark terminals and to
-/// echo the group hues used elsewhere.
-const DAILY_CHART_COLORS: [Color; DAILY_CHART_SERIES] =
-    [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
 
-/// Tokens-per-Day line chart (UI-3 U14): one braille line per top model over
-/// the selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]),
-/// modern-minimal — no grid, dim axes,
-/// a single legend line with colored dots. Data = the daily fold carried on
-/// the document (history filled by the persisted-request replay).
+/// The theme both trend charts draw with (tokens per day, perf t/s). The
+/// library's series ramp reads `accent`, `wait`, `done`, `fail` by rank, so
+/// this carries the hues the charts always had — magenta, cyan, yellow,
+/// green, distinct on dark terminals. Under `NO_COLOR` the charts draw with
+/// [`twolab_tui::Theme::mono`] instead ([`chart_theme`]), where a glyph at
+/// every sample (`* + x o`, also in the legend) tells the series apart.
+const CHART_THEME: twolab_tui::Theme = twolab_tui::Theme {
+    accent: Color::Magenta,
+    wait: Color::Cyan,
+    done: Color::Yellow,
+    fail: Color::Green,
+    ..KEYBAR_THEME
+};
+
+/// [`CHART_THEME`], or mono under `NO_COLOR` — the frame loop's `decolor`
+/// pass alone would leave four identical lines.
+fn chart_theme() -> twolab_tui::Theme {
+    if super::no_color() {
+        twolab_tui::Theme::mono()
+    } else {
+        CHART_THEME
+    }
+}
+
+/// The one renderer of both trend charts (tokens per day, perf t/s): a top
+/// rule carrying `title`, then the twolab-tui trend chart — braille lines for
+/// the top four series, dim axes with three labels each, gaps where a day has
+/// no data, and a legend that counts the series it leaves out (`+N more`).
+fn draw_trend_chart(frame: &mut Frame, area: Rect, title: &str, chart: &TrendChart) {
+    let inner = section(frame, area, title);
+    frame.render_widget(chart, inner);
+}
+
+/// Tokens-per-Day line chart (UI-3 U14): one line per top model over the
+/// selected trailing span (`d` cycles [`DAILY_CHART_SPANS`]), legend
+/// `model share%` with each model's share of every token in the span. Data =
+/// the daily fold carried on the document (history filled by the
+/// persisted-request replay). A day with no record at all — before history
+/// starts, or while nothing was recorded — is a gap; on a recorded day a
+/// model that served nothing reads 0.
 fn draw_daily_chart(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     chart_days: u64,
+    theme: twolab_tui::Theme,
 ) {
     let chart_days = chart_days.clamp(2, 366);
-    let today = ctx
-        .now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0);
-    let start = today.saturating_sub(chart_days.saturating_sub(1));
-    // Rank models by window total, then build one (x=day-offset, y=tokens)
-    // series per top model, zero-filled across the whole span so a quiet day
-    // reads as a drop to zero, not a gap.
+    let (start, today) = perf_window(ctx.now, chart_days);
     // Bounded on BOTH ends: a future-dated replay row (clock skew) must not
     // index past the series (review R1 MUST-FIX 2).
     let in_span = |r: &&crate::dashboard::DailyUsageDoc| r.day >= start && r.day <= today;
+    let tokens = |r: &crate::dashboard::DailyUsageDoc| {
+        r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation
+    };
+    let days = chart_days as usize;
+    let mut recorded = vec![false; days];
     let mut totals: std::collections::HashMap<(&str, &str), u64> = Default::default();
     for r in view.daily_usage.iter().filter(&in_span) {
+        recorded[(r.day - start) as usize] = true;
         *totals
             .entry((r.group.as_str(), r.model.as_str()))
-            .or_default() += r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation;
+            .or_default() += tokens(r);
     }
+    // Rank models by span total; the chart draws the top four and counts
+    // the rest in its legend.
     let mut ranked: Vec<((&str, &str), u64)> = totals.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(DAILY_CHART_SERIES);
-    if ranked.is_empty() {
-        return;
-    }
     let grand: u64 = ranked.iter().map(|(_, t)| *t).sum::<u64>().max(1);
-    let days = chart_days as usize;
-    let mut series: Vec<Vec<(f64, f64)>> = vec![vec![(0.0, 0.0); days]; ranked.len()];
-    for (s, serie) in series.iter_mut().enumerate() {
-        for (i, point) in serie.iter_mut().enumerate() {
-            point.0 = i as f64;
-        }
-        let _ = s;
-    }
-    let mut y_max = 0f64;
-    for r in view.daily_usage.iter().filter(&in_span) {
-        if let Some(idx) = ranked
-            .iter()
-            .position(|((g, m), _)| *g == r.group && *m == r.model)
-        {
-            let x = (r.day - start) as usize;
-            let y = (r.tokens_in + r.tokens_out + r.cache_read + r.cache_creation) as f64;
-            series[idx][x].1 += y;
-            y_max = y_max.max(series[idx][x].1);
-        }
-    }
-    let y_max = y_max.max(1.0);
-
-    let datasets: Vec<Dataset> = series
+    let rank: std::collections::HashMap<(&str, &str), usize> = ranked
         .iter()
         .enumerate()
-        .map(|(i, data)| {
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::new().fg(DAILY_CHART_COLORS[i]))
-                .data(data)
-        })
+        .map(|(i, (key, _))| (*key, i))
         .collect();
-    let day_label = |d: u64| {
-        let at = UNIX_EPOCH + Duration::from_secs(d * 86_400);
-        let full = format::month_day_hm(at, 0);
-        full.split(' ').next().unwrap_or("").to_string()
-    };
-    let x_axis = Axis::default()
-        .bounds([0.0, (days - 1) as f64])
-        .labels(vec![
-            Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + chart_days / 2), dim()),
-            Span::styled(day_label(today), dim()),
-        ])
-        .style(dim());
-    let y_axis = Axis::default()
-        .bounds([0.0, y_max])
-        .labels(vec![
-            Span::styled("0", dim()),
-            Span::styled(format::human_count((y_max / 2.0) as u64), dim()),
-            Span::styled(format::human_count(y_max as u64), dim()),
-        ])
-        .style(dim());
-    let [plot_area, legend_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let plot_body = section(
-        frame,
-        plot_area,
-        &format!(" tokens per day — last {chart_days}d · d cycles "),
-    );
-    let chart = Chart::new(datasets).x_axis(x_axis).y_axis(y_axis);
-    frame.render_widget(chart, plot_body);
-    // Legend: ● model (share%) — one line, dim separators.
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, ((group, model), total)) in ranked.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
+    let blank: Vec<Option<f64>> = recorded.iter().map(|r| r.then_some(0.0)).collect();
+    let mut points = vec![blank; ranked.len()];
+    for r in view.daily_usage.iter().filter(&in_span) {
+        let i = rank[&(r.group.as_str(), r.model.as_str())];
+        if let Some(y) = points[i][(r.day - start) as usize].as_mut() {
+            *y += tokens(r) as f64;
         }
-        spans.push(Span::styled(
-            "● ".to_string(),
-            Style::new().fg(DAILY_CHART_COLORS[i]),
-        ));
-        spans.push(Span::raw(format!("{} ", abbrev_model(Some(group), model))));
-        spans.push(Span::styled(
-            format!("({:.1}%)", *total as f64 * 100.0 / grand as f64),
-            dim(),
-        ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+    let series = ranked
+        .iter()
+        .zip(points)
+        .map(|(((group, model), total), points)| {
+            Series::new(abbrev_model(Some(group), model), points)
+                .note(format!("{:.1}%", *total as f64 * 100.0 / grand as f64))
+        });
+    let chart = TrendChart::new(series)
+        .x_labels([
+            day_label(start),
+            day_label(start + chart_days / 2),
+            day_label(today),
+        ])
+        .empty("no tokens in this span")
+        .theme(theme);
+    draw_trend_chart(
+        frame,
+        area,
+        &format!(" tokens per day — last {chart_days}d · d cycles "),
+        &chart,
+    );
 }
 
 /// Compact per-client request-attribution table (issue #32): top
@@ -2076,9 +2067,6 @@ fn perf_series_for_day(view: &DashboardView, off: u64, now: SystemTime) -> Vec<P
     rows
 }
 
-/// Colors for the perf chart series (rank order, distinct on dark terminals).
-const PERF_CHART_COLORS: [Color; 4] = [Color::Magenta, Color::Cyan, Color::Yellow, Color::Green];
-
 /// Perf overlay (`p`, perf telemetry v1 — "observed performance"): a daily
 /// e2e tokens/sec chart for the top series, a date × provider health matrix,
 /// and the per-(model, fast) series table. Passive telemetry from real
@@ -2133,7 +2121,7 @@ fn draw_perf_overlay(
     ])
     .areas(area);
     if chart_h > 0 {
-        draw_perf_chart(frame, chart_area, view, ctx, days, &title);
+        draw_perf_chart(frame, chart_area, view, ctx, days, &title, chart_theme());
         draw_perf_health(frame, health_area, view, ctx, days, None);
     } else {
         draw_perf_health(frame, health_area, view, ctx, days, Some(&title));
@@ -2159,9 +2147,11 @@ fn day_label(d: u64) -> String {
     full.split(' ').next().unwrap_or("").to_string()
 }
 
-/// Daily e2e tokens/sec line chart: one braille line per top series over the
-/// span. A day without throughput samples plots 0 (trend view; the tables
-/// stay the honest `—` surface).
+/// Daily e2e tokens/sec line chart: one line per top series over the span,
+/// on the same renderer as the tokens chart ([`draw_trend_chart`]). A day
+/// without throughput samples is a GAP, never a fabricated 0 (contract C5);
+/// a day with fewer than five samples is drawn dim — low traffic is itself a
+/// signal, but must not read as a confident trend point.
 fn draw_perf_chart(
     frame: &mut Frame,
     area: Rect,
@@ -2169,13 +2159,15 @@ fn draw_perf_chart(
     ctx: &FrameCtx,
     days: u64,
     title: &str,
+    theme: twolab_tui::Theme,
 ) {
     let (start, today) = perf_window(ctx.now, days);
     let in_span = |r: &&crate::dashboard::DailyPerfDoc| r.day >= start && r.day <= today;
-    // Rank series by window output; plot the top 4.
-    let ranked = {
-        let mut totals: std::collections::BTreeMap<(&str, &str, Option<bool>), u64> =
-            Default::default();
+    // Rank series by window output; the chart draws the top four and counts
+    // the rest in its legend.
+    type Key<'a> = (&'a str, &'a str, Option<bool>);
+    let ranked: Vec<(Key, u64)> = {
+        let mut totals: std::collections::BTreeMap<Key, u64> = Default::default();
         for r in view.daily_perf.iter().filter(&in_span) {
             *totals
                 .entry((r.group.as_str(), r.model.as_str(), r.fast))
@@ -2183,124 +2175,52 @@ fn draw_perf_chart(
         }
         let mut ranked: Vec<_> = totals.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(PERF_CHART_COLORS.len());
         ranked
     };
-    if ranked.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())));
-        let body = section(frame, area, title);
-        frame.render_widget(empty, body);
-        return;
-    }
-    let span_days = days as usize;
-    // Per-day per-series raw sums → tps points. A day WITHOUT throughput
-    // samples is a GAP, never a fabricated 0 (contract C5): each series is
-    // split into contiguous sampled segments and each segment becomes its
-    // own same-colored dataset, so the line breaks over quiet days.
-    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; span_days]; ranked.len()];
+    // Per-day per-series raw sums (output tokens, e2e ms, samples) → t/s.
+    let mut sums: Vec<Vec<Option<(u64, u64, u64)>>> = vec![vec![None; days as usize]; ranked.len()];
     for r in view.daily_perf.iter().filter(&in_span) {
+        if r.tps_n == 0 {
+            continue;
+        }
         if let Some(idx) = ranked
             .iter()
             .position(|((g, m, f), _)| *g == r.group && *m == r.model && *f == r.fast)
         {
-            let x = (r.day - start) as usize;
-            if r.tps_n > 0 {
-                let slot = sums[idx][x].get_or_insert((0, 0, 0));
-                slot.0 += r.output_tokens;
-                slot.1 += r.e2e_ms;
-                slot.2 += r.tps_n;
-            }
+            let slot = sums[idx][(r.day - start) as usize].get_or_insert((0, 0, 0));
+            slot.0 += r.output_tokens;
+            slot.1 += r.e2e_ms;
+            slot.2 += r.tps_n;
         }
     }
-    // Segments split on BOTH gaps and confidence flips: low-sample (n<5)
-    // stretches render dim so a thin day can't read as a confident trend
-    // point; quiet days stay gaps (never a fabricated 0).
-    let mut y_max = 1f64;
-    // (series rank, low-confidence?, points)
-    type Segment = (usize, bool, Vec<(f64, f64)>);
-    let mut segments: Vec<Segment> = Vec::new();
-    for (idx, day_sums) in sums.iter().enumerate() {
-        let mut current: Vec<(f64, f64)> = Vec::new();
-        let mut current_low = false;
-        for (x, slot) in day_sums.iter().enumerate() {
-            match slot {
-                Some((out, ms, n)) if *ms > 0 => {
-                    let y = *out as f64 * 1000.0 / *ms as f64;
-                    y_max = y_max.max(y);
-                    let low = *n < 5;
-                    if low != current_low && !current.is_empty() {
-                        let last = *current.last().expect("non-empty");
-                        segments.push((idx, current_low, std::mem::take(&mut current)));
-                        // Connect across the flip only INTO the dim segment
-                        // — a low-confidence point must never be repainted
-                        // at full brightness (review MUST-FIX: dim = n<5).
-                        if low {
-                            current.push(last);
-                        }
-                    }
-                    current_low = low;
-                    current.push((x as f64, y));
-                }
-                _ => {
-                    if !current.is_empty() {
-                        segments.push((idx, current_low, std::mem::take(&mut current)));
-                    }
-                }
-            }
-        }
-        if !current.is_empty() {
-            segments.push((idx, current_low, current));
-        }
-    }
-    let datasets: Vec<Dataset> = segments
+    let series = ranked
         .iter()
-        .map(|(idx, low, data)| {
-            let style = if *low {
-                dim()
-            } else {
-                Style::new().fg(PERF_CHART_COLORS[*idx])
-            };
-            Dataset::default()
-                .marker(Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(style)
-                .data(data)
+        .zip(&sums)
+        .map(|(((group, model, fast), _), day_sums)| {
+            let tps = day_sums.iter().map(|slot| match slot {
+                Some((out, ms, _)) if *ms > 0 => Some(*out as f64 * 1000.0 / *ms as f64),
+                _ => None,
+            });
+            let low = day_sums
+                .iter()
+                .map(|slot| slot.is_some_and(|(_, _, n)| n < 5));
+            Series::new(perf_series_label(group, model, *fast), tps).low(low)
+        });
+    let chart = TrendChart::new(series)
+        .x_labels([
+            day_label(start),
+            day_label(start + days / 2),
+            day_label(today),
+        ])
+        .y_unit("e2e t/s")
+        .low_note("dim = n<5")
+        .empty(if ranked.is_empty() {
+            "no requests in this span"
+        } else {
+            "no throughput samples in this span"
         })
-        .collect();
-    let x_axis = Axis::default()
-        .bounds([0.0, (span_days.saturating_sub(1)) as f64])
-        .labels(vec![
-            Span::styled(day_label(start), dim()),
-            Span::styled(day_label(start + days / 2), dim()),
-            Span::styled(day_label(today), dim()),
-        ])
-        .style(dim());
-    let y_axis = Axis::default()
-        .bounds([0.0, y_max])
-        .labels(vec![
-            Span::styled("0", dim()),
-            Span::styled(format!("{:.0}", y_max / 2.0), dim()),
-            Span::styled(format!("{y_max:.0} t/s"), dim()),
-        ])
-        .style(dim());
-    let [plot_area, legend_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let plot_body = section(frame, plot_area, title);
-    let chart = Chart::new(datasets).x_axis(x_axis).y_axis(y_axis);
-    frame.render_widget(chart, plot_body);
-    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, ((group, model, fast), _)) in ranked.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", dim()));
-        }
-        spans.push(Span::styled("● ", Style::new().fg(PERF_CHART_COLORS[i])));
-        spans.push(Span::raw(perf_series_label(group, model, *fast)));
-    }
-    spans.push(Span::styled(
-        "   (e2e t/s · dim = n<5 — estimated post-delta rates in the table below)",
-        dim(),
-    ));
-    frame.render_widget(Paragraph::new(Line::from(spans)), legend_area);
+        .theme(theme);
+    draw_trend_chart(frame, area, title, &chart);
 }
 
 /// Date × provider health matrix: per day and backend group — sample count,
@@ -3028,38 +2948,28 @@ fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
     use twolab_tui::key_hints::KeyHelp;
     frame.render_widget(Clear, area);
-    let bytes = |b: Option<u64>| match b {
-        Some(b) => format!("{}B", format::human_count(b)),
-        None => "—".into(),
-    };
+    let bytes = |b: Option<u64>| b.map(|b| format!("{}B", format::human_count(b)));
     let f = &view.config_facts;
-    let facts = vec![
-        Line::default(),
-        Line::from(Span::styled(" build", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "   llmux {} · daemon pid {} · port {} · up {}",
-            view.display_version(),
-            view.pid,
-            view.port,
-            format::countdown(view.uptime)
-        ))),
-        Line::from(Span::styled(" daemon", dim().add_modifier(Modifier::BOLD))),
-        Line::from(Span::raw(format!(
-            "   config {}",
-            view.config_path.clone().unwrap_or_else(|| "—".into())
-        ))),
-        Line::from(Span::raw(format!(
-            "   accounts {} · raw-io {} ({}) · activity log {}",
-            view.snapshot.accounts.len(),
-            if f.raw_io_enabled { "on" } else { "off" },
-            bytes(f.raw_io_bytes),
-            bytes(f.activity_log_bytes),
-        ))),
-    ];
+    // The build and daemon facts on a fact table: two columns when the pane
+    // holds them — the build on the left, the daemon on the right — figures
+    // right-aligned on their last digit, `—` for a size not measured yet.
+    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+        Fact::new("llmux", view.display_version()),
+        Fact::new("daemon pid", view.pid.to_string()),
+        Fact::new("port", view.port.to_string()),
+        Fact::new("up", format::countdown(view.uptime)),
+        Fact::new("accounts", view.snapshot.accounts.len().to_string()),
+        Fact::new("raw-io", if f.raw_io_enabled { "on" } else { "off" }),
+        Fact::maybe("raw-io store", bytes(f.raw_io_bytes)),
+        Fact::maybe("activity log", bytes(f.activity_log_bytes)),
+    ]);
+    // A path, not a figure: its own row under the table.
+    let config = FactTable::new(KEYBAR_THEME).fact(Fact::maybe("config", view.config_path.clone()));
     let inner = section(frame, area, " misc — keys · build · daemon ");
-    // The facts keep their rows at the bottom; the key grid takes the rest
-    // and, when it does not fit, ends in `… +N more` — never cut silently.
-    let facts_h = (facts.len() as u16).min(inner.height.saturating_sub(2));
+    // The facts keep their rows at the bottom (a blank row, the table, the
+    // config path); the key grid takes the rest and, when it does not fit,
+    // ends in `… +N more` — never cut silently.
+    let facts_h = (facts.height(inner.width) + 2).min(inner.height.saturating_sub(2));
     let help_area = Rect {
         x: inner.x + 1,
         width: inner.width.saturating_sub(1),
@@ -3070,14 +2980,18 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         KeyHelp::new(help_groups(chrome)).theme(KEYBAR_THEME),
         help_area,
     );
-    frame.render_widget(
-        Paragraph::new(facts),
-        Rect {
-            y: help_area.bottom(),
-            height: facts_h,
-            ..inner
-        },
-    );
+    let [_, table_area, config_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(Rect {
+        y: help_area.bottom(),
+        height: facts_h,
+        ..inner
+    });
+    frame.render_widget(&facts, table_area);
+    frame.render_widget(&config, config_area);
 }
 
 /// One editable (or honestly-labeled read-only) config row's action
@@ -6021,17 +5935,26 @@ fn draw_accounts_with(
     let table: Vec<usize> = (0..ctx.order.len())
         .filter(|pos| fold.is_none_or(|f| !f.members.contains(pos)))
         .collect();
+    // The fold block sits directly under the table's rows. It is drawn
+    // first — the rows are its own, the table below never reaches them — so
+    // the title can count the members it could not show.
+    let (fold_hits, fold_hidden) = match fold {
+        Some(fold) => {
+            let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
+            draw_fold(frame, area, top, fold)
+        }
+        None => (Vec::new(), 0),
+    };
     // The title carries the active within-group order (`o` toggles it), so the
     // operator never has to guess why two rows swapped — plus the per-group
     // account counts and, when the pane is shorter than the table, how many
     // accounts it cannot show (never a silent cut): hidden table rows, then
-    // the folded accounts on the fold lines below the pane's edge.
+    // the folded accounts the block could not show.
     let title = if snapshot.accounts.is_empty() {
         format!(" accounts · sort {} ", chrome.account_sort.label())
     } else {
         let lines = usize::from(area.height.saturating_sub(2));
-        let hidden = table.len().saturating_sub(lines)
-            + fold.map_or(0, |f| f.hidden(lines.saturating_sub(table.len())));
+        let hidden = table.len().saturating_sub(lines) + fold_hidden;
         accounts_title(
             chrome.account_sort.label(),
             view,
@@ -6144,10 +6067,7 @@ fn draw_accounts_with(
             display_idx: pos,
         })
         .collect();
-    if let Some(fold) = fold {
-        let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
-        hits.extend(draw_fold(frame, area, top, fold));
-    }
+    hits.extend(fold_hits);
     hits
 }
 
@@ -6327,9 +6247,6 @@ fn account_row(parts: RowParts, bar_width: usize) -> Row<'static> {
     Row::new(cells)
 }
 
-/// Blank cells between two fold entries on one line.
-const FOLD_ENTRY_GAP: usize = 3;
-
 /// What MAIN's fold (`z`) does this frame — decided in [`draw_main`] and
 /// stated in the accounts title, so the toggle never claims a fold that did
 /// not happen.
@@ -6391,16 +6308,15 @@ struct FoldPlan {
     /// Display positions (`ctx.order` indices) of the folded accounts, in
     /// table order.
     members: Vec<usize>,
-    /// One entry per member, in table order: its table cells as fields.
-    entries: Vec<Vec<FoldField>>,
-    /// Index into `members` of the account under the cursor, if folded.
-    cursor: Option<usize>,
+    /// The block: one entry per member, in table order — its table cells as
+    /// fields under a dim header word each — packed by twolab-tui's
+    /// [`PackedGrid`], the entry under the cursor selected.
+    grid: PackedGrid<'static>,
     /// The status text every member shares, shown once in the accounts
     /// title; `None` = the statuses differ, each entry has its own field.
     shared_status: Option<String>,
-    /// Entries per line, and each entry column's field widths.
+    /// Entries per line.
     per_line: usize,
-    columns: Vec<Vec<usize>>,
 }
 
 impl FoldPlan {
@@ -6409,38 +6325,14 @@ impl FoldPlan {
     fn lines(&self) -> usize {
         1 + self.members.len().div_ceil(self.per_line)
     }
-
-    /// Members the block cannot show when only its first `lines` lines fit
-    /// the pane.
-    fn hidden(&self, lines: usize) -> usize {
-        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
-        self.members.len().saturating_sub(shown)
-    }
 }
 
-/// One field of a fold entry: the header word over it, its alignment and
-/// the table cell's text.
-struct FoldField {
-    header: &'static str,
-    right: bool,
-    spans: Vec<Span<'static>>,
-    /// The widest form a clock tick can give this field ([`FoldBounds`]);
-    /// 0 for a field only a poll or an event can change.
-    min: usize,
-}
-
-impl FoldField {
-    /// Cells the field's column must hold for this entry: the live text,
-    /// or its widest clock-driven form when that is wider — so a value
-    /// past that form (a 100-day countdown) widens the column, never cut.
-    fn width(&self) -> usize {
-        self.spans
-            .iter()
-            .map(Span::width)
-            .sum::<usize>()
-            .max(self.min)
-    }
-}
+/// One field of a fold entry: the header word over it, and the table
+/// cell's text as a grid field — right-aligned for the numbers, with the
+/// widest form a clock tick can give it ([`FoldBounds`]; 0 for a field only
+/// a poll or an event can change) as its `widest`, so a value past that
+/// form (a 100-day countdown) widens the column, never cut.
+type FoldField = (&'static str, packed_grid::Field<'static>);
 
 /// The widest form of each fold field the clock alone can change (rule B:
 /// a tick never moves the fold), formatted by the same code as the live
@@ -6464,34 +6356,34 @@ impl FoldBounds {
             WindowDisplayState::Stale,
             WindowDisplayState::PollDegraded,
         ];
-        let bar = |text: String, marker: Option<char>| GaugeParts::Bar {
-            fill: 1.0,
-            color: Color::Reset,
-            text,
-            bold_chars: 0,
-            over: true,
-            marker,
-        };
+        let mode = crate::config::QuotaDisplay::Remaining;
         let cells = |spans: Vec<Span<'static>>| spans.iter().map(Span::width).sum::<usize>();
+        let bar = |span: Duration, state: WindowDisplayState| {
+            let window = QuotaWindow {
+                utilization: 0.0,
+                resets_at: now + span,
+                fetched_at: now,
+                source: crate::scheduler::window::WindowSource::Headers,
+            };
+            let (meter, marker) = quota_meter(&window, 0.0, now, state, mode, reset_absolute);
+            GaugeParts::Bar {
+                meter: meter.over(true),
+                marker,
+            }
+        };
         let reset = BOUND_SPANS
             .into_iter()
-            .flat_map(|span| {
-                let window = QuotaWindow {
-                    utilization: 1.0,
-                    resets_at: now + span,
-                    fetched_at: now,
-                    source: crate::scheduler::window::WindowSource::Headers,
-                };
-                glyphs.map(|state| {
-                    let (text, _, _) = quota_bar_text(&window, now, state, reset_absolute);
-                    cells(bar(text, Some(state.glyph())).text_fields().0)
-                })
-            })
+            .flat_map(|span| glyphs.map(|state| cells(bar(span, state).text_fields().0)))
             .max()
             .unwrap_or(0);
         Self {
             reset,
-            percent: cells(bar(String::new(), None).text_fields().1),
+            // A full fill and the `!`: `100%!`.
+            percent: cells(
+                bar(Duration::ZERO, WindowDisplayState::Populated)
+                    .text_fields()
+                    .1,
+            ),
         }
     }
 }
@@ -6501,15 +6393,13 @@ impl FoldBounds {
 /// colors kept, only the fill bar goes), and the status field is left out
 /// when the label column shows the status every member shares.
 fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<FoldField> {
-    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| FoldField {
-        header,
-        right,
-        spans,
-        min: 0,
+    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| {
+        let field = packed_grid::Field::new(spans);
+        (header, if right { field.right() } else { field })
     };
-    let bounded = |mut field: FoldField, min: usize| {
-        field.min = min;
-        field
+    let bounded = |(header, mut field): FoldField, min: usize| {
+        field.widest = min;
+        (header, field)
     };
     // Only a drawn gauge has a countdown that ticks; a bare state (`○ cold`,
     // `-`) changes on a poll.
@@ -6543,41 +6433,6 @@ fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<F
         fields.push(field("tok", false, vec![Span::raw(tokens)]));
     }
     fields
-}
-
-/// Field widths per entry column when `per_line` entries share a line:
-/// column `c` holds entries `c`, `c + per_line`, …, and each of its fields
-/// is as wide as its widest entry or its header.
-fn fold_columns(widths: &[Vec<usize>], headers: &[usize], per_line: usize) -> Vec<Vec<usize>> {
-    (0..per_line)
-        .map(|c| {
-            headers
-                .iter()
-                .enumerate()
-                .map(|(f, &header)| {
-                    widths
-                        .iter()
-                        .skip(c)
-                        .step_by(per_line)
-                        .map(|w| w[f])
-                        .max()
-                        .unwrap_or(0)
-                        .max(header)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Width of one entry: its fields and the one-cell gap between each pair.
-fn fold_entry_width(column: &[usize]) -> usize {
-    column.iter().sum::<usize>() + column.len().saturating_sub(1)
-}
-
-/// Width of a full fold line: the entries and the gaps between them.
-fn fold_line_width(columns: &[Vec<usize>]) -> usize {
-    columns.iter().map(|c| fold_entry_width(c)).sum::<usize>()
-        + FOLD_ENTRY_GAP * columns.len().saturating_sub(1)
 }
 
 /// The fold for this frame ([`Fold`]), planned with the table's own
@@ -6654,18 +6509,18 @@ fn fold_plan(
             fold_fields(parts, shared_status.is_none(), &bounds)
         })
         .collect();
-    let widths: Vec<Vec<usize>> = entries
-        .iter()
-        .map(|entry| entry.iter().map(FoldField::width).collect())
-        .collect();
-    let headers: Vec<usize> = entries[0]
-        .iter()
-        .map(|f| Line::from(f.header).width())
-        .collect();
-    let Some((per_line, columns)) = (1..=members.len()).rev().find_map(|per_line| {
-        let columns = fold_columns(&widths, &headers, per_line);
-        (fold_line_width(&columns) <= usize::from(width)).then_some((per_line, columns))
-    }) else {
+    let headers: Vec<&'static str> = entries[0].iter().map(|(header, _)| *header).collect();
+    // The cursor's entry is drawn the way the table draws the row under
+    // the cursor: reverse video (the theme's `selected`).
+    let grid = PackedGrid::new(
+        entries
+            .into_iter()
+            .map(|entry| entry.into_iter().map(|(_, field)| field).collect()),
+    )
+    .headers(headers)
+    .cursor(members.iter().position(|&pos| selected == Some(pos)))
+    .theme(KEYBAR_THEME);
+    let Some(GridPlan { per_line, .. }) = grid.plan(width) else {
         return Fold::TooNarrow;
     };
     // The fold never makes the pane taller (rule A): its header line plus
@@ -6674,115 +6529,43 @@ fn fold_plan(
         return Fold::SavesNoRow;
     }
     Fold::Applied(FoldPlan {
-        cursor: members.iter().position(|&pos| selected == Some(pos)),
         members,
-        entries,
+        grid,
         shared_status,
         per_line,
-        columns,
     })
 }
 
-/// Lay one entry's (or the header's) fields out at the column widths, a
-/// one-cell gap between fields; `reversed` paints the whole entry the way
-/// the table paints the row under the cursor.
-fn fold_cells(
-    fields: impl Iterator<Item = (Vec<Span<'static>>, bool)>,
-    widths: &[usize],
-    reversed: bool,
-) -> Vec<Span<'static>> {
-    let paint = |style: Style| {
-        if reversed {
-            style.add_modifier(Modifier::REVERSED)
-        } else {
-            style
-        }
+/// Draw the fold block from row `top` down, from the table's left column,
+/// and return a click target per drawn entry, mapped to its account's
+/// display position, and how many members it could not show. When the
+/// pane is too short for every line the block's last line says `+N more`
+/// (the accounts title counts them too); with no row left at all, every
+/// member is hidden.
+fn draw_fold(
+    frame: &mut Frame,
+    area: Rect,
+    top: u16,
+    fold: &FoldPlan,
+) -> (Vec<AccountRowHit>, usize) {
+    let block = Rect {
+        y: top,
+        height: area.bottom().saturating_sub(top),
+        ..area
     };
-    let blank = |n: usize| Span::styled(" ".repeat(n), paint(Style::new()));
-    let mut out = Vec::new();
-    for (f, ((spans, right), &width)) in fields.zip(widths).enumerate() {
-        if f > 0 {
-            out.push(blank(1));
-        }
-        let fill = width.saturating_sub(spans.iter().map(Span::width).sum());
-        if right && fill > 0 {
-            out.push(blank(fill));
-        }
-        out.extend(
-            spans
-                .into_iter()
-                .map(|span| Span::styled(span.content, paint(span.style))),
-        );
-        if !right && fill > 0 {
-            out.push(blank(fill));
-        }
+    if block.is_empty() {
+        return (Vec::new(), fold.members.len());
     }
-    out
-}
-
-/// Draw the fold block from row `top` down, from the table's left column
-/// (lines past the pane's bottom are cut, and counted in its title), and
-/// return a click target per visible entry, mapped to its account's display
-/// position.
-fn draw_fold(frame: &mut Frame, area: Rect, top: u16, fold: &FoldPlan) -> Vec<AccountRowHit> {
-    let gap = || Span::raw(" ".repeat(FOLD_ENTRY_GAP));
-    // Line 0: the dim field header over every entry column.
-    let mut header = Vec::new();
-    for (c, widths) in fold.columns.iter().enumerate() {
-        if c > 0 {
-            header.push(gap());
-        }
-        let fields = fold.entries[0]
-            .iter()
-            .map(|f| (vec![Span::styled(f.header, dim())], f.right));
-        header.extend(fold_cells(fields, widths, false));
-    }
-    let mut lines = vec![(Line::from(header), Vec::new())];
-    for (i, chunk) in fold.entries.chunks(fold.per_line).enumerate() {
-        let mut spans = Vec::new();
-        let mut x = 0;
-        let mut targets = Vec::new();
-        for (c, entry) in chunk.iter().enumerate() {
-            if c > 0 {
-                spans.push(gap());
-                x += FOLD_ENTRY_GAP;
-            }
-            let member = i * fold.per_line + c;
-            let fields = entry.iter().map(|f| (f.spans.clone(), f.right));
-            spans.extend(fold_cells(
-                fields,
-                &fold.columns[c],
-                fold.cursor == Some(member),
-            ));
-            let width = fold_entry_width(&fold.columns[c]);
-            targets.push((x, width, fold.members[member]));
-            x += width;
-        }
-        lines.push((Line::from(spans), targets));
-    }
-    let mut hits = Vec::new();
-    for (i, (line, targets)) in lines.into_iter().enumerate() {
-        let y = top.saturating_add(i as u16);
-        if y >= area.bottom() {
-            break;
-        }
-        let row = Rect {
-            y,
-            height: 1,
-            ..area
-        };
-        frame.render_widget(Paragraph::new(line), row);
-        hits.extend(targets.into_iter().map(|(x, width, pos)| AccountRowHit {
-            area: Rect {
-                x: area.x.saturating_add(x as u16),
-                y,
-                width: width as u16,
-                height: 1,
-            },
-            display_idx: pos,
-        }));
-    }
-    hits
+    let drawn = fold.grid.render_layout(block, frame.buffer_mut());
+    let hits = drawn
+        .hits
+        .iter()
+        .map(|hit| AccountRowHit {
+            area: hit.rect,
+            display_idx: fold.members[hit.index],
+        })
+        .collect();
+    (hits, drawn.hidden)
 }
 
 /// Status column: active (green) / ready (default) / the concrete blocking
@@ -6873,153 +6656,84 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     }
 }
 
-/// Build one in-bar quota line: a `width`-column bar whose leading
-/// `fill`-fraction of columns render REVERSE-video in `color` (the fill), with
-/// `text` overlaid centered on top. The first `bold_chars` characters of
-/// `text` (the larger countdown unit) are emboldened. Spans are split at the
-/// fill boundary so the fill shows behind the text — a single-style span
-/// could not paint a partial background. The text stands alone — no label
-/// in front of the countdown (owner 2026-11-04: the `rst ` prefix is gone;
-/// the header's `RESET` names the time). Only spaces + the caller's text are
-/// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
-/// `anim.rs` is untouched.
+/// One quota window as a twolab-tui [`Meter`]: `used` of the window gone,
+/// filled by what is used or what is left (`quota_display`, the `u` toggle),
+/// coloured by the FR6 bands on the USED share whichever way it fills
+/// (green below 70 %, yellow to 90 %, red above), the reset inside the bar —
+/// the top-2-unit countdown (`7d 10h`, the first unit bold) or, under `t`,
+/// the UTC stamp `MM/DD HH:MM` (the date bold); an expired window reads `0s`
+/// in both — and the display-state glyph (issue #33: `○` cold, `◑` stale,
+/// `!` poll-degraded) pinned to the bar's last cell when the value is not
+/// fresh, so the centred time never moves when it comes and goes (Z
+/// 2026-07-15). No label in front of the countdown (owner 2026-11-04: the
+/// `rst ` prefix is gone; the header's `RESET` names the time). The meter
+/// places the text by grapheme and measures it in cells; it draws only
+/// spaces, the text and the glyph, no bar glyphs.
 ///
-/// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
-/// the FIXED last bar column, independent of the centered `text`, so the
-/// time never shifts when the marker appears or disappears (Z 2026-07-15).
-/// A text long enough to reach that column loses its last char to the
-/// marker — the marker is the rarer, higher-signal fact.
-fn quota_bar_line(
-    fill: f64,
-    color: Color,
-    text: &str,
-    bold_chars: usize,
-    width: usize,
-    marker: Option<char>,
-) -> Line<'static> {
-    let fill_cols = ((fill.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    let chars: Vec<char> = text.chars().collect();
-    let text_len = chars.len().min(width);
-    let start = (width - text_len) / 2;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut run_style: Option<Style> = None;
-    for col in 0..width {
-        let ch = if marker.is_some() && col == width.saturating_sub(1) {
-            marker.unwrap_or(' ')
-        } else if col >= start && col < start + text_len {
-            chars[col - start]
-        } else {
-            ' '
-        };
-        let mut style = Style::new().fg(color);
-        if col < fill_cols {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        if col >= start && col < start + bold_chars.min(text_len) {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if run_style == Some(style) {
-            run.push(ch);
-        } else {
-            if let Some(prev) = run_style {
-                spans.push(Span::styled(std::mem::take(&mut run), prev));
-            }
-            run.push(ch);
-            run_style = Some(style);
-        }
-    }
-    if let Some(prev) = run_style {
-        spans.push(Span::styled(run, prev));
-    }
-    Line::from(spans)
-}
-
-/// The text overlaid inside a quota bar: the top-2-unit reset countdown
-/// (`7d 10h`), plus the window display-state glyph when the value is not
-/// fresh (issue #33) — returned SEPARATELY so the renderer can pin it to a
-/// fixed trailing column instead of appending it to the centered time (the
-/// append shifted the time sideways whenever the glyph came and went — Z
-/// 2026-07-15 "가운데 시간 표시 위치 고정"). The parked/over `!` is NOT here —
-/// it rides the percent label to the right of the bar, where it always
-/// lived. Returns `(text, bold_chars, marker)` where `bold_chars` covers the
-/// FIRST countdown unit — the day/hour magnitude carries most of the signal,
-/// so it gets the emphasis. An expired window (no live reset) reads `0s` —
-/// honest and ASCII-narrow.
-fn quota_bar_text(
+/// Returns the glyph too: the meter keeps its own private, and the fold's
+/// text form writes it after the reset.
+fn quota_meter(
     window: &QuotaWindow,
+    used: f64,
     now: SystemTime,
     display: WindowDisplayState,
+    mode: crate::config::QuotaDisplay,
     absolute: bool,
-) -> (String, usize, Option<char>) {
-    let live = window
-        .resets_at
-        .duration_since(now)
-        .ok()
-        .filter(|rem| !rem.is_zero());
-    let (text, bold_chars) = match (absolute, live) {
-        // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
-        (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
-        (false, Some(rem)) => {
-            let (head, tail) = format::countdown_units(rem);
-            let bold = head.chars().count();
-            let mut text = head;
-            if let Some(tail) = tail {
-                text.push(' ');
-                text.push_str(&tail);
-            }
-            (text, bold)
-        }
-        // Expired window: no live reset to point at in either mode.
-        (_, None) => ("0s".to_string(), 2),
+) -> (Meter, Option<char>) {
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => Fill::Used,
+        crate::config::QuotaDisplay::Remaining => Fill::Left,
+    };
+    let meter = Meter::new(used)
+        .thresholds(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT)
+        .fill(fill)
+        .theme(KEYBAR_THEME);
+    let meter = if absolute {
+        meter.resets_at(window.resets_at, now, 0)
+    } else {
+        meter.resets_in(window.resets_at.duration_since(now).unwrap_or_default())
     };
     let marker = (!matches!(display, WindowDisplayState::Populated)).then(|| display.glyph());
-    (text, bold_chars, marker)
+    let meter = match marker {
+        Some(glyph) => meter.marker(glyph),
+        None => meter,
+    };
+    (meter, marker)
 }
 
-/// Assemble one full quota gauge cell line: the countdown bar
-/// ([`quota_bar_line`], `bar_width` cols) + a space + the right-aligned
-/// percent label (`QUOTA_LABEL_WIDTH` cols, `!`-marked when parked/over) —
-/// `bar_width + 1 + QUOTA_LABEL_WIDTH` columns total (`QUOTA_CELL_WIDTH` is the
-/// minimum, when the terminal has no leftover width to pour into the bar). The
-/// label is the percent of the
-/// FILL fraction, so number and bar always say the same thing: in the default
-/// `remaining` mode a fresh account reads a full green bar + `100%` and
-/// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
-/// past threshold) stays keyed on USED utilization either way, as do the
-/// color bands.
-#[allow(clippy::too_many_arguments)]
-fn quota_cell_line(
-    fill: f64,
-    color: Color,
-    bar_text: &str,
-    bold_chars: usize,
-    over: bool,
-    bar_width: usize,
-    marker: Option<char>,
-) -> Line<'static> {
-    let mut label = format::percent(fill);
-    if over {
-        label.push('!');
+/// One full quota gauge cell: the meter's bar in `bar_width` cells, a space,
+/// and its percent label right-aligned in `QUOTA_LABEL_WIDTH` cells (`!` when
+/// parked or over) — `bar_width + 1 + QUOTA_LABEL_WIDTH` cells, at least
+/// `QUOTA_CELL_WIDTH`. The label is the percent of the FILL, so number and
+/// bar always say the same thing: in the default `remaining` mode a fresh
+/// account reads a full green bar and `100%` and drains toward `0%`.
+///
+/// [`Meter::line`] draws it whenever the bar holds its widest text; in the
+/// one case it does not — the 11-cell bar with the absolute stamp and a
+/// display-state glyph, where the meter would give up the label — the bar
+/// is drawn alone (the stamp falls back to its bold date) and the label is
+/// put back beside it, so the percent never disappears.
+fn quota_cell_line(meter: &Meter, bar_width: usize) -> Line<'static> {
+    let width = bar_width + 1 + QUOTA_LABEL_WIDTH;
+    if usize::from(meter.full_width()) <= width {
+        return meter.line(width as u16);
     }
-    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width, marker);
+    let mut line = meter.clone().label(false).line(bar_width as u16);
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
-        format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
-        Style::new().fg(color),
+        cells::pad(&meter.label_text(), QUOTA_LABEL_WIDTH, cells::Align::Right),
+        KEYBAR_THEME.level(meter.current_level()),
     ));
     line
 }
 
-/// One quota window → its gauge cell: the WHOLE cell is one bar whose
-/// reverse-video fill is the utilization (fill direction per `quota_display`:
-/// `used` grows as quota burns, `remaining` drains toward the reset), with the
-/// reset countdown overlaid inside ([`quota_bar_text`]). This supersedes req4
-/// ("the gauge label is ALWAYS the percentage"): that rule existed because the
-/// countdown once REPLACED the percent label — now both facts render at once
-/// (fill + color carry utilization, the in-bar text carries the reset), so
-/// neither hides the other. Color bands stay keyed on USED utilization
-/// regardless of the fill direction.
+/// One quota window → its gauge: the WHOLE cell is one bar whose
+/// reverse-video fill is the utilization, with the reset inside
+/// ([`quota_meter`]). This supersedes req4 ("the gauge label is ALWAYS the
+/// percentage"): that rule existed because the countdown once REPLACED the
+/// percent label — now both facts render at once (fill + color carry
+/// utilization, the in-bar text carries the reset), so neither hides the
+/// other.
 ///
 /// Issue #33: the cell still carries the [`WindowDisplayState`] so a
 /// never-used (`cold`), stale, or poll-degraded window is visibly distinct
@@ -7048,38 +6762,18 @@ fn window_gauge_parts(
         ));
     };
     let utilization = window.effective_utilization(now);
-    let color = level_color(format::gauge_level(utilization));
+    let (meter, marker) = quota_meter(window, utilization, now, display, mode, reset_absolute);
     // The `!` flags an account that is parked or past its threshold — carried
     // on the percent label, where it always lived.
-    let over = parked || utilization > threshold;
-    let fill = match mode {
-        crate::config::QuotaDisplay::Used => utilization,
-        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-    };
-    let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
-    GaugeParts::Bar {
-        fill,
-        color,
-        text,
-        bold_chars,
-        over,
-        marker,
-    }
+    let meter = meter.over(parked || utilization > threshold);
+    GaugeParts::Bar { meter, marker }
 }
 
 /// A quota gauge's content before it is drawn: a bare state text
-/// (`○ cold`, `-`), or a fill with its reset text, display-state marker and
-/// `!`-marked percent label.
+/// (`○ cold`, `-`), or a meter and its display-state glyph.
 enum GaugeParts {
     Bare(Span<'static>),
-    Bar {
-        fill: f64,
-        color: Color,
-        text: String,
-        bold_chars: usize,
-        over: bool,
-        marker: Option<char>,
-    },
+    Bar { meter: Meter, marker: Option<char> },
 }
 
 impl GaugeParts {
@@ -7087,16 +6781,7 @@ impl GaugeParts {
     fn cell(self, bar_width: usize) -> Cell<'static> {
         match self {
             GaugeParts::Bare(span) => Cell::from(span),
-            GaugeParts::Bar {
-                fill,
-                color,
-                text,
-                bold_chars,
-                over,
-                marker,
-            } => Cell::from(quota_cell_line(
-                fill, color, &text, bold_chars, over, bar_width, marker,
-            )),
+            GaugeParts::Bar { meter, .. } => Cell::from(quota_cell_line(&meter, bar_width)),
         }
     }
 
@@ -7107,43 +6792,35 @@ impl GaugeParts {
     fn text_fields(&self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         match self {
             GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
-            GaugeParts::Bar {
-                fill,
-                color,
-                text,
-                bold_chars,
-                over,
-                marker,
-            } => {
-                let style = Style::new().fg(*color);
-                let head: String = text.chars().take(*bold_chars).collect();
-                let tail: String = text.chars().skip(*bold_chars).collect();
-                let mut reset = vec![Span::styled(head, style.add_modifier(Modifier::BOLD))];
+            GaugeParts::Bar { meter, marker } => {
+                let style = KEYBAR_THEME.level(meter.current_level());
+                let (text, bold) = meter.bar_text();
+                let (head, _) = cells::take_cells(&text, bold);
+                let tail = &text[head.len()..];
+                let mut reset = vec![Span::styled(
+                    head.to_string(),
+                    style.add_modifier(Modifier::BOLD),
+                )];
                 if !tail.is_empty() {
-                    reset.push(Span::styled(tail, style));
+                    reset.push(Span::styled(tail.to_string(), style));
                 }
                 reset.extend(marker.map(|m| Span::styled(format!(" {m}"), style)));
-                let mut label = format::percent(*fill);
-                if *over {
-                    label.push('!');
-                }
-                (reset, vec![Span::styled(label, style)])
+                (reset, vec![Span::styled(meter.label_text(), style)])
             }
         }
     }
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
-/// following the same pattern as [`window_cells`] but as a single cell (no
-/// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
-/// critical coloring:
+/// following the same pattern as [`window_gauge_parts`] but as a single cell
+/// (no paired reset column — W0 keeps the Fbl slot light) and with
+/// scope-aware critical coloring:
 ///
-/// - Present window: the same in-bar countdown gauge as the 7d window
-///   ([`quota_bar_line`]) at EVERY width (.prd/18 rule 3 — the compact narrow
+/// - Present window: the same in-bar countdown meter as the 7d window
+///   ([`quota_meter`]) at EVERY width (.prd/18 rule 3 — the compact narrow
 ///   `F 22h!` marker is gone; the Fbl gauge never gives way, the `status` and
-///   `account` columns absorb a tight width instead). Colored by fill level through
-///   the SAME [`format::gauge_level`] / [`level_color`] palette, EXCEPT the
-///   scope's own signal wins —
+///   `account` columns absorb a tight width instead). Colored by the SAME
+///   70 % / 90 % bands, EXCEPT the scope's own signal wins —
 ///   a *constraining* Fable limit reads red regardless of the raw percent (the
 ///   limit is engaged upstream even if the number looks calm). "Constraining"
 ///   is [`ScopedQuotaWindow::is_constraining`], so the red is **reset-aware**:
@@ -7184,44 +6861,37 @@ fn fable_gauge_parts(
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
     let Some(scoped) = scoped else {
-        // Cold / absent: mirror the `window_cells` absent branch — the glyph +
-        // label — so a never-seen Fable window reads distinctly from an honest
-        // 0%.
+        // Cold / absent: mirror the 7d absent branch — the glyph + label — so
+        // a never-seen Fable window reads distinctly from an honest 0%.
         return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
     };
     let utilization = scoped.window.effective_utilization(now);
+    let (mut meter, marker) = quota_meter(
+        &scoped.window,
+        utilization,
+        now,
+        display,
+        mode,
+        reset_absolute,
+    );
     // Scope signal wins: a *constraining* Fable limit is red no matter the
     // percent — but `is_constraining` is reset-aware (it short-circuits on an
     // expired/reset window), so a stale-`Critical` severity no longer paints a
     // just-reset 0% window red. `is_active` is NOT a red trigger either — it
-    // marks the representative limit, not an exhausted one. Otherwise fall to
-    // the fill band.
-    let critical = scoped.is_constraining(now, fable_max);
-    let level = if critical {
-        GaugeLevel::Red
-    } else {
-        format::gauge_level(utilization)
-    };
-    let color = level_color(level);
-    // `!` on the red-critical read, same signal window_cells carries with its
+    // marks the representative limit, not an exhausted one. Otherwise the
+    // fill band decides. The critical override only changes the color/`!`,
+    // never the fill math.
+    if scoped.is_constraining(now, fable_max) {
+        meter = meter.level(Level::Crit);
+    }
+    // `!` on the red read, the same signal the 7d gauge carries with its
     // over-threshold `!`.
-    let over = matches!(level, GaugeLevel::Red);
-    // Same in-bar countdown gauge as the 7d cell, at every width; the critical
-    // override only changes the color/`!`, never the fill math.
-    let fill = match mode {
-        crate::config::QuotaDisplay::Used => utilization,
-        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-    };
-    let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+    let red = meter.current_level() == Level::Crit;
     GaugeParts::Bar {
-        fill,
-        color,
-        text,
-        bold_chars,
-        over,
+        meter: meter.over(red),
         marker,
     }
 }
@@ -8890,6 +8560,9 @@ pub(crate) struct MainChrome {
     pub tabs: Vec<TabHit>,
     pub separators: Vec<SeparatorHit>,
     pub account_rows: Vec<AccountRowHit>,
+    /// The models strip's click targets this frame: one per drawn model
+    /// (packed entry or table row), `index` into `model_usage`.
+    pub models_strip: Vec<packed_grid::GridHit>,
     pub menu: Option<twolab_tui::menu::MenuLayout>,
     pub settings: Vec<SettingHit>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
@@ -10508,17 +10181,14 @@ fn model_label_spans(
     (group, name)
 }
 
-/// Fields of one packed models-strip entry: marker · group · model · share ·
-/// req · tok · $ · last.
-const STRIP_FIELDS: usize = 8;
-/// Spaces between two packed entries on one line.
-const STRIP_ENTRY_GAP: usize = 3;
+/// Cells the packed strip keeps left of its grid: the breathing room the
+/// marker's leading space gives the table's marker column. In the grid the
+/// marker is its glyph alone, one cell in every entry column, so the packer
+/// measures every column alike and the first entry still sits one cell in.
+const STRIP_MARGIN: u16 = 1;
 /// The dim column legend a packed strip carries in its border fill (the
 /// packed layout has no header row).
 const STRIP_LEGEND: &str = " group · model · share · req · tok · $ · last ";
-
-/// Display width of each [`STRIP_FIELDS`] field of one entry.
-type StripWidths = [usize; STRIP_FIELDS];
 
 /// The models strip's plan for one frame, decided once in [`draw_main`]:
 /// `per_line >= 2` packs that many entries per line under a one-row title
@@ -10542,88 +10212,84 @@ fn strip_last(m: &ModelUsageDoc, now: SystemTime) -> String {
     }
 }
 
-/// Widest `last` cell, for the packing decision: `N in-flight` with N at
-/// its type's widest (`ModelUsageDoc::in_flight` is a u32) — wider than any
-/// age (`compact_duration`, 6–7 cells), `now` or `—`. Rendering aligns on
-/// the live text; only the decision uses this, so the strip's height does
-/// not change when a model starts or stops running or its age ticks.
-fn strip_last_bound() -> usize {
-    format!("{} in-flight", u32::MAX).chars().count()
+/// Widest `last` cell: `N in-flight` with N at its type's widest
+/// (`ModelUsageDoc::in_flight` is a u32) — wider than any age
+/// (`compact_duration`, 6–7 cells), `now` or `—`. Every packed entry
+/// reserves it, so neither the strip's height nor any of its columns moves
+/// when a model starts or stops running or its age ticks.
+fn strip_last_widest() -> String {
+    format!("{} in-flight", u32::MAX)
 }
 
-/// [`strip_entry_widths`] with the time-driven `last` cell at its bound —
-/// what [`strip_plan`] decides on.
-fn strip_entry_bound(m: &ModelUsageDoc) -> StripWidths {
-    let mut widths = strip_entry_widths(m, UNIX_EPOCH);
-    widths[STRIP_FIELDS - 1] = strip_last_bound();
-    widths
-}
-
-/// Display width (terminal cells) of each field exactly as the packed strip
-/// renders it — the uppercase group word, the model name (wide CJK names
-/// count two cells per character), the counts.
-fn strip_entry_widths(m: &ModelUsageDoc, now: SystemTime) -> StripWidths {
-    let cells = |text: String| Line::from(text).width();
-    [
-        2,
-        cells(m.group.to_uppercase()),
-        cells(m.model.clone()),
-        MODEL_BAR_WIDTH,
-        cells(format::human_count(m.requests)),
-        cells(format::human_count(model_total(m))),
-        cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
-            .line()
-            .width(),
-        cells(strip_last(m, now)),
+/// One packed models-strip entry as twolab-tui grid fields — marker ·
+/// group · model · share · req · tok · $ · last — each drawn as the table
+/// draws its cell. The marker drops its leading space ([`STRIP_MARGIN`]);
+/// the share bar reserves its full width (it reads `—` when no model has
+/// tokens) and `last` its widest form ([`strip_last_widest`]).
+fn strip_fields(
+    m: &ModelUsageDoc,
+    max_total: u64,
+    view: &DashboardView,
+    now: SystemTime,
+    frame: usize,
+) -> Vec<packed_grid::Field<'static>> {
+    let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
+    let (group, name) = model_label_spans(m, active, frame, view.tui_effects, view.gradient);
+    let marker = model_active_marker(m, now, frame);
+    let glyph: String = marker.content.chars().skip(1).collect();
+    let mut share = packed_grid::Field::new(
+        share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+            .style(group_color(Some(m.group.as_str())))
+            .spans(),
+    );
+    share.widest = MODEL_BAR_WIDTH;
+    vec![
+        packed_grid::Field::new(Span::styled(glyph, marker.style)),
+        packed_grid::Field::new(group),
+        packed_grid::Field::new(name),
+        share,
+        packed_grid::Field::new(format::human_count(m.requests)),
+        packed_grid::Field::new(format::human_count(model_total(m))),
+        packed_grid::Field::new(cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line()),
+        packed_grid::Field::new(Span::styled(strip_last(m, now), dim()))
+            .widest(&strip_last_widest()),
     ]
 }
 
-/// Per-column field maxima for `entries` laid out row-major, `per_line` to a
-/// line — every field aligns down its entry column. Past the first column
-/// the marker drops its leading breathing space (the entry gap already
-/// separates it), so it is one cell there.
-fn strip_columns(entries: &[StripWidths], per_line: usize) -> Vec<StripWidths> {
-    let mut columns = vec![[0; STRIP_FIELDS]; per_line.min(entries.len())];
-    for (i, entry) in entries.iter().enumerate() {
-        let column = &mut columns[i % per_line];
-        for (have, want) in column.iter_mut().zip(entry) {
-            *have = (*have).max(*want);
-        }
-    }
-    for column in columns.iter_mut().skip(1) {
-        column[0] = column[0].min(1);
-    }
-    columns
-}
-
-/// Width of one packed line: fields 1 space apart, entries
-/// [`STRIP_ENTRY_GAP`] apart.
-fn strip_line_width(columns: &[StripWidths]) -> usize {
-    columns
+/// The first `n` models as one entry each ([`strip_fields`]), in strip
+/// order — the share bars scaled to the busiest model of them all.
+fn strip_entries(
+    view: &DashboardView,
+    n: usize,
+    now: SystemTime,
+    frame: usize,
+) -> Vec<Vec<packed_grid::Field<'static>>> {
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
+    view.model_usage
         .iter()
-        .map(|c| c.iter().sum::<usize>() + STRIP_FIELDS - 1)
-        .sum::<usize>()
-        + STRIP_ENTRY_GAP * columns.len().saturating_sub(1)
+        .take(n)
+        .map(|m| strip_fields(m, max_total, view, now, frame))
+        .collect()
 }
 
-/// Whether `entries`, `per_line` to a line, fit `width` without clipping.
-fn strip_fits(entries: &[StripWidths], per_line: usize, width: u16) -> bool {
-    strip_line_width(&strip_columns(entries, per_line)) <= usize::from(width)
-}
-
-/// Rule 4, pure: the largest entries-per-line count (2..=entries) whose
-/// packed line fits `width`; 1 (= today's table) when not even two fit.
-fn strip_per_line(entries: &[StripWidths], width: u16) -> usize {
-    (2..=entries.len())
-        .rev()
-        .find(|&k| strip_fits(entries, k, width))
-        .unwrap_or(1)
+/// Rule 4, pure: the most entries per line (two or more) whose aligned
+/// line fits `width` beside the margin — twolab-tui's packer; 1 (= today's
+/// table) when not even two fit.
+fn strip_per_line(widths: &[Vec<usize>], width: u16) -> usize {
+    packed_grid::per_line(
+        widths,
+        &[],
+        usize::from(width.saturating_sub(STRIP_MARGIN)),
+        2,
+    )
+    .unwrap_or(1)
 }
 
 /// The strip's plan: auto height = title + ceil(n/k) packed lines (n = the
 /// top [`MODEL_STRIP_ROWS`]), or today's table height when fewer than two
 /// entries fit a line. A drag override keeps its height; packing then
-/// shows as many entries as its lines hold.
+/// shows as many entries as its lines hold. Decided on the fields the grid
+/// draws, every clock-driven one at its widest form — so at a fixed clock.
 fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan {
     let total = view.model_usage.len();
     if total == 0 {
@@ -10633,7 +10299,10 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             height: 0,
         };
     }
-    let widths: Vec<StripWidths> = view.model_usage.iter().map(strip_entry_bound).collect();
+    let widths: Vec<Vec<usize>> = strip_entries(view, total, UNIX_EPOCH, 0)
+        .iter()
+        .map(|entry| entry.iter().map(packed_grid::Field::width).collect())
+        .collect();
     match drag.map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT)) {
         None => {
             let shown = total.min(MODEL_STRIP_ROWS);
@@ -10650,101 +10319,60 @@ fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan 
             }
         }
         Some(height) => {
+            // The most entries the lines hold at k per line, for the
+            // largest k at which the packer puts at least k of them on a
+            // line — it may put more, which only leaves a line spare.
             let lines = usize::from(height - 1);
             (2..=total)
                 .rev()
-                .map(|k| (k, total.min(lines * k)))
-                .find(|&(k, shown)| strip_fits(&widths[..shown], k, width))
-                .map_or(
-                    StripPlan {
-                        shown: total.min(usize::from(height - 2)),
-                        per_line: 1,
-                        height,
-                    },
-                    |(per_line, shown)| StripPlan {
+                .find_map(|k| {
+                    let shown = total.min(lines * k);
+                    let per_line = strip_per_line(&widths[..shown], width);
+                    (per_line >= k).then_some(StripPlan {
                         shown,
                         per_line,
                         height,
-                    },
-                )
+                    })
+                })
+                .unwrap_or(StripPlan {
+                    shown: total.min(usize::from(height - 2)),
+                    per_line: 1,
+                    height,
+                })
         }
     }
 }
 
-/// Packed models strip: `plan.per_line` entries per line, row-major, every
-/// field aligned down its entry column; the title is today's, with the
-/// column legend in the border fill when it fits.
+/// Packed models strip on twolab-tui's [`PackedGrid`]: `plan.per_line`
+/// entries per line, row-major, every field aligned down its entry column;
+/// the title is today's, with the column legend in the border fill when it
+/// fits. Returns a click target per drawn entry, carrying its model's index
+/// in the strip order.
 fn draw_models_strip_packed(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     plan: StripPlan,
-) {
-    let now = ctx.now;
+) -> Vec<packed_grid::GridHit> {
     let per_line = plan.per_line.max(1);
     let shown = plan
         .shown
-        .min(usize::from(area.height.saturating_sub(1)) * per_line);
-    let entries = &view.model_usage[..shown.min(view.model_usage.len())];
-    let widths: Vec<StripWidths> = entries.iter().map(|m| strip_entry_widths(m, now)).collect();
-    let columns = strip_columns(&widths, per_line);
-    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
-    let frame_n = ctx.frame;
-    let pad = |spans: &mut Vec<Span<'static>>, field: Vec<Span<'static>>, width: usize| {
-        let w = Line::from(field.clone()).width();
-        spans.extend(field);
-        if width > w {
-            spans.push(Span::raw(" ".repeat(width - w)));
-        }
-    };
-    let lines: Vec<Line> = entries
-        .chunks(per_line)
-        .map(|line| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for (j, m) in line.iter().enumerate() {
-                if j > 0 {
-                    spans.push(Span::raw(" ".repeat(STRIP_ENTRY_GAP)));
-                }
-                let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
-                let (group, name) =
-                    model_label_spans(m, active, frame_n, view.tui_effects, view.gradient);
-                let marker = model_active_marker(m, now, frame_n);
-                let fields: [Vec<Span<'static>>; STRIP_FIELDS] = [
-                    vec![if j == 0 {
-                        marker
-                    } else {
-                        Span::styled(
-                            marker.content.chars().skip(1).collect::<String>(),
-                            marker.style,
-                        )
-                    }],
-                    vec![group],
-                    name,
-                    share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
-                        .style(group_color(Some(m.group.as_str())))
-                        .spans(),
-                    vec![Span::raw(format::human_count(m.requests))],
-                    vec![Span::raw(format::human_count(model_total(m)))],
-                    cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
-                        .line()
-                        .spans,
-                    vec![Span::styled(strip_last(m, now), dim())],
-                ];
-                for (f, field) in fields.into_iter().enumerate() {
-                    if f > 0 {
-                        spans.push(Span::raw(" "));
-                    }
-                    pad(&mut spans, field, columns[j][f]);
-                }
-            }
-            Line::from(spans)
-        })
-        .collect();
+        .min(usize::from(area.height.saturating_sub(1)) * per_line)
+        .min(view.model_usage.len());
     let title = strip_title(view, shown);
     let title_w = section_title_width(&title);
-    let body = section(frame, area, &title);
-    frame.render_widget(Paragraph::new(lines), body);
+    section(frame, area, &title);
+    let grid = PackedGrid::new(strip_entries(view, shown, ctx.now, ctx.frame))
+        .min_per_line(2)
+        .theme(KEYBAR_THEME);
+    let inner = Rect {
+        x: area.x.saturating_add(STRIP_MARGIN),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(STRIP_MARGIN),
+        height: area.height.saturating_sub(1),
+    };
+    let hits = grid.render_hits(inner, frame.buffer_mut());
     let legend_w = Line::from(STRIP_LEGEND).width();
     if area.height > 0 && title_w + TITLE_GAP + legend_w <= usize::from(area.width) {
         frame.render_widget(
@@ -10763,6 +10391,7 @@ fn draw_models_strip_packed(
             &format!("{title}{STRIP_LEGEND}"),
         );
     }
+    hits
 }
 
 /// ` models — top N of M by tokens — {scope} (g: all) ` — shared by the
@@ -10784,6 +10413,8 @@ fn strip_title(view: &DashboardView, shown: usize) -> String {
 /// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
 /// drop the bar so the column set stays readable (req29). A plan that packs
 /// two or more entries per line renders [`draw_models_strip_packed`].
+/// Returns a click target per drawn model — its entry, or its table row —
+/// carrying the model's index in the strip order.
 fn draw_models_strip(
     frame: &mut Frame,
     area: Rect,
@@ -10791,10 +10422,9 @@ fn draw_models_strip(
     ctx: &FrameCtx,
     now: SystemTime,
     plan: StripPlan,
-) {
+) -> Vec<packed_grid::GridHit> {
     if plan.per_line >= 2 {
-        draw_models_strip_packed(frame, area, view, ctx, plan);
-        return;
+        return draw_models_strip_packed(frame, area, view, ctx, plan);
     }
     // Fill the pane: rows follow the AREA height (border + header take 2), so
     // a drag-resized strip (U8) shows more than the MODEL_STRIP_ROWS default
@@ -10873,6 +10503,17 @@ fn draw_models_strip(
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
     let body = section(frame, area, &title);
     frame.render_widget(table, body);
+    // Data row `i` sits under the title and the header row.
+    (0..shown)
+        .map(|index| packed_grid::GridHit {
+            rect: Rect {
+                y: area.y + 2 + index as u16,
+                height: 1,
+                ..area
+            },
+            index,
+        })
+        .collect()
 }
 
 /// Detailed model view body: the full scrollable table beside (or above) the
@@ -11062,24 +10703,6 @@ fn draw_model_detail(
             group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
         ),
         Span::styled(m.model.clone(), Style::new().add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" req   ", dim()),
-        Span::raw(format!("{} (", format::human_count(m.requests))),
-        Span::styled(
-            format!("{} ok", format::human_count(m.ok)),
-            Style::new().fg(Color::Green),
-        ),
-        Span::raw("/"),
-        Span::styled(
-            format!("{} err", format::human_count(m.errors)),
-            if m.errors > 0 {
-                Style::new().fg(Color::Red)
-            } else {
-                dim()
-            },
-        ),
-        Span::raw(")"),
         Span::styled(
             if m.in_flight > 0 {
                 format!(" · {} in-flight", m.in_flight)
@@ -11089,44 +10712,49 @@ fn draw_model_detail(
             Style::new().fg(Color::Cyan),
         ),
     ]));
+    // The counts on a fact table: requests and cost on the left, the four
+    // token classes on the right (one column under the other when the pane
+    // is too narrow), each figure right-aligned on its last digit. A cache
+    // class the upstream never reported, or a cost no rate prices, is `—` —
+    // never a made-up 0 (req9).
+    let facts = FactTable::new(KEYBAR_THEME).max_columns(2).facts([
+        Fact::new("requests", format::human_count(m.requests)),
+        Fact::new("ok", format::human_count(m.ok)).style(Style::new().fg(Color::Green)),
+        Fact::new("errors", format::human_count(m.errors)).style(if m.errors > 0 {
+            Style::new().fg(Color::Red)
+        } else {
+            dim()
+        }),
+        Fact::maybe("cost", model_cost(m).map(twolab_tui::fact_table::money)),
+        Fact::new("tokens in", format::human_count(m.tokens_in)),
+        Fact::new("tokens out", format::human_count(m.tokens_out)),
+        Fact::maybe("cache read", m.cache_read.map(format::human_count)),
+        Fact::maybe("cache write", m.cache_creation.map(format::human_count)),
+    ]);
+    lines.extend(facts.lines(area.width));
+    // The rest is text, its labels on the facts' indent.
+    let pad = " ".repeat(twolab_tui::fact_table::INDENT);
+    let label = |l: &str| Span::styled(format!("{pad}{l:<8}"), dim());
     lines.push(Line::from(vec![
-        Span::styled(" tok   ", dim()),
-        Span::raw(format!(
-            "in {} · out {}",
-            format::human_count(m.tokens_in),
-            format::human_count(m.tokens_out)
-        )),
-    ]));
-    // Cache split — explicit "—" when the upstream did not report it (req9),
-    // and a reminder that quota windows are account-level only (req27).
-    lines.push(Line::from(vec![
-        Span::styled(" cache ", dim()),
-        Span::raw(format!(
-            "read {} · creation {}",
-            opt_count(m.cache_read),
-            opt_count(m.cache_creation)
-        )),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" last  ", dim()),
+        label("last"),
         Span::raw(model_age_compact(m.last_used_ms, now)),
         Span::styled(" ago", dim()),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" effort", dim()),
-        Span::raw(format!(" {}", counts(&m.efforts))),
+        label("effort"),
+        Span::raw(counts(&m.efforts)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" route ", dim()),
+        label("route"),
         Span::raw(counts(&m.endpoints)),
     ]));
-    lines.push(Line::from(Span::styled(" accounts", dim())));
+    lines.push(Line::from(label("accounts")));
     if m.accounts.is_empty() {
-        lines.push(Line::from(Span::styled("   —", dim())));
+        lines.push(Line::from(Span::styled(format!("{pad}  —"), dim())));
     } else {
         for a in &m.accounts {
             lines.push(Line::from(vec![
-                Span::raw(format!("   {} ", masked_name(&a.name, ctx.mask))),
+                Span::raw(format!("{pad}  {} ", masked_name(&a.name, ctx.mask))),
                 Span::styled(
                     format!(
                         "{} req · in {}/out {}",
@@ -11142,7 +10770,7 @@ fn draw_model_detail(
     // Quota windows are an account/provider fact, never per-model (req27) — make
     // that explicit so the per-account list above isn't read as a model limit.
     lines.push(Line::from(Span::styled(
-        " quota is account-level (see accounts table)",
+        format!("{pad}quota is account-level (see accounts table)"),
         dim(),
     )));
 
@@ -13149,7 +12777,12 @@ mod tests {
         // and the daemon facts keep their rows.
         let small = render_rows(&view, &chrome, 80, 24).join("\n");
         assert!(small.contains("… +"), "{small}");
-        assert!(small.contains("accounts 2 · raw-io"), "{small}");
+        let facts = small
+            .lines()
+            .find(|r| r.contains("llmux  ") && r.contains("accounts"))
+            .unwrap_or_else(|| panic!("{small}"));
+        assert!(facts.trim_end().ends_with(" 2"), "{small}");
+        assert!(small.contains("raw-io "), "{small}");
     }
 
     /// The hand-built prompts are fitted like every other bar: on a narrow
@@ -13316,9 +12949,33 @@ mod tests {
         assert_eq!(row_account_name("plainname", false, &abbrev), "plainname");
     }
 
+    /// A quota meter's bar alone, `width` cells: `fill` of it used (and
+    /// filled), coloured for `level`, `text` centred inside with its first
+    /// `bold` cells bold, `marker` in the last cell — what llmux's own
+    /// `quota_bar_line` drew before the gauges moved to twolab-tui's meter.
+    fn meter_bar(
+        fill: f64,
+        level: Level,
+        text: &str,
+        bold: usize,
+        width: usize,
+        marker: Option<char>,
+    ) -> ratatui::text::Line<'static> {
+        let meter = Meter::new(fill)
+            .level(level)
+            .text(text, bold)
+            .label(false)
+            .theme(KEYBAR_THEME);
+        match marker {
+            Some(glyph) => meter.marker(glyph),
+            None => meter,
+        }
+        .line(width as u16)
+    }
+
     #[test]
     fn quota_bar_line_is_cell_width_and_splits_at_fill_boundary() {
-        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None);
+        let line = meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, None);
         let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, 16, "cell is exactly bar-width wide");
         // First 8 columns reversed (the fill), the rest plain.
@@ -13341,15 +12998,8 @@ mod tests {
         let flat = |line: ratatui::text::Line| -> String {
             line.spans.iter().map(|s| s.content.as_ref()).collect()
         };
-        let without = flat(quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None));
-        let with = flat(quota_bar_line(
-            0.5,
-            Color::Green,
-            "7d 10h",
-            2,
-            16,
-            Some('○'),
-        ));
+        let without = flat(meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, None));
+        let with = flat(meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, Some('○')));
         assert_eq!(
             without.find("7d 10h"),
             with.find("7d 10h"),
@@ -13366,7 +13016,7 @@ mod tests {
     #[test]
     fn quota_bar_line_empty_and_full_fill() {
         for (fill, want_rev) in [(0.0, 0usize), (1.0, 16usize)] {
-            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16, None);
+            let line = meter_bar(fill, Level::Crit, "17m 35s", 3, 16, None);
             let rev: usize = line
                 .spans
                 .iter()
@@ -13379,7 +13029,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_bolds_only_the_leading_unit() {
-        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16, None);
+        let line = meter_bar(0.0, Level::Ok, "7d 10h", 2, 16, None);
         let bold: String = line
             .spans
             .iter()
@@ -13397,7 +13047,7 @@ mod tests {
     #[test]
     fn quota_bar_countdown_stands_alone_without_rst_prefix() {
         for marker in [None, Some('○'), Some('◑')] {
-            let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 32, marker);
+            let line = meter_bar(0.5, Level::Ok, "7d 10h", 2, 32, marker);
             let cells: Vec<_> = line
                 .spans
                 .iter()
@@ -13437,7 +13087,7 @@ mod tests {
     fn quota_bar_long_countdown_keeps_its_centered_column() {
         // Nine countdown characters at width 16: centered at column 3.
         for marker in [None, Some('○')] {
-            let line = quota_bar_line(0.5, Color::Green, "1234d 10h", 5, 16, marker);
+            let line = meter_bar(0.5, Level::Ok, "1234d 10h", 5, 16, marker);
             let text: String = line
                 .spans
                 .iter()
@@ -13456,7 +13106,7 @@ mod tests {
             ("10/20 12:34", 5, None, "10/20 12:34"),
             ("0s", 2, Some('○'), "    0s    ○"),
         ] {
-            let line = quota_bar_line(0.5, Color::Green, time, bold_chars, 11, marker);
+            let line = meter_bar(0.5, Level::Ok, time, bold_chars, 11, marker);
             let text: String = line
                 .spans
                 .iter()
@@ -13973,6 +13623,91 @@ mod tests {
             "lower rows reachable (req13)"
         );
         assert!(text.contains("model detail"), "drill-down panel present");
+    }
+
+    /// The drill-down's counts were free text (`req 3.7k (3.7k ok/14 err)`,
+    /// `tok in 41.2M · out 6.9M`, `cache read 38.0M · creation —`), so no
+    /// figure lined up with another and the cost was not there. They are a
+    /// fact table now: requests and cost on the left, the four token classes
+    /// on the right, every figure right-aligned on its last digit, and `—`
+    /// for a class the upstream never reported.
+    #[test]
+    fn model_detail_counts_line_up_in_two_columns() {
+        let mut m = model_row("claude", "claude-opus-4-8", 41_200_000, 6_900_000);
+        m.requests = 3_665;
+        m.ok = 3_651;
+        m.errors = 14;
+        m.in_flight = 2;
+        m.cache_read = Some(38_000_000);
+        m.cache_creation = None;
+        m.cost_usd = 397.5;
+        let view = view_with(vec![m]);
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Stats), 179, 43);
+        let text = rows.join("\n");
+        let row = |label: &str| {
+            rows.iter()
+                .find(|r| r.contains(&format!("  {label}  ")))
+                .unwrap_or_else(|| panic!("{label}:\n{text}"))
+                .as_str()
+        };
+        // The column where `needle` ends on `row`, in cells.
+        let end = |row: &str, needle: &str| {
+            let at = row
+                .rfind(needle)
+                .unwrap_or_else(|| panic!("{needle}: {row}"));
+            cells::width(&row[..at]) + cells::width(needle)
+        };
+        // Two columns: each left fact shares its row with a token class.
+        assert!(row("requests").contains("tokens in"), "{text}");
+        assert!(row("ok").contains("tokens out"), "{text}");
+        assert!(row("errors").contains("cache read"), "{text}");
+        assert!(row("cost").contains("cache write"), "{text}");
+        // Figures end on one column per side.
+        let left = end(row("requests"), "3.7k ");
+        assert_eq!(end(row("ok"), "3.7k "), left, "{text}");
+        assert_eq!(end(row("errors"), "14 "), left, "{text}");
+        assert_eq!(end(row("cost"), "$397.50 "), left, "{text}");
+        let right = end(row("requests"), "41.2M");
+        assert_eq!(end(row("ok"), "6.9M"), right, "{text}");
+        assert_eq!(end(row("errors"), "38.0M"), right, "{text}");
+        // A cache class nobody reported is unknown, not zero.
+        assert_eq!(end(row("cost"), "—"), right, "{text}");
+        assert!(text.contains("claude-opus-4-8 · 2 in-flight"), "{text}");
+    }
+
+    /// The misc tab's build and daemon facts were two run-on lines
+    /// (`llmux … · daemon pid 1 · port 3456 · up 1s`); they are a fact table
+    /// now — the build on the left, the daemon on the right, figures on
+    /// their last digit, `—` for a size not measured yet — and take the
+    /// same rows as before.
+    #[test]
+    fn misc_facts_line_up_build_left_daemon_right() {
+        let mut view = view_with(Vec::new());
+        view.config_path = Some("/home/me/.config/llmux/config.toml".into());
+        view.config_facts.raw_io_enabled = true;
+        view.config_facts.raw_io_bytes = Some(12_400_000);
+        for (w, h) in [(179, 43), (80, 24)] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::Misc), w, h);
+            let text = rows.join("\n");
+            let at = rows
+                .iter()
+                .position(|r| r.starts_with("  llmux  "))
+                .unwrap_or_else(|| panic!("{text}"));
+            let facts: Vec<&str> = rows[at..at + 5].iter().map(|r| r.trim_end()).collect();
+            assert_eq!(
+                facts,
+                [
+                    "  llmux       0.0 (test)    accounts           0",
+                    "  daemon pid           1    raw-io            on",
+                    "  port              3456    raw-io store  12.4MB",
+                    "  up                  1s    activity log       —",
+                    "  config  /home/me/.config/llmux/config.toml",
+                ],
+                "{text}"
+            );
+            // The facts sit right above the footer rows, as they did.
+            assert_eq!(at + 5, usize::from(h) - 2, "{text}");
+        }
     }
 
     // --- issue #5: MAIN-always + summoned overlays -------------------------
@@ -18330,6 +18065,174 @@ mod tests {
         assert!(text.contains("tokens per day"), "chart still renders");
     }
 
+    /// Tokens-per-day rows for the trend-chart tests: history starts five
+    /// days back, nothing at all was recorded three days back, and on the
+    /// day two back only fable served (codex read 0 that day).
+    fn trend_view() -> DashboardView {
+        use crate::dashboard::{DailyPerfDoc, DailyUsageDoc};
+        let mut view = view_with(Vec::new());
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_secs()
+            / 86_400;
+        let usage = |d: u64, group: &str, model: &str, tokens_in: u64| DailyUsageDoc {
+            day: today - d,
+            group: group.into(),
+            model: model.into(),
+            tokens_in,
+            tokens_out: 50_000,
+            cache_read: 0,
+            cache_creation: 0,
+        };
+        view.daily_usage = [0u64, 1, 2, 4, 5]
+            .into_iter()
+            .flat_map(|d| {
+                let mut rows = vec![usage(d, "claude", "claude-fable-5", 100_000 * (d + 1))];
+                if d != 2 {
+                    rows.push(usage(d, "codex", "gpt-5.6-sol", 0));
+                }
+                rows
+            })
+            .collect();
+        let perf = |d: u64, model: &str, tps_n: u64, output_tokens: u64| DailyPerfDoc {
+            day: today - d,
+            group: "codex".into(),
+            model: model.into(),
+            fast: Some(false),
+            requests: 10,
+            ok: 9,
+            errors: 1,
+            tps_n,
+            output_tokens,
+            e2e_ms: 20_000,
+            measured_n: 6,
+            measured_output: 3_000,
+            post_ttft_ms: 10_000,
+            ttfb_n: 8,
+            ttfb_ms_sum: 1_600,
+        };
+        view.daily_perf = [0u64, 1, 2, 4, 5]
+            .into_iter()
+            .flat_map(|d| {
+                // Day one back is thin for gpt-5.5: two samples.
+                let n = if d == 1 { 2 } else { 8 };
+                [
+                    perf(d, "gpt-5.5", n, 6_000),
+                    perf(d, "gpt-5.6-sol", 8, 2_000),
+                ]
+            })
+            .collect();
+        view
+    }
+
+    /// One trend chart drawn on its own `w`×13 terminal (the overlays'
+    /// slice): `draw` gets the frame and the theme.
+    fn render_trend(w: u16, draw: impl FnOnce(&mut Frame, &FrameCtx)) -> ratatui::buffer::Buffer {
+        let view = trend_view();
+        let ctx = frame_ctx(&view, &chrome_overlay(Overlay::Stats));
+        let mut terminal =
+            Terminal::new(TestBackend::new(w, DAILY_CHART_HEIGHT)).expect("terminal");
+        terminal.draw(|f| draw(f, &ctx)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Under `NO_COLOR` both trend charts told their series apart by colour
+    /// only — four identical lines, legend `●` dots (two cells on CJK-wide
+    /// terminals). Mono now marks every sample with its series' glyph
+    /// (`*` `+` `x` `o`, the same glyph in the legend), and no chart cell
+    /// carries a colour.
+    #[test]
+    fn trend_charts_tell_series_apart_without_colour() {
+        let view = trend_view();
+        let mono = twolab_tui::Theme::mono();
+        let tokens = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, mono);
+        });
+        let perf = render_trend(80, |f, ctx| {
+            draw_perf_chart(f, f.area(), &view, ctx, 14, " perf ", mono);
+        });
+        for buf in [&tokens, &perf] {
+            let rows = buffer_rows(buf);
+            let text = rows.join("\n");
+            assert!(!text.contains('●'), "{text}");
+            assert!(
+                buf.content()
+                    .iter()
+                    .all(|c| (c.fg, c.bg) == (Color::Reset, Color::Reset)),
+                "{text}"
+            );
+            // Five sampled days per series, one glyph each.
+            let plot = rows[1..10].join("\n");
+            assert_eq!(plot.matches('*').count(), 5, "{text}");
+            assert_eq!(plot.matches('+').count(), 5, "{text}");
+        }
+        let legend = |buf: &ratatui::buffer::Buffer| buffer_rows(buf)[12].trim_end().to_string();
+        assert_eq!(legend(&tokens), "* fable-5 90.7%  + gpt-5.6-sol 9.3%");
+        assert_eq!(
+            legend(&perf),
+            "* codex gpt-5.5  + codex gpt-5.6-sol  (dim = n<5)"
+        );
+        // The thin day (two samples) is the one dim glyph of its series.
+        let dim_stars = perf
+            .content()
+            .iter()
+            .filter(|c| c.symbol() == "*" && c.modifier.contains(Modifier::DIM))
+            .count();
+        assert_eq!(dim_stars, 1, "{}", buffer_rows(&perf).join("\n"));
+        // In colour the lines keep the hues they always had, rank by rank.
+        let colour = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, CHART_THEME);
+        });
+        assert_eq!(colour[(0, 12)].fg, Color::Magenta);
+        let second = buffer_rows(&colour)[12].find("⠒⠒ gpt").expect("legend");
+        let second = cells::width(&buffer_rows(&colour)[12][..second]) as u16;
+        assert_eq!(colour[(second, 12)].fg, Color::Cyan);
+    }
+
+    /// The tokens chart zero-filled the whole span, so a fourteen-day span
+    /// over five days of history drew nine days of a flat 0 and a cliff
+    /// into the first real day. Days before history — and a day with no
+    /// record at all — are gaps now; a recorded day on which a model served
+    /// nothing still reads 0.
+    #[test]
+    fn tokens_chart_draws_nothing_before_history_or_on_unrecorded_days() {
+        let view = trend_view();
+        let buf = render_trend(80, |f, ctx| {
+            draw_daily_chart(f, f.area(), &view, ctx, 14, twolab_tui::Theme::mono());
+        });
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        // Plot rows 1–9 right of the `650.0k│` gutter: 73 cells for 14 days;
+        // the first recorded day (index 8) is at cell 44.
+        let plot: Vec<Vec<&str>> = (1..10)
+            .map(|y| (7..80).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        for row in &plot {
+            assert!(row[..44].iter().all(|s| *s == " "), "{text}");
+        }
+        // Day index 10 (three back) is unrecorded: no glyph of either
+        // series in its column, and no line through it.
+        let day10 = (10.0_f64 * 145.0 / 13.0).round() as usize / 2;
+        for row in &plot {
+            assert_eq!(row[day10], " ", "{text}");
+        }
+        // Codex served nothing two days back while fable did: a `+` on the
+        // zero row in that day's column.
+        let day11 = (11.0_f64 * 145.0 / 13.0).round() as usize / 2;
+        assert_eq!(plot[8][day11], "+", "{text}");
+    }
+
     #[test]
     fn tab_row_stays_visible_under_every_overlay() {
         // Review R1 MUST-FIX 3: overlays used to paint over the tab strip
@@ -20973,6 +20876,62 @@ mod tests {
         );
     }
 
+    /// The packed strip on twolab-tui's packed grid: one click rect per
+    /// drawn entry, on the entry's own cells and carrying its model's
+    /// index; and the columns sit on the widest `last` form, so a model
+    /// starting to run (`12 in-flight` where `9s` was) moves no entry —
+    /// llmux's own packer aligned on the live text, and the second column
+    /// slid sideways.
+    #[test]
+    fn packed_strip_entries_are_clickable_and_never_slide() {
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let with_last = |in_flight: u32| {
+            let (mut view, chrome) = fold_view();
+            for m in &mut view.model_usage {
+                m.in_flight = in_flight;
+                m.last_used_ms = ms(now - Duration::from_secs(9));
+            }
+            (view, chrome)
+        };
+        let strip = |in_flight: u32| {
+            let (view, chrome) = with_last(in_flight);
+            let chrome = Chrome {
+                fold_exhausted: false,
+                ..chrome
+            };
+            let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+            (view, rows, hits.models_strip)
+        };
+        let (view, rows, quiet) = strip(0);
+        let frame = rows.join("\n");
+        let title = row_of(&rows, " models — top 5 of 6 ");
+        assert_eq!(quiet.len(), 5, "{frame}");
+        for hit in &quiet {
+            let row = &rows[usize::from(hit.rect.y)];
+            let cells: String = row
+                .chars()
+                .skip(usize::from(hit.rect.x))
+                .take(usize::from(hit.rect.width))
+                .collect();
+            let model = &view.model_usage[hit.index].model;
+            assert!(
+                cells.contains(model.as_str()),
+                "{model} in {cells:?}\n{frame}"
+            );
+            assert!(hit.rect.y > title as u16, "{frame}");
+        }
+        let indexes: Vec<usize> = quiet.iter().map(|h| h.index).collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
+        let (_, busy_rows, busy) = strip(12);
+        assert!(
+            busy_rows[title + 1].contains("12 in-flight"),
+            "{}",
+            busy_rows.join("\n")
+        );
+        assert_eq!(busy, quiet, "no entry moved");
+    }
+
     /// Index of the first row containing `needle`, with the frame in the
     /// panic message.
     fn row_of(rows: &[String], needle: &str) -> usize {
@@ -21815,14 +21774,24 @@ mod tests {
         );
     }
 
-    /// Rule 4, pure: the largest per-line count whose aligned line fits.
+    /// Rule 4, pure: the largest per-line count whose aligned line fits,
+    /// on twolab-tui's packer — the same breakpoints as llmux's own: the
+    /// marker is one cell in every column and the strip keeps one cell of
+    /// margin, where the first column's marker used to carry it.
     #[test]
     fn strip_per_line_packs_the_most_entries_that_fit() {
-        // 2+6+15+10+6+9+9+11 fields + 7 gaps = 75 cells; past the first
-        // column the marker is 1 cell, so a second entry adds 3 + 74.
-        let entry: StripWidths = [2, 6, 15, 10, 6, 9, 9, 11];
-        let five = [entry; 5];
-        assert_eq!(strip_line_width(&strip_columns(&five, 2)), 75 + 3 + 74);
+        // 1+6+15+10+6+9+9+11 fields + 7 gaps = 74 cells; a second entry
+        // adds 3 + 74, the margin 1.
+        let entry = vec![1, 6, 15, 10, 6, 9, 9, 11];
+        let five = vec![entry; 5];
+        let line = |widths: &[Vec<usize>], k: usize| {
+            GridPlan {
+                per_line: k,
+                columns: packed_grid::columns(widths, &[], k),
+            }
+            .line_width()
+        };
+        assert_eq!(usize::from(STRIP_MARGIN) + line(&five, 2), 1 + 74 + 3 + 74);
         assert_eq!(strip_per_line(&five, 179), 2);
         assert_eq!(strip_per_line(&five, 152), 2);
         assert_eq!(strip_per_line(&five, 151), 1, "below two → today's table");
@@ -21831,9 +21800,9 @@ mod tests {
         assert_eq!(strip_per_line(&five[..1], 400), 1, "one entry never packs");
         // Columns align per entry column: a long name in column 0 does not
         // widen column 1.
-        let mut long = five;
+        let mut long = five.clone();
         long[2][2] = 30;
-        let columns = strip_columns(&long, 2);
+        let columns = packed_grid::columns(&long, &[], 2);
         assert_eq!((columns[0][2], columns[1][2]), (30, 15));
     }
 
@@ -22299,7 +22268,22 @@ mod tests {
     /// each row's closing fill is two cells shorter. Every row is still 179
     /// cells, and every other cell is unchanged (previous digest
     /// 16_419_190_790_333_588_667).
-    const FOLD_OFF_179X43_DIGEST: u64 = 8_543_463_821_239_879_891;
+    /// Not re-pinned when the quota gauges moved to twolab-tui's `meter`
+    /// (2026-11-06): the frame is identical, text and styles — so is this
+    /// fixture at 80×24 and with `t`, `u` or the fold on. The one change is
+    /// off this frame: a cursor row's bar keeps its empty part un-reversed
+    /// (`cursor_row_quota_bar_keeps_its_fill_visible`).
+    /// Re-pinned 2026-11-06 for the fold and the models strip on twolab-tui's
+    /// `packed_grid`: only the strip's two packed lines change. The second
+    /// entry column starts nine cells further right (`2 in-flight` then
+    /// fourteen spaces before `CLAUDE claude-opus-5`, was five): every entry
+    /// now reserves the widest `last` form, `4294967295 in-flight`, that the
+    /// packing decision already used, so a model starting or stopping never
+    /// slides the column; and the first entry's leading blank cell no longer
+    /// carries the marker's colour (the grid sits one cell in instead of the
+    /// marker carrying the space). Packing, heights and every other cell
+    /// unchanged (previous digest 11_040_274_043_730_846_167).
+    const FOLD_OFF_179X43_DIGEST: u64 = 17_866_181_982_027_554_185;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -22408,6 +22392,106 @@ mod tests {
                 assert_eq!(word(before), word(after), "{overlay:?} row {y}");
             }
         }
+    }
+
+    /// On the cursor row the row highlight used to reverse every cell of the
+    /// quota bar as well, so the bar read as one solid block — how full the
+    /// window is was gone on exactly the account being looked at. The meter
+    /// draws the bar's empty part un-reversed, so the fill stays visible
+    /// there; the percent label and the rest of the row keep the highlight.
+    /// (The only change the move to twolab-tui's meter makes on MAIN: the
+    /// fold fixture's 179×43 frame is identical, cell for cell.)
+    #[test]
+    fn cursor_row_quota_bar_keeps_its_fill_visible() {
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let first = view.snapshot.accounts[frame_ctx(&view, &chrome).order[0]]
+            .id
+            .0
+            .clone();
+        let chrome = cursor_on(&view, &chrome, &first);
+        let mut terminal = Terminal::new(TestBackend::new(179, 43)).expect("terminal");
+        let mut hits = None;
+        let buf = terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone();
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let at = |row: &str, needle: &str| {
+            cells::width(
+                &row[..row
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle}:\n{text}"))],
+            ) as u16
+        };
+        let header = rows
+            .iter()
+            .position(|r| r.contains("7d RESET"))
+            .expect("header");
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with('>'))
+            .unwrap_or_else(|| panic!("{text}"));
+        // The 7d cell: from its header to the end of `LEFT` — the bar, a
+        // space and the five-cell label.
+        let x0 = at(&rows[header], "7d RESET");
+        let x1 = at(&rows[header], "LEFT") + 4;
+        let bar = x1 - x0 - 6;
+        let reversed: Vec<bool> = (x0..x0 + bar)
+            .map(|x| buf[(x, y as u16)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        let fill = reversed.iter().take_while(|r| **r).count();
+        assert!(fill > 0 && fill < reversed.len(), "{reversed:?}\n{text}");
+        assert!(reversed[fill..].iter().all(|r| !r), "{reversed:?}");
+        for x in x1 - 5..x1 {
+            assert!(
+                buf[(x, y as u16)].modifier.contains(Modifier::REVERSED),
+                "the label keeps the row highlight"
+            );
+        }
+        // The account cell is highlighted as before.
+        assert!(buf[(4, y as u16)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Under `t` the bar shows the UTC stamp `MM/DD HH:MM`, all eleven cells
+    /// of the narrowest bar. With a display-state glyph in the last cell the
+    /// stamp used to lose the minute's last digit (`07/07 13:5◑`, which
+    /// reads as 13:05); the meter gives the stamp way to its bold date
+    /// instead, and the cell keeps its percent label.
+    #[test]
+    fn absolute_stamp_beside_a_glyph_falls_back_to_its_date() {
+        use crate::config::QuotaDisplay;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        // 2026-07-07 13:50 UTC, three days out.
+        let resets_at = UNIX_EPOCH + Duration::from_secs(1_783_432_200);
+        let now = resets_at - Duration::from_secs(3 * 86_400);
+        let window = QuotaWindow {
+            utilization: 0.58,
+            resets_at,
+            fetched_at: now,
+            source: WindowSource::Headers,
+        };
+        let cell = |state: WindowDisplayState, absolute: bool| {
+            let (meter, _) =
+                quota_meter(&window, 0.58, now, state, QuotaDisplay::Remaining, absolute);
+            let line = quota_cell_line(&meter, QUOTA_BAR_WIDTH);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(cells::width(&text), QUOTA_CELL_WIDTH, "{text:?}");
+            text
+        };
+        assert_eq!(cell(WindowDisplayState::Stale, true), "   07/07  ◑   42%");
+        // Without a glyph the whole stamp fits, as before; countdowns fit
+        // beside one.
+        assert_eq!(
+            cell(WindowDisplayState::Populated, true),
+            "07/07 13:50   42%"
+        );
+        assert_eq!(cell(WindowDisplayState::Stale, false), "   3d 0h  ◑   42%");
     }
 
     /// The backend group of fixture account `n`.
@@ -23006,7 +23090,8 @@ mod tests {
                 .map(|h| (h.display_idx, h.area.x))
                 .collect();
             println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
-            Some((plan.per_line, plan.columns.clone(), starts))
+            let columns = plan.grid.plan(w).expect("the plan's width").columns;
+            Some((plan.per_line, columns, starts))
         };
         let (base_view, base_chrome) = live_view();
         for w in [fold_bound(&base_view, &base_chrome), 179, 250] {
@@ -23163,8 +23248,11 @@ mod tests {
     }
 
     /// The `+N more` count on a short terminal: table rows first, then the
-    /// fold block — N counts the hidden table rows plus the accounts on the
-    /// fold lines the pane cannot show.
+    /// fold block — N counts the hidden table rows plus the accounts the
+    /// block cannot show. The block (twolab-tui's packed grid) says it on
+    /// its own last line instead of stopping at the pane's edge, so that
+    /// line holds `+5 more` where the third entry line was cut (the title
+    /// read `+3 more` then).
     #[test]
     fn fold_on_a_short_terminal_counts_the_hidden_entries() {
         let (view, chrome) = live_view();
@@ -23174,12 +23262,13 @@ mod tests {
         let band = row_of(&rows, " scheduler · poller ");
         assert_eq!(band - accounts, 18, "{frame}");
         assert!(
-            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +3 more "),
+            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +5 more "),
             "{frame}"
         );
         assert!(rows[accounts + 14].starts_with("   group "), "{frame}");
-        assert!(rows[band - 1].contains(&fold_name(12)), "{frame}");
-        assert!(!frame.contains(&fold_name(14)), "{frame}");
+        assert!(rows[band - 2].contains(&fold_name(7)), "{frame}");
+        assert_eq!(rows[band - 1].trim_end(), "+5 more", "{frame}");
+        assert!(!frame.contains(&fold_name(11)), "{frame}");
     }
 
     /// Membership is recomputed every frame: an account whose 7d window

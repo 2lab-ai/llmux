@@ -57,7 +57,10 @@ terminal cutting a hint in half.
 With `NO_COLOR` set to any non-empty value (<https://no-color.org>), the
 dashboard draws no colour at all: every cell keeps your terminal's default
 colours, bold, dim, reversed and underline stay, and text that would be red
-(errors, failures, a nearly spent window) is bold instead.
+(errors, failures, a nearly spent window) is bold instead. The two trend
+charts (tokens per day in `stats`, tokens/sec in `perf`) then mark every
+sample with its series' glyph — `*`, `+`, `x`, `o`, the same glyph in the
+legend — so four lines stay apart without colour.
 
 The status line (the row above the key bar) shows the last message for
 5 seconds, led by how it went: `✓ ok` (it worked, or it was accepted and is
@@ -164,10 +167,18 @@ rules: table rows, gauges and the popups' box borders draw as before.
   grouped (`$112,293.04`; the old 9-cell column cut it to `$112293.0`), the
   decimal point in one column, cents dimmer, and `—` for a model no rate
   prices (it read `$0.0000`). Narrower terminals keep the one-model-per-row
-  table. The
-  packing choice reserves room for the widest `last` value (`N in-flight`),
-  so a model starting or finishing a request does not change the strip's
-  height.
+  table. In the `stats` tab, the model detail beside the table (110 columns
+  and wider) gives the cursored model's counts as a fact table: requests,
+  ok, errors and cost on the left, tokens in, tokens out, cache read and
+  cache write on the right, every figure right-aligned on its last digit,
+  and `—` for a cache class the upstream never reported or a cost no rate
+  prices. Every
+  packed entry reserves room for the widest `last` value (`N in-flight`),
+  so a model starting or finishing a request changes neither the strip's
+  height nor where its columns start (the second column used to slide
+  sideways with the first column's `last` text). Clicking a model in the
+  strip, packed or as a table row, opens the `stats` tab with that model
+  under the cursor.
 - **Header tail.** When the header does not fit its row, its last part —
   `cfg <config path>` and the attach marker — moves to the right end of the
   tab row. There your home directory is shown as `~`, and the marker reads
@@ -217,8 +228,9 @@ rules: table rows, gauges and the popups' box borders draw as before.
   cursor still moves through every account in table order, a folded
   account under the cursor is highlighted like a table row, and clicking
   a folded account works like clicking its row. When the terminal is too
-  short, `+N more` counts the table rows that do not fit plus the folded
-  accounts on the lines that do not fit. The columns keep room for the
+  short, the block's last line reads `+N more` for the folded accounts it
+  cannot show (the lines used to stop at the pane's edge), and the title's
+  `+N more` counts the table rows that do not fit plus those accounts. The columns keep room for the
   widest form of every value the clock changes (a reset countdown with
   its `◑` mark, a Fable window resetting), so the block does not move as
   time passes. The fold never makes the accounts pane taller.
@@ -241,7 +253,12 @@ is no `5h` column: no provider reports a 5h window any more (the scheduler's
 
 The time inside a weekly gauge is its reset countdown, shown bare and
 centered (`7d 10h`, or the absolute stamp under `t`); the header's `RESET`
-names it. Cold or unavailable cells show no reset time. The `rst` column
+names it. A value that is not fresh carries its state glyph (`○` cold, `◑`
+stale, `!` poll-degraded) in the bar's last cell; in the narrowest bar the
+absolute stamp then shows its date only (`07/07`) rather than a time with
+its last digit cut. On the cursor row the bar's empty part is drawn
+without the row highlight, so the fill stays visible. Cold or unavailable
+cells show no reset time. The `rst` column
 described below counts **reset credits/grants owned**; it is not a
 countdown.
 
@@ -307,7 +324,7 @@ carries on where it was. `Ctrl-C` still quits.
 
 The `perf` tab (`p`, or click the tab bar) is the observed-performance surface: passive telemetry from real proxied requests — deliberately not an active healthcheck. Three panes over a selectable trailing span (`d` cycles 7/14/30/90 days):
 
-- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series, y = end-to-end output tokens/sec (`Σoutput / Σduration` per day).
+- **Daily tokens/sec chart** — one braille line per top `(provider, model, fast)` series (the top four; the legend counts the rest as `+N more`), y = end-to-end output tokens/sec (`Σoutput / Σduration` per day). A day with fewer than 5 throughput samples is drawn dim and the legend says `(dim = n<5)`; a day without samples is a gap. The `stats` tab's tokens-per-day chart is the same chart over token totals, its legend giving each model's share of every token in the span; a day with no recorded request at all — before the history starts, for example — is a gap there too, while a recorded day on which a model served nothing reads 0.
 - **Provider health matrix** — one row per day, one column per provider: request count, error %, average TTFB (time to first upstream body byte), and e2e t/s. A day with no traffic renders `—`, never a fabricated `0`.
 - **Series table** — per `(provider, model, fast)` over the span (`j`/`k` scroll): requests, error %, output tokens, `e2e t/s`, `est t/s`, average TTFB, and measured coverage (`measured/throughput` samples).
 
@@ -335,7 +352,7 @@ The `config` tab (`c`, or click the tab bar) is a mouse-driven config editor cov
 
 Rows show a section column, the label, then the value in a column measured on the widest label (so a label never runs into its value), the apply state and a note cut with `…` where the screen ends. Read-only rows are dim and marked `(disabled: <where it is managed>)`. When the rows do not all fit, `▾`/`▴` and `N of M` say so. `j`/`k`, the arrows, `PgUp`/`PgDn`, `Home`/`End` (or the wheel) move the cursor over the editable rows — read-only rows are skipped — and stop at the ends; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0, a retention decrease — open a confirmation card above the footer that states the setting and its current → new value (`Set routing.enabled: off → on?`) and what applying it does, with two numbered choices: `1`/`y` applies, `2`/`n`/`Esc` cancels, `↑↓` move the mark and `Enter` answers the marked choice (Apply until you move it). The raw-io `retention` row is read-only ("never deletes"); the settings API rejects `raw_io_retention_days`. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
 
-The `misc` tab (`?`) carries the keybinding reference plus daemon facts. The reference is built from the same key tables the footers use — one group per surface (dashboard, accounts, stats, usage, keys, perf, sessions, logs, config), the account switcher, the raw viewer, the surface keys and the mouse — in up to three columns; in attach mode it shows `R disabled (attached)` exactly as the footer does, and when the groups do not fit it ends in `… +N more` instead of dropping rows silently. Every footer bar, the limits and add-key prompts and the raw viewer's legend drop whole hints and count them (`… +N more`) when the terminal is too narrow. The facts: config path, account count, raw-io capture state and store size (partitions, archives, spool, legacy), and the activity-log size (sizes refresh at most every 30s).
+The `misc` tab (`?`) carries the keybinding reference plus daemon facts. The reference is built from the same key tables the footers use — one group per surface (dashboard, accounts, stats, usage, keys, perf, sessions, logs, config), the account switcher, the raw viewer, the surface keys and the mouse — in up to three columns; in attach mode it shows `R disabled (attached)` exactly as the footer does, and when the groups do not fit it ends in `… +N more` instead of dropping rows silently. Every footer bar, the limits and add-key prompts and the raw viewer's legend drop whole hints and count them (`… +N more`) when the terminal is too narrow. The facts, under the key grid: the build (version, daemon pid, port, uptime) on the left and the daemon (account count, raw-io capture state and store size — partitions, archives, spool, legacy — and the activity-log size) on the right, figures right-aligned on their last digit and `—` for a size not measured yet (sizes refresh at most every 30s); one column under the other on a narrow pane; the config path on its own row below.
 
 ## Install and launch details
 
