@@ -7134,6 +7134,51 @@ mod tests {
         }
     }
 
+    /// Review of #234: the mouse wiring of the twolab-tui modal — a click on
+    /// `esc close` closes the account modal, a click on the scrollbar track
+    /// jumps the body there, and a click outside the popup is swallowed
+    /// without closing it.
+    #[test]
+    fn account_modal_close_button_and_scrollbar_take_clicks() {
+        use crossterm::event::MouseEventKind;
+        let view = two_account_view();
+        let rect = |x, y, width, height| ratatui::layout::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let open = |app: &mut App| {
+            let mut modal = AccountModal::new("claude:a@x.com".into());
+            // What a frame drew: 60 body rows through a 20-row view, a
+            // 20-row track at column 70 and `esc close` on the top border.
+            modal.state.layout.outer = rect(10, 2, 62, 23);
+            modal.state.layout.pos = ScrollPos::of(60, 20, 0);
+            modal.state.layout.track = Some(rect(70, 4, 1, 20));
+            modal.state.layout.close = Some(rect(60, 2, 9, 1));
+            app.account_modal = Some(modal);
+        };
+        let click = |col, row| mouse(MouseEventKind::Down(MouseButton::Left), col, row);
+
+        let mut app = remote_app();
+        open(&mut app);
+        assert!(
+            app.on_mouse(click(1, 1), Some(&view)),
+            "an outside click is swallowed"
+        );
+        assert!(app.account_modal.is_some(), "and does not close the modal");
+
+        assert!(app.on_mouse(click(70, 23), Some(&view)));
+        let scrolled = app.account_modal.as_ref().unwrap().state.scroll;
+        assert!(
+            scrolled > 0,
+            "a click low on the track scrolls down ({scrolled})"
+        );
+
+        assert!(app.on_mouse(click(62, 2), Some(&view)));
+        assert!(app.account_modal.is_none(), "`esc close` closes the modal");
+    }
+
     /// .prd/19 rule 6: while the modal is open every key and click beneath it
     /// is swallowed — `q` closes the modal instead of quitting, a row click
     /// neither re-pins nor opens a menu, and Esc closes.
