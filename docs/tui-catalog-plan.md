@@ -75,7 +75,7 @@ catalog (27 + herdr) ─┬─ #231 move onto twolab-tui ... text · spinner · 
 ## Library gaps found (2lab-ai/tui, not blocking)
 
 - `Theme` has no series or provider hues; llmux keeps them as a named palette.
-- ANSI `surface_raised` is `Reset`, so the OpenAI-endpoint row background stays a palette constant.
+- ANSI `surface_raised` is `Reset`, so the OpenAI-endpoint row background (and the light text on it) stay palette constants.
 - `Theme::selected()` is not `const`.
 - `HitMap` has no `FromIterator`.
 - menu, modal, tabs and packed_grid return their own hit lists instead of pushing into a `HitMap`.
