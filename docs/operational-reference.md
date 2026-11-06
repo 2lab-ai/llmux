@@ -124,7 +124,11 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   then `154.6G`, `T` and up, and a count that would read `1000.0k` reads
   `1.0M` (they used to stay in `M`, so the one-model-per-row table cut
   243.6 billion tokens to `243578.5`). A percentage that cannot be computed
-  reads `—`. Narrower terminals keep the one-model-per-row table. The
+  reads `—`. Costs in the strip and in the `stats` table are ledger-style:
+  grouped (`$112,293.04`; the old 9-cell column cut it to `$112293.0`), the
+  decimal point in one column, cents dimmer, and `—` for a model no rate
+  prices (it read `$0.0000`). Narrower terminals keep the one-model-per-row
+  table. The
   packing choice reserves room for the widest `last` value (`N in-flight`),
   so a model starting or finishing a request does not change the strip's
   height.
@@ -474,6 +478,9 @@ usage is recorded per tenant (name + email) instead of one anonymous pool.
   secret), kind, state, requests, ok/err, tokens, API-equivalent cost, the
   used-from → used-to span, and a per-model breakdown — the builtin
   `local`/`legacy` buckets included, so every request is accounted for.
+  Costs are ledger-style like the `usage` tab: decimal points in one
+  column, thousands grouped, cents dimmer, model rows a tier darker, and
+  `—` for a key with no usage in the window.
   History persisted before multi-tenant keys shows as the `unknown` tenant —
   it is never folded into a live bucket.
 

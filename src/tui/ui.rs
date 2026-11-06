@@ -150,6 +150,24 @@ fn format_cost(usd: f64) -> String {
     }
 }
 
+/// Cells of a ledger cost column (models strip and table, keys panel): the
+/// `$`, a `999,999` integer part and a `.0000` fraction — twolab-tui's
+/// `Amount::width`, so no amount up to $999,999.99 loses a digit (the
+/// 9-cell column cut `$112293.04` to `$112293.0`).
+const COST_COL_WIDTH: u16 =
+    (1 + twolab_tui::ledger::INT_WIDTH + twolab_tui::ledger::FRAC_WIDTH) as u16;
+
+/// A cost on twolab-tui's ledger: the decimal point in one column for every
+/// row, dollars at the row's weight, cents a tier dimmer, the `$` quietest,
+/// and `—` where the ones digit would be when the cost is unknown. A
+/// [`twolab_tui::ledger::Tier::Detail`] row (a per-model line under a total)
+/// is one tier dimmer throughout.
+fn cost_amount(usd: Option<f64>, tier: twolab_tui::ledger::Tier) -> twolab_tui::ledger::Amount {
+    twolab_tui::ledger::Amount::new(usd)
+        .tier(tier)
+        .theme(KEYBAR_THEME)
+}
+
 /// Everything a row/pane needs that is derived once per frame.
 struct FrameCtx {
     now: SystemTime,
@@ -2224,10 +2242,14 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
 /// key / builtin bucket, or one of its per-model breakdown rows. Built ONCE
 /// per frame and shared by the renderer and the scroll handler, so "how many
 /// rows can I scroll through" and "what is drawn" can never disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KeysRow {
-    /// Display cells, in header order.
+    /// Display cells, in header order. The `cost` cell is drawn from
+    /// [`KeysRow::cost`] on the ledger; its text here is empty.
     pub cells: Vec<String>,
+    /// The row's API-equivalent cost; `None` (a key with no usage in the
+    /// window) reads `—`.
+    pub cost: Option<f64>,
     pub kind: KeysRowKind,
 }
 
@@ -2326,7 +2348,7 @@ pub(crate) const KEYS_COLUMNS: [KeysColumn; 10] = [
     },
     KeysColumn {
         header: "cost",
-        width: 9,
+        width: COST_COL_WIDTH,
         shed: 5,
     },
     KeysColumn {
@@ -2418,9 +2440,10 @@ pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
                     String::new(),
                     format::human_count(m.tokens_in),
                     format::human_count(m.tokens_out),
-                    format!("${:.2}", m.cost_usd),
+                    String::new(),
                     String::new(),
                 ],
+                cost: Some(m.cost_usd),
                 kind: KeysRowKind::Model,
             });
         }
@@ -2452,15 +2475,13 @@ pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
                 },
                 format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0)),
                 format::human_count(usage.map(|t| t.tokens_out).unwrap_or(0)),
-                match usage {
-                    Some(t) => format!("${:.2}", t.cost_usd),
-                    None => "—".into(),
-                },
+                String::new(),
                 match usage {
                     Some(t) => span_label(t.first_ms, t.last_ms),
                     None => "never".into(),
                 },
             ],
+            cost: usage.map(|t| t.cost_usd),
             kind: KeysRowKind::Key(state),
         });
         push_models(&mut rows, usage);
@@ -2481,9 +2502,10 @@ pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
                 format!("{}/{}", t.ok, t.errors),
                 format::human_count(t.tokens_in),
                 format::human_count(t.tokens_out),
-                format!("${:.2}", t.cost_usd),
+                String::new(),
                 span_label(t.first_ms, t.last_ms),
             ],
+            cost: Some(t.cost_usd),
             kind: KeysRowKind::Builtin,
         });
         push_models(&mut rows, Some(t));
@@ -2594,6 +2616,18 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
                             (KeysRowKind::Key(state), "state") => Cell::from(Line::from(
                                 Span::styled(text, Style::new().fg(state.color())),
                             )),
+                            // Cost on the ledger; a model row one tier dimmer.
+                            (kind, "cost") => Cell::from(
+                                cost_amount(
+                                    row.cost,
+                                    if kind == KeysRowKind::Model {
+                                        twolab_tui::ledger::Tier::Detail
+                                    } else {
+                                        twolab_tui::ledger::Tier::Total
+                                    },
+                                )
+                                .line(),
+                            ),
                             _ => Cell::from(text),
                         }
                     })
@@ -9871,15 +9905,16 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
 /// pricing the token parts locally so the `$` column stays useful during a
 /// rolling upgrade. The fallback holds no config overrides (empty map = the
 /// built-in default rate table); an unknown/zero-rate `(group, model)` still
-/// yields `0.0`.
-fn model_cost(m: &ModelUsageDoc) -> f64 {
+/// yields `None`: no rate is known, and the `$` cell says `—` rather than a
+/// credible `$0`.
+fn model_cost(m: &ModelUsageDoc) -> Option<f64> {
     if m.cost_usd > 0.0 {
-        return m.cost_usd;
+        return Some(m.cost_usd);
     }
     if m.tokens_in.saturating_add(m.tokens_out) == 0 {
-        return 0.0;
+        return Some(0.0);
     }
-    crate::pricing::cost_from_parts(
+    crate::pricing::priced_cost(
         &m.group,
         &m.model,
         m.tokens_in,
@@ -10045,7 +10080,9 @@ fn strip_entry_widths(m: &ModelUsageDoc, now: SystemTime) -> StripWidths {
         MODEL_BAR_WIDTH,
         cells(format::human_count(m.requests)),
         cells(format::human_count(model_total(m))),
-        cells(format_cost(model_cost(m))),
+        cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
+            .line()
+            .width(),
         cells(strip_last(m, now)),
     ]
 }
@@ -10198,10 +10235,9 @@ fn draw_models_strip_packed(
                         .spans(),
                     vec![Span::raw(format::human_count(m.requests))],
                     vec![Span::raw(format::human_count(model_total(m)))],
-                    vec![Span::styled(
-                        format_cost(model_cost(m)),
-                        Style::new().fg(Color::Green),
-                    )],
+                    cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total)
+                        .line()
+                        .spans,
                     vec![Span::styled(strip_last(m, now), dim())],
                 ];
                 for (f, field) in fields.into_iter().enumerate() {
@@ -10296,11 +10332,11 @@ fn draw_models_strip(
         }
         cells.push(Cell::from(format::human_count(m.requests)));
         cells.push(Cell::from(format::human_count(model_total(m))));
-        // API-equivalent cost ($) cell, right after tok (item #4).
-        cells.push(Cell::from(Span::styled(
-            format_cost(model_cost(m)),
-            Style::new().fg(Color::Green),
-        )));
+        // API-equivalent cost ($) cell, right after tok (item #4), on the
+        // ledger: the point in one column, every digit kept.
+        cells.push(Cell::from(
+            cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line(),
+        ));
         let mut last = model_age_compact(m.last_used_ms, now);
         if m.in_flight > 0 {
             last = format!("{} in-flight", m.in_flight);
@@ -10319,7 +10355,7 @@ fn draw_models_strip(
                 Constraint::Length(MODEL_BAR_WIDTH as u16 + 1),
                 Constraint::Length(7),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(12),
             ],
         )
@@ -10332,7 +10368,7 @@ fn draw_models_strip(
                 Constraint::Fill(1),
                 Constraint::Length(7),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(12),
             ],
         )
@@ -10422,11 +10458,9 @@ fn draw_models_table(
                 Cell::from(ok_err),
                 Cell::from(format::human_count(m.tokens_in)),
                 Cell::from(format::human_count(m.tokens_out)),
-                // API-equivalent cost ($) column, after out (item #4).
-                Cell::from(Span::styled(
-                    format_cost(model_cost(m)),
-                    Style::new().fg(Color::Green),
-                )),
+                // API-equivalent cost ($) column, after out (item #4), on
+                // the ledger.
+                Cell::from(cost_amount(model_cost(m), twolab_tui::ledger::Tier::Total).line()),
             ];
             if wide {
                 cells.push(Cell::from(Span::styled(opt_count(m.cache_read), dim())));
@@ -10457,7 +10491,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(3),
@@ -10476,7 +10510,7 @@ fn draw_models_table(
                 Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Length(8),
-                Constraint::Length(9),
+                Constraint::Length(COST_COL_WIDTH),
                 Constraint::Length(3),
             ],
         )
@@ -11672,6 +11706,48 @@ mod tests {
         );
         assert!(all.contains("local"), "builtin bucket with usage:\n{all}");
         assert!(all.contains("→"), "used-from → used-to span:\n{all}");
+    }
+
+    /// The keys panel's cost column is on the ledger: decimal points in one
+    /// column for keys, builtin buckets and their model rows (a model row
+    /// one tier dimmer), and `—` for a key with no usage in the window.
+    #[test]
+    fn keys_overlay_costs_line_up_on_the_decimal_point() {
+        let mut view = keys_view();
+        view.client_keys.push(crate::dashboard::KeyRowDoc {
+            id: "k-idle".into(),
+            name: "pc-idle".into(),
+            ..view.client_keys[0].clone()
+        });
+        let mut doc = keys_doc("all", Vec::new());
+        doc.tenants[0].cost_usd = 1_204.5;
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        let rows = render_rows(&view, &keys_chrome(panel), 200, 30);
+        let all = rows.join("\n");
+        let find = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}:\n{all}"))
+                .clone()
+        };
+        let point = |r: &str, money: &str| {
+            let at = r.find(money).unwrap_or_else(|| panic!("{money} in {r}"));
+            cells::width(&r[..at]) + money.find('.').expect("point")
+        };
+        let key = find("$1,204.50");
+        let model = find("└ claude/claude-opus-4-8");
+        assert_eq!(point(&key, "$1,204.50"), point(&model, "$1.25"), "{all}");
+        let idle = find("pc-idle");
+        assert!(!idle.contains('$'), "{idle}");
+        // The cost dash is the row's last one (`ok/err` reads `—` too).
+        assert_eq!(
+            cells::width(&idle[..idle.rfind('—').expect("dash")]) + 1,
+            point(&key, "$1,204.50"),
+            "{all}"
+        );
     }
 
     /// K-6 `name을 맨 앞`: the NAME column is first and the key metadata cell
@@ -12977,6 +13053,57 @@ mod tests {
             assert!(!strip.contains('▱') && !strip.contains('▰'), "{strip}");
             // Two models, each with `—` for its share and for `last`.
             assert_eq!(strip.matches('—').count(), 4, "{strip}");
+        }
+    }
+
+    /// Audit frame 5.1: the strip's 9-cell `$` column cut `$112293.04` to
+    /// `$112293.0`. Costs are on the ledger now: every digit kept, grouped,
+    /// the decimal point in one column down the strip and the table, and
+    /// `—` for a model no rate prices.
+    #[test]
+    fn model_costs_keep_their_cents_on_one_decimal_column() {
+        let priced = |model: &str, cost: f64| ModelUsageDoc {
+            cost_usd: cost,
+            ..model_row("claude", model, 1_000, 10)
+        };
+        let view = view_with(vec![
+            priced("claude-opus-5-5", 112_293.04),
+            priced("claude-sonnet-5", 8.5),
+            priced("claude-haiku-5", 0.0123),
+            model_row("openrouter", "vendor/unlisted-model", 1_000, 10),
+        ]);
+        assert_eq!(
+            usize::from(COST_COL_WIDTH),
+            cost_amount(None, twolab_tui::ledger::Tier::Total).width()
+        );
+        for overlay in [Overlay::None, Overlay::Stats] {
+            let rows = render_rows(&view, &chrome_overlay(overlay), 80, 24);
+            let row = |needle: &str| {
+                rows.iter()
+                    .find(|r| r.contains(needle))
+                    .unwrap_or_else(|| panic!("{needle}:\n{}", rows.join("\n")))
+                    .clone()
+            };
+            let point = |r: &str| cells::width(&r[..r.find('.').expect("a point")]);
+            let big = row("claude-opus-5-5");
+            assert!(big.contains("$112,293.04"), "{big}");
+            let mid = row("claude-sonnet-5");
+            assert!(mid.contains("$8.50"), "{mid}");
+            let small = row("claude-haiku-5");
+            assert!(small.contains("$0.0123"), "{small}");
+            let cost_point = |r: &str| {
+                let at = r.find('$').expect("a $");
+                cells::width(&r[..at]) + point(&r[at..])
+            };
+            assert_eq!(cost_point(&big), cost_point(&mid), "{big}\n{mid}");
+            assert_eq!(cost_point(&big), cost_point(&small), "{big}\n{small}");
+            let unpriced = row("vendor/unlisted");
+            assert!(!unpriced.contains('$'), "never a free $0: {unpriced}");
+            assert_eq!(
+                cells::width(&unpriced[..unpriced.find('—').expect("dash")]) + 1,
+                cost_point(&big),
+                "the dash stands in the ones column: {unpriced}"
+            );
         }
     }
 
@@ -15687,7 +15814,7 @@ mod tests {
         let mut m = model_row("claude", "claude-opus-4-8", 200_000, 100_000);
         m.cache_read = Some(40_000);
         m.cache_creation = None;
-        let cost = model_cost(&m);
+        let cost = model_cost(&m).expect("opus has a rate");
         assert!((cost - (1.0 + 2.5 + 0.02)).abs() < 1e-9, "got {cost}");
         assert_eq!(format_cost(cost), "$3.52");
     }
@@ -15699,15 +15826,19 @@ mod tests {
         let mut m = model_row("claude", "claude-opus-4-8", 200_000, 100_000);
         m.cache_read = Some(40_000);
         m.cost_usd = 9.99;
-        assert!((model_cost(&m) - 9.99).abs() < 1e-12);
+        assert!((model_cost(&m).expect("server cost") - 9.99).abs() < 1e-12);
         // Old-daemon doc (serde default 0.0) with tokens → local pricing
         // fallback (same math as `model_cost_matches_pricing_table`).
         m.cost_usd = 0.0;
-        assert!((model_cost(&m) - 3.52).abs() < 1e-9);
+        assert!((model_cost(&m).expect("local rate") - 3.52).abs() < 1e-9);
         // No tokens at all (e.g. an in-flight-only row) → $0, no lookup.
         let mut idle = model_row("claude", "claude-opus-4-8", 0, 0);
         idle.cache_read = None;
-        assert!(model_cost(&idle).abs() < 1e-12);
+        assert_eq!(model_cost(&idle), Some(0.0));
+        // Tokens under a group nothing prices (an uncurated openrouter
+        // model) and no server cost: unknown, never a free `$0`.
+        let unpriced = model_row("openrouter", "vendor/unlisted-model", 1_000, 10);
+        assert_eq!(model_cost(&unpriced), None);
     }
 
     #[test]
@@ -19933,10 +20064,8 @@ mod tests {
     /// pane — the accounts pane dragged, or a short terminal where the
     /// table already bottoms out at `PANE_MIN_HEIGHT`: `Min(3)` activity
     /// outranks the `Length` panes, so the solver takes rows from them. At
-    /// 21 rows with accounts dragged to 3 the middle area is 6 rows
-    /// (measured; 22 rows until the strip's token counts took the `G` unit
-    /// and the strip packs two per line at this width, one row shorter):
-    /// the band would get 5 content rows and lose its `mode`
+    /// 22 rows with accounts dragged to 3 the middle area is 6 rows
+    /// (measured): the band would get 5 content rows and lose its `mode`
     /// row, so the middle pane falls back to today's pair, which shows it.
     /// Over a sweep of heights the band is drawn in some frames and never
     /// without its `mode` row.
@@ -19945,7 +20074,7 @@ mod tests {
         let (view, mut chrome) = recompose_view();
         let w = band_bound(&view, &chrome);
         chrome.pane_heights.accounts = Some(3);
-        let rows = render_rows(&view, &chrome, w, 21);
+        let rows = render_rows(&view, &chrome, w, 22);
         let frame = rows.join("\n");
         let accounts = row_of(&rows, " accounts · sort ");
         let middle = row_of(&rows, " scheduler ");
@@ -20588,7 +20717,13 @@ mod tests {
     /// `mini_bar`: text unchanged; the empty `▱` cells are dim (DarkGray)
     /// instead of the group colour, so the filled part stands out (previous
     /// digest 5_486_511_068_981_384_955).
-    const FOLD_OFF_179X43_DIGEST: u64 = 7_483_902_083_238_678_069;
+    /// Re-pinned the same day for the strip's `$` cells on twolab-tui's
+    /// `ledger`: amounts are grouped and lined up on the decimal point
+    /// (`$71123.86` reads ` $71,123.86`, `$8349.47` reads `  $8,349.47`,
+    /// each entry two cells wider), dollars in the default colour over dim
+    /// cents and a dim `$` instead of all green; every other cell unchanged
+    /// (previous digest 7_483_902_083_238_678_069).
+    const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
