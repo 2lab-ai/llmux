@@ -788,6 +788,10 @@ pub(crate) struct Chrome {
     /// The Logs pager's drag selection (content rows and cells), drawn
     /// reversed; `None` when nothing is selected.
     pub logs_selection: Option<twolab_tui::pager::Selection>,
+    /// The log lines as they were when the pager was pressed, while a
+    /// selection is being made or shown: the pager draws these instead of
+    /// the live ring, so the text selected is the text on screen.
+    pub logs_frozen: Option<std::sync::Arc<[crate::logging::LogLine]>>,
     /// Copy mode (`v`): the mouse is released to the terminal for its own
     /// selection and the footer's key bar is the banner that says so.
     pub copy_mode: bool,
@@ -1317,6 +1321,9 @@ struct App {
     /// The Logs pager's drag selection; see [`Chrome::logs_selection`]. While
     /// one is shown the pager holds still instead of following.
     logs_sel: Option<twolab_tui::pager::Selection>,
+    /// The lines the Logs pager holds from a press on it until its
+    /// selection is gone; see [`Chrome::logs_frozen`].
+    logs_frozen: Option<std::sync::Arc<[crate::logging::LogLine]>>,
     /// Copy mode (`v`), see [`Chrome::copy_mode`]: the event loop releases
     /// mouse capture while it is on and holds the frame still, so the text
     /// under the terminal's own selection does not move.
@@ -1444,6 +1451,7 @@ impl App {
             logs_pos: Default::default(),
             logs_area: None,
             logs_sel: None,
+            logs_frozen: None,
             copy_mode: false,
             copy_since: None,
             held_for: Duration::ZERO,
@@ -1696,6 +1704,7 @@ impl App {
             usage_scroll: self.usage_scroll,
             logs_scroll: self.logs_scroll,
             logs_selection: self.logs_sel,
+            logs_frozen: self.logs_frozen.clone(),
             copy_mode: self.copy_mode,
             input_modal: self.input_modal.clone(),
             // The Loading spinner rides the shared frame counter (set here so
@@ -3068,6 +3077,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Esc => {
                 self.overlay = Overlay::None;
                 self.logs_sel = None;
+                self.logs_frozen = None;
                 return;
             }
             KeyCode::Char('k') => KeyCode::Up,
@@ -3084,6 +3094,7 @@ impl App {
     fn open_logs(&mut self) {
         self.logs_scroll = None;
         self.logs_sel = None;
+        self.logs_frozen = None;
         self.overlay = Overlay::Logs;
     }
 
@@ -3096,7 +3107,10 @@ impl App {
     /// selection the view holds still (new lines must not scroll it out from
     /// under the pointer); a drag past the top or bottom edge scrolls. A
     /// press off the pager (`target`: what the last frame drew under the
-    /// pointer) clears the selection, as one on its border does.
+    /// pointer) clears the selection, as one on its border does. From the
+    /// press until the selection is gone the pager holds the lines it had at
+    /// the press ([`Self::logs_frozen`]): a line arriving, or the ring
+    /// dropping its oldest, mid-drag never changes what is copied.
     /// `None`: not a left-button event, or no pager on screen.
     fn logs_select_mouse(
         &mut self,
@@ -3117,10 +3131,18 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(_))
             && target != Some(&ui::ClickTarget::LogsPager)
         {
+            self.logs_frozen = None;
             return Some(self.logs_sel.take().is_some());
         }
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            // The lines on screen now — already held, if a selection is up.
+            self.logs_frozen
+                .get_or_insert_with(|| view.logs.as_slice().into());
+        }
         let before = (self.logs_sel, self.logs_scroll);
-        let mut pager = ui::logs_pager(view, self.logs_scroll, self.logs_sel);
+        let lines = self.logs_frozen.as_deref().unwrap_or(&view.logs);
+        let mask = view.email_anonymous;
+        let mut pager = ui::logs_pager(lines, mask, self.logs_scroll, self.logs_sel);
         let mut scratch = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(&pager, area, &mut scratch);
         let changed = match mouse.kind {
@@ -3138,6 +3160,9 @@ impl App {
         self.logs_sel = pager.selection().copied();
         if self.logs_sel.is_some_and(|s| s.is_visible()) {
             self.logs_scroll = Some(pager.scroll_offset());
+        }
+        if self.logs_sel.is_none() {
+            self.logs_frozen = None;
         }
         Some(changed || (self.logs_sel, self.logs_scroll) != before)
     }
@@ -3173,6 +3198,12 @@ impl App {
         let pos = pos.with_top(self.logs_scroll.unwrap_or(pos.max));
         if let Some(top) = to(pos) {
             self.logs_scroll = (top < pos.max).then_some(top);
+        }
+        // Following the tail again shows the live lines, which the held
+        // selection does not point into: it goes, and the lines with it.
+        if self.logs_scroll.is_none() && self.logs_frozen.is_some() {
+            self.logs_sel = None;
+            self.logs_frozen = None;
         }
     }
 
@@ -8847,6 +8878,78 @@ mod tests {
         );
         assert_eq!(app.logs_sel, None, "a plain click clears the selection");
         assert!(app.pending_clip.is_empty(), "and copies nothing");
+    }
+
+    /// From the press on the Logs pager until its selection is gone, the
+    /// pager holds the lines it showed at the press: a line arriving
+    /// mid-drag that makes the ring drop its oldest moves nothing on screen
+    /// and the release copies the text that was drawn — it used to copy the
+    /// lines one row further on. A plain click lets go and the live lines
+    /// show again; so does `End`, which follows the tail.
+    #[test]
+    fn logs_drag_copies_the_text_drawn_at_the_press_while_lines_arrive() {
+        let line = |i: usize| crate::logging::LogLine {
+            level: tracing::Level::INFO,
+            text: format!("log line {i:03}"),
+        };
+        let mut view = stats_view_with_account();
+        view.logs = (0..5).map(line).collect();
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('l'), None);
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 000", "{rows:#?}");
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        // A new line arrives; the ring drops its oldest.
+        view.logs.remove(0);
+        view.logs.push(line(5));
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 000", "held: {rows:#?}");
+        app.on_mouse(
+            left(MouseEventKind::Drag(MouseButton::Left), 18, 4),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), 18, 4),
+            Some(&view),
+        );
+        let req = app.pending_clip.pop_front().expect("the release copies");
+        assert_eq!(req.payload, "log line 000\n  INFO log line 001");
+        assert!(app.logs_frozen.is_some(), "held while the selection shows");
+        // A plain click clears the selection and lets go of the lines.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.on_mouse(left(kind, 10, 6), Some(&view));
+        }
+        assert_eq!((app.logs_sel, app.logs_frozen.is_some()), (None, false));
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert_eq!(rows[3].trim_end(), "  INFO log line 001", "{rows:#?}");
+        // A selection held, then `End`: the tail is followed, live.
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), 18, 4),
+            Some(&view),
+        );
+        app.pending_clip.clear();
+        view.logs.push(line(6));
+        app.on_key_logs(KeyCode::End);
+        assert_eq!((app.logs_sel, app.logs_frozen.is_some()), (None, false));
+        let rows = draw_and_adopt(&mut app, &view, 80, 24);
+        assert!(rows.join("\n").contains("log line 006"), "{rows:#?}");
+        // Closing the overlay forgets them too.
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), 7, 3),
+            Some(&view),
+        );
+        app.on_key_logs(KeyCode::Esc);
+        assert!(app.logs_frozen.is_none());
     }
 
     /// A drag past the bottom of the Logs pager scrolls it (3 rows per row
