@@ -34,7 +34,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | scroll, input (modules) | Codex | each list clamps its own cursor; handlers match crossterm keys directly | PgUp/PgDn/Home/End behave the same in every list | 1 |
 | pager | Codex | the logs overlay cannot scroll and shows a blank pane when empty; modals scroll with no position | scroll back through the log ring, long lines wrap, `NN%` position, an honest "no log lines yet" | 2 |
 | modal | herdr | popups are 80%×80% (input), 80%×70% (keys picker), 80%×85% (account) whatever their content | popups fit their content up to a cap, with a footer of keys and a scrollbar when the body overflows | 2 |
-| scrollbar | herdr | tables and modals scroll with no scrollbar; the raw viewer's bars cannot be dragged | a thumb that shows where you are and can be dragged | 2 |
+| scrollbar | herdr | tables and modals scroll with no scrollbar; the raw viewer's bars cannot be dragged | a thumb that shows where you are and can be dragged | done |
 | tabs (raw viewer) | llmux | Request/Response tabs measured in bytes | same look and click behaviour as the main tab row | 2 |
 | json_view (raw body) | llmux | bodies chunked at 2048 bytes and panned with H/L | wrapped at the width, `lines 12–40 of 213`, still fast on 8 MiB bodies (row heights cached per width) | 2 |
 | toast | herdr | status messages are one row, cut at 80 columns, replaced by the next one and gone after 5 s | messages stack in a corner card with ok/warn/fail glyphs; a multi-account refresh result can be read line by line | 3 |

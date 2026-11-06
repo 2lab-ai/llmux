@@ -292,7 +292,13 @@ pub(crate) fn draw(
             }
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
-        Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
+        Overlay::Usage => {
+            let bar;
+            (usage_scope, bar) = draw_usage_overlay(frame, overlay_area, view, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.table_scroll = bar;
+            }
+        }
         Overlay::Logs => {
             let pos = draw_logs_overlay(frame, overlay_area, view, chrome);
             if let Some(hits) = hits.as_mut() {
@@ -303,7 +309,12 @@ pub(crate) fn draw(
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view, chrome),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
-        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view, chrome),
+        Overlay::Keys => {
+            let bar = draw_keys_overlay(frame, overlay_area, view, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.table_scroll = bar;
+            }
+        }
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -553,6 +564,7 @@ fn draw_main(
         input_modal: None,
         account_modal: None,
         logs: None,
+        table_scroll: None,
         raw_modal: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
@@ -1045,7 +1057,7 @@ fn draw_usage_overlay(
     area: Rect,
     view: &DashboardView,
     chrome: &Chrome,
-) -> Option<String> {
+) -> (Option<String>, Option<TableScroll>) {
     frame.render_widget(Clear, area);
     let gran = chrome.usage_gran;
     // Keep the daemon's cost wording verbatim on wide screens. The compact
@@ -1080,7 +1092,7 @@ fn draw_usage_overlay(
             gran.label()
         )));
         frame.render_widget(empty, area);
-        return None;
+        return (None, None);
     }
 
     // Group consecutive rows by bucket — the document orders each granularity
@@ -1114,6 +1126,16 @@ fn draw_usage_overlay(
         .map(usage_row_tokens)
         .fold(0, u64::saturating_add);
     let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
+    // The scrollbar counts table rows (a bucket row plus one per model), so
+    // its thumb is the share of rows in view; `scroll` stays in buckets.
+    let rows_total: usize = buckets.iter().map(|(_, _, g)| 1 + g.len()).sum();
+    let rows_above: usize = buckets
+        .iter()
+        .take(scroll)
+        .map(|(_, _, g)| 1 + g.len())
+        .sum();
+    let body_h = usize::from(area.height.saturating_sub(2)); // rule + header
+    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(rows_total, body_h, rows_above);
     let (label, n) = (gran.label(), buckets.len());
     let (tok, cost) = (format::human_count(total_tokens), format_cost(total_cost));
     let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
@@ -1223,16 +1245,20 @@ fn draw_usage_overlay(
         Constraint::Length(8),
         Constraint::Length(USAGE_COST_COL_WIDTH),
     ];
+    let block = Block::new().borders(Borders::TOP).title(title);
+    let (table_area, track) = table_scroll_split(block.inner(area), bar_pos);
+    frame.render_widget(block, area);
     let table = Table::new(trows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
-    buckets.get(scroll).map(|(_, label, _)| {
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, table_area);
+    let bar = track.and_then(|track| draw_table_scrollbar(frame, bar_pos, track));
+    let scope = buckets.get(scroll).map(|(_, label, _)| {
         format!(
             "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
             gran.label()
         )
-    })
+    });
+    (scope, bar)
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -1360,6 +1386,44 @@ fn group_thousands(n: u64) -> String {
 /// lines while `chrome.logs_scroll` is `None` (the bottom) and holds still
 /// once scrolled back. Returns where it drew, so the runtime can turn the
 /// next key or wheel step into a row offset.
+/// A table's scrollbar as one frame drew it (keys, sessions, usage): where
+/// the rows are and the one-column track a press or drag acts on. Only
+/// reported while the rows overflow, so `None` means there is nothing to drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableScroll {
+    pub pos: twolab_tui::scrollbar::ScrollPos,
+    pub track: Rect,
+}
+
+/// A borderless-sided table's body split for its scrollbar: when `pos`
+/// overflows, the rightmost column becomes the track (beside the data rows,
+/// under the header row) and the table gets the rest.
+fn table_scroll_split(inner: Rect, pos: twolab_tui::scrollbar::ScrollPos) -> (Rect, Option<Rect>) {
+    let (table, track) = twolab_tui::scrollbar::split(inner, pos);
+    let track = track.map(|t| Rect {
+        y: t.y.saturating_add(1),
+        height: t.height.saturating_sub(1),
+        ..t
+    });
+    (table, track)
+}
+
+/// Draw a table's scrollbar (twolab-tui, herdr's glyphs: track `╎`, thumb
+/// `▐`) on `track` and report it for the mouse — `None` when nothing
+/// overflows or the track has no rows.
+fn draw_table_scrollbar(
+    frame: &mut Frame,
+    pos: twolab_tui::scrollbar::ScrollPos,
+    track: Rect,
+) -> Option<TableScroll> {
+    twolab_tui::scrollbar::thumb(pos, track)?;
+    frame.render_widget(
+        twolab_tui::scrollbar::Scrollbar::new(pos).theme(KEYBAR_THEME),
+        track,
+    );
+    Some(TableScroll { pos, track })
+}
+
 fn draw_logs_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -1451,7 +1515,7 @@ fn draw_sessions_overlay(
         frame.render_widget(empty, area);
         return;
     }
-    let table_chrome = if area.width >= SIDE_BY_SIDE_AT {
+    let (table_chrome, bar) = if area.width >= SIDE_BY_SIDE_AT {
         let [list_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(46)]).areas(area);
         let tc = draw_sessions_table(frame, list_area, ctx, chrome);
@@ -1462,6 +1526,7 @@ fn draw_sessions_overlay(
     };
     if let Some(hits) = hits.as_mut() {
         hits.sessions_table = table_chrome;
+        hits.table_scroll = bar;
     }
 }
 
@@ -1474,7 +1539,7 @@ fn draw_sessions_table(
     area: Rect,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) -> Option<SessionsChrome> {
+) -> (Option<SessionsChrome>, Option<TableScroll>) {
     let total = chrome.sessions.len();
     let cursor = chrome.session_cursor.min(total.saturating_sub(1));
     let capacity = (area.height.saturating_sub(2) as usize).max(1); // border + header
@@ -1484,6 +1549,7 @@ fn draw_sessions_table(
         0
     };
     let end = (start + capacity).min(total);
+    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(total, capacity, start);
 
     let rows = chrome.sessions[start..end]
         .iter()
@@ -1554,22 +1620,27 @@ fn draw_sessions_table(
     } else {
         format!(" sessions — {} of {total} — sort {sort} (o) ", cursor + 1)
     };
+    let block = Block::new().borders(Borders::TOP).title(title);
+    let (table_area, track) = table_scroll_split(block.inner(area), bar_pos);
+    frame.render_widget(block, area);
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
-    // Data rows start under the top border + header row.
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, table_area);
+    let bar = track.and_then(|track| draw_table_scrollbar(frame, bar_pos, track));
+    // Data rows start under the top border + header row; the scrollbar's
+    // column is not a row click.
     let rows_rect = Rect {
         x: area.x,
         y: area.y.saturating_add(2),
-        width: area.width,
+        width: table_area.width,
         height: area.height.saturating_sub(2),
     };
     let _ = ctx;
-    (rows_rect.height > 0).then_some(SessionsChrome {
+    let table_chrome = (rows_rect.height > 0).then_some(SessionsChrome {
         rows: rows_rect,
         start,
-    })
+    });
+    (table_chrome, bar)
 }
 
 /// Drill-down pane for the cursored session: the grouping confidence, the full
@@ -2530,7 +2601,12 @@ pub(crate) fn keys_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
 /// The table is scrolled by the panel's own offset (rows are sliced here, not
 /// clipped by the widget), so the final rows are reachable on any terminal
 /// height. Read-only: mutations stay in the CLI/API (admin-gated).
-fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+fn draw_keys_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Option<TableScroll> {
     frame.render_widget(Clear, area);
     let panel = &chrome.keys;
     let rows = keys_rows(view, chrome);
@@ -2569,7 +2645,7 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         .block(Block::bordered().title(title));
         frame.render_widget(body, area);
         draw_keys_picker(frame, area, panel);
-        return;
+        return None;
     }
     if rows.is_empty() {
         let body = if panel.doc.is_none() {
@@ -2592,7 +2668,7 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         .block(Block::bordered().title(title));
         frame.render_widget(body, area);
         draw_keys_picker(frame, area, panel);
-        return;
+        return None;
     }
 
     // Only the columns this frame can hold — the name is never one of the
@@ -2660,7 +2736,22 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::bordered().title(format!("{title}{scrolled}")));
     frame.render_widget(table, area);
+    // The scrollbar stands on the right border beside the data rows (under
+    // the header row, above the bottom border), so it costs no column.
+    let track = Rect {
+        x: area.right().saturating_sub(1),
+        y: area.y.saturating_add(2),
+        width: area.width.min(1),
+        height: area.height.saturating_sub(3),
+    };
+    let bar = draw_table_scrollbar(
+        frame,
+        twolab_tui::scrollbar::ScrollPos::of(rows.len(), visible, scroll),
+        track,
+    );
     draw_keys_picker(frame, area, panel);
+    // An open picker owns the panel: its table cannot be dragged then.
+    bar.filter(|_| panel.picker.is_none())
 }
 
 /// The `f` model picker's keys (its footer and the `?` help): `/` starts
@@ -8426,6 +8517,9 @@ pub(crate) struct MainChrome {
     /// Where the Logs overlay's pager drew this frame (`None`: not open), so
     /// a scroll key or wheel step moves from what is on screen.
     pub logs: Option<twolab_tui::scrollbar::ScrollPos>,
+    /// The open keys, sessions or usage table's scrollbar this frame, when
+    /// its rows overflow: a press on the track jumps, a drag moves the thumb.
+    pub table_scroll: Option<TableScroll>,
     /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
     /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
@@ -11086,12 +11180,13 @@ const GO_TO_KEYS: [(&str, &str); 10] = [
 ];
 
 /// MAIN bindings the clickable settings bar and the rows stand in for.
-const OTHER_KEYS: [(&str, &str); 6] = [
+const OTHER_KEYS: [(&str, &str); 7] = [
     ("f m e", "codex fast / model / effort"),
     ("h", "account detail"),
     ("click", "tab · row detail · value edit"),
     ("right-click", "account menu"),
     ("wheel", "activity · overlay cursors"),
+    ("drag", "scrollbar · pane border"),
     ("ctrl+c", "quit anywhere"),
 ];
 
@@ -11820,6 +11915,128 @@ mod tests {
             ..Default::default()
         };
         (view, panel)
+    }
+
+    /// Batch 2 scrollbar: a keys table longer than the panel carries the
+    /// library scrollbar on its right border beside the data rows — thumb at
+    /// the top, then at the bottom once scrolled to the end — at 80×24 and
+    /// 179×43; a table that fits keeps its plain border.
+    #[test]
+    fn keys_overlay_draws_a_scrollbar_on_its_border_when_rows_overflow() {
+        let (view, panel) = big_keys_panel();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &keys_chrome(panel.clone()), w, h);
+            let frame = rows.join("\n");
+            let bar = hits.table_scroll.expect("the rows overflow");
+            assert_eq!(bar.track.x, w - 1, "{w}x{h}: on the right border\n{frame}");
+            let edge = |y: u16| rows[usize::from(y)].chars().last().unwrap_or(' ');
+            assert_eq!(edge(bar.track.y), '▐', "{w}x{h}: thumb at the top\n{frame}");
+            assert_eq!(
+                edge(bar.track.bottom() - 1),
+                '╎',
+                "{w}x{h}: track below\n{frame}"
+            );
+            assert_eq!(
+                edge(bar.track.y - 1),
+                '│',
+                "{w}x{h}: header row keeps the border"
+            );
+
+            let end = crate::tui::KeysPanel {
+                scroll: usize::MAX,
+                ..panel.clone()
+            };
+            let (rows, _) = render_with_hits(&view, &keys_chrome(end), w, h);
+            let edge = |y: u16| rows[usize::from(y)].chars().last().unwrap_or(' ');
+            assert_eq!(
+                edge(bar.track.y),
+                '╎',
+                "{w}x{h}: scrolled away from the top"
+            );
+            assert_eq!(
+                edge(bar.track.bottom() - 1),
+                '▐',
+                "{w}x{h}: thumb at the end"
+            );
+        }
+        let (rows, hits) = render_with_hits(&keys_view(), &keys_chrome(loaded_panel()), 80, 24);
+        assert_eq!(hits.table_scroll, None, "a table that fits has no bar");
+        assert!(!rows.join("").contains('▐'), "and draws none");
+    }
+
+    /// The sessions and usage tables give the scrollbar their last column
+    /// (beside the data rows, under the header) only while they overflow;
+    /// side by side the sessions bar stays on the list, off the detail pane.
+    #[test]
+    fn sessions_and_usage_tables_draw_a_scrollbar_only_when_they_overflow() {
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions = (0..60)
+            .map(|i| crate::session::Session {
+                user_id: Some(format!("u-{i:02}")),
+                ..one_session()
+            })
+            .collect();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let bar = hits.table_scroll.expect("60 sessions overflow");
+            let table = hits.sessions_table.expect("table drawn");
+            assert_eq!(
+                bar.track.x,
+                table.rows.right(),
+                "{w}x{h}: right of the rows\n{frame}"
+            );
+            assert_eq!(bar.track.y, table.rows.y, "{w}x{h}: beside the data rows");
+            if w >= SIDE_BY_SIDE_AT {
+                assert!(bar.track.x < w - 46, "{w}x{h}: on the list, not the detail");
+            }
+            let at = |y: u16| rows[usize::from(y)].chars().nth(usize::from(bar.track.x));
+            assert_eq!(at(bar.track.y), Some('▐'), "{w}x{h}:\n{frame}");
+            assert_eq!(at(bar.track.bottom() - 1), Some('╎'), "{w}x{h}:\n{frame}");
+        }
+        chrome.sessions.truncate(3);
+        let (_, hits) = render_with_hits(&view, &chrome, 80, 24);
+        assert_eq!(hits.table_scroll, None, "three sessions fit");
+
+        let row = |bucket: u64, model: &str| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket,
+            label: format!("day-{bucket:02}"),
+            group: "claude".into(),
+            model: model.into(),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            cost_usd: 0.1,
+            priced: true,
+        };
+        let mut view = view_with(Vec::new());
+        view.usage_stats = (0..20u64)
+            .rev()
+            .flat_map(|b| [row(b, "m1"), row(b, "m2")])
+            .collect();
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.usage_gran = crate::tui::activity::UsageGran::Day;
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let bar = hits.table_scroll.expect("60 usage rows overflow");
+            assert_eq!(bar.track.x, w - 1, "{w}x{h}: the last column\n{frame}");
+            assert_eq!((bar.pos.top, bar.pos.max), (0, 60 - bar.pos.viewport));
+            let at = |y: u16| rows[usize::from(y)].chars().last();
+            assert_eq!(at(bar.track.y), Some('▐'), "{w}x{h}:\n{frame}");
+            assert_eq!(
+                at(bar.track.y - 1),
+                Some(' '),
+                "{w}x{h}: the header row has no bar"
+            );
+        }
+        view.usage_stats.truncate(4);
+        let (_, hits) = render_with_hits(&view, &chrome, 80, 24);
+        assert_eq!(hits.table_scroll, None, "two buckets fit");
     }
 
     #[test]
