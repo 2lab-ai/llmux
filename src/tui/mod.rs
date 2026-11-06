@@ -395,16 +395,97 @@ pub(crate) struct KeysPanel {
     pub generation: u64,
 }
 
-/// The `f` multi-select model picker (keys-history K-0).
-#[derive(Debug, Clone, Default)]
+/// The `f` multi-select model picker (keys-history K-0) — twolab-tui's
+/// `multi_select`, which owns the offered models, their checkboxes (the
+/// working selection, applied to the panel only on Enter), the cursor and
+/// the filter.
+#[derive(Debug, Clone)]
 pub(crate) struct KeysPicker {
-    pub cursor: usize,
-    /// Working selection — applied to the panel only on Enter.
-    pub selected: std::collections::BTreeSet<String>,
-    /// Offered names: the models observed in the current window, UNIONED with
-    /// anything already selected (so a selection made under a wider window
-    /// stays visible and deselectable).
-    pub options: Vec<String>,
+    pub list: twolab_tui::multi_select::MultiSelect,
+    /// `/` opened the filter: printable keys type into it (so `a`, `c`, `j`,
+    /// `k`, `f` and `q` stay picker keys until then).
+    pub filtering: bool,
+}
+
+impl KeysPicker {
+    /// Rows the picker shows before it scrolls.
+    const ROWS: usize = 10;
+
+    /// A picker offering `options` (the models observed in the current
+    /// window, UNIONED with anything already selected, so a selection made
+    /// under a wider window stays visible and deselectable), `selected`
+    /// checked.
+    pub(crate) fn new(
+        options: Vec<String>,
+        selected: &std::collections::BTreeSet<String>,
+    ) -> KeysPicker {
+        KeysPicker {
+            list: Self::list(options, selected),
+            filtering: false,
+        }
+    }
+
+    fn list(
+        options: Vec<String>,
+        selected: &std::collections::BTreeSet<String>,
+    ) -> twolab_tui::multi_select::MultiSelect {
+        use twolab_tui::multi_select::{MultiItem, MultiSelect};
+        let items = options
+            .into_iter()
+            .map(|m| {
+                let checked = selected.contains(&m);
+                MultiItem::new(m.clone(), m).checked(checked)
+            })
+            .collect();
+        MultiSelect::new(items).max_rows(Self::ROWS)
+    }
+
+    /// The offered model names, in order.
+    pub(crate) fn options(&self) -> Vec<String> {
+        self.list.items().iter().map(|i| i.id.clone()).collect()
+    }
+
+    /// The working selection.
+    pub(crate) fn selected(&self) -> std::collections::BTreeSet<String> {
+        self.list.checked_ids().into_iter().collect()
+    }
+
+    /// Offer `options` instead, keeping what is checked, the filter and the
+    /// row under the cursor (the list has no way to set items or the cursor
+    /// in place — library gap — so it is rebuilt and moved back).
+    fn rebuild(&mut self, options: Vec<String>, selected: &std::collections::BTreeSet<String>) {
+        use twolab_tui::{Key, KeyInput};
+        let cursor = self
+            .list
+            .selected()
+            .and_then(|i| self.list.items().get(i))
+            .map(|i| i.id.clone());
+        let mut list = Self::list(options, selected).with_query(self.list.search_query());
+        if let Some(id) = cursor {
+            for _ in 0..list.visible_len() {
+                if list
+                    .selected()
+                    .and_then(|i| list.items().get(i))
+                    .map(|i| &i.id)
+                    == Some(&id)
+                {
+                    break;
+                }
+                list.key(KeyInput::new(Key::Down));
+            }
+        }
+        self.list = list;
+    }
+
+    /// `a` / `c`: check or clear every offered model.
+    fn set_all(&mut self, checked: bool) {
+        let all: std::collections::BTreeSet<String> = if checked {
+            self.options().into_iter().collect()
+        } else {
+            Default::default()
+        };
+        self.rebuild(self.options(), &all);
+    }
 }
 
 /// One dispatched keys-usage query, drained by the event loop.
@@ -2689,6 +2770,15 @@ impl App {
                 self.keys.available = doc.available_models.clone();
                 self.keys.doc = Some(std::sync::Arc::new(doc));
                 self.keys.error = None;
+                // An open picker offers what this answer observed: opened
+                // during the first load it used to say "no models observed"
+                // over a panel full of models.
+                if let Some(working) = self.keys.picker.as_ref().map(KeysPicker::selected) {
+                    let options = self.keys_picker_options(&working);
+                    if let Some(picker) = self.keys.picker.as_mut() {
+                        picker.rebuild(options, &working);
+                    }
+                }
             }
             // The previous answer is DROPPED on failure: showing older rows
             // under the new filter label is exactly the lie this panel must
@@ -2703,15 +2793,19 @@ impl App {
     /// Open the `f` model picker over the models the current answer observed,
     /// unioned with the current selection.
     fn open_keys_picker(&mut self) {
+        let options = self.keys_picker_options(&self.keys.models);
+        self.keys.picker = Some(KeysPicker::new(options, &self.keys.models));
+    }
+
+    /// What the picker offers: the models the last answer observed, unioned
+    /// with the applied filter and the `working` selection.
+    fn keys_picker_options(&self, working: &std::collections::BTreeSet<String>) -> Vec<String> {
         let mut options: Vec<String> = self.keys.available.clone();
         options.extend(self.keys.models.iter().cloned());
+        options.extend(working.iter().cloned());
         options.sort();
         options.dedup();
-        self.keys.picker = Some(KeysPicker {
-            cursor: 0,
-            selected: self.keys.models.clone(),
-            options,
-        });
+        options
     }
 
     /// Key handling for the Keys overlay (keys-history K-0): `w` cycles the
@@ -2751,36 +2845,67 @@ impl App {
         }
     }
 
-    /// Key handling inside the `f` picker: arrows move, Space toggles, `a`
-    /// selects every offered model, `c` clears, Enter applies (and re-queries),
-    /// `Esc`/`f` cancels without touching the active filter.
+    /// Key handling inside the `f` picker ([`KeysPicker`]): arrows and
+    /// `j`/`k` move, Space toggles, `a` checks every offered model, `c`
+    /// clears, `/` starts the filter, Enter applies (and re-queries),
+    /// `Esc`/`f` cancel without touching the active filter, `q` quits. While
+    /// the filter is open printable keys type into it, Backspace on an empty
+    /// filter or Esc closes it (the picker stays), and Space/Enter/arrows
+    /// keep working.
     fn on_key_keys_picker(&mut self, code: KeyCode) {
+        use twolab_tui::multi_select::Outcome;
         let Some(picker) = self.keys.picker.as_mut() else {
             return;
         };
-        let last = picker.options.len().saturating_sub(1);
-        match code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc | KeyCode::Char('f') => self.keys.picker = None,
-            KeyCode::Up | KeyCode::Char('k') => picker.cursor = picker.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => picker.cursor = (picker.cursor + 1).min(last),
-            KeyCode::Char(' ') => {
-                if let Some(model) = picker.options.get(picker.cursor).cloned() {
-                    if !picker.selected.remove(&model) {
-                        picker.selected.insert(model);
-                    }
+        let code = if picker.filtering {
+            match code {
+                KeyCode::Esc => {
+                    picker.list.set_search_query("");
+                    picker.filtering = false;
+                    return;
                 }
+                KeyCode::Backspace if picker.list.search_query().is_empty() => {
+                    picker.filtering = false;
+                    return;
+                }
+                code => code,
             }
-            KeyCode::Char('a') => picker.selected = picker.options.iter().cloned().collect(),
-            KeyCode::Char('c') => picker.selected.clear(),
-            KeyCode::Enter => {
-                let selected = picker.selected.clone();
-                self.keys.models = selected;
+        } else {
+            match code {
+                KeyCode::Char('q') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Esc | KeyCode::Char('f') => {
+                    self.keys.picker = None;
+                    return;
+                }
+                KeyCode::Char('a') => return picker.set_all(true),
+                KeyCode::Char('c') => return picker.set_all(false),
+                KeyCode::Char('/') => {
+                    picker.filtering = true;
+                    return;
+                }
+                KeyCode::Char('k') => KeyCode::Up,
+                KeyCode::Char('j') => KeyCode::Down,
+                // Letters do not type until `/` opens the filter.
+                KeyCode::Char(c) if c != ' ' => return,
+                KeyCode::Backspace => return,
+                code => code,
+            }
+        };
+        let Some(key) = key_input(code) else {
+            return;
+        };
+        match picker.list.key(key) {
+            Outcome::Applied(models) => {
+                self.keys.models = models.into_iter().collect();
                 self.keys.picker = None;
                 self.keys.scroll = 0;
                 self.request_keys_usage();
             }
-            _ => {}
+            Outcome::Cancelled => self.keys.picker = None,
+            Outcome::Changed | Outcome::Ignored => {}
         }
     }
 
@@ -7622,8 +7747,8 @@ mod tests {
 
         app.on_key_keys(KeyCode::Char('f'), None);
         let picker = app.keys.picker.as_ref().expect("picker opened");
-        assert_eq!(picker.options, vec!["model-a", "model-b"]);
-        assert!(picker.selected.is_empty(), "starts from the live filter");
+        assert_eq!(picker.options(), vec!["model-a", "model-b"]);
+        assert!(picker.selected().is_empty(), "starts from the live filter");
 
         app.on_key_keys(KeyCode::Char(' '), None); // select model-a
         app.on_key_keys(KeyCode::Down, None);
@@ -7660,10 +7785,10 @@ mod tests {
 
         app.on_key_keys(KeyCode::Char('f'), None);
         app.on_key_keys(KeyCode::Char('a'), None);
-        assert_eq!(app.keys.picker.as_ref().unwrap().selected.len(), 2, "all");
+        assert_eq!(app.keys.picker.as_ref().unwrap().selected().len(), 2, "all");
         app.on_key_keys(KeyCode::Char('c'), None);
         assert!(
-            app.keys.picker.as_ref().unwrap().selected.is_empty(),
+            app.keys.picker.as_ref().unwrap().selected().is_empty(),
             "clear"
         );
 
@@ -7735,9 +7860,102 @@ mod tests {
         app.on_key_keys(KeyCode::Char('f'), None);
         let picker = app.keys.picker.as_ref().expect("picker opened");
         assert_eq!(
-            picker.options,
+            picker.options(),
             vec!["model-a".to_string(), "model-b".to_string()],
             "cached options survive the in-flight query"
+        );
+    }
+
+    /// The picker refreshes its options when the query lands: `f` pressed
+    /// during the first load used to keep an empty list ("no models
+    /// observed") over a panel full of models. Checks and the cursor row
+    /// survive the refresh.
+    #[test]
+    fn the_model_picker_refreshes_its_options_when_the_query_lands() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.overlay = Overlay::Keys;
+        app.on_key_keys(KeyCode::Char('f'), None);
+        assert!(app.keys.picker.as_ref().expect("open").options().is_empty());
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(
+            frame.contains("loading the models in this window"),
+            "{frame}"
+        );
+
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc.clone()),
+        });
+        let picker = app.keys.picker.as_ref().expect("still open");
+        assert_eq!(picker.options(), vec!["model-a", "model-b"]);
+        app.on_key_keys(KeyCode::Down, None);
+        app.on_key_keys(KeyCode::Char(' '), None); // check model-b
+                                                   // A later answer (a refresh) rebuilds again and keeps the check and
+                                                   // the cursor on model-b.
+        app.request_keys_usage();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        let picker = app.keys.picker.as_ref().expect("still open");
+        assert_eq!(
+            picker.selected().into_iter().collect::<Vec<_>>(),
+            vec!["model-b"]
+        );
+        assert_eq!(picker.list.selected(), Some(1), "cursor stays on model-b");
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("1 of 2 selected"), "{frame}");
+    }
+
+    /// Type-to-filter starts on `/` (letters are picker keys until then):
+    /// the count still covers every model and says how many the filter
+    /// hides; Esc closes the filter, not the picker.
+    #[test]
+    fn the_model_picker_filters_after_slash_and_counts_every_model() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.overlay = Overlay::Keys;
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+        app.on_key_keys(KeyCode::Char('f'), None);
+        app.on_key_keys(KeyCode::Char('b'), None);
+        assert_eq!(
+            app.keys.picker.as_ref().unwrap().list.search_query(),
+            "",
+            "a letter before `/` types nothing"
+        );
+        app.on_key_keys(KeyCode::Char('/'), None);
+        for c in "del-b".chars() {
+            app.on_key_keys(KeyCode::Char(c), None);
+        }
+        let picker = app.keys.picker.as_ref().unwrap();
+        assert_eq!(picker.list.search_query(), "del-b");
+        assert_eq!(picker.list.visible_len(), 1);
+        app.on_key_keys(KeyCode::Char(' '), None); // check model-b under the filter
+        let frame = render_app(&app, &view, 80, 24);
+        assert!(frame.contains("1 of 2 selected"), "{frame}");
+        assert!(frame.contains("(1 hidden by the filter)"), "{frame}");
+        assert!(frame.contains("Esc stop filtering"), "{frame}");
+        // `a` while filtering is a letter of the filter, not "select all".
+        app.on_key_keys(KeyCode::Char('a'), None);
+        assert_eq!(app.keys.picker.as_ref().unwrap().selected().len(), 1);
+        app.on_key_keys(KeyCode::Esc, None);
+        let picker = app
+            .keys
+            .picker
+            .as_ref()
+            .expect("Esc closes the filter only");
+        assert!(!picker.filtering && picker.list.search_query().is_empty());
+        app.on_key_keys(KeyCode::Enter, None);
+        assert_eq!(
+            app.keys.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["model-b".to_string()]
         );
     }
 

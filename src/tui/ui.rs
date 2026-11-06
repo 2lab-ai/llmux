@@ -2561,47 +2561,91 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
     draw_keys_picker(frame, area, panel);
 }
 
+/// The `f` model picker's keys (its footer and the `?` help): `/` starts
+/// the filter because the picker's letters (`a`, `c`, `j`, `k`, `f`, `q`)
+/// are keys until then.
+const KEYS_PICKER_KEYS: [(&str, &str); 6] = [
+    ("Space", "toggle"),
+    ("a", "all"),
+    ("c", "clear"),
+    ("/", "filter"),
+    ("Enter", "apply"),
+    ("Esc", "cancel"),
+];
+/// …and while the filter is open.
+const KEYS_PICKER_FILTER_KEYS: [(&str, &str); 4] = [
+    ("type", "filter"),
+    ("Space", "toggle"),
+    ("Enter", "apply"),
+    ("Esc", "stop filtering"),
+];
+
 /// The `f` multi-select model picker (keys-history K-0), drawn over the panel
-/// while open. Space toggles, `a` selects every offered model, `c` clears,
-/// Enter applies, Esc cancels.
+/// while open: twolab-tui's `multi_select` — a filter line, `[x]` rows,
+/// `k of n selected` (with how many the filter hides), its keys on the
+/// footer — in a popup sized to what it shows.
 fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel) {
+    use twolab_tui::render::Renderable;
     let Some(picker) = &panel.picker else {
         return;
     };
-    // Half the frame on a wide terminal, most of it on a narrow one: the key
-    // legend below is ~57 cells and must not be clipped at 80 columns.
-    let popup = centered_rect(area, if area.width < 130 { 80 } else { 50 }, 70);
-    frame.render_widget(Clear, popup);
-    let mut lines: Vec<Line> = Vec::new();
-    if picker.options.is_empty() {
-        lines.push(Line::from("  no models observed in this window"));
-    }
-    // Keep the cursor in view on a short popup: scroll by whole rows.
-    let visible = popup.height.saturating_sub(4) as usize;
-    let first = picker.cursor.saturating_sub(visible.saturating_sub(1));
-    for (i, model) in picker.options.iter().enumerate().skip(first) {
-        let marker = if picker.selected.contains(model) {
-            "[x]"
+    let mut list = picker.list.clone().theme(KEYBAR_THEME);
+    list = if picker.filtering {
+        list.placeholder("type to filter by name")
+    } else {
+        list.placeholder("/ to filter by name")
+    };
+    if picker.list.items().is_empty() {
+        // The list's own empty row says "nothing to choose from"; say why.
+        list = list.subtitle(if panel.loading {
+            "loading the models in this window…"
         } else {
-            "[ ]"
-        };
-        let line = Line::from(format!(" {marker} {model}"));
-        lines.push(if i == picker.cursor {
-            line.style(Style::new().fg(Color::Black).bg(Color::Cyan))
-        } else {
-            line
+            "no models observed in this window"
         });
     }
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        " Space toggle · a all · c clear · Enter apply · Esc cancel",
-        dim(),
-    )));
-    let title = format!(" models — {} selected ", picker.selected.len());
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title)),
-        popup,
-    );
+    // The popup's own footer keeps the two keys that leave it; every key is
+    // on the footer bar below.
+    let short: &[(&str, &str)] = if picker.filtering {
+        &[("Enter", "apply"), ("Esc", "stop filtering")]
+    } else {
+        &[("Space", "toggle"), ("Enter", "apply"), ("Esc", "cancel")]
+    };
+    // Content width: the widest row (`› [x] name`), the summary line, the
+    // short legend; at least 40 cells, inside the panel.
+    let rows_w = picker
+        .list
+        .items()
+        .iter()
+        .map(|i| 6 + cells::width(&i.name))
+        .max()
+        .unwrap_or(0);
+    let summary_w = cells::width(&format!(
+        "{0} of {0} selected  ({0} hidden by the filter)",
+        picker.list.items().len()
+    ));
+    let legend_w: usize = short
+        .iter()
+        .map(|(k, l)| cells::width(k) + 1 + cells::width(l) + 2)
+        .sum();
+    let inner_w = rows_w
+        .max(summary_w + 2)
+        .max(legend_w + 2)
+        .max(40)
+        .min(usize::from(area.width.saturating_sub(4)));
+    let width = inner_w as u16 + 2;
+    let list = list.footer(keybar_after(Vec::new(), short, inner_w as u16 - 2));
+    let height = (list.desired_height(inner_w as u16) + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(" models ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(&list, inner);
 }
 
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
@@ -10915,6 +10959,7 @@ fn help_groups(chrome: &Chrome) -> Vec<twolab_tui::key_hints::HintGroup<'static>
         groups.push(group(title, &overlay_hints(overlay, chrome, true).1));
     }
     groups.push(group("switcher (s)", &SELECT_KEYS));
+    groups.push(group("keys: model picker (f)", &KEYS_PICKER_KEYS));
     groups.push(group("raw viewer", &RAW_KEYS));
     groups.push(group("other", &OTHER_KEYS));
     groups
@@ -11092,6 +11137,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
         // While a Mode interaction is pending it owns the keybar regardless of
         // which overlay summoned it (the interactions run within Accounts).
+        // The keys tab's model picker owns the bar while it is open.
+        Mode::Normal if chrome.overlay == Overlay::Keys && chrome.keys.picker.is_some() => {
+            let filtering = chrome.keys.picker.as_ref().is_some_and(|p| p.filtering);
+            let hints: &[(&str, &str)] = if filtering {
+                &KEYS_PICKER_FILTER_KEYS
+            } else {
+                &KEYS_PICKER_KEYS
+            };
+            keybar(Some("models"), hints, area.width)
+        }
         Mode::Normal => {
             let (title, hints) = overlay_hints(chrome.overlay, chrome, false);
             keybar(title, &hints, area.width)
@@ -11739,17 +11794,17 @@ mod tests {
     fn keys_overlay_model_picker_lists_options_and_marks_selection() {
         let panel = crate::tui::KeysPanel {
             doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
-            picker: Some(crate::tui::KeysPicker {
-                cursor: 0,
-                selected: ["gpt-6-astra".to_string()].into_iter().collect(),
-                options: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
-            }),
+            picker: Some(crate::tui::KeysPicker::new(
+                vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+                &["gpt-6-astra".to_string()].into_iter().collect(),
+            )),
             ..Default::default()
         };
         let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
         assert!(text.contains("[ ] claude-opus-4-8"), "unselected:\n{text}");
         assert!(text.contains("[x] gpt-6-astra"), "selected:\n{text}");
         assert!(text.contains("Space toggle"), "picker legend:\n{text}");
+        assert!(text.contains("1 of 2 selected"), "count:\n{text}");
     }
 
     /// The picker's key legend stays fully readable on a narrow terminal —
@@ -11758,18 +11813,25 @@ mod tests {
     fn keys_model_picker_legend_is_readable_at_eighty_columns() {
         let panel = crate::tui::KeysPanel {
             doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
-            picker: Some(crate::tui::KeysPicker {
-                cursor: 0,
-                selected: Default::default(),
-                options: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
-            }),
+            picker: Some(crate::tui::KeysPicker::new(
+                vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+                &Default::default(),
+            )),
             ..Default::default()
         };
-        let text = render(&keys_view(), &keys_chrome(panel), 80, 24);
+        let rows = render_rows(&keys_view(), &keys_chrome(panel), 80, 24);
+        let text = rows.join("\n");
         assert!(
-            text.contains("Enter apply · Esc cancel"),
-            "the whole legend fits:\n{text}"
+            text.contains("Space toggle  Enter apply  Esc cancel"),
+            "the popup legend fits:\n{text}"
         );
+        let footer = rows[rows.len() - 1].clone();
+        for hint in ["a all", "c clear", "/ filter", "Enter apply", "Esc cancel"] {
+            assert!(
+                footer.contains(hint),
+                "every picker key on the bar: {footer}"
+            );
+        }
     }
 
     /// The keys tab with nothing issued and no usage renders the how-to hint
@@ -12103,16 +12165,13 @@ mod tests {
         let chrome = chrome_attach(Overlay::Misc);
         let text = render_rows(&view, &chrome, 179, 43).join("\n");
         assert!(!text.contains("reload"), "{text}");
-        for overlay in [
-            Overlay::None,
-            Overlay::Accounts,
-            Overlay::Config,
-            Overlay::Keys,
-        ] {
+        // The first groups fit whole at 179x43; the grid counts the rest.
+        for overlay in [Overlay::None, Overlay::Accounts] {
             for (keys, label) in overlay_hints(overlay, &chrome, true).1 {
                 assert!(text.contains(label), "{keys} {label} missing:\n{text}");
             }
         }
+        assert!(text.contains("… +"), "{text}");
         // MAIN's footer and the help agree on R.
         let main = render_rows(&view, &chrome_attach(Overlay::None), 179, 43);
         assert!(main[main.len() - 1].contains("R disabled (attached)"));
