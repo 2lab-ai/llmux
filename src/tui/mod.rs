@@ -867,9 +867,15 @@ fn modal_key(state: &mut ModalState, code: KeyCode) -> bool {
 
 /// A mouse event on an open text modal: the wheel scrolls `step` rows, a
 /// press on the scrollbar jumps there or grabs the thumb, a drag moves it,
-/// and a press on `esc close` closes the modal (`true`). Every event is
-/// swallowed, so nothing reaches the rows beneath.
-fn modal_mouse(state: &mut ModalState, mouse: &crossterm::event::MouseEvent, step: isize) -> bool {
+/// and a press on `esc close` closes the modal (`true`). `target` is what
+/// the last frame drew under the pointer. Every event is swallowed, so
+/// nothing reaches the rows beneath.
+fn modal_mouse(
+    state: &mut ModalState,
+    mouse: &crossterm::event::MouseEvent,
+    target: Option<&ui::ClickTarget>,
+    step: isize,
+) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             state.scroll_by(-step);
@@ -877,9 +883,14 @@ fn modal_mouse(state: &mut ModalState, mouse: &crossterm::event::MouseEvent, ste
         MouseEventKind::ScrollDown => {
             state.scroll_by(step);
         }
-        MouseEventKind::Down(MouseButton::Left) => {
-            return state.press(mouse.column, mouse.row) == ModalOutcome::Closed;
-        }
+        MouseEventKind::Down(MouseButton::Left) => match target {
+            Some(ui::ClickTarget::ModalClose) => return true,
+            Some(ui::ClickTarget::ModalScrollbar) => {
+                state.press(mouse.column, mouse.row);
+            }
+            // Anywhere else: swallowed, and a thumb still held is let go.
+            _ => state.release(),
+        },
         MouseEventKind::Drag(MouseButton::Left) => {
             state.drag(mouse.column, mouse.row);
         }
@@ -1175,30 +1186,20 @@ struct App {
     history_loading: bool,
     /// Sender the blocking history loader delivers on (mirrors `sessions_tx`).
     history_tx: Option<mpsc::Sender<Vec<activity::Completed>>>,
-    /// The activity panel's hit-test layout from the LAST rendered frame: the
-    /// panel rect + the clickable request rows. Recorded by the event loop after
-    /// each `draw`, read by the mouse handler to map a click to an entry.
-    activity_chrome: ui::ActivityChrome,
-    /// The tab bar's hit-test layout from the LAST rendered frame (UI-3 U6):
-    /// one rect per tab label. Same record/read cycle as `activity_chrome`.
-    tab_chrome: Vec<ui::TabHit>,
-    /// Sessions table hit layout from the last frame (mouse row select).
-    sessions_chrome: Option<ui::SessionsChrome>,
+    /// Every click target the LAST rendered frame drew, in paint order (the
+    /// hit module): replaced after each `draw`, so a click never maps onto
+    /// an older layout. The mouse handler asks it once per event.
+    hits: ui::Hits,
     /// The open keys / sessions / usage table's scrollbar from the last frame
     /// (`None`: nothing overflows), and the press-drag-release on it.
     table_scroll: Option<ui::TableScroll>,
     table_drag: twolab_tui::scrollbar::ScrollbarDrag,
-    /// Config-editor value-cell hits from the last frame.
-    config_chrome: Vec<ui::ConfigHit>,
-    /// The raw viewer's hit-test layout from the LAST rendered frame (UI-8):
-    /// payload-tab rects + top-right action buttons. Same record/read cycle
-    /// as `activity_chrome`; empty while the modal is closed.
+    /// The raw viewer's layout from the LAST rendered frame (UI-8): its
+    /// scroll clamp, page size and body scrollbar (its tabs and buttons are
+    /// in `hits`). Same record/read cycle as `hits`; empty while closed.
     raw_chrome: ui::RawModalChrome,
     /// A press-drag-release on the raw viewer's body scrollbar.
     raw_drag: twolab_tui::scrollbar::ScrollbarDrag,
-    /// Separator rows from the LAST rendered frame (UI-3 U7/U8): each is the
-    /// top-border row of a pane, dragging it resizes the pane ABOVE it.
-    separator_chrome: Vec<ui::SeparatorHit>,
     /// Session-local pane-height overrides set by separator drags.
     pane_heights: PaneHeights,
     /// Tokens-per-day chart span (UI-3 U14), cycled with `d` in Stats.
@@ -1207,16 +1208,6 @@ struct App {
     perf_days: u64,
     perf_cursor: usize,
     perf_day_off: Option<u64>,
-    /// Accounts-table row rects from the LAST rendered frame (UI-3 U11) —
-    /// right-click target map.
-    account_row_chrome: Vec<ui::AccountRowHit>,
-    /// Models-strip entry rects from the LAST rendered frame — left-click
-    /// opens the model in the Stats tab.
-    strip_chrome: Vec<twolab_tui::packed_grid::GridHit>,
-    /// The rendered context menu's hit layout (UI-3 U11), when open.
-    menu_chrome: Option<twolab_tui::menu::MenuLayout>,
-    /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
-    setting_chrome: Vec<ui::SettingHit>,
     /// Anchor cell of the open context menu (col, row).
     menu_anchor: Option<(u16, u16)>,
     /// The REAL account id the open context menu targets, captured at open
@@ -1228,7 +1219,8 @@ struct App {
     /// Whether the limits editor was opened FROM the context menu (then it
     /// exits to Normal, not back into the switcher).
     limits_from_menu: bool,
-    /// The separator currently being dragged, if any (mouse button held).
+    /// The separator currently being dragged, if any (mouse button held):
+    /// the target its press landed on, kept for the drag that follows.
     drag: Option<ui::SeparatorHit>,
     /// Cursor row in the Stats overlay's model table.
     model_cursor: usize,
@@ -1406,26 +1398,18 @@ impl App {
             history_take: 0,
             history_loading: false,
             history_tx: None,
-            activity_chrome: ui::ActivityChrome::default(),
-            tab_chrome: Vec::new(),
-            sessions_chrome: None,
+            hits: ui::Hits::new(),
             table_scroll: None,
             table_drag: Default::default(),
-            config_chrome: Vec::new(),
             raw_chrome: ui::RawModalChrome::default(),
             raw_drag: Default::default(),
-            separator_chrome: Vec::new(),
             pane_heights: PaneHeights::default(),
             chart_days: 14,
             perf_days: 14,
             perf_cursor: 0,
             perf_day_off: None,
-            account_row_chrome: Vec::new(),
-            strip_chrome: Vec::new(),
-            menu_chrome: None,
             menu_anchor: None,
             menu_account: None,
-            setting_chrome: Vec::new(),
             limits_from_menu: false,
             drag: None,
             model_cursor: 0,
@@ -1980,12 +1964,20 @@ impl App {
         mouse: crossterm::event::MouseEvent,
         view: Option<&DashboardView>,
     ) -> bool {
+        // What the last frame drew under the pointer, topmost first — the one
+        // lookup every click below matches on. Open modals, the menu and
+        // the current surface still decide who gets the event at all.
+        let hit = self
+            .hits
+            .hit(mouse.column, mouse.row)
+            .map(|(rect, target)| (rect, target.clone()));
+        let target = hit.as_ref().map(|(_, target)| target);
         // The input modal (UI-6 item 3), when open, owns the mouse: the wheel
         // scrolls it, its scrollbar can be clicked and dragged, `esc close`
         // closes it, and every other click is swallowed so it can't reach a
         // row beneath the modal.
         if let Some(modal) = self.input_modal.as_mut() {
-            if modal_mouse(&mut modal.state, &mouse, 1) {
+            if modal_mouse(&mut modal.state, &mouse, target, 1) {
                 self.input_modal = None;
             }
             return true;
@@ -1994,43 +1986,32 @@ impl App {
         // adds clickable payload tabs + the top-right action buttons, and the
         // body's scrollbar takes a press and a drag.
         if self.raw_modal.is_some() {
-            let hit = |r: &ratatui::layout::Rect| {
-                mouse.column >= r.x
-                    && mouse.column < r.x + r.width
-                    && mouse.row >= r.y
-                    && mouse.row < r.y + r.height
-            };
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let button = self
-                        .raw_chrome
-                        .buttons
-                        .iter()
-                        .find(|(_, r)| hit(r))
-                        .map(|&(b, _)| b);
-                    let tab = self
-                        .raw_chrome
-                        .tabs
-                        .iter()
-                        .find(|(_, r)| hit(r))
-                        .map(|&(i, _)| i);
-                    let bar = self.raw_chrome.bar;
-                    if let Some(btn) = button {
-                        self.raw_modal_action(btn);
-                    } else if let (Some(idx), Some(modal)) = (tab, self.raw_modal.as_mut()) {
-                        modal.tab = idx;
-                        modal.scroll = 0;
-                    } else if let (Some(bar), Some(modal)) = (bar, self.raw_modal.as_mut()) {
-                        // The body's scrollbar: a press on the track jumps,
-                        // one on the thumb grabs it for the drag below.
-                        if let Some(top) =
-                            self.raw_drag
-                                .press(bar.pos, bar.track, mouse.column, mouse.row)
-                        {
-                            modal.scroll = top;
+                MouseEventKind::Down(MouseButton::Left) => match target {
+                    Some(&ui::ClickTarget::RawButton(btn)) => self.raw_modal_action(btn),
+                    Some(&ui::ClickTarget::RawTab(idx)) => {
+                        if let Some(modal) = self.raw_modal.as_mut() {
+                            modal.tab = idx;
+                            modal.scroll = 0;
                         }
                     }
-                }
+                    // The body's scrollbar: a press on the track jumps, one
+                    // on the thumb grabs it for the drag below.
+                    Some(ui::ClickTarget::RawScrollbar) => {
+                        if let (Some(bar), Some(modal)) =
+                            (self.raw_chrome.bar, self.raw_modal.as_mut())
+                        {
+                            if let Some(top) =
+                                self.raw_drag
+                                    .press(bar.pos, bar.track, mouse.column, mouse.row)
+                            {
+                                modal.scroll = top;
+                            }
+                        }
+                    }
+                    // Anywhere else: swallowed, and a thumb still held is let go.
+                    _ => self.raw_drag.release(),
+                },
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let (Some(bar), Some(modal)) = (self.raw_chrome.bar, self.raw_modal.as_mut())
                     {
@@ -2061,7 +2042,7 @@ impl App {
         // every other event is swallowed so a click can't reach the row
         // beneath it.
         if let Some(modal) = self.account_modal.as_mut() {
-            if modal_mouse(&mut modal.state, &mouse, 3) {
+            if modal_mouse(&mut modal.state, &mouse, target, 3) {
                 self.account_modal = None;
             }
             return true;
@@ -2071,7 +2052,7 @@ impl App {
         if self.mode == Mode::Normal
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
-            if let Some(tab) = ui::hit_test_tabs(&self.tab_chrome, mouse.column, mouse.row) {
+            if let Some(&ui::ClickTarget::Tab(tab)) = target {
                 self.open_tab(tab, view);
                 return true;
             }
@@ -2088,7 +2069,7 @@ impl App {
                 self.scroll_logs_to(|pos| Some(pos.top.saturating_add_signed(step).min(pos.max)));
                 return true;
             }
-            if let Some(changed) = self.logs_select_mouse(&mouse, view) {
+            if let Some(changed) = self.logs_select_mouse(&mouse, target, view) {
                 return changed;
             }
         }
@@ -2102,7 +2083,7 @@ impl App {
         ) && self.mode == Mode::Normal
             && self.keys.picker.is_none()
         {
-            if let Some(changed) = self.table_scrollbar_mouse(&mouse, view) {
+            if let Some(changed) = self.table_scrollbar_mouse(&mouse, target, view) {
                 return changed;
             }
         }
@@ -2153,18 +2134,9 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(hit) = self
-                        .config_chrome
-                        .iter()
-                        .find(|h| {
-                            mouse.row == h.area.y
-                                && mouse.column >= h.area.x
-                                && mouse.column < h.area.right()
-                        })
-                        .copied()
-                    {
-                        self.config_cursor = hit.row;
-                        self.activate_config_action(hit.action, view);
+                    if let Some(&ui::ClickTarget::ConfigRow { row, action }) = target {
+                        self.config_cursor = row;
+                        self.activate_config_action(action, view);
                         return true;
                     }
                 }
@@ -2184,19 +2156,11 @@ impl App {
                     return true;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(t) = self.sessions_chrome {
-                        let r = t.rows;
-                        if mouse.row >= r.y
-                            && mouse.row < r.bottom()
-                            && mouse.column >= r.x
-                            && mouse.column < r.right()
-                        {
-                            let idx = t.start + (mouse.row - r.y) as usize;
-                            if idx < self.sessions.len() {
-                                self.session_cursor = idx;
-                            }
-                            return true;
+                    if let Some(&ui::ClickTarget::SessionsRow(idx)) = target {
+                        if idx < self.sessions.len() {
+                            self.session_cursor = idx;
                         }
+                        return true;
                     }
                 }
                 _ => {}
@@ -2209,13 +2173,12 @@ impl App {
                 mouse.kind,
                 MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
             ) {
-                let menu = self.menu_chrome.as_ref();
-                match menu.and_then(|m| m.hit(mouse.column, mouse.row)) {
-                    Some(item) => self.run_menu_item(idx, item, view),
+                match target {
+                    Some(&ui::ClickTarget::MenuItem(item)) => self.run_menu_item(idx, item, view),
                     // A dim (cannot-run) item or the border: nothing runs,
                     // the menu stays.
-                    None if menu.is_some_and(|m| m.contains(mouse.column, mouse.row)) => {}
-                    None => self.close_menu(),
+                    Some(ui::ClickTarget::Surface(ui::Surface::Menu)) => {}
+                    _ => self.close_menu(),
                 }
                 return true;
             }
@@ -2226,16 +2189,7 @@ impl App {
             && self.mode == Mode::Normal
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
         {
-            if let Some(idx) = self
-                .account_row_chrome
-                .iter()
-                .find(|r| {
-                    mouse.row == r.area.y
-                        && mouse.column >= r.area.x
-                        && mouse.column < r.area.right()
-                })
-                .map(|r| r.display_idx)
-            {
+            if let Some(&ui::ClickTarget::AccountRow(idx)) = target {
                 // Pin the REAL account id now; display indexes reorder.
                 self.menu_account = view.and_then(|v| {
                     let order = v.display_order(self.account_sort, SystemTime::now());
@@ -2253,24 +2207,13 @@ impl App {
         // Left-click on an accounts row opens the account detail modal
         // (.prd/19 rule 6). Works on MAIN and on the accounts overlay, which
         // render the same table; the modal blocks above already returned when
-        // one is open, so no modal can be stacked. Checked BEFORE the MAIN
-        // match because the row rects are their own set — separator drags, the
-        // settings bar and the activity panel occupy different rows and are
-        // untouched.
+        // one is open, so no modal can be stacked. On the accounts overlay the
+        // overlay's rows lie over MAIN's, so the map answers with them.
         if self.mode == Mode::Normal
             && matches!(self.overlay, Overlay::None | Overlay::Accounts)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
-            if let Some(idx) = self
-                .account_row_chrome
-                .iter()
-                .find(|r| {
-                    mouse.row == r.area.y
-                        && mouse.column >= r.area.x
-                        && mouse.column < r.area.right()
-                })
-                .map(|r| r.display_idx)
-            {
+            if let Some(&ui::ClickTarget::AccountRow(idx)) = target {
                 // Pin the REAL account id now; display indexes reorder.
                 if let Some(id) = view.and_then(|v| {
                     let order = v.display_order(self.account_sort, SystemTime::now());
@@ -2291,46 +2234,41 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Separator rows first (UI-3 U7/U8): press starts a drag.
-                if let Some(sep) = self
-                    .separator_chrome
-                    .iter()
-                    .find(|s| s.y == mouse.row)
-                    .copied()
-                {
-                    self.drag = Some(sep);
-                    return true;
-                }
-                // Group-settings bar (UI-3 U9/U10): click a segment to
-                // rotate that setting.
-                if let Some(action) = self
-                    .setting_chrome
-                    .iter()
-                    .find(|h| {
-                        mouse.row == h.area.y
-                            && mouse.column >= h.area.x
-                            && mouse.column < h.area.right()
-                    })
-                    .map(|h| h.action)
-                {
-                    match action {
-                        ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
-                        ui::SettingAction::CodexModel => self.cycle_codex_model(view),
-                        ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
-                        ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
-                        ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                match target {
+                    // A separator row (UI-3 U7/U8): the press starts a drag.
+                    Some(&ui::ClickTarget::Separator(sep)) => {
+                        self.drag = Some(sep);
+                        return true;
                     }
-                    return true;
+                    // Group-settings bar (UI-3 U9/U10): click a segment to
+                    // rotate that setting.
+                    Some(&ui::ClickTarget::Setting(action)) => {
+                        match action {
+                            ui::SettingAction::SchedMode => self.toggle_scheduler_mode(view),
+                            ui::SettingAction::CodexModel => self.cycle_codex_model(view),
+                            ui::SettingAction::CodexEffort => self.cycle_codex_effort(view),
+                            ui::SettingAction::CodexFast => self.toggle_codex_fast(view),
+                            ui::SettingAction::GrokEffort => self.cycle_grok_effort(view),
+                        }
+                        return true;
+                    }
+                    // A models-strip entry opens the Stats tab with that
+                    // model under the cursor, its drill-down beside the table.
+                    Some(&ui::ClickTarget::StripEntry(model)) => {
+                        self.open_model(model, view);
+                        return true;
+                    }
+                    _ => {}
                 }
-                // A models-strip entry opens the Stats tab with that model
-                // under the cursor, its drill-down beside the table.
-                if let Some(model) =
-                    twolab_tui::packed_grid::hit_test(&self.strip_chrome, mouse.column, mouse.row)
-                {
-                    self.open_model(model, view);
-                    return true;
-                }
-                match ui::hit_test_activity(&self.activity_chrome, mouse.column, mouse.row) {
+                // An activity row or one of its detail lines: what the click
+                // means depends on where in the recorded rect it fell.
+                let click = match hit {
+                    Some((rect, ui::ClickTarget::Activity { key, kind })) => {
+                        Some(ui::activity_click(rect, key, kind, mouse.column))
+                    }
+                    _ => None,
+                };
+                match click {
                     // Clicking the `🔍 input` detail line opens the full-text
                     // modal instead of collapsing the entry (UI-6 item 3).
                     Some(ui::ActivityClick::OpenInput(key)) => {
@@ -2403,17 +2341,24 @@ impl App {
     }
 
     /// A mouse event on the open table's scrollbar (keys, sessions, usage).
-    /// `Some(changed)` when the scrollbar took it — a press on the track, a
-    /// drag while the thumb is held, the release that ends it; `None` lets
-    /// the event through to the table's own clicks and wheel.
+    /// `Some(changed)` when the scrollbar took it — a press on the track
+    /// (`target`, what the last frame drew under the pointer), a drag while
+    /// the thumb is held, the release that ends it; `None` lets the event
+    /// through to the table's own clicks and wheel.
     fn table_scrollbar_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
+        target: Option<&ui::ClickTarget>,
         view: Option<&DashboardView>,
     ) -> Option<bool> {
         let top = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let bar = self.table_scroll?;
+                if target != Some(&ui::ClickTarget::TableScrollbar) {
+                    // A press anywhere else lets go of a thumb still held.
+                    self.table_drag.release();
+                    return None;
+                }
                 let top = self
                     .table_drag
                     .press(bar.pos, bar.track, mouse.column, mouse.row)?;
@@ -3090,11 +3035,14 @@ impl App {
     /// off-screen at the rect it drew in last, so its mouse methods map the
     /// pointer onto the cells the person saw. Once the drag shows a
     /// selection the view holds still (new lines must not scroll it out from
-    /// under the pointer); a drag past the top or bottom edge scrolls.
+    /// under the pointer); a drag past the top or bottom edge scrolls. A
+    /// press off the pager (`target`: what the last frame drew under the
+    /// pointer) clears the selection, as one on its border does.
     /// `None`: not a left-button event, or no pager on screen.
     fn logs_select_mouse(
         &mut self,
         mouse: &crossterm::event::MouseEvent,
+        target: Option<&ui::ClickTarget>,
         view: Option<&DashboardView>,
     ) -> Option<bool> {
         let (area, view) = (self.logs_area?, view?);
@@ -3106,6 +3054,11 @@ impl App {
                 | MouseEventKind::Up(MouseButton::Left)
         ) {
             return None;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(_))
+            && target != Some(&ui::ClickTarget::LogsPager)
+        {
+            return Some(self.logs_sel.take().is_some());
         }
         let before = (self.logs_sel, self.logs_scroll);
         let mut pager = ui::logs_pager(view, self.logs_scroll, self.logs_sel);
@@ -6608,17 +6561,9 @@ async fn event_loop(
                 }
             })?;
             let main = hits.unwrap_or_default();
-            app.activity_chrome = main.activity;
-            app.tab_chrome = main.tabs;
-            app.sessions_chrome = main.sessions_table;
+            app.hits = main.hits;
             app.table_scroll = main.table_scroll;
-            app.config_chrome = main.config_rows;
             app.raw_chrome = main.raw_modal.clone().unwrap_or_default();
-            app.separator_chrome = main.separators;
-            app.account_row_chrome = main.account_rows;
-            app.strip_chrome = main.models_strip;
-            app.menu_chrome = main.menu;
-            app.setting_chrome = main.settings;
             // The open text field's window, as drawn.
             app.track_field(main.field_width);
             // The Logs pager clamps a held offset itself; one at (or past)
@@ -7470,26 +7415,24 @@ mod tests {
     fn tab_click_switches_overlay_and_active_tab_toggles_back() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let mut app = remote_app();
-        app.tab_chrome = vec![
-            ui::TabHit {
-                area: ratatui::layout::Rect {
-                    x: 1,
-                    y: 2,
-                    width: 9,
-                    height: 1,
-                },
-                overlay: Overlay::None,
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 1,
+                y: 2,
+                width: 9,
+                height: 1,
             },
-            ui::TabHit {
-                area: ratatui::layout::Rect {
-                    x: 13,
-                    y: 2,
-                    width: 8,
-                    height: 1,
-                },
-                overlay: Overlay::Config,
+            ui::ClickTarget::Tab(Overlay::None),
+        );
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 13,
+                y: 2,
+                width: 8,
+                height: 1,
             },
-        ];
+            ui::ClickTarget::Tab(Overlay::Config),
+        );
         let click = |x: u16, y: u16| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: x,
@@ -7518,11 +7461,14 @@ mod tests {
     fn separator_drag_resizes_the_pane_above() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let mut app = remote_app();
-        app.separator_chrome = vec![ui::SeparatorHit {
-            y: 10,
-            pane: ui::PaneId::Accounts,
-            pane_top: 3,
-        }];
+        app.hits.push(
+            ratatui::layout::Rect::new(0, 10, 80, 1),
+            ui::ClickTarget::Separator(ui::SeparatorHit {
+                y: 10,
+                pane: ui::PaneId::Accounts,
+                pane_top: 3,
+            }),
+        );
         let ev = |kind, row| MouseEvent {
             kind,
             column: 5,
@@ -7567,10 +7513,7 @@ mod tests {
 
         // pause (item 1): queues the remote pause POST.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
         assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 0 });
         assert!(app.menu_anchor.is_some());
@@ -7585,10 +7528,7 @@ mod tests {
         // set limit (item 2): opens the limits editor; Esc exits to Normal
         // (not into the switcher) because the menu opened it.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
         app.on_key(press(KeyCode::Down), Some(&view));
         app.on_key(press(KeyCode::Down), Some(&view));
@@ -7599,10 +7539,7 @@ mod tests {
 
         // delete (item 3): opens the destructive confirm, never silent.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
         // A key that is no item's own (`x`) closes; End moves, it does not.
         app.on_key(press(KeyCode::Char('x')), Some(&view));
@@ -7616,20 +7553,17 @@ mod tests {
 
         // Click outside the open menu dismisses it.
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: row_rect,
-            display_idx: 0,
-        }];
+        app.hits.push(row_rect, ui::ClickTarget::AccountRow(0));
         assert!(app.on_mouse(rclick, Some(&view)));
-        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 10,
                 y: 6,
                 width: 14,
                 height: 5,
             },
-            ..Default::default()
-        });
+            ui::ClickTarget::Surface(ui::Surface::Menu),
+        );
         let lclick_outside = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 70,
@@ -7650,15 +7584,15 @@ mod tests {
         let mut view = stats_view_with_account();
         view.snapshot.accounts[0].paused = true;
         let open = |app: &mut App| {
-            app.account_row_chrome = vec![ui::AccountRowHit {
-                area: ratatui::layout::Rect {
+            app.hits.push(
+                ratatui::layout::Rect {
                     x: 0,
                     y: 5,
                     width: 80,
                     height: 1,
                 },
-                display_idx: 0,
-            }];
+                ui::ClickTarget::AccountRow(0),
+            );
             let rclick = MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Right),
                 column: 10,
@@ -7716,21 +7650,17 @@ mod tests {
             width: 14,
             height: 1,
         };
-        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 9,
                 y: 6,
                 width: 16,
                 height: 6,
             },
-            items: (1..4)
-                .map(|index| twolab_tui::menu::MenuHit {
-                    rect: rect(7 + index as u16),
-                    index,
-                })
-                .collect(),
-            ..Default::default()
-        });
+            ui::ClickTarget::Surface(ui::Surface::Menu),
+        );
+        app.hits
+            .extend((1..4).map(|index| (rect(7 + index as u16), ui::ClickTarget::MenuItem(index))));
         let lclick = |row| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 12,
@@ -7807,26 +7737,24 @@ mod tests {
         view.codex.model = "gpt-5.6-sol".into();
         view.codex.effort = Some("xhigh".into());
         let mut app = remote_app();
-        app.setting_chrome = vec![
-            ui::SettingHit {
-                area: ratatui::layout::Rect {
-                    x: 0,
-                    y: 30,
-                    width: 10,
-                    height: 1,
-                },
-                action: ui::SettingAction::CodexEffort,
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 0,
+                y: 30,
+                width: 10,
+                height: 1,
             },
-            ui::SettingHit {
-                area: ratatui::layout::Rect {
-                    x: 20,
-                    y: 30,
-                    width: 6,
-                    height: 1,
-                },
-                action: ui::SettingAction::GrokEffort,
+            ui::ClickTarget::Setting(ui::SettingAction::CodexEffort),
+        );
+        app.hits.push(
+            ratatui::layout::Rect {
+                x: 20,
+                y: 30,
+                width: 6,
+                height: 1,
             },
-        ];
+            ui::ClickTarget::Setting(ui::SettingAction::GrokEffort),
+        );
         let click = |x: u16| MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: x,
@@ -7887,15 +7815,15 @@ mod tests {
         let mut view = stats_view_with_account();
         view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 0,
                 y: 5,
                 width: 80,
                 height: 1,
             },
-            display_idx: 0,
-        }];
+            ui::ClickTarget::AccountRow(0),
+        );
         let rclick = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: 10,
@@ -7983,15 +7911,15 @@ mod tests {
         for overlay in [Overlay::None, Overlay::Accounts] {
             let mut app = remote_app();
             app.overlay = overlay;
-            app.account_row_chrome = vec![ui::AccountRowHit {
-                area: ratatui::layout::Rect {
+            app.hits.push(
+                ratatui::layout::Rect {
                     x: 0,
                     y: 6,
                     width: 80,
                     height: 1,
                 },
-                display_idx: 1,
-            }];
+                ui::ClickTarget::AccountRow(1),
+            );
             assert!(app.on_mouse(lclick, Some(&view)), "{overlay:?}");
             assert_eq!(
                 app.account_modal.as_ref().map(|m| m.account.as_str()),
@@ -8020,12 +7948,14 @@ mod tests {
             row: 30,
             modifiers: KeyModifiers::NONE,
         };
-        let entry = |x, index| twolab_tui::packed_grid::GridHit {
-            rect: ratatui::layout::Rect::new(x, 30, 70, 1),
-            index,
+        let entry = |x, index| {
+            (
+                ratatui::layout::Rect::new(x, 30, 70, 1),
+                ui::ClickTarget::StripEntry(index),
+            )
         };
         let mut app = remote_app();
-        app.strip_chrome = vec![entry(1, 0), entry(74, 1)];
+        app.hits.extend([entry(1, 0), entry(74, 1)]);
         assert!(
             !app.on_mouse(click(72), Some(&view)),
             "the gap between entries"
@@ -8058,6 +7988,7 @@ mod tests {
             modal.state.layout.pos = ScrollPos::of(60, 20, 0);
             modal.state.layout.track = Some(rect(70, 4, 1, 20));
             modal.state.layout.close = Some(rect(60, 2, 9, 1));
+            ui::push_modal(&mut app.hits, rect(0, 0, 80, 26), &modal.state.layout);
             app.account_modal = Some(modal);
         };
         let click = |col, row| mouse(MouseEventKind::Down(MouseButton::Left), col, row);
@@ -8095,15 +8026,15 @@ mod tests {
             app.account_modal = Some(modal);
         };
         let mut app = remote_app();
-        app.account_row_chrome = vec![ui::AccountRowHit {
-            area: ratatui::layout::Rect {
+        app.hits.push(
+            ratatui::layout::Rect {
                 x: 0,
                 y: 6,
                 width: 80,
                 height: 1,
             },
-            display_idx: 1,
-        }];
+            ui::ClickTarget::AccountRow(1),
+        );
         open(&mut app);
         // `q` never reaches the quit handler beneath the modal.
         app.on_key(press(KeyCode::Char('q')), Some(&view));
@@ -9119,7 +9050,7 @@ mod tests {
             .draw(|frame| ui::draw(frame, Some(view), &chrome, &mut hits))
             .expect("draw");
         let main = hits.unwrap_or_default();
-        app.sessions_chrome = main.sessions_table;
+        app.hits = main.hits;
         app.table_scroll = main.table_scroll;
         app.logs_area = main.logs_area;
         if let Some(pos) = main.logs {
@@ -9133,6 +9064,16 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    /// Where the last frame drew the sessions table's data rows: the rows'
+    /// click targets together.
+    fn sessions_rows(hits: &ui::Hits) -> ratatui::layout::Rect {
+        hits.iter()
+            .filter(|(_, target)| matches!(target, ui::ClickTarget::SessionsRow(_)))
+            .map(|(rect, _)| rect)
+            .reduce(|a, b| a.union(b))
+            .expect("rows drawn")
     }
 
     fn left(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
@@ -9344,7 +9285,11 @@ mod tests {
             Some(raw.max_scroll),
             "End clamps to the last row"
         );
-        let (index, rect) = raw.tabs[1];
+        let index = 1;
+        let rect = app
+            .hits
+            .area_of(&ui::ClickTarget::RawTab(index))
+            .expect("the Response tab drawn");
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y),
             None,
@@ -9384,7 +9329,7 @@ mod tests {
         draw_and_adopt(&mut app, &view, 80, 24);
         let bar = app.table_scroll.expect("60 sessions overflow");
         let page = bar.pos.viewport;
-        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        let rows_hit = sessions_rows(&app.hits);
         assert!(
             rows_hit.right() <= bar.track.x,
             "the bar's column is not a row"
@@ -9406,7 +9351,7 @@ mod tests {
         );
 
         // A row click still selects that row, not the bar.
-        let rows_hit = app.sessions_chrome.expect("rows drawn").rows;
+        let rows_hit = sessions_rows(&app.hits);
         app.on_mouse(
             left(MouseEventKind::Down(MouseButton::Left), 5, rows_hit.y),
             Some(&view),
@@ -10086,29 +10031,35 @@ mod tests {
         }
     }
 
-    /// Seed `app.activity_chrome` with one clickable request row spanning the
-    /// given screen rows, returning its key.
+    /// Seed `app.hits` with one clickable request row on screen row 6 of an
+    /// activity panel at rows 5..15, returning its key.
     fn seed_one_hit(app: &mut App) -> activity::ActivityKey {
+        seed_hit_as(app, ui::ActivityHitKind::Entry)
+    }
+
+    /// [`seed_one_hit`] as a target of `kind` (the frame's map holds only it).
+    fn seed_hit_as(app: &mut App, kind: ui::ActivityHitKind) -> activity::ActivityKey {
         let key = activity::ActivityKey {
             at_ms: 42,
             method: "POST".into(),
             path: "/v1/messages".into(),
             status: 200,
         };
-        app.activity_chrome = ui::ActivityChrome {
-            area: ratatui::layout::Rect {
-                x: 0,
-                y: 5,
-                width: 80,
-                height: 10,
-            },
-            hits: vec![ui::ActivityHit {
-                key: key.clone(),
-                y_start: 6,
-                height: 1,
-                kind: ui::ActivityHitKind::Entry,
-            }],
+        let panel = ratatui::layout::Rect {
+            x: 0,
+            y: 5,
+            width: 80,
+            height: 10,
         };
+        app.hits.clear();
+        app.hits.push_clipped(
+            ratatui::layout::Rect::new(panel.x, 6, panel.width, 1),
+            panel,
+            ui::ClickTarget::Activity {
+                key: key.clone(),
+                kind,
+            },
+        );
         key
     }
 
@@ -10128,8 +10079,7 @@ mod tests {
     #[test]
     fn run_header_marker_toggles_and_body_expands_only(/* UI-5, Z 2026-07-15 */) {
         let mut app = remote_app();
-        let key = seed_one_hit(&mut app);
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::RunHeader { expanded: false };
+        let key = seed_hit_as(&mut app, ui::ActivityHitKind::RunHeader { expanded: false });
         // Marker-zone click (col < RUN_MARKER_ZONE) → opens the run.
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 6), None);
         assert_eq!(app.expanded_run.as_ref(), Some(&key));
@@ -10150,9 +10100,8 @@ mod tests {
     #[test]
     fn click_input_line_opens_modal_and_swallows_mouse_beneath(/* UI-6 item 3 */) {
         let mut app = remote_app();
-        let key = seed_one_hit(&mut app);
         // Make the seeded hit the 🔍 input detail line.
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::InputLine;
+        let key = seed_hit_as(&mut app, ui::ActivityHitKind::InputLine);
         // Click it → opens the modal on that key WITHOUT expanding the row.
         let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
         assert!(changed, "opening the modal warrants a redraw");
@@ -10162,7 +10111,7 @@ mod tests {
             "the input click does not expand"
         );
         // A click beneath is now swallowed: nothing toggles, the modal stays.
-        app.activity_chrome.hits[0].kind = ui::ActivityHitKind::Entry;
+        seed_hit_as(&mut app, ui::ActivityHitKind::Entry);
         let changed = app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 6), None);
         assert!(changed, "the modal consumes the click (redraw)");
         assert_eq!(
