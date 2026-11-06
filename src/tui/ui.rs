@@ -1306,7 +1306,8 @@ fn heatmap_panel_height(
 /// overrides are the single source of truth — see `UsageStatDoc`); this
 /// renderer only filters by the selected granularity, groups consecutive
 /// rows by bucket, and draws a bold per-bucket total row above the per-model
-/// rows (cost desc). `usage_scroll` skips whole buckets, newest first.
+/// rows (cost desc). `usage_scroll` is the table row at the top, counting
+/// bucket and model rows alike, up to [`usage_max_top`].
 fn draw_usage_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -1381,17 +1382,19 @@ fn draw_usage_overlay(
         .flat_map(|(_, _, g)| g.iter())
         .map(usage_row_tokens)
         .fold(0, u64::saturating_add);
-    let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
-    // The scrollbar counts table rows (a bucket row plus one per model), so
-    // its thumb is the share of rows in view; `scroll` stays in buckets.
-    let rows_total: usize = buckets.iter().map(|(_, _, g)| 1 + g.len()).sum();
-    let rows_above: usize = buckets
-        .iter()
-        .take(scroll)
-        .map(|(_, _, g)| 1 + g.len())
-        .sum();
+    // The table scrolls by row (a bucket row plus one per model), so every
+    // model of a bucket taller than the screen can be brought into view;
+    // the scrollbar counts the same rows.
+    let (starts, rows_total) = usage_rows(view, gran);
     let body_h = usize::from(area.height.saturating_sub(2)); // rule + header
-    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(rows_total, body_h, rows_above);
+    let top = chrome
+        .usage_scroll
+        .min(usage_max_top(&starts, rows_total, body_h));
+    // The bucket the top row belongs to (the footer's scope names it).
+    let top_bucket = starts
+        .partition_point(|&start| start <= top)
+        .saturating_sub(1);
+    let bar_pos = twolab_tui::scrollbar::ScrollPos::of(rows_total, body_h, top);
     let (label, n) = (gran.label(), buckets.len());
     let (tok, cost) = (format::human_count(total_tokens), format_cost(total_cost));
     let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
@@ -1417,13 +1420,16 @@ fn draw_usage_overlay(
     };
 
     let mut trows: Vec<Row> = Vec::new();
-    for (_, label, group) in buckets.iter().skip(scroll) {
+    for ((_, label, group), &start) in buckets.iter().zip(&starts).skip(top_bucket) {
         // The table widget truncates below the fold, so building rows past
         // the visible area is pure waste — bound the construction to the
         // screen (review CR: 180 daily buckets × models per frame otherwise).
         if trows.len() > area.height as usize {
             break;
         }
+        // Rows of this bucket above the top one (only the first bucket's).
+        let skip = top.saturating_sub(start);
+        let mut bucket_rows: Vec<Row> = Vec::with_capacity(1 + group.len());
         // ONE accumulator pass per bucket (review CR): six parallel `.sum()`
         // sweeps were six lines nothing forced to stay in step with the
         // columns rendered below them.
@@ -1447,7 +1453,7 @@ fn draw_usage_overlay(
                     )
                 },
             );
-        trows.push(
+        bucket_rows.push(
             Row::new(vec![
                 Cell::from(*label),
                 Cell::from(Span::styled(format!("{} models", group.len()), dim())),
@@ -1472,7 +1478,7 @@ fn draw_usage_overlay(
                 .then_with(|| usage_row_tokens(b).cmp(&usage_row_tokens(a)))
         });
         for m in models {
-            trows.push(Row::new(vec![
+            bucket_rows.push(Row::new(vec![
                 Cell::from(""),
                 Cell::from(Span::styled(
                     format!("{}/{}", m.group, m.model),
@@ -1489,6 +1495,7 @@ fn draw_usage_overlay(
                 usage_cost_cell(usage_cost_valid(m), UsageCostTier::Detail, ""),
             ]));
         }
+        trows.extend(bucket_rows.into_iter().skip(skip));
     }
 
     let header = vec![
@@ -1510,13 +1517,46 @@ fn draw_usage_overlay(
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
     frame.render_widget(table, table_area);
     let bar = track.and_then(|track| draw_table_scrollbar(frame, bar_pos, track));
-    let scope = buckets.get(scroll).map(|(_, label, _)| {
+    let scope = buckets.get(top_bucket).map(|(_, label, _)| {
         format!(
             "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
             gran.label()
         )
     });
     (scope, bar)
+}
+
+/// The usage table's rows for granularity `gran`, as the overlay draws them
+/// — a bucket row, then one row per model, newest bucket first (the
+/// document keeps a bucket's rows adjacent): the row each bucket starts on,
+/// and how many rows there are in all.
+pub(crate) fn usage_rows(
+    view: &DashboardView,
+    gran: crate::tui::activity::UsageGran,
+) -> (Vec<usize>, usize) {
+    let mut starts = Vec::new();
+    let (mut rows, mut last) = (0usize, None);
+    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
+        if last != Some(r.bucket) {
+            starts.push(rows);
+            rows += 1;
+            last = Some(r.bucket);
+        }
+        rows += 1;
+    }
+    (starts, rows)
+}
+
+/// The furthest top row of the usage table with `viewport` rows on screen:
+/// the last bucket's own row (the table always could put it at the top),
+/// or further when the rows below it outrun the screen — far enough that
+/// the last model shows.
+pub(crate) fn usage_max_top(starts: &[usize], total: usize, viewport: usize) -> usize {
+    starts
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .max(total.saturating_sub(viewport))
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -14787,8 +14827,10 @@ mod tests {
                     "misc/mystery 3 11 2 40 4 —",
                 ],
             ),
+            // Row 3: the second bucket's row (the first bucket and its two
+            // models are rows 0–2).
             (
-                1,
+                3,
                 "2024-10-03",
                 vec![
                     "2024-10-03 2 models 6 101 11 80 8 $0.7500+?",
@@ -14964,7 +15006,8 @@ mod tests {
         ] {
             let mut chrome = chrome_overlay(Overlay::Usage);
             chrome.usage_gran = gran;
-            chrome.usage_scroll = 1;
+            // The second bucket's row at the top.
+            chrome.usage_scroll = usage_rows(&view, gran).0[1];
             let rows = render_rows(&view, &chrome, 160, 50);
             assert!(
                 [label, count, tokens, cost]
