@@ -148,42 +148,6 @@ fn codex_status_line(c: &CodexSettingsDoc) -> String {
     )
 }
 
-/// Distinct buckets of one granularity on the view (usage-stats): the Usage
-/// overlay's scroll bound. Rows arrive grouped by bucket (newest first), so
-/// counting key CHANGES equals counting distinct buckets — the same grouping
-/// the renderer applies.
-fn usage_bucket_count(view: &DashboardView, gran: activity::UsageGran) -> usize {
-    let mut count = 0;
-    let mut last: Option<u64> = None;
-    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
-        if last != Some(r.bucket) {
-            count += 1;
-            last = Some(r.bucket);
-        }
-    }
-    count
-}
-
-/// The usage bucket the table's scrollbar points at for table row `row`
-/// (a bucket row plus one row per model, as the overlay draws them): the
-/// first bucket that starts at or after `row`, the last when none does.
-fn usage_bucket_at_row(view: &DashboardView, gran: activity::UsageGran, row: usize) -> usize {
-    let mut starts: Vec<usize> = Vec::new();
-    let (mut rows, mut last) = (0usize, None);
-    for r in view.usage_stats.iter().filter(|r| r.gran == gran.tag()) {
-        if last != Some(r.bucket) {
-            starts.push(rows);
-            rows += 1;
-            last = Some(r.bucket);
-        }
-        rows += 1;
-    }
-    starts
-        .iter()
-        .position(|&start| start >= row)
-        .unwrap_or(starts.len().saturating_sub(1))
-}
-
 /// Can this client open a browser for an OAuth flow? The login dance (browser
 /// plus localhost callback) runs in the CLIENT, so this gates the `n` new-login
 /// key; when it returns false the picker is replaced by the `llmux login`
@@ -779,8 +743,8 @@ pub(crate) struct Chrome {
     pub perf_day_off: Option<u64>,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     pub usage_gran: activity::UsageGran,
-    /// Usage-tab scroll offset: number of newest BUCKETS skipped (0 = most
-    /// recent at the top).
+    /// Usage-tab scroll offset: the table ROW at the top, bucket and model
+    /// rows alike (0 = the newest bucket's row at the top).
     pub usage_scroll: usize,
     /// Logs-overlay position: `None` follows the newest line (the pager
     /// sits at the bottom), `Some(top)` holds the view at wrapped row `top`.
@@ -1306,8 +1270,8 @@ struct App {
     compact_accounts: bool,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     usage_gran: activity::UsageGran,
-    /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
-    /// the granularity changes so a deep hourly scroll can't strand the
+    /// Usage-tab scroll offset in table ROWS (0 = the newest bucket's row at
+    /// the top); reset when the granularity changes so a deep hourly scroll can't strand the
     /// monthly table past its last row.
     usage_scroll: usize,
     /// Logs-overlay position (`None` = follow the tail); see
@@ -2449,10 +2413,9 @@ impl App {
     /// Scroll the open table so its first row in view is `top` (a row of
     /// `pos`, which the last frame drew). Keys: the panel's own offset.
     /// Sessions: the view follows the cursor, so the cursor moves — the way
-    /// the wheel does — to the row that puts `top` first. Usage: the
-    /// scrollbar counts rows and the table scrolls by bucket, so the first
-    /// bucket that starts at or after `top` (dragging to the end shows the
-    /// last rows). Returns whether anything moved.
+    /// the wheel does — to the row that puts `top` first. Usage: the table
+    /// scrolls by row, as its scrollbar counts. Returns whether anything
+    /// moved.
     fn scroll_table_to(
         &mut self,
         pos: twolab_tui::scrollbar::ScrollPos,
@@ -2481,10 +2444,11 @@ impl App {
                 moved
             }
             Overlay::Usage => {
-                let Some(view) = view else { return false };
-                let bucket = usage_bucket_at_row(view, self.usage_gran, top);
-                let moved = bucket != self.usage_scroll;
-                self.usage_scroll = bucket;
+                if view.is_none() {
+                    return false;
+                }
+                let moved = top != self.usage_scroll;
+                self.usage_scroll = top;
                 moved
             }
             _ => false,
@@ -3956,38 +3920,46 @@ impl App {
     }
 
     /// Key handling for the Usage overlay (usage-stats). `g` cycles the
-    /// granularity (hour → day → month), arrows/`j`/`k` scroll by bucket,
-    /// `U`/Esc closes back to MAIN, `q` quits. The STORED offset is clamped
-    /// against the selected granularity's bucket count on every press —
-    /// clamping only a draw-time copy would let presses at the bottom
-    /// accumulate invisible overscroll debt (review R1 MUST-FIX 2).
+    /// granularity (hour → day → month), `U`/Esc closes back to MAIN, `q`
+    /// quits. The table scrolls by row (`usage_scroll` is its top row):
+    /// arrows/`j`/`k` (and the wheel) step to the next or previous bucket's
+    /// row — but never more than a page, so a bucket taller than the screen
+    /// is read a page at a time — PgUp/PgDn move a page, Home/End go to the
+    /// top and to [`ui::usage_max_top`]. The page is the screen the last
+    /// frame drew. The STORED offset is clamped on every press — clamping
+    /// only a draw-time copy would let presses at the bottom accumulate
+    /// invisible overscroll debt (review R1 MUST-FIX 2).
     fn on_key_usage(&mut self, code: KeyCode, view: Option<&DashboardView>) {
-        let max_scroll = view
-            .map(|v| usage_bucket_count(v, self.usage_gran).saturating_sub(1))
-            .unwrap_or(0);
-        match code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('U') | KeyCode::Esc => self.overlay = Overlay::None,
+        let (starts, total) = view.map_or((Vec::new(), 0), |v| ui::usage_rows(v, self.usage_gran));
+        // The rows on screen last frame; no scrollbar means they all fit.
+        let viewport = self.table_scroll.map_or(total, |bar| bar.pos.viewport);
+        let max = ui::usage_max_top(&starts, total, viewport);
+        let page = viewport.saturating_sub(1).max(1);
+        let top = self.usage_scroll.min(max);
+        let next = starts.iter().copied().find(|&s| s > top).unwrap_or(max);
+        let prev = starts.iter().copied().rev().find(|&s| s < top).unwrap_or(0);
+        self.usage_scroll = match code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            KeyCode::Char('U') | KeyCode::Esc => {
+                self.overlay = Overlay::None;
+                return;
+            }
             KeyCode::Char('g') => {
                 self.usage_gran = self.usage_gran.next();
-                self.usage_scroll = 0;
+                0
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.usage_scroll = self.usage_scroll.saturating_sub(1).min(max_scroll);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.usage_scroll = self.usage_scroll.saturating_add(1).min(max_scroll);
-            }
-            KeyCode::PageUp => {
-                self.usage_scroll = self.usage_scroll.saturating_sub(10).min(max_scroll);
-            }
-            KeyCode::PageDown => {
-                self.usage_scroll = self.usage_scroll.saturating_add(10).min(max_scroll);
-            }
-            KeyCode::Home => self.usage_scroll = 0,
-            KeyCode::End => self.usage_scroll = max_scroll,
-            _ => {}
+            KeyCode::Up | KeyCode::Char('k') => prev.max(top.saturating_sub(page)),
+            KeyCode::Down | KeyCode::Char('j') => next.min(top.saturating_add(page)),
+            KeyCode::PageUp => top.saturating_sub(page),
+            KeyCode::PageDown => top.saturating_add(page),
+            KeyCode::Home => 0,
+            KeyCode::End => max,
+            _ => top,
         }
+        .min(max);
     }
 
     /// Move the model cursor by `delta` rows, clamped to `[0, len-1]`.
@@ -9044,6 +9016,8 @@ mod tests {
     /// Usage-overlay scroll clamps the STORED offset at the last bucket
     /// (review R1 MUST-FIX 2): pressing `j` at the bottom must not bank
     /// invisible overscroll debt that later `k` presses have to pay off.
+    /// The offset counts table rows: bucket `b` of one model starts on row
+    /// `2b`, and `j`/`k` step from one bucket's row to the next.
     #[test]
     fn usage_scroll_clamps_stored_offset_no_overscroll_debt() {
         let row = |bucket: u64| crate::dashboard::UsageStatDoc {
@@ -9065,14 +9039,14 @@ mod tests {
         let mut app = remote_app();
         app.overlay = Overlay::Usage;
 
-        // Overscroll: 5 downs against 3 buckets pin at the LAST bucket (2).
+        // Overscroll: 5 downs against 3 buckets pin at the LAST bucket (row 4).
         for _ in 0..5 {
             app.on_key_usage(KeyCode::Char('j'), Some(&view));
         }
-        assert_eq!(app.usage_scroll, 2, "stored offset clamped at last bucket");
+        assert_eq!(app.usage_scroll, 4, "stored offset clamped at last bucket");
         // ONE up moves immediately — no invisible debt to pay first.
         app.on_key_usage(KeyCode::Char('k'), Some(&view));
-        assert_eq!(app.usage_scroll, 1);
+        assert_eq!(app.usage_scroll, 2, "the middle bucket's row");
         // Granularity cycle resets the scroll; the next granularity (month)
         // has no rows in this view, so the offset stays pinned at 0.
         app.on_key_usage(KeyCode::Char('g'), Some(&view));
@@ -9096,7 +9070,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(app.on_mouse(wheel(MouseEventKind::ScrollDown), Some(&view)));
-        assert_eq!(app.usage_scroll, 1, "wheel down scrolls one bucket");
+        assert_eq!(app.usage_scroll, 2, "wheel down scrolls one bucket");
         assert!(app.on_mouse(wheel(MouseEventKind::ScrollUp), Some(&view)));
         assert_eq!(app.usage_scroll, 0, "wheel up scrolls back");
     }
@@ -9718,11 +9692,12 @@ mod tests {
         assert_eq!(app.keys.scroll, before, "the picker holds the keys bar");
     }
 
-    /// The usage table scrolls by bucket while its scrollbar counts rows: a
-    /// press at the bottom of the track lands on the first bucket that shows
-    /// the last rows; one at the top returns to the newest bucket.
+    /// The usage table scrolls by row, as its scrollbar counts: a press at
+    /// the bottom of the track shows the last rows (it used to snap to the
+    /// first bucket at or after them); one at the top returns to the newest
+    /// bucket.
     #[test]
-    fn usage_table_scrollbar_lands_on_buckets() {
+    fn usage_table_scrollbar_reaches_the_last_rows() {
         let row = |bucket: u64, model: &str| crate::dashboard::UsageStatDoc {
             gran: "day".into(),
             bucket,
@@ -9758,13 +9733,13 @@ mod tests {
             left(MouseEventKind::Up(MouseButton::Left), bar.track.x, last),
             Some(&view),
         );
-        // Rows before bucket k: 3k. The first bucket at or after max.
-        assert_eq!(app.usage_scroll, bar.pos.max.div_ceil(3));
+        assert_eq!(app.usage_scroll, bar.pos.max, "the last page, by row");
         let rows = draw_and_adopt(&mut app, &view, 120, 24);
         assert!(
             rows.join("\n").contains("day-00"),
             "the oldest bucket shows"
         );
+        assert_eq!(app.table_scroll.map(|b| b.pos.top), Some(bar.pos.max));
         app.on_mouse(
             left(
                 MouseEventKind::Down(MouseButton::Left),
@@ -9777,6 +9752,86 @@ mod tests {
             app.usage_scroll, 0,
             "the top of the track is the newest bucket"
         );
+    }
+
+    /// One bucket of 40 models in an 18-row table: every model is reachable
+    /// — `↓` reads it a page at a time (there is no next bucket to step
+    /// to), PgDn pages, End shows the last model, a drag on the scrollbar
+    /// lands on any row — and `↑`/Home come back to the bucket's row. The
+    /// table used to scroll by bucket only, so models 18–40 never showed.
+    #[test]
+    fn usage_one_tall_bucket_scrolls_to_every_model() {
+        let row = |i: usize| crate::dashboard::UsageStatDoc {
+            gran: "day".into(),
+            bucket: 7,
+            label: "day-07".into(),
+            group: "claude".into(),
+            model: format!("model-{i:02}"),
+            requests: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            // Cost descending keeps the drawn order model-00 … model-39.
+            cost_usd: 100.0 - i as f64,
+            priced: true,
+        };
+        let mut view = empty_view();
+        view.usage_stats = (0..40).map(row).collect();
+        let mut app = remote_app();
+        app.overlay = Overlay::Usage;
+        app.usage_gran = activity::UsageGran::Day;
+        let (w, h) = (120, 24);
+        let shown = |rows: &[String]| -> Vec<usize> {
+            (0..40)
+                .filter(|i| rows.iter().any(|r| r.contains(&format!("model-{i:02}"))))
+                .collect()
+        };
+        let rows = draw_and_adopt(&mut app, &view, w, h);
+        let bar = app.table_scroll.expect("41 rows overflow");
+        let viewport = bar.pos.viewport;
+        assert_eq!(bar.pos.max, 41 - viewport, "{rows:#?}");
+        assert!(!shown(&rows).contains(&39), "{rows:#?}");
+        // ↓ walks the bucket a page at a time and reaches its last model.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..10 {
+            seen.extend(shown(&draw_and_adopt(&mut app, &view, w, h)));
+            app.on_key_usage(KeyCode::Down, Some(&view));
+        }
+        assert_eq!(seen.len(), 40, "every model came into view by ↓: {seen:?}");
+        assert_eq!(app.usage_scroll, bar.pos.max, "and it stops there");
+        app.on_key_usage(KeyCode::Home, Some(&view));
+        assert_eq!(app.usage_scroll, 0);
+        app.on_key_usage(KeyCode::PageDown, Some(&view));
+        assert_eq!(app.usage_scroll, viewport - 1, "a page");
+        app.on_key_usage(KeyCode::End, Some(&view));
+        let rows = draw_and_adopt(&mut app, &view, w, h);
+        assert!(shown(&rows).contains(&39), "End shows the last: {rows:#?}");
+        app.on_key_usage(KeyCode::Up, Some(&view));
+        assert_eq!(app.usage_scroll, bar.pos.max - (viewport - 1), "↑ a page");
+        // A drag on the scrollbar lands on any row, not a bucket start.
+        app.on_key_usage(KeyCode::Home, Some(&view));
+        draw_and_adopt(&mut app, &view, w, h);
+        let mid = bar.track.y + bar.track.height / 2;
+        app.on_mouse(
+            left(MouseEventKind::Down(MouseButton::Left), bar.track.x, mid),
+            Some(&view),
+        );
+        app.on_mouse(
+            left(MouseEventKind::Up(MouseButton::Left), bar.track.x, mid),
+            Some(&view),
+        );
+        assert!(
+            (1..bar.pos.max).contains(&app.usage_scroll),
+            "mid-bucket: {}",
+            app.usage_scroll
+        );
+        let rows = draw_and_adopt(&mut app, &view, w, h);
+        assert!(shown(&rows)[0] > 0, "{rows:#?}");
+        // The footer still names the bucket the top row belongs to.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("top/displayed bucket day-07")));
     }
 
     /// K-3 `f`: Space toggles, Enter applies the selection AND re-queries;
