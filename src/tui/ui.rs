@@ -6332,6 +6332,35 @@ fn compact_word(
     }
 }
 
+/// The compact list's label for each account id: the table's short name
+/// ([`row_account_name`] — no provider, abbreviated domain), except where two
+/// entries would read the same (`claude:me@x.com` and `codex:me@x.com` are
+/// both `me@x.com`): those show the masked full id, provider and all. The
+/// list has no group column to tell them apart.
+fn compact_labels<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    mask: bool,
+    abbrev: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let named: Vec<(&str, String)> = ids
+        .map(|id| (id, row_account_name(id, mask, abbrev)))
+        .collect();
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, short) in &named {
+        *seen.entry(short.as_str()).or_default() += 1;
+    }
+    named
+        .iter()
+        .map(|(id, short)| {
+            if seen.get(short.as_str()).is_some_and(|&n| n > 1) {
+                masked_name(id, mask)
+            } else {
+                short.clone()
+            }
+        })
+        .collect()
+}
+
 /// The compact account list (`V` on the accounts tab; MAIN's own choice
 /// when the table would show fewer than [`COMPACT_BELOW`] rows): a
 /// twolab-tui `agent_list` with one row per account — focus mark, state
@@ -6352,15 +6381,22 @@ fn draw_accounts_compact(
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let selected = cursor_pos(chrome, ctx.order.len());
+    let labels = compact_labels(
+        ctx.order
+            .iter()
+            .map(|&idx| snapshot.accounts[idx].id.0.as_str()),
+        ctx.mask,
+        &view.domain_abbrev,
+    );
     let (kinds, items): (Vec<CompactKind>, Vec<AgentItem>) = ctx
         .order
         .iter()
+        .zip(labels)
         .enumerate()
-        .map(|(pos, &idx)| {
+        .map(|(pos, (&idx, label))| {
             let account = &snapshot.accounts[idx];
             let gate = select::eligibility(account, params, ctx.now, ctx.headers_only);
             let kind = CompactKind::of(gate, snapshot.is_current(&account.id));
-            let label = row_account_name(&account.id.0, ctx.mask, &view.domain_abbrev);
             let item = AgentItem::new(kind.state(), label)
                 .word(compact_word(account, gate, kind, ctx.now))
                 .focused(selected == Some(pos));
@@ -24716,6 +24752,48 @@ mod tests {
         for frame in [0, 3, 7] {
             assert_eq!(entry(reduced, frame), '⠋', "frame {frame} holds still");
         }
+    }
+
+    /// Two accounts with the same email under two providers read the same
+    /// once the provider is dropped, and the compact list has no group
+    /// column: those two show their provider (`codex:me@example.com`),
+    /// masked or not, while a unique name stays short.
+    #[test]
+    fn compact_list_names_the_provider_where_two_entries_would_read_the_same() {
+        let (mut view, _) = compact_view();
+        rename_account(&mut view, &live_id(1), "claude:me@example.com");
+        rename_account(&mut view, &live_id(15), "codex:me@example.com");
+        let chrome = Chrome {
+            compact_accounts: true,
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let rows = render_rows(&view, &chrome, 179, 30);
+        let frame = rows.join("\n");
+        for id in ["claude:me@example.com", "codex:me@example.com"] {
+            assert!(frame.contains(&format!(" {id} ")), "{id}:\n{frame}");
+        }
+        assert!(frame.contains(" u02@ex.io "), "{frame}");
+        assert!(!frame.contains("claude:u02"), "a unique name stays short");
+
+        let abbrev = crate::config::default_domain_abbrev();
+        let ids = [
+            "claude:me@example.com",
+            "codex:me@example.com",
+            "claude:u02@ex.io",
+        ];
+        let plain = compact_labels(ids.into_iter(), false, &abbrev);
+        assert_eq!(
+            plain,
+            ["claude:me@example.com", "codex:me@example.com", "u02@ex.io"]
+        );
+        let masked = compact_labels(ids.into_iter(), true, &abbrev);
+        assert!(masked[0].starts_with("claude:") && masked[1].starts_with("codex:"));
+        assert_eq!(masked[0]["claude:".len()..], masked[1]["codex:".len()..]);
+        assert!(
+            !masked.iter().any(|l| l.contains("me@example.com")),
+            "{masked:?}"
+        );
+        assert!(!masked[2].contains(':'), "{masked:?}");
     }
 
     /// The switcher's cursor is the list's focus: `›` and the selected

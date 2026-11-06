@@ -248,8 +248,11 @@ rules: table rows, gauges and the popups' box borders draw as before.
   room for every name, the state's word — `✗ error 401` (auth failed),
   `◌ 7d spent` / `5h spent` (over a ceiling until the window resets),
   `◉ cooling 45m10s` (parked by a cooldown), `⠋ active` (the scheduler's
-  current account; the glyph turns), `◦ ok` (eligible), `ǁ paused` and
-  `? stale` (usage too old to trust). Every glyph is one cell wide, CJK
+  current account; the glyph turns, and holds still under
+  `LLMUX_REDUCED_MOTION`), `◦ ok` (eligible), `ǁ paused` and
+  `? stale` (usage too old to trust). The name is the table's short one
+  (no provider); two entries that would read the same — one email under
+  two providers — show their provider (`codex:me@example.com`). Every glyph is one cell wide, CJK
   terminals included, so states differ by shape under `NO_COLOR` too. The
   rows keep the table's order and run down, then across in as many
   columns as fit (at least 14 cells each). The title keeps the sort and
