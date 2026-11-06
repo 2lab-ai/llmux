@@ -4422,20 +4422,15 @@ fn draw_account_modal(
     // The window cards lay out at the body's width, which the body decides:
     // size the popup with the cards at their widest, then lay them out at
     // the width that gave and keep that width.
-    let wide = popup(account_modal_lines(view, ctx, chrome, account, u16::MAX)).outer(area);
-    let body_w = modal_body_width(wide.width);
+    let wide_modal = popup(account_modal_lines(view, ctx, chrome, account, u16::MAX));
+    let wide = wide_modal.outer(area);
+    // The library's own geometry (border only from 4×3 up, padding from 8
+    // wide, the scrollbar column when the body overflows) — not a copy of it.
+    let body_w = wide_modal.layout(area, &modal.state).body.width;
     let popup = popup(account_modal_lines(view, ctx, chrome, account, body_w))
         .width(ModalSize::Fixed(PopupSize::Cells(wide.width)));
     let mut state = modal.state.clone();
     Some(popup.render(area, frame.buffer_mut(), &mut state))
-}
-
-/// The text width inside a twolab-tui modal `outer` cells wide: its border,
-/// then one cell of padding on each side (the right one holds the
-/// scrollbar when the body overflows).
-fn modal_body_width(outer: u16) -> u16 {
-    let inner = if outer >= 4 { outer - 2 } else { outer };
-    inner.saturating_sub(2 * u16::from(inner >= 8))
 }
 
 // ---------------------------------------------------------------------------
