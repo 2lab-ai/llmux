@@ -16,9 +16,11 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use twolab_tui::fact_table::{Fact, FactTable};
+use twolab_tui::meter::{Fill, Meter};
 use twolab_tui::spinner::SpinnerKind;
 use twolab_tui::text as cells;
 use twolab_tui::trend_chart::{Series, TrendChart};
+use twolab_tui::Level;
 
 use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
@@ -5878,34 +5880,34 @@ impl FoldBounds {
             WindowDisplayState::Stale,
             WindowDisplayState::PollDegraded,
         ];
-        let bar = |text: String, marker: Option<char>| GaugeParts::Bar {
-            fill: 1.0,
-            color: Color::Reset,
-            text,
-            bold_chars: 0,
-            over: true,
-            marker,
-        };
+        let mode = crate::config::QuotaDisplay::Remaining;
         let cells = |spans: Vec<Span<'static>>| spans.iter().map(Span::width).sum::<usize>();
+        let bar = |span: Duration, state: WindowDisplayState| {
+            let window = QuotaWindow {
+                utilization: 0.0,
+                resets_at: now + span,
+                fetched_at: now,
+                source: crate::scheduler::window::WindowSource::Headers,
+            };
+            let (meter, marker) = quota_meter(&window, 0.0, now, state, mode, reset_absolute);
+            GaugeParts::Bar {
+                meter: meter.over(true),
+                marker,
+            }
+        };
         let reset = BOUND_SPANS
             .into_iter()
-            .flat_map(|span| {
-                let window = QuotaWindow {
-                    utilization: 1.0,
-                    resets_at: now + span,
-                    fetched_at: now,
-                    source: crate::scheduler::window::WindowSource::Headers,
-                };
-                glyphs.map(|state| {
-                    let (text, _, _) = quota_bar_text(&window, now, state, reset_absolute);
-                    cells(bar(text, Some(state.glyph())).text_fields().0)
-                })
-            })
+            .flat_map(|span| glyphs.map(|state| cells(bar(span, state).text_fields().0)))
             .max()
             .unwrap_or(0);
         Self {
             reset,
-            percent: cells(bar(String::new(), None).text_fields().1),
+            // A full fill and the `!`: `100%!`.
+            percent: cells(
+                bar(Duration::ZERO, WindowDisplayState::Populated)
+                    .text_fields()
+                    .1,
+            ),
         }
     }
 }
@@ -6287,153 +6289,84 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
     }
 }
 
-/// Build one in-bar quota line: a `width`-column bar whose leading
-/// `fill`-fraction of columns render REVERSE-video in `color` (the fill), with
-/// `text` overlaid centered on top. The first `bold_chars` characters of
-/// `text` (the larger countdown unit) are emboldened. Spans are split at the
-/// fill boundary so the fill shows behind the text — a single-style span
-/// could not paint a partial background. The text stands alone — no label
-/// in front of the countdown (owner 2026-11-04: the `rst ` prefix is gone;
-/// the header's `RESET` names the time). Only spaces + the caller's text are
-/// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
-/// `anim.rs` is untouched.
+/// One quota window as a twolab-tui [`Meter`]: `used` of the window gone,
+/// filled by what is used or what is left (`quota_display`, the `u` toggle),
+/// coloured by the FR6 bands on the USED share whichever way it fills
+/// (green below 70 %, yellow to 90 %, red above), the reset inside the bar —
+/// the top-2-unit countdown (`7d 10h`, the first unit bold) or, under `t`,
+/// the UTC stamp `MM/DD HH:MM` (the date bold); an expired window reads `0s`
+/// in both — and the display-state glyph (issue #33: `○` cold, `◑` stale,
+/// `!` poll-degraded) pinned to the bar's last cell when the value is not
+/// fresh, so the centred time never moves when it comes and goes (Z
+/// 2026-07-15). No label in front of the countdown (owner 2026-11-04: the
+/// `rst ` prefix is gone; the header's `RESET` names the time). The meter
+/// places the text by grapheme and measures it in cells; it draws only
+/// spaces, the text and the glyph, no bar glyphs.
 ///
-/// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
-/// the FIXED last bar column, independent of the centered `text`, so the
-/// time never shifts when the marker appears or disappears (Z 2026-07-15).
-/// A text long enough to reach that column loses its last char to the
-/// marker — the marker is the rarer, higher-signal fact.
-fn quota_bar_line(
-    fill: f64,
-    color: Color,
-    text: &str,
-    bold_chars: usize,
-    width: usize,
-    marker: Option<char>,
-) -> Line<'static> {
-    let fill_cols = ((fill.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    let chars: Vec<char> = text.chars().collect();
-    let text_len = chars.len().min(width);
-    let start = (width - text_len) / 2;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut run_style: Option<Style> = None;
-    for col in 0..width {
-        let ch = if marker.is_some() && col == width.saturating_sub(1) {
-            marker.unwrap_or(' ')
-        } else if col >= start && col < start + text_len {
-            chars[col - start]
-        } else {
-            ' '
-        };
-        let mut style = Style::new().fg(color);
-        if col < fill_cols {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        if col >= start && col < start + bold_chars.min(text_len) {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if run_style == Some(style) {
-            run.push(ch);
-        } else {
-            if let Some(prev) = run_style {
-                spans.push(Span::styled(std::mem::take(&mut run), prev));
-            }
-            run.push(ch);
-            run_style = Some(style);
-        }
-    }
-    if let Some(prev) = run_style {
-        spans.push(Span::styled(run, prev));
-    }
-    Line::from(spans)
-}
-
-/// The text overlaid inside a quota bar: the top-2-unit reset countdown
-/// (`7d 10h`), plus the window display-state glyph when the value is not
-/// fresh (issue #33) — returned SEPARATELY so the renderer can pin it to a
-/// fixed trailing column instead of appending it to the centered time (the
-/// append shifted the time sideways whenever the glyph came and went — Z
-/// 2026-07-15 "가운데 시간 표시 위치 고정"). The parked/over `!` is NOT here —
-/// it rides the percent label to the right of the bar, where it always
-/// lived. Returns `(text, bold_chars, marker)` where `bold_chars` covers the
-/// FIRST countdown unit — the day/hour magnitude carries most of the signal,
-/// so it gets the emphasis. An expired window (no live reset) reads `0s` —
-/// honest and ASCII-narrow.
-fn quota_bar_text(
+/// Returns the glyph too: the meter keeps its own private, and the fold's
+/// text form writes it after the reset.
+fn quota_meter(
     window: &QuotaWindow,
+    used: f64,
     now: SystemTime,
     display: WindowDisplayState,
+    mode: crate::config::QuotaDisplay,
     absolute: bool,
-) -> (String, usize, Option<char>) {
-    let live = window
-        .resets_at
-        .duration_since(now)
-        .ok()
-        .filter(|rem| !rem.is_zero());
-    let (text, bold_chars) = match (absolute, live) {
-        // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
-        (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
-        (false, Some(rem)) => {
-            let (head, tail) = format::countdown_units(rem);
-            let bold = head.chars().count();
-            let mut text = head;
-            if let Some(tail) = tail {
-                text.push(' ');
-                text.push_str(&tail);
-            }
-            (text, bold)
-        }
-        // Expired window: no live reset to point at in either mode.
-        (_, None) => ("0s".to_string(), 2),
+) -> (Meter, Option<char>) {
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => Fill::Used,
+        crate::config::QuotaDisplay::Remaining => Fill::Left,
+    };
+    let meter = Meter::new(used)
+        .thresholds(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT)
+        .fill(fill)
+        .theme(KEYBAR_THEME);
+    let meter = if absolute {
+        meter.resets_at(window.resets_at, now, 0)
+    } else {
+        meter.resets_in(window.resets_at.duration_since(now).unwrap_or_default())
     };
     let marker = (!matches!(display, WindowDisplayState::Populated)).then(|| display.glyph());
-    (text, bold_chars, marker)
+    let meter = match marker {
+        Some(glyph) => meter.marker(glyph),
+        None => meter,
+    };
+    (meter, marker)
 }
 
-/// Assemble one full quota gauge cell line: the countdown bar
-/// ([`quota_bar_line`], `bar_width` cols) + a space + the right-aligned
-/// percent label (`QUOTA_LABEL_WIDTH` cols, `!`-marked when parked/over) —
-/// `bar_width + 1 + QUOTA_LABEL_WIDTH` columns total (`QUOTA_CELL_WIDTH` is the
-/// minimum, when the terminal has no leftover width to pour into the bar). The
-/// label is the percent of the
-/// FILL fraction, so number and bar always say the same thing: in the default
-/// `remaining` mode a fresh account reads a full green bar + `100%` and
-/// drains toward `0%`; in `used` mode it reads `0%` growing. `over` (parked /
-/// past threshold) stays keyed on USED utilization either way, as do the
-/// color bands.
-#[allow(clippy::too_many_arguments)]
-fn quota_cell_line(
-    fill: f64,
-    color: Color,
-    bar_text: &str,
-    bold_chars: usize,
-    over: bool,
-    bar_width: usize,
-    marker: Option<char>,
-) -> Line<'static> {
-    let mut label = format::percent(fill);
-    if over {
-        label.push('!');
+/// One full quota gauge cell: the meter's bar in `bar_width` cells, a space,
+/// and its percent label right-aligned in `QUOTA_LABEL_WIDTH` cells (`!` when
+/// parked or over) — `bar_width + 1 + QUOTA_LABEL_WIDTH` cells, at least
+/// `QUOTA_CELL_WIDTH`. The label is the percent of the FILL, so number and
+/// bar always say the same thing: in the default `remaining` mode a fresh
+/// account reads a full green bar and `100%` and drains toward `0%`.
+///
+/// [`Meter::line`] draws it whenever the bar holds its widest text; in the
+/// one case it does not — the 11-cell bar with the absolute stamp and a
+/// display-state glyph, where the meter would give up the label — the bar
+/// is drawn alone (the stamp falls back to its bold date) and the label is
+/// put back beside it, so the percent never disappears.
+fn quota_cell_line(meter: &Meter, bar_width: usize) -> Line<'static> {
+    let width = bar_width + 1 + QUOTA_LABEL_WIDTH;
+    if usize::from(meter.full_width()) <= width {
+        return meter.line(width as u16);
     }
-    let mut line = quota_bar_line(fill, color, bar_text, bold_chars, bar_width, marker);
+    let mut line = meter.clone().label(false).line(bar_width as u16);
     line.spans.push(Span::raw(" "));
     line.spans.push(Span::styled(
-        format!("{:>width$}", label, width = QUOTA_LABEL_WIDTH),
-        Style::new().fg(color),
+        cells::pad(&meter.label_text(), QUOTA_LABEL_WIDTH, cells::Align::Right),
+        KEYBAR_THEME.level(meter.current_level()),
     ));
     line
 }
 
-/// One quota window → its gauge cell: the WHOLE cell is one bar whose
-/// reverse-video fill is the utilization (fill direction per `quota_display`:
-/// `used` grows as quota burns, `remaining` drains toward the reset), with the
-/// reset countdown overlaid inside ([`quota_bar_text`]). This supersedes req4
-/// ("the gauge label is ALWAYS the percentage"): that rule existed because the
-/// countdown once REPLACED the percent label — now both facts render at once
-/// (fill + color carry utilization, the in-bar text carries the reset), so
-/// neither hides the other. Color bands stay keyed on USED utilization
-/// regardless of the fill direction.
+/// One quota window → its gauge: the WHOLE cell is one bar whose
+/// reverse-video fill is the utilization, with the reset inside
+/// ([`quota_meter`]). This supersedes req4 ("the gauge label is ALWAYS the
+/// percentage"): that rule existed because the countdown once REPLACED the
+/// percent label — now both facts render at once (fill + color carry
+/// utilization, the in-bar text carries the reset), so neither hides the
+/// other.
 ///
 /// Issue #33: the cell still carries the [`WindowDisplayState`] so a
 /// never-used (`cold`), stale, or poll-degraded window is visibly distinct
@@ -6462,38 +6395,18 @@ fn window_gauge_parts(
         ));
     };
     let utilization = window.effective_utilization(now);
-    let color = level_color(format::gauge_level(utilization));
+    let (meter, marker) = quota_meter(window, utilization, now, display, mode, reset_absolute);
     // The `!` flags an account that is parked or past its threshold — carried
     // on the percent label, where it always lived.
-    let over = parked || utilization > threshold;
-    let fill = match mode {
-        crate::config::QuotaDisplay::Used => utilization,
-        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-    };
-    let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
-    GaugeParts::Bar {
-        fill,
-        color,
-        text,
-        bold_chars,
-        over,
-        marker,
-    }
+    let meter = meter.over(parked || utilization > threshold);
+    GaugeParts::Bar { meter, marker }
 }
 
 /// A quota gauge's content before it is drawn: a bare state text
-/// (`○ cold`, `-`), or a fill with its reset text, display-state marker and
-/// `!`-marked percent label.
+/// (`○ cold`, `-`), or a meter and its display-state glyph.
 enum GaugeParts {
     Bare(Span<'static>),
-    Bar {
-        fill: f64,
-        color: Color,
-        text: String,
-        bold_chars: usize,
-        over: bool,
-        marker: Option<char>,
-    },
+    Bar { meter: Meter, marker: Option<char> },
 }
 
 impl GaugeParts {
@@ -6501,16 +6414,7 @@ impl GaugeParts {
     fn cell(self, bar_width: usize) -> Cell<'static> {
         match self {
             GaugeParts::Bare(span) => Cell::from(span),
-            GaugeParts::Bar {
-                fill,
-                color,
-                text,
-                bold_chars,
-                over,
-                marker,
-            } => Cell::from(quota_cell_line(
-                fill, color, &text, bold_chars, over, bar_width, marker,
-            )),
+            GaugeParts::Bar { meter, .. } => Cell::from(quota_cell_line(&meter, bar_width)),
         }
     }
 
@@ -6521,43 +6425,35 @@ impl GaugeParts {
     fn text_fields(&self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         match self {
             GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
-            GaugeParts::Bar {
-                fill,
-                color,
-                text,
-                bold_chars,
-                over,
-                marker,
-            } => {
-                let style = Style::new().fg(*color);
-                let head: String = text.chars().take(*bold_chars).collect();
-                let tail: String = text.chars().skip(*bold_chars).collect();
-                let mut reset = vec![Span::styled(head, style.add_modifier(Modifier::BOLD))];
+            GaugeParts::Bar { meter, marker } => {
+                let style = KEYBAR_THEME.level(meter.current_level());
+                let (text, bold) = meter.bar_text();
+                let (head, _) = cells::take_cells(&text, bold);
+                let tail = &text[head.len()..];
+                let mut reset = vec![Span::styled(
+                    head.to_string(),
+                    style.add_modifier(Modifier::BOLD),
+                )];
                 if !tail.is_empty() {
-                    reset.push(Span::styled(tail, style));
+                    reset.push(Span::styled(tail.to_string(), style));
                 }
                 reset.extend(marker.map(|m| Span::styled(format!(" {m}"), style)));
-                let mut label = format::percent(*fill);
-                if *over {
-                    label.push('!');
-                }
-                (reset, vec![Span::styled(label, style)])
+                (reset, vec![Span::styled(meter.label_text(), style)])
             }
         }
     }
 }
 
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
-/// following the same pattern as [`window_cells`] but as a single cell (no
-/// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
-/// critical coloring:
+/// following the same pattern as [`window_gauge_parts`] but as a single cell
+/// (no paired reset column — W0 keeps the Fbl slot light) and with
+/// scope-aware critical coloring:
 ///
-/// - Present window: the same in-bar countdown gauge as the 7d window
-///   ([`quota_bar_line`]) at EVERY width (.prd/18 rule 3 — the compact narrow
+/// - Present window: the same in-bar countdown meter as the 7d window
+///   ([`quota_meter`]) at EVERY width (.prd/18 rule 3 — the compact narrow
 ///   `F 22h!` marker is gone; the Fbl gauge never gives way, the `status` and
-///   `account` columns absorb a tight width instead). Colored by fill level through
-///   the SAME [`format::gauge_level`] / [`level_color`] palette, EXCEPT the
-///   scope's own signal wins —
+///   `account` columns absorb a tight width instead). Colored by the SAME
+///   70 % / 90 % bands, EXCEPT the scope's own signal wins —
 ///   a *constraining* Fable limit reads red regardless of the raw percent (the
 ///   limit is engaged upstream even if the number looks calm). "Constraining"
 ///   is [`ScopedQuotaWindow::is_constraining`], so the red is **reset-aware**:
@@ -6598,44 +6494,37 @@ fn fable_gauge_parts(
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
     let Some(scoped) = scoped else {
-        // Cold / absent: mirror the `window_cells` absent branch — the glyph +
-        // label — so a never-seen Fable window reads distinctly from an honest
-        // 0%.
+        // Cold / absent: mirror the 7d absent branch — the glyph + label — so
+        // a never-seen Fable window reads distinctly from an honest 0%.
         return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
     };
     let utilization = scoped.window.effective_utilization(now);
+    let (mut meter, marker) = quota_meter(
+        &scoped.window,
+        utilization,
+        now,
+        display,
+        mode,
+        reset_absolute,
+    );
     // Scope signal wins: a *constraining* Fable limit is red no matter the
     // percent — but `is_constraining` is reset-aware (it short-circuits on an
     // expired/reset window), so a stale-`Critical` severity no longer paints a
     // just-reset 0% window red. `is_active` is NOT a red trigger either — it
-    // marks the representative limit, not an exhausted one. Otherwise fall to
-    // the fill band.
-    let critical = scoped.is_constraining(now, fable_max);
-    let level = if critical {
-        GaugeLevel::Red
-    } else {
-        format::gauge_level(utilization)
-    };
-    let color = level_color(level);
-    // `!` on the red-critical read, same signal window_cells carries with its
+    // marks the representative limit, not an exhausted one. Otherwise the
+    // fill band decides. The critical override only changes the color/`!`,
+    // never the fill math.
+    if scoped.is_constraining(now, fable_max) {
+        meter = meter.level(Level::Crit);
+    }
+    // `!` on the red read, the same signal the 7d gauge carries with its
     // over-threshold `!`.
-    let over = matches!(level, GaugeLevel::Red);
-    // Same in-bar countdown gauge as the 7d cell, at every width; the critical
-    // override only changes the color/`!`, never the fill math.
-    let fill = match mode {
-        crate::config::QuotaDisplay::Used => utilization,
-        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-    };
-    let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+    let red = meter.current_level() == Level::Crit;
     GaugeParts::Bar {
-        fill,
-        color,
-        text,
-        bold_chars,
-        over,
+        meter: meter.over(red),
         marker,
     }
 }
@@ -12430,9 +12319,33 @@ mod tests {
         assert_eq!(row_account_name("plainname", false, &abbrev), "plainname");
     }
 
+    /// A quota meter's bar alone, `width` cells: `fill` of it used (and
+    /// filled), coloured for `level`, `text` centred inside with its first
+    /// `bold` cells bold, `marker` in the last cell — what llmux's own
+    /// `quota_bar_line` drew before the gauges moved to twolab-tui's meter.
+    fn meter_bar(
+        fill: f64,
+        level: Level,
+        text: &str,
+        bold: usize,
+        width: usize,
+        marker: Option<char>,
+    ) -> ratatui::text::Line<'static> {
+        let meter = Meter::new(fill)
+            .level(level)
+            .text(text, bold)
+            .label(false)
+            .theme(KEYBAR_THEME);
+        match marker {
+            Some(glyph) => meter.marker(glyph),
+            None => meter,
+        }
+        .line(width as u16)
+    }
+
     #[test]
     fn quota_bar_line_is_cell_width_and_splits_at_fill_boundary() {
-        let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None);
+        let line = meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, None);
         let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(total, 16, "cell is exactly bar-width wide");
         // First 8 columns reversed (the fill), the rest plain.
@@ -12455,15 +12368,8 @@ mod tests {
         let flat = |line: ratatui::text::Line| -> String {
             line.spans.iter().map(|s| s.content.as_ref()).collect()
         };
-        let without = flat(quota_bar_line(0.5, Color::Green, "7d 10h", 2, 16, None));
-        let with = flat(quota_bar_line(
-            0.5,
-            Color::Green,
-            "7d 10h",
-            2,
-            16,
-            Some('○'),
-        ));
+        let without = flat(meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, None));
+        let with = flat(meter_bar(0.5, Level::Ok, "7d 10h", 2, 16, Some('○')));
         assert_eq!(
             without.find("7d 10h"),
             with.find("7d 10h"),
@@ -12480,7 +12386,7 @@ mod tests {
     #[test]
     fn quota_bar_line_empty_and_full_fill() {
         for (fill, want_rev) in [(0.0, 0usize), (1.0, 16usize)] {
-            let line = quota_bar_line(fill, Color::Red, "17m 35s", 3, 16, None);
+            let line = meter_bar(fill, Level::Crit, "17m 35s", 3, 16, None);
             let rev: usize = line
                 .spans
                 .iter()
@@ -12493,7 +12399,7 @@ mod tests {
 
     #[test]
     fn quota_bar_line_bolds_only_the_leading_unit() {
-        let line = quota_bar_line(0.0, Color::Green, "7d 10h", 2, 16, None);
+        let line = meter_bar(0.0, Level::Ok, "7d 10h", 2, 16, None);
         let bold: String = line
             .spans
             .iter()
@@ -12511,7 +12417,7 @@ mod tests {
     #[test]
     fn quota_bar_countdown_stands_alone_without_rst_prefix() {
         for marker in [None, Some('○'), Some('◑')] {
-            let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 32, marker);
+            let line = meter_bar(0.5, Level::Ok, "7d 10h", 2, 32, marker);
             let cells: Vec<_> = line
                 .spans
                 .iter()
@@ -12551,7 +12457,7 @@ mod tests {
     fn quota_bar_long_countdown_keeps_its_centered_column() {
         // Nine countdown characters at width 16: centered at column 3.
         for marker in [None, Some('○')] {
-            let line = quota_bar_line(0.5, Color::Green, "1234d 10h", 5, 16, marker);
+            let line = meter_bar(0.5, Level::Ok, "1234d 10h", 5, 16, marker);
             let text: String = line
                 .spans
                 .iter()
@@ -12570,7 +12476,7 @@ mod tests {
             ("10/20 12:34", 5, None, "10/20 12:34"),
             ("0s", 2, Some('○'), "    0s    ○"),
         ] {
-            let line = quota_bar_line(0.5, Color::Green, time, bold_chars, 11, marker);
+            let line = meter_bar(0.5, Level::Ok, time, bold_chars, 11, marker);
             let text: String = line
                 .spans
                 .iter()
@@ -20871,6 +20777,11 @@ mod tests {
     /// each entry two cells wider), dollars in the default colour over dim
     /// cents and a dim `$` instead of all green; every other cell unchanged
     /// (previous digest 7_483_902_083_238_678_069).
+    /// Not re-pinned when the quota gauges moved to twolab-tui's `meter`
+    /// (2026-11-06): the frame is identical, text and styles — so is this
+    /// fixture at 80×24 and with `t`, `u` or the fold on. The one change is
+    /// off this frame: a cursor row's bar keeps its empty part un-reversed
+    /// (`cursor_row_quota_bar_keeps_its_fill_visible`).
     const FOLD_OFF_179X43_DIGEST: u64 = 11_040_274_043_730_846_167;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
@@ -20887,6 +20798,106 @@ mod tests {
             hash, FOLD_OFF_179X43_DIGEST,
             "fold-OFF frame changed:\n{frame}"
         );
+    }
+
+    /// On the cursor row the row highlight used to reverse every cell of the
+    /// quota bar as well, so the bar read as one solid block — how full the
+    /// window is was gone on exactly the account being looked at. The meter
+    /// draws the bar's empty part un-reversed, so the fill stays visible
+    /// there; the percent label and the rest of the row keep the highlight.
+    /// (The only change the move to twolab-tui's meter makes on MAIN: the
+    /// fold fixture's 179×43 frame is identical, cell for cell.)
+    #[test]
+    fn cursor_row_quota_bar_keeps_its_fill_visible() {
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let first = view.snapshot.accounts[frame_ctx(&view, &chrome).order[0]]
+            .id
+            .0
+            .clone();
+        let chrome = cursor_on(&view, &chrome, &first);
+        let mut terminal = Terminal::new(TestBackend::new(179, 43)).expect("terminal");
+        let mut hits = None;
+        let buf = terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone();
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let at = |row: &str, needle: &str| {
+            cells::width(
+                &row[..row
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle}:\n{text}"))],
+            ) as u16
+        };
+        let header = rows
+            .iter()
+            .position(|r| r.contains("7d RESET"))
+            .expect("header");
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with('>'))
+            .unwrap_or_else(|| panic!("{text}"));
+        // The 7d cell: from its header to the end of `LEFT` — the bar, a
+        // space and the five-cell label.
+        let x0 = at(&rows[header], "7d RESET");
+        let x1 = at(&rows[header], "LEFT") + 4;
+        let bar = x1 - x0 - 6;
+        let reversed: Vec<bool> = (x0..x0 + bar)
+            .map(|x| buf[(x, y as u16)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        let fill = reversed.iter().take_while(|r| **r).count();
+        assert!(fill > 0 && fill < reversed.len(), "{reversed:?}\n{text}");
+        assert!(reversed[fill..].iter().all(|r| !r), "{reversed:?}");
+        for x in x1 - 5..x1 {
+            assert!(
+                buf[(x, y as u16)].modifier.contains(Modifier::REVERSED),
+                "the label keeps the row highlight"
+            );
+        }
+        // The account cell is highlighted as before.
+        assert!(buf[(4, y as u16)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Under `t` the bar shows the UTC stamp `MM/DD HH:MM`, all eleven cells
+    /// of the narrowest bar. With a display-state glyph in the last cell the
+    /// stamp used to lose the minute's last digit (`07/07 13:5◑`, which
+    /// reads as 13:05); the meter gives the stamp way to its bold date
+    /// instead, and the cell keeps its percent label.
+    #[test]
+    fn absolute_stamp_beside_a_glyph_falls_back_to_its_date() {
+        use crate::config::QuotaDisplay;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        // 2026-07-07 13:50 UTC, three days out.
+        let resets_at = UNIX_EPOCH + Duration::from_secs(1_783_432_200);
+        let now = resets_at - Duration::from_secs(3 * 86_400);
+        let window = QuotaWindow {
+            utilization: 0.58,
+            resets_at,
+            fetched_at: now,
+            source: WindowSource::Headers,
+        };
+        let cell = |state: WindowDisplayState, absolute: bool| {
+            let (meter, _) =
+                quota_meter(&window, 0.58, now, state, QuotaDisplay::Remaining, absolute);
+            let line = quota_cell_line(&meter, QUOTA_BAR_WIDTH);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(cells::width(&text), QUOTA_CELL_WIDTH, "{text:?}");
+            text
+        };
+        assert_eq!(cell(WindowDisplayState::Stale, true), "   07/07  ◑   42%");
+        // Without a glyph the whole stamp fits, as before; countdowns fit
+        // beside one.
+        assert_eq!(
+            cell(WindowDisplayState::Populated, true),
+            "07/07 13:50   42%"
+        );
+        assert_eq!(cell(WindowDisplayState::Stale, false), "   3d 0h  ◑   42%");
     }
 
     /// The backend group of fixture account `n`.
