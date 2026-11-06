@@ -352,7 +352,10 @@ pub(crate) fn draw(
         height: 2,
     };
     frame.render_widget(Clear, footer_area);
-    draw_footer(frame, footer_area, chrome, ctx.mask);
+    let footer_field = draw_footer(frame, footer_area, chrome, ctx.mask);
+    if let Some(hits) = hits.as_mut() {
+        hits.field_width = hits.field_width.or(footer_field);
+    }
     // Usage context uses only the spare status row; flashes and modal chrome win.
     if chrome.status_line.as_deref().is_none_or(str::is_empty)
         && matches!(chrome.mode, Mode::Normal)
@@ -554,6 +557,7 @@ fn draw_main(
         account_modal: None,
         logs: None,
         raw_modal: None,
+        field_width: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
@@ -3578,26 +3582,36 @@ fn draw_config_overlay(
             }
         }
     }
-    // Edit prompt line (config-editor v1). The confirm gate is the card
+    // Edit prompt line (config-editor v1): the value in a twolab-tui
+    // composer field, the format hint after it. The confirm gate is the card
     // above the footer (`draw_gate`).
+    let mut field_width = None;
     if let Some(action) = editing {
-        let hint = action.input_hint().unwrap_or("");
-        let prompt = Line::from(vec![
-            Span::styled(" edit ", Style::new().fg(Color::Cyan)),
-            Span::raw(format!("{}▏", chrome.config_input)),
-            Span::styled(format!("   ({hint} · Enter apply · Esc cancel)"), dim()),
-        ]);
+        let lead = " edit ";
+        let hint = format!("   ({})", action.input_hint().unwrap_or(""));
+        let room = inner.width.saturating_sub(cells::width(lead) as u16);
+        let width = room
+            .saturating_sub(cells::width(&hint) as u16)
+            .max(FIELD_MIN.min(room));
+        let mut spans = vec![Span::styled(lead, Style::new().fg(Color::Cyan))];
+        spans.extend(field_line(&chrome.field, "", width).spans);
+        spans.push(Span::styled(hint, dim()));
         frame.render_widget(
-            Paragraph::new(prompt),
+            Paragraph::new(cells::truncate_line(
+                Line::from(spans),
+                usize::from(inner.width),
+            )),
             Rect {
                 y: list_area.bottom() + 1,
                 height: 1,
                 ..inner
             },
         );
+        field_width = Some(width);
     }
     if let Some(hits) = hits.as_mut() {
         hits.config_rows = hit_rows;
+        hits.field_width = field_width;
     }
 }
 
@@ -8431,6 +8445,9 @@ pub(crate) struct MainChrome {
     /// the input modal, `None` only means "no raw modal drawn this frame" —
     /// the raw modal owns its content and never closes on entry aging.
     pub raw_modal: Option<RawModalChrome>,
+    /// Cells the open text field (add key · limits · config value) was drawn
+    /// in this frame — its window follows the caret from there.
+    pub field_width: Option<u16>,
 }
 
 /// Per-frame raw-viewer chrome (UI-8): what the runtime needs to clamp scroll
@@ -10798,6 +10815,82 @@ fn keybar_after(
     Line::from(spans)
 }
 
+/// The fewest cells a text field is given (its `❯` column and ten cells of
+/// text); past that the hints after it drop whole instead.
+const FIELD_MIN: u16 = 12;
+
+/// A footer field this wide still leaves every hint after it in view.
+const FIELD_ROOMY: u16 = 24;
+
+/// The keys of a text field (add key · limits · config value), Enter's label
+/// first: the prompt's bar and the `?` help read this one table.
+fn field_keys(enter: &'static str) -> [(&'static str, &'static str); 5] {
+    [
+        ("Enter", enter),
+        ("Esc", "cancel"),
+        ("←→ Home/End", "move"),
+        ("ctrl+u/k/w", "cut"),
+        ("ctrl+y", "put back"),
+    ]
+}
+
+/// A text field as one line `width` cells wide (twolab-tui composer): `❯`,
+/// the window of the value around the caret (a reversed cell), `‹` / `›`
+/// when the value runs past either side, `placeholder` dim while empty. A
+/// masked field draws `∙` glyphs only. The field's window is moved on a
+/// copy; the runtime moves its own the same way ([`MainChrome::field_width`]).
+fn field_line(
+    field: &twolab_tui::composer::ComposerState,
+    placeholder: &str,
+    width: u16,
+) -> Line<'static> {
+    let mut state = field.clone();
+    twolab_tui::composer::Composer::new()
+        .placeholder(placeholder)
+        .theme(KEYBAR_THEME)
+        .line(&mut state, width)
+}
+
+/// A footer prompt with a text field: `label`, the field, then the key bar
+/// ([`field_keys`]: Enter and Esc first, then the editing keys). On a wide
+/// row every hint keeps its place and the field takes the rest; otherwise
+/// the field keeps room for Enter, Esc and the `… +N more` that counts the
+/// editing keys, never less than [`FIELD_MIN`] cells. Returns the line and
+/// the field's width.
+fn field_bar(
+    label: &'static str,
+    field: &twolab_tui::composer::ComposerState,
+    placeholder: &str,
+    hints: &[(&'static str, &'static str)],
+    width: u16,
+) -> (Line<'static>, u16) {
+    use twolab_tui::key_hints::KeyHints;
+    let natural = |hints: &[(&'static str, &'static str)]| {
+        let line = KeyHints::new(hints.iter().map(|&(k, l)| key_hint(k, l)))
+            .no_more()
+            .theme(KEYBAR_THEME)
+            .line(u16::MAX);
+        cells::spans_width(&line.spans) as u16
+    };
+    // The field and the two spaces after it.
+    let room = width
+        .saturating_sub(cells::width(label) as u16 + 1)
+        .saturating_sub(2);
+    let all = natural(hints);
+    let (keep, rest) = hints.split_at(hints.len().min(2));
+    let counted = cells::width(&format!("  … +{} more", rest.len())) as u16;
+    let essential = natural(keep) + if rest.is_empty() { 0 } else { counted };
+    let field_w = if room >= all + FIELD_ROOMY {
+        room - all
+    } else {
+        room.saturating_sub(essential).max(FIELD_MIN.min(room))
+    };
+    let mut lead = vec![Span::raw(label), Span::raw(" ")];
+    lead.extend(field_line(field, placeholder, field_w).spans);
+    lead.push(Span::raw("  "));
+    (keybar_after(lead, hints, width), field_w)
+}
+
 /// The theme every twolab-tui widget on the dashboard draws with (key bars,
 /// confirm gates, pickers): ANSI colours with labels in the terminal's
 /// default foreground (as before the move to KeyHints) — ANSI grey labels
@@ -11118,6 +11211,10 @@ fn help_groups(chrome: &Chrome) -> Vec<twolab_tui::key_hints::HintGroup<'static>
         groups.push(group(title, &overlay_hints(overlay, chrome, true).1));
     }
     groups.push(group("switcher (s)", &SELECT_KEYS));
+    groups.push(group(
+        "text fields (add key · limits · config)",
+        &field_keys("apply"),
+    ));
     groups.push(group("keys: model picker (f)", &KEYS_PICKER_KEYS));
     groups.push(group("raw viewer", &RAW_KEYS));
     groups.push(group("other", &OTHER_KEYS));
@@ -11267,7 +11364,9 @@ fn overlay_hints(overlay: Overlay, chrome: &Chrome, help: bool) -> HintTable {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
+/// The footer: the status line and the key bar of the open prompt or
+/// surface. Returns the width of the text field it drew, if any.
+fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) -> Option<u16> {
     // Status messages quote account names ("switched to a@x.com") — mask any
     // embedded email under the email-anonymous setting.
     let status = Line::from(Span::styled(
@@ -11277,14 +11376,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
         Style::new().fg(Color::Yellow),
     ));
+    let mut field_width = None;
     let keybar = match chrome.mode {
-        // Config-editor prompts render their own inline hint line inside the
-        // overlay; the keybar mirrors the essentials.
-        Mode::ConfigEdit { .. } => keybar(
-            Some("edit"),
-            &[("Enter", "apply"), ("Esc", "cancel")],
-            area.width,
-        ),
+        // Config-editor prompts render their own inline field and hint line
+        // inside the overlay; the keybar lists the field's keys.
+        Mode::ConfigEdit { .. } => keybar(Some("edit"), &field_keys("apply"), area.width),
         // The gate card above names the setting and its old → new value.
         Mode::ConfigConfirm { .. } => keybar(
             Some("confirm"),
@@ -11320,32 +11416,30 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             keybar(title, &hints, area.width)
         }
         Mode::Select { .. } => keybar(None, &SELECT_KEYS, area.width),
-        // The typed key is shown ONLY as a masked width — never the raw
-        // characters (AGENTS.md credential rule).
-        Mode::EditLimits { .. } => keybar_after(
-            vec![
-                Span::raw(" limits (5h,7d,fbl %): "),
-                Span::styled(
-                    format!("{}▏", chrome.limits_input),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-            ],
-            &[("Enter", "apply"), ("Esc", "cancel")],
-            area.width,
-        ),
-        Mode::AddKey => keybar_after(
-            vec![
-                Span::raw(" add account — key: "),
-                Span::styled(
-                    "•".repeat(chrome.add_input_len),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw("  "),
-            ],
-            &[("Enter", "add"), ("Esc", "cancel")],
-            area.width,
-        ),
+        Mode::EditLimits { .. } => {
+            let (bar, width) = field_bar(
+                " limits (5h,7d,fbl %)",
+                &chrome.field,
+                "empty = global",
+                &field_keys("apply"),
+                area.width,
+            );
+            field_width = Some(width);
+            bar
+        }
+        // The key is a masked composer: the field draws one `∙` per
+        // character and can draw nothing else (AGENTS.md credential rule).
+        Mode::AddKey => {
+            let (bar, width) = field_bar(
+                " add account — key",
+                &chrome.field,
+                "paste an API key",
+                &field_keys("add"),
+                area.width,
+            );
+            field_width = Some(width);
+            bar
+        }
         Mode::ContextMenu { .. } => keybar(
             None,
             &[
@@ -11392,6 +11486,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
         ),
     };
     frame.render_widget(Paragraph::new(vec![status, keybar]), area);
+    field_width
 }
 
 #[cfg(test)]
@@ -11401,6 +11496,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::collections::{BTreeMap, HashMap};
+    use twolab_tui::composer::{ComposerState, Mask};
 
     fn model_row(group: &str, model: &str, tokens_in: u64, tokens_out: u64) -> ModelUsageDoc {
         ModelUsageDoc {
@@ -12421,28 +12517,41 @@ mod tests {
         let view = usage_control_view();
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::EditLimits { idx: 0 };
-        chrome.limits_input = "80,90".into();
+        // The field is a composer now: `❯` and the value, the caret a
+        // reversed cell after it (it was a literal `▏`).
+        chrome.field = ComposerState::with_text("80,90").single_line();
         let wide = render_rows(&view, &chrome, 80, 24);
         let bar = wide[wide.len() - 1].clone();
         assert!(
-            bar.contains("80,90▏") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
+            bar.contains("❯ 80,90") && bar.contains("Enter apply") && bar.contains("Esc cancel"),
             "{bar}"
         );
         let narrow = render_rows(&view, &chrome, 40, 24);
         let bar = narrow[narrow.len() - 1].clone();
-        assert!(bar.contains("80,90▏"), "{bar}");
+        assert!(bar.contains("❯ 80,90"), "{bar}");
         assert!(bar.contains("… +"), "{bar}");
         assert!(
             !bar.contains("Enter a ") && !bar.trim_end().ends_with("Ente"),
             "{bar}"
         );
 
+        // A 30-character key: the masked field scrolls (`‹` says more is to
+        // the left) instead of drawing all 30 bullets and pushing the keys
+        // off; at 56 columns Esc and the count of the rest stay, at 80 Enter
+        // and Esc both do.
         let mut chrome = chrome_overlay(Overlay::Accounts);
         chrome.mode = Mode::AddKey;
-        chrome.add_input_len = 30;
+        chrome.field = ComposerState::with_text(&"k".repeat(30)).masked(Mask::default());
         let bar = render_rows(&view, &chrome, 56, 24).pop().expect("footer");
-        assert!(bar.contains(&"•".repeat(30)), "masked width kept: {bar}");
-        assert!(bar.contains("… +"), "{bar}");
+        assert!(bar.contains("‹ ∙∙∙"), "masked and scrolled: {bar}");
+        assert!(!bar.contains("kk"), "{bar}");
+        assert!(bar.contains("Esc cancel") && bar.contains("… +"), "{bar}");
+        let bar = render_rows(&view, &chrome, 80, 24).pop().expect("footer");
+        assert!(bar.contains("‹ ∙∙∙") && !bar.contains("kk"), "{bar}");
+        assert!(
+            bar.contains("Enter add") && bar.contains("Esc cancel"),
+            "{bar}"
+        );
     }
 
     /// The raw viewer's legend sits on its bottom border above the footer and
@@ -12881,11 +12990,10 @@ mod tests {
             confirm_choice: 0,
             reset_held: None,
             config_saved: Default::default(),
-            add_input_len: 0,
+            field: Default::default(),
             quota_display_override: None,
             reset_absolute: false,
             fold_exhausted: false,
-            limits_input: String::new(),
             attach: None,
             keys: Default::default(),
         }

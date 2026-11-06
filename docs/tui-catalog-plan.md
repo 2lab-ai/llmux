@@ -47,7 +47,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | trend_chart | llmux | series are told apart only by colour; the tokens chart zero-fills days before history | `* + x o` per series without colour, gaps for missing days | 3 |
 | working | Codex | the attach screen is static yellow text | a spinner and how long it has been retrying | 3 |
 | mini_bar | llmux | an empty share bar when the total is zero | `—` when the share cannot be computed | 3 |
-| composer | fx + herdr | add-key and config edits only append or delete at the end | caret moves, mid-value edits, Ctrl+U/Ctrl+Y; the API key stays masked in every render | 3 |
+| composer | fx + herdr | add-key and config edits only append or delete at the end | add key, limits and config value are one-line composer fields: caret moves, mid-value edits, Ctrl+U/K/W cut and Ctrl+Y puts back, a paste lands whole; the API key is a masked composer, `∙` in every frame | done |
 | text, spinner, gradient_text, osc52 | llmux, Codex | done in PR #231 | — | done |
 | key_hints (main bar), tabs (main row), json_view (highlighter), theme (decolor) | | done in PR #231 | — | done |
 | meter | llmux | the original of the crate's meter | no visible change; moving it re-pins the 179×43 frame digest for every account row | later |
