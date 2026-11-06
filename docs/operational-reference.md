@@ -332,9 +332,13 @@ dragging past the top or bottom edge scrolls). Releasing copies the
 selection — exactly the cells shown, one line per row — through the same
 clipboard path as the raw viewer's copy buttons (`pbcopy`/`wl-copy`/`xclip`/
 `xsel`, else OSC 52, wrapped for tmux or GNU screen), and the status line
-confirms it (`copied 2 lines → pbcopy`). While a selection is shown the
-pager holds still instead of following (`held for the selection — End
-follows`); a plain click clears it, and `End` follows again.
+confirms it (`copied 2 lines → pbcopy`). From the press until the
+selection is gone the pager keeps the lines it showed at the press — new
+lines, or the ring dropping its oldest, change nothing under the pointer,
+so the copy is the text you saw. While a selection is shown the pager holds
+still instead of following (`held for the selection — End follows`); a
+plain click clears it, and `End` (or scrolling to the last line) drops it
+and follows the live lines again.
 
 ### Copy mode
 

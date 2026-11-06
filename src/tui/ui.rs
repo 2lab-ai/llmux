@@ -1692,7 +1692,14 @@ fn draw_logs_overlay(
     use twolab_tui::scrollbar::ScrollPos;
 
     frame.render_widget(Clear, area);
-    let pager = logs_pager(view, chrome.logs_scroll, chrome.logs_selection);
+    // Held at a press on the pager until its selection is gone.
+    let lines = chrome.logs_frozen.as_deref().unwrap_or(&view.logs);
+    let pager = logs_pager(
+        lines,
+        view.email_anonymous,
+        chrome.logs_scroll,
+        chrome.logs_selection,
+    );
     frame.render_widget(&pager, area);
     // The pager's own rows: a title row from 3 rows up, a bottom rule from 2.
     let chrome_rows = u16::from(area.height >= 3) + u16::from(area.height >= 2);
@@ -1704,19 +1711,22 @@ fn draw_logs_overlay(
     )
 }
 
-/// The Logs overlay's pager over this frame's log ring — the one build the
-/// draw and the mouse share, so a drag lands on the cells the person saw.
-/// `scroll` is `chrome.logs_scroll` (`None` follows the tail); `selection`
-/// is the drag-selected stretch, drawn reversed (it shows under `NO_COLOR`
-/// too). A pager held for a selection says so in its title.
+/// The Logs overlay's pager over `logs` — this frame's log ring, or the
+/// lines held since a press on the pager — the one build the draw and the
+/// mouse share, so a drag lands on the cells the person saw. `mask` is the
+/// email-anonymous setting. `scroll` is `chrome.logs_scroll` (`None`
+/// follows the tail); `selection` is the drag-selected stretch, drawn
+/// reversed (it shows under `NO_COLOR` too). A pager held for a selection
+/// says so in its title.
 pub(crate) fn logs_pager(
-    view: &DashboardView,
+    logs: &[crate::logging::LogLine],
+    mask: bool,
     scroll: Option<usize>,
     selection: Option<twolab_tui::pager::Selection>,
 ) -> twolab_tui::pager::Pager {
     use twolab_tui::pager::Pager;
 
-    let lines: Vec<Line<'static>> = if view.logs.is_empty() {
+    let lines: Vec<Line<'static>> = if logs.is_empty() {
         // Say so instead of a blank pane (the same in attach mode, where the
         // lines come from the daemon's document).
         vec![
@@ -1727,12 +1737,9 @@ pub(crate) fn logs_pager(
             )),
         ]
     } else {
-        view.logs
-            .iter()
-            .map(|line| log_line(line, view.email_anonymous))
-            .collect()
+        logs.iter().map(|line| log_line(line, mask)).collect()
     };
-    let n = view.logs.len();
+    let n = logs.len();
     let count = if n == 1 {
         "1 line".to_string()
     } else {
@@ -14125,6 +14132,7 @@ mod tests {
             usage_scroll: 0,
             logs_scroll: None,
             logs_selection: None,
+            logs_frozen: None,
             copy_mode: false,
             input_modal: None,
             raw_modal: None,
