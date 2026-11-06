@@ -17,7 +17,8 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
                       │                                · trend_chart · working · mini_bar · composer (masked field)
                       ├─ Already done (PR #231) ...... text · spinner · gradient_text · key_hints (main bar) · tabs (main row)
                       │                                · json_view highlighter · theme decolor · osc52
-                      ├─ Later, with a reason ........ meter · packed_grid · rule · shimmer · theme sweep · hit · agent_list
+                      ├─ Done after the batches ...... agent_list (compact account list)
+                      ├─ Later, with a reason ........ meter · packed_grid · rule · shimmer · theme sweep · hit
                       │                                · pager selection (copy mode)
                       └─ Not applicable .............. completion_menu · diff_view · approval_card · layout · fact_table*
 ```
@@ -56,7 +57,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | shimmer | Codex | loading labels are plain text | cosmetic | later |
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
-| agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a narrow account sidebar with a state glyph per account; needs a layout decision first | later |
+| agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a compact account list: one row per account with a one-cell glyph per state (`✗ ◌ ◉ ⠋ ◦ ǁ ?`), the cursor's account highlighted, a one-line tally and `+N more` in the title; `v` on the accounts tab, and MAIN uses it whenever its table would show fewer than 5 rows (21 accounts at 80×24: 10 shown instead of 2) | done |
 | pager selection (copy mode) | herdr | mouse capture blocks the terminal's own selection | drag to select and copy an email or an error; needs a mouse-capture design first | later |
 | fact_table | fx | model drill-down facts as free text | figures aligned on the last digit; no problem reported today | later |
 | completion_menu | fx | no typed command line | — | not applicable |
@@ -70,8 +71,8 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 - Batch 2 needs the library's modal, scrollbar and json_view row cache (2lab-ai/tui, herdr port).
 - Batch 3 needs the library's toast and format units. `format`, `status_bar` and `mini_bar` can move the pinned 179×43
   frame digest; each re-pin is explained next to the digest, as PR #231 did.
-- The later items either change nothing a person sees (meter, packed_grid) or need a design decision first (agent_list,
-  copy mode, rule).
+- The later items either change nothing a person sees (meter, packed_grid) or need a design decision first (copy mode,
+  rule). agent_list got its decision — the compact list replaces the table in the same pane, never beside it.
 
 ## Evidence
 

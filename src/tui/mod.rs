@@ -636,6 +636,11 @@ pub(crate) struct Chrome {
     /// `z`-key session toggle: MAIN packs the accounts whose 7d window is
     /// over its ceiling into a text block under the table (off by default).
     pub fold_exhausted: bool,
+    /// `v`-key session toggle on the accounts tab: the compact account list
+    /// (one row per account with its state glyph) instead of the table.
+    /// MAIN switches to that list by itself when the table would show
+    /// fewer than five rows.
+    pub compact_accounts: bool,
     /// Drag-set pane heights (UI-3 U7/U8); `None` entries keep the automatic
     /// layout.
     pub pane_heights: PaneHeights,
@@ -1133,6 +1138,9 @@ struct App {
     /// over its ceiling into a text block under the accounts table. Off
     /// until the first press; session-local like `u`/`t`/`o`.
     fold_exhausted: bool,
+    /// Session toggle (`v` on the accounts tab): the compact account list
+    /// instead of the table (see [`Chrome::compact_accounts`]).
+    compact_accounts: bool,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     usage_gran: activity::UsageGran,
     /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
@@ -1270,6 +1278,7 @@ impl App {
             clip_tx: None,
             reset_absolute: false,
             fold_exhausted: false,
+            compact_accounts: false,
             pending_control: None,
             control_inflight: false,
             control_tx: None,
@@ -1486,6 +1495,7 @@ impl App {
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
             fold_exhausted: self.fold_exhausted,
+            compact_accounts: self.compact_accounts,
             pane_heights: self.pane_heights,
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
@@ -3700,6 +3710,18 @@ impl App {
             // Same row-order toggle as MAIN — this overlay is the full-width
             // accounts table, so the order matters most here.
             KeyCode::Char('o') => self.toggle_account_sort(),
+            // The compact account list (twolab-tui agent_list) or the table.
+            KeyCode::Char('v') => {
+                self.compact_accounts = !self.compact_accounts;
+                self.set_status(
+                    if self.compact_accounts {
+                        "accounts: compact list (v: table)"
+                    } else {
+                        "accounts: table (v: compact list)"
+                    }
+                    .into(),
+                );
+            }
             // Switch the active account (the `s` switcher, now scoped to this
             // overlay). The cursor starts at row 0 — which is the first row of
             // the first group block under EITHER sort (name order does not put
@@ -7461,6 +7483,31 @@ mod tests {
             "toggles back"
         );
         assert_eq!(app.status_line(), Some("fold off"));
+    }
+
+    /// `v` on the accounts tab switches between the table and the compact
+    /// account list: off by default, a status line naming the view, carried
+    /// on the frame's chrome, kept across a MAIN round trip; on MAIN `v`
+    /// does nothing (MAIN picks the list by itself when its table is
+    /// crowded).
+    #[test]
+    fn compact_key_toggles_the_account_list_on_the_accounts_tab() {
+        let view = control_view();
+        let mut app = remote_app();
+        assert!(!app.compact_accounts && !app.chrome().compact_accounts);
+        app.on_key(press(KeyCode::Char('v')), Some(&view));
+        assert!(!app.compact_accounts, "MAIN leaves it alone");
+        app.on_key(press(KeyCode::Char('a')), Some(&view));
+        assert_eq!(app.overlay, Overlay::Accounts);
+        app.on_key(press(KeyCode::Char('v')), Some(&view));
+        assert!(app.compact_accounts && app.chrome().compact_accounts);
+        assert_eq!(app.status_line(), Some("accounts: compact list (v: table)"));
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        app.on_key(press(KeyCode::Char('a')), Some(&view));
+        assert!(app.chrome().compact_accounts, "kept");
+        app.on_key(press(KeyCode::Char('v')), Some(&view));
+        assert!(!app.compact_accounts && !app.chrome().compact_accounts);
+        assert_eq!(app.status_line(), Some("accounts: table (v: compact list)"));
     }
 
     #[test]

@@ -25,7 +25,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `v` (accounts overlay) switches between the table and the compact account list (see **Compact account list** under [Dashboard layout](#dashboard-layout-main)), and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 **Text fields.** The add-account key prompt (`a`), the per-account limits prompt (`L` in the switcher) and a config value edit are one-line text fields after a `❯`: `←`/`→` and `Home`/`End` (`Ctrl+A`/`Ctrl+E`) move the caret, `Ctrl+←`/`Ctrl+→` by word; typing, `Backspace` and `Delete` edit at the caret; `Ctrl+U`, `Ctrl+K` and `Ctrl+W` cut to the start, to the end and the word before the caret, and `Ctrl+Y` puts the cut back. A paste lands whole at the caret (bracketed paste — a line break in it never submits; outside a text field a paste is typed key by key, as before). A value wider than the field scrolls with the caret, `‹` or `›` marking the side with more. The key field draws one `∙` per character and never the key itself, in any frame; the limits field takes only digits, `,`, `.` and spaces, keeps its text when Enter finds an error, and Enter on an empty field returns the account to the global ceilings. The keys are listed in the `?` help under *text fields*.
 
@@ -178,6 +178,31 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   folded lines would not take fewer rows than the accounts they fold
   (always the case with one or two spent accounts). Pressing `z` only says
   `fold on` or `fold off`.
+- **Compact account list (`v`).** One row per account: a focus mark, a
+  glyph for what the account is doing, its name and, when the column has
+  room for every name, the state's word — `✗ error 401` (auth failed),
+  `◌ 7d spent` / `5h spent` (over a ceiling until the window resets),
+  `◉ cooling 45m10s` (parked by a cooldown), `⠋ active` (the scheduler's
+  current account; the glyph turns), `◦ ok` (eligible), `ǁ paused` and
+  `? stale` (usage too old to trust). Every glyph is one cell wide, CJK
+  terminals included, so states differ by shape under `NO_COLOR` too. The
+  rows keep the table's order and run down, then across in as many
+  columns as fit (at least 14 cells each). The title keeps the sort and
+  the account count (and the group counts when they fit), adds a one-line
+  tally of the states with their glyphs (`✗ 1 error · ◌ 10 spent · ⠋ 2
+  active …`; a slot two states share reads `spent+cooling` or
+  `paused+stale`, and the tally drops whole counts with `…` when the width
+  runs out) and ends with `+N more` for the accounts that do not fit. The
+  account under the cursor (the switcher, a remove/reset card, the
+  context menu) is marked `›` and reversed, and the list moves to keep it
+  in view. A left click on an entry opens that account's detail modal and
+  a right click (dashboard) its context menu, exactly like its table row.
+  `v` on the accounts tab switches between the table and the list for this
+  session (the footer says `v compact` or `v table`); the dashboard uses the
+  list by itself whenever its table would show fewer than 5 account rows
+  and still hide some (at 80×24 the table showed 2 rows and `+19 more` of
+  21 accounts; the list shows 10). `z` folding does not apply while the
+  list is shown.
 
 ### Reading account quota columns
 
@@ -360,6 +385,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 | Gemini backend group (`llmux login --gemini`, the dashboard picker's Gemini row, `gemini` / `argon` models, Islands Gemini tiles) | no | yes | yes |
 | Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | yes | yes |
 | `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | yes | yes |
+| Compact account list (`v` on the accounts tab; automatic on a dashboard whose table would show fewer than 5 rows) ([Dashboard layout](#dashboard-layout-main)) | no | no | yes |
 | Explicit Haiku 4.5 ids served by Haiku 5.5 on Claude Code / Agent SDK–shaped requests with default sampling and the bare `quota` probe (bare, custom-system or non-default-sampling requests still reach Haiku 4.5; row retired), Claude Code system block on the bare `quota` probe ([models](models.md#alias-semantics)) | no | yes | yes |
 | Subscription plan per account: `plan` / `rate_limit_tier` / `plan_type` in `/llmux/status`, `llmux status` lines (`max20 · 7d 66% left`), TUI detail pane ([Usage controls](#usage-controls-refresh--resets)) | no | yes | yes |
 
