@@ -561,7 +561,7 @@ accounts for every observed completion.
 
 Only one process can own port 3456 — normally the background daemon created by `llmux run`. To inspect it:
 
-- `llmux dashboard` polls `GET /llmux/dashboard` once a second and renders the same view model the in-process TUI uses. Dropped connections show a reconnecting banner and keep retrying.
+- `llmux dashboard` polls `GET /llmux/dashboard` once a second and renders the same view model the in-process TUI uses. Dropped connections show a reconnecting banner and keep retrying. Until the first document arrives the screen shows a spinner and how long it has been trying — `⠋ connecting to daemon — retrying… (42s) - q quit`; `q` quits. With `LLMUX_REDUCED_MOTION` set to any non-empty value that spinner holds still and its label is plain bold (the count still runs).
 - `llmux server`, when a llmux daemon already owns the port, prints `daemon already running (pid N) — attaching…` and enters attach mode instead of failing with `Address already in use`.
 - A foreign process on the port remains a clean error and is never overwritten.
 
