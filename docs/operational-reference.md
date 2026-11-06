@@ -136,10 +136,13 @@ legend — so four lines stay apart without colour.
   ok, errors and cost on the left, tokens in, tokens out, cache read and
   cache write on the right, every figure right-aligned on its last digit,
   and `—` for a cache class the upstream never reported or a cost no rate
-  prices. The
-  packing choice reserves room for the widest `last` value (`N in-flight`),
-  so a model starting or finishing a request does not change the strip's
-  height.
+  prices. Every
+  packed entry reserves room for the widest `last` value (`N in-flight`),
+  so a model starting or finishing a request changes neither the strip's
+  height nor where its columns start (the second column used to slide
+  sideways with the first column's `last` text). Clicking a model in the
+  strip, packed or as a table row, opens the `stats` tab with that model
+  under the cursor.
 - **Header tail.** When the header does not fit its row, its last part —
   `cfg <config path>` and the attach marker — moves to the right end of the
   tab row. There your home directory is shown as `~`, and the marker reads
@@ -172,8 +175,9 @@ legend — so four lines stay apart without colour.
   cursor still moves through every account in table order, a folded
   account under the cursor is highlighted like a table row, and clicking
   a folded account works like clicking its row. When the terminal is too
-  short, `+N more` counts the table rows that do not fit plus the folded
-  accounts on the lines that do not fit. The columns keep room for the
+  short, the block's last line reads `+N more` for the folded accounts it
+  cannot show (the lines used to stop at the pane's edge), and the title's
+  `+N more` counts the table rows that do not fit plus those accounts. The columns keep room for the
   widest form of every value the clock changes (a reset countdown with
   its `◑` mark, a Fable window resetting), so the block does not move as
   time passes. The fold never makes the accounts pane taller.

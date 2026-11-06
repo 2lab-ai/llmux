@@ -51,7 +51,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | text, spinner, gradient_text, osc52 | llmux, Codex | done in PR #231 | — | done |
 | key_hints (main bar), tabs (main row), json_view (highlighter), theme (decolor) | | done in PR #231 | — | done |
 | meter | llmux | the original of the crate's meter | the same bars (the 179×43 frame digest is unchanged); the cursor row's bar keeps its fill visible; under `t` a stamp beside a state glyph shows its date instead of losing a digit | done |
-| packed_grid | llmux | the original, twice (fold and models strip) | one packer and click rects per strip entry; largest digest change | later |
+| packed_grid | llmux | the original, twice (fold and models strip) | one packer for both; a click on a strip entry opens that model in `stats`; the strip's columns stay put when a model starts or stops running; a fold cut by a short pane ends in `+N more` | done |
 | rule | fx | 28 section rules drawn as block borders | only differs on CJK-wide terminals; needs a host setting first | later |
 | shimmer | Codex | loading labels are plain text | cosmetic | later |
 | theme (sweep) | 2lab | 149 literal colours left in drawing code | one selected style everywhere; each batch removes the literals it touches | later |
