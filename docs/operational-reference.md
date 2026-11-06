@@ -25,7 +25,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `v` releases the mouse for the terminal's own selection ([Copy mode](#copy-mode)), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Tab shortcut hints
 
@@ -235,7 +235,7 @@ Claude grants are gated upstream on the client **surface and version**: the endp
 
 ### Usage tab (calendar usage + cost)
 
-The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
+The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; when the rows overflow, a scrollbar in the table's last column shows where you are (it counts rows: a bucket row plus one per model) — click the track to jump, drag the thumb to scroll, and the table lands on the first bucket at or after that row; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
 
 ### Logs tab
 
@@ -249,6 +249,29 @@ follows`), and `End`, or scrolling down to the last line, follows again.
 Lines that leave the 500-line ring while you read move the text up by as
 much. Before the first line arrives it says `no log lines yet` — locally and
 attached — instead of showing an empty pane. `l`/`Esc` goes back, `q` quits.
+
+Drag across the lines with the left button to select them (drawn reversed;
+dragging past the top or bottom edge scrolls). Releasing copies the
+selection — exactly the cells shown, one line per row — through the same
+clipboard path as the raw viewer's copy buttons (`pbcopy`/`wl-copy`/`xclip`/
+`xsel`, else OSC 52, wrapped for tmux or GNU screen), and the status line
+confirms it (`copied 2 lines → pbcopy`). While a selection is shown the
+pager holds still instead of following (`held for the selection — End
+follows`); a plain click clears it, and `End` follows again.
+
+### Copy mode
+
+The dashboard captures the mouse for its clicks, drags and wheel, so the
+terminal's own text selection does not work over it. `v` — on the dashboard,
+in any tab, or over a modal, whenever no prompt is open and nothing is being
+typed — releases the mouse to the terminal: select and copy with it as you
+would anywhere else (an account email, an error on the status line, an
+activity row). The footer's key bar becomes the banner `copy mode — mouse
+released for selecting; press v/Esc to return`; the status line above it
+keeps its message. While copy mode is on the screen holds still (it redraws
+only on a resize) and every key but `v`/`Esc` is ignored, so nothing moves
+under the selection; `v` or `Esc` takes the mouse back and the dashboard
+carries on where it was. `Ctrl-C` still quits.
 
 ### Perf tab (observed performance)
 
@@ -269,7 +292,7 @@ Metric semantics (v1, deliberately conservative):
 
 The activity feed gains the same per-request view: a `t/s` column (e2e) on every completed row, and the click-expanded detail shows `e2e` / `est … post-delta` / `ttfb` / `first output` when recorded. Attach clients receive the same rows on `GET /llmux/dashboard` (`daily_perf`).
 
-In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
+In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. When the sessions overflow, a scrollbar in the list's last column shows where you are; clicking its track or dragging its thumb scrolls the list by moving the cursor, as the wheel does. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
 
 ### Config tab (the config editor)
 
@@ -516,7 +539,7 @@ the in-memory activity fold, so they survive restarts and can be narrowed:
 |---|---|
 | `w` | Cycle the window: `all` → `1h` → `24h` → `7d` → `14d` → `30d` → `90d` → `all`. Each window is the exact closed interval `[now − duration, now]`; future-stamped rows are never counted. |
 | `f` | Multi-select the models observed in the current window — `↑/↓` (or `j`/`k`) move, `Space` toggles, `a` selects all, `c` clears, `/` starts a type-to-filter (fuzzy, matched letters highlighted; letters are picker keys until then — while it is open they type, `Esc` or `Backspace` on an empty filter closes it), `Enter` applies, `Esc` cancels. `k of n selected` counts every model and says how many the filter hides. No selection = every model. The offered list is the window's models, never narrowed by the filter already applied, so a selection can be changed and not just narrowed; opened while the query is still loading, it fills in when the answer lands (checks and the cursor row kept). The popup is sized to its rows, and the footer bar lists the picker's keys while it is open. |
-| `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. |
+| `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. The mouse wheel scrolls too, and when the rows overflow a scrollbar on the panel's right border shows where you are: click the track to jump, drag the thumb to scroll. |
 | `r` | Re-run the query. |
 
 On a narrow terminal the table sheds its widest, lowest-value columns (the
@@ -745,17 +768,26 @@ from a day that is already archived answers "in the DAY archive — run
   for gemini) → `Upstream Resp` (the provider's
   verbatim reply before conversion) → `Response` (what the client
   received). A byte-identity Anthropic passthrough shows the classic 2 tabs
-  (client and upstream exchange are the same bytes). Click a tab or walk
-  with `←`/`→`/`Tab`/`h`/`l`.
+  (client and upstream exchange are the same bytes). The tabs sit on the
+  same strip as the dashboard's tab row (`Request │ Response`, the active
+  one bold); click a tab or walk with `←`/`→`/`Tab`/`h`/`l`.
 For Claude-through-Codex, the `claude-agent-sdk` upstream legs record the Messages
 bridge transport, not the SDK’s private HTTP bytes; only the original client
 request is a replayable HTTP request. Raw capture is enabled by default and follows
 the configured size/redaction limits.
 
-- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, and the
-  wheel scroll vertically; `H`/`L` (or a horizontal wheel) pan sideways.
-  Proportional scrollbars render on the right and bottom edges when the
-  content overflows.
+- **Body.** The general and header sections come first as plain lines,
+  then the body — one JSON document pretty-printed and coloured, an SSE
+  stream line by line. Long lines (a base64 image, a minified stream) wrap
+  at the modal's width with continuation rows under their indent, so
+  nothing runs off the right edge and nothing pans sideways; the bottom
+  row says `lines 12–40 of 213` (or `17 lines` when it all fits), counted
+  in the body's own lines. An 8 MiB line is wrapped once per width, so
+  scrolling through it stays fast.
+- **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn` (the view's height),
+  `Home`/`End`, and the wheel scroll. When the lines overflow, a scrollbar
+  on the right edge shows where you are: click its track to jump, drag
+  its thumb to scroll.
 - **Action buttons** (top-right, click or key): `copy` (`c`) puts the
   active tab's raw body on the system clipboard; `copy as curl` (`C`)
   reconstructs a replayable curl for that tab's side of the exchange
