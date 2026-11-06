@@ -1888,7 +1888,7 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
             && self.mode == Mode::Normal
-            && !self.keys.picker.as_ref().is_some_and(|p| p.filtering)
+            && !self.keys_filter_typing()
         {
             self.copy_mode = true;
             return;
@@ -5075,25 +5075,39 @@ impl App {
     /// key), the limits field keeps only the characters it accepts. Anywhere
     /// else the paste is typed key by key, as it was before bracketed paste
     /// was turned on. Returns whether anything changed.
-    fn on_paste(&mut self, text: &str, view: Option<&DashboardView>) -> bool {
+    /// The keys picker's filter is the surface taking text: the keys tab is
+    /// showing with the picker filtering, no modal over it and copy mode off.
+    /// A filter left open on a tab the person has since left takes nothing.
+    fn keys_filter_typing(&self) -> bool {
+        self.overlay == Overlay::Keys
+            && !self.copy_mode
+            && self.input_modal.is_none()
+            && self.raw_modal.is_none()
+            && self.account_modal.is_none()
+            && self.keys.picker.as_ref().is_some_and(|p| p.filtering)
+    }
+
+    fn on_paste(&mut self, text: &str, _view: Option<&DashboardView>) -> bool {
         match self.mode {
             Mode::AddKey | Mode::ConfigEdit { .. } => self.field.insert_str(text),
             Mode::EditLimits { .. } => {
                 let kept: String = text.chars().filter(|&c| limits_char(c)).collect();
                 self.field.insert_str(&kept)
             }
-            // The keys picker's open filter is the one other place text
-            // goes: its printable characters land as typed (a pasted newline
-            // applies nothing).
-            Mode::Normal
-                if !self.copy_mode && self.keys.picker.as_ref().is_some_and(|p| p.filtering) =>
-            {
-                let mut typed = false;
-                for c in text.chars().filter(|c| !c.is_control()) {
-                    self.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), view);
-                    typed = true;
+            // The keys picker's open filter, when it is the surface taking
+            // text, is the one other place a paste goes: its printable
+            // characters join the query directly — never replayed as keys, so
+            // nothing in it can act (a newline applies nothing).
+            Mode::Normal if self.keys_filter_typing() => {
+                let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                match self.keys.picker.as_mut() {
+                    Some(picker) if !typed.is_empty() => {
+                        let query = format!("{}{typed}", picker.list.search_query());
+                        picker.list.set_search_query(&query);
+                        true
+                    }
+                    _ => false,
                 }
-                typed
             }
             // Anywhere else a paste is not keys: a pasted `y` never confirms
             // a removal, a pasted `q` never quits, and copy mode stays on.
@@ -9701,6 +9715,25 @@ mod tests {
         assert!(app.on_paste("del-b\n", None));
         let picker = app.keys.picker.as_ref().expect("the paste applies nothing");
         assert_eq!(picker.list.search_query(), "del-b");
+        // The filter left open on a tab the person has since left takes no
+        // paste, and a paste there is not keys: `ary` opens no account and
+        // no removal, and `q` does not quit.
+        app.overlay = Overlay::None;
+        assert!(!app.on_paste("ary", None));
+        assert!(!app.on_paste("q", None));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.keys.picker.as_ref().unwrap().list.search_query(),
+            "del-b",
+            "the hidden filter took nothing"
+        );
+        // Nor does it hold `v` back there: copy mode is on.
+        app.on_key(press(KeyCode::Char('v')), None);
+        assert!(app.copy_mode, "v enters copy mode beside a hidden filter");
+        app.copy_mode = false;
+        app.overlay = Overlay::Keys;
         app.on_key_keys(KeyCode::Esc, None);
         app.on_key_keys(KeyCode::Enter, None);
         assert_eq!(
