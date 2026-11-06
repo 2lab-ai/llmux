@@ -12913,6 +12913,33 @@ mod tests {
         assert!(text.contains("gpt-5.5"), "strip shows the top model");
     }
 
+    /// Audit frame 5.1: at 80 columns the strip's 8-cell `tok` column cut
+    /// 243.6 billion tokens to `243578.5` (its `M` clipped). The count now
+    /// steps to `G` and keeps its unit, in the strip and the full table.
+    #[test]
+    fn billions_of_tokens_keep_their_unit_in_the_models_strip_and_table() {
+        let view = view_with(vec![model_row(
+            "claude",
+            "claude-opus-5-5",
+            243_000_000_000,
+            578_500_000,
+        )]);
+        let main = render_rows(&view, &chrome_overlay(Overlay::None), 80, 24);
+        let row = main
+            .iter()
+            .find(|r| r.contains("claude-opus-5-5"))
+            .expect("strip row");
+        assert!(row.contains(" 243.6G "), "{row}");
+        assert!(!row.contains("243578"), "{row}");
+        let stats = render_rows(&view, &chrome_overlay(Overlay::Stats), 80, 24);
+        let row = stats
+            .iter()
+            .find(|r| r.contains("claude-opus-5-5"))
+            .expect("table row");
+        assert!(row.contains(" 243.0G "), "{row}");
+        assert!(row.contains(" 578.5M "), "{row}");
+    }
+
     #[test]
     fn detailed_view_lists_all_model_rows_and_drilldown() {
         let view = view_with(vec![
@@ -13448,7 +13475,7 @@ mod tests {
                 );
             }
             assert!(
-                ["ALL", "daily", "106 buckets", "267417.9M tok", "$188871.31"]
+                ["ALL", "daily", "106 buckets", "267.4G tok", "$188871.31"]
                     .iter()
                     .all(|text| rows[2].contains(text)),
                 "100-column title retains ALL scope and both totals: {}",
@@ -13490,7 +13517,7 @@ mod tests {
                 [
                     "ALL 106",
                     "daily",
-                    "267417.9M tok",
+                    "267.4G tok",
                     "$188871.31",
                     "(+unpriced)"
                 ]
@@ -19377,7 +19404,7 @@ mod tests {
             "{frame}"
         );
         let strip = &rows[models + 1..models + 4];
-        assert!(strip.iter().any(|r| r.contains("154581.1M")), "{frame}");
+        assert!(strip.iter().any(|r| r.contains("154.6G")), "{frame}");
         for row in strip {
             assert!(share_bar_runs(row).iter().all(|&len| len == 10), "{row}");
         }
@@ -19432,7 +19459,7 @@ mod tests {
     }
 
     const BAND_179_TITLE: &str =
-        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5036.9M / out 847.6M tok ────────── detail ───────────────────────────";
+        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ──────────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -19866,8 +19893,10 @@ mod tests {
     /// pane — the accounts pane dragged, or a short terminal where the
     /// table already bottoms out at `PANE_MIN_HEIGHT`: `Min(3)` activity
     /// outranks the `Length` panes, so the solver takes rows from them. At
-    /// 22 rows with accounts dragged to 3 the middle area is 6 rows
-    /// (measured): the band would get 5 content rows and lose its `mode`
+    /// 21 rows with accounts dragged to 3 the middle area is 6 rows
+    /// (measured; 22 rows until the strip's token counts took the `G` unit
+    /// and the strip packs two per line at this width, one row shorter):
+    /// the band would get 5 content rows and lose its `mode`
     /// row, so the middle pane falls back to today's pair, which shows it.
     /// Over a sweep of heights the band is drawn in some frames and never
     /// without its `mode` row.
@@ -19876,7 +19905,7 @@ mod tests {
         let (view, mut chrome) = recompose_view();
         let w = band_bound(&view, &chrome);
         chrome.pane_heights.accounts = Some(3);
-        let rows = render_rows(&view, &chrome, w, 22);
+        let rows = render_rows(&view, &chrome, w, 21);
         let frame = rows.join("\n");
         let accounts = row_of(&rows, " accounts · sort ");
         let middle = row_of(&rows, " scheduler ");
@@ -20322,7 +20351,7 @@ mod tests {
         let mode = plan.summary.band_head.len() - 1;
         let (left, right) = rows[band + 1 + mode].split_once('│').expect("bar");
         assert!(
-            left.trim_end().ends_with("in 5036.9M / out 847.6M tok"),
+            left.trim_end().ends_with("in 5.0G / out 847.6M tok"),
             "{frame}"
         );
         assert!(
@@ -20509,7 +20538,13 @@ mod tests {
     /// default foreground (ANSI grey was near-invisible on light terminals)
     /// and `R disabled (attached)` drawn dim as a whole; text unchanged
     /// (previous digest 17_379_241_155_914_426_102).
-    const FOLD_OFF_179X43_DIGEST: u64 = 9_289_721_260_446_823_680;
+    /// Re-pinned 2026-11-06 for counts on twolab-tui's `human_count`, which
+    /// steps past `M` to `G`: the strip's tok cells read `154.6G` / `40.8G`
+    /// / `30.1G` / `14.1G` / `13.2G` (were `154581.1M` …) and the band title
+    /// `in 5.0G` (was `in 5036.9M`; the rule after `detail` three cells
+    /// longer); styles and
+    /// every other cell unchanged (previous digest 9_289_721_260_446_823_680).
+    const FOLD_OFF_179X43_DIGEST: u64 = 5_486_511_068_981_384_955;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
