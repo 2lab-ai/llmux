@@ -977,7 +977,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> (Vec<TabHit>, us
     let active_i = TABS.iter().position(|(_, o)| *o == active).unwrap_or(0);
     let strip = twolab_tui::tabs::Tabs::new(tabs)
         .active(active_i)
-        .theme(twolab_tui::Theme::ansi())
+        .theme(THEME)
         .hints(twolab_tui::tabs::Hints::Bracket);
     let layout = strip.render_layout(area, frame.buffer_mut());
     let hits = layout
@@ -5398,7 +5398,7 @@ fn draw_raw_modal(
             .map(|t| twolab_tui::tabs::Tab::new(t.label)),
     )
     .active(active)
-    .theme(twolab_tui::Theme::ansi())
+    .theme(THEME)
     .hints(twolab_tui::tabs::Hints::Off);
     let layout = strip.render_layout(Rect { height: 1, ..inner }, frame.buffer_mut());
     chrome.tabs = layout.hits.iter().map(|h| (h.index, h.rect)).collect();
@@ -22832,40 +22832,69 @@ mod tests {
         );
     }
 
-    /// The theme sweep's guard: every colour the drawing code uses comes
-    /// from `mod palette` — a field of the dashboard [`THEME`] or a named
-    /// categorical hue. A `Color::` literal anywhere else in the non-test
-    /// part of this file (comments aside) fails here, with its lines.
+    /// The theme sweep's guard: every colour the dashboard draws comes from
+    /// `mod palette` — a field of the dashboard [`THEME`] or a named
+    /// categorical hue. A `Color::` literal, or a second colour theme
+    /// (`Theme::ansi()`, `dark()`, `light()`; `mono()` is `NO_COLOR`'s), in
+    /// the non-test part of any TUI source (comments aside) fails here, with
+    /// its lines — the palette module in this file is the one exception.
     #[test]
     fn colour_literals_live_only_in_the_palette() {
-        let src = include_str!("ui.rs");
-        let lines: Vec<&str> = src.lines().collect();
-        let tests = lines
-            .iter()
-            .position(|l| *l == "mod tests {")
-            .expect("tests module");
-        let open = lines
-            .iter()
-            .position(|l| *l == "mod palette {")
-            .expect("palette module");
-        let close = open
-            + lines[open..]
+        let sources = [
+            ("ui.rs", include_str!("ui.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("activity.rs", include_str!("activity.rs")),
+            ("clip.rs", include_str!("clip.rs")),
+            ("event.rs", include_str!("event.rs")),
+            ("format.rs", include_str!("format.rs")),
+            ("logs.rs", include_str!("logs.rs")),
+            ("triage.rs", include_str!("triage.rs")),
+            ("view.rs", include_str!("view.rs")),
+        ];
+        let mut stray = Vec::new();
+        for (name, src) in sources {
+            let lines: Vec<&str> = src.lines().collect();
+            let tests = lines
                 .iter()
-                .position(|l| *l == "}")
-                .expect("palette end");
-        assert!(close < tests, "the palette sits before the tests");
-        let stray: Vec<String> = lines[..tests]
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !(open..=close).contains(i))
-            .filter(|(_, l)| !l.trim_start().starts_with("//"))
-            .filter(|(_, l)| l.contains("Color::"))
-            .map(|(i, l)| format!("ui.rs:{}: {}", i + 1, l.trim()))
-            .collect();
+                .position(|l| *l == "mod tests {")
+                .unwrap_or(lines.len());
+            // The palette: from `mod palette {` to its closing brace.
+            let palette = match lines.iter().position(|l| *l == "mod palette {") {
+                Some(open) => {
+                    let close = open
+                        + lines[open..]
+                            .iter()
+                            .position(|l| *l == "}")
+                            .expect("palette end");
+                    assert!(close < tests, "the palette sits before the tests");
+                    open..close + 1
+                }
+                None => 0..0,
+            };
+            assert_eq!(
+                name == "ui.rs",
+                !palette.is_empty(),
+                "the palette is in ui.rs"
+            );
+            stray.extend(
+                lines[..tests]
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !palette.contains(i))
+                    .filter(|(_, l)| !l.trim_start().starts_with("//"))
+                    .filter(|(_, l)| {
+                        l.contains("Color::")
+                            || ["Theme::ansi(", "Theme::dark(", "Theme::light("]
+                                .iter()
+                                .any(|t| l.contains(t))
+                    })
+                    .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim())),
+            );
+        }
         assert!(
             stray.is_empty(),
-            "colour literals outside `mod palette` — name the theme field (or add a \
-             palette const with its reason):\n{}",
+            "colours outside `mod palette` — name the THEME field (or add a palette \
+             const with its reason):\n{}",
             stray.join("\n")
         );
     }
