@@ -58,7 +58,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | hit (module) | 2lab | ten hand-written hit structs | one lookup path; new widgets bring their rects | later |
 | agent_list | herdr | 29 accounts show 1–4 rows on MAIN at 80 columns | a narrow account sidebar with a state glyph per account; needs a layout decision first | later |
 | pager selection (copy mode) | herdr | mouse capture blocks the terminal's own selection | drag to select and copy an email or an error; needs a mouse-capture design first | later |
-| fact_table | fx | model drill-down facts as free text | figures aligned on the last digit; no problem reported today | later |
+| fact_table | fx | model drill-down facts as free text | figures aligned on the last digit, two columns on a wide pane, `—` for unknown; the misc tab's build/daemon facts too | done |
 | completion_menu | fx | no typed command line | — | not applicable |
 | diff_view | fx | config edits are single values; prompts already show old → new | — | not applicable |
 | approval_card | fx | three fixed choices; llmux gates need two | choice_form covers it | not applicable |

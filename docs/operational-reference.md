@@ -131,7 +131,12 @@ legend — so four lines stay apart without colour.
   grouped (`$112,293.04`; the old 9-cell column cut it to `$112293.0`), the
   decimal point in one column, cents dimmer, and `—` for a model no rate
   prices (it read `$0.0000`). Narrower terminals keep the one-model-per-row
-  table. The
+  table. In the `stats` tab, the model detail beside the table (110 columns
+  and wider) gives the cursored model's counts as a fact table: requests,
+  ok, errors and cost on the left, tokens in, tokens out, cache read and
+  cache write on the right, every figure right-aligned on its last digit,
+  and `—` for a cache class the upstream never reported or a cost no rate
+  prices. The
   packing choice reserves room for the widest `last` value (`N in-flight`),
   so a model starting or finishing a request does not change the strip's
   height.
@@ -262,7 +267,7 @@ The `config` tab (`c`, or click the tab bar) is a mouse-driven config editor cov
 
 Rows show a section column, the label, then the value in a column measured on the widest label (so a label never runs into its value), the apply state and a note cut with `…` where the screen ends. Read-only rows are dim and marked `(disabled: <where it is managed>)`. When the rows do not all fit, `▾`/`▴` and `N of M` say so. `j`/`k`, the arrows, `PgUp`/`PgDn`, `Home`/`End` (or the wheel) move the cursor over the editable rows — read-only rows are skipped — and stop at the ends; **Enter or a left-click on the value cell** activates the row — toggles flip in place, value rows open a prefilled edit prompt (`Enter` applies, `Esc` cancels). Blast-radius changes — scheduler mode, `routing.enabled`, raw-io capture, upstream endpoints, a ceiling set to 0, a retention decrease — open a confirmation card above the footer that states the setting and its current → new value (`Set routing.enabled: off → on?`) and what applying it does, with two numbered choices: `1`/`y` applies, `2`/`n`/`Esc` cancels, `↑↓` move the mark and `Enter` answers the marked choice (Apply until you move it). The raw-io `retention` row is read-only ("never deletes"); the settings API rejects `raw_io_retention_days`. Everything goes through `POST /llmux/settings` semantics (identical validation locally and in attach mode); invalid values are rejected before anything is written.
 
-The `misc` tab (`?`) carries the keybinding reference plus daemon facts. The reference is built from the same key tables the footers use — one group per surface (dashboard, accounts, stats, usage, keys, perf, sessions, logs, config), the account switcher, the raw viewer, the surface keys and the mouse — in up to three columns; in attach mode it shows `R disabled (attached)` exactly as the footer does, and when the groups do not fit it ends in `… +N more` instead of dropping rows silently. Every footer bar, the limits and add-key prompts and the raw viewer's legend drop whole hints and count them (`… +N more`) when the terminal is too narrow. The facts: config path, account count, raw-io capture state and store size (partitions, archives, spool, legacy), and the activity-log size (sizes refresh at most every 30s).
+The `misc` tab (`?`) carries the keybinding reference plus daemon facts. The reference is built from the same key tables the footers use — one group per surface (dashboard, accounts, stats, usage, keys, perf, sessions, logs, config), the account switcher, the raw viewer, the surface keys and the mouse — in up to three columns; in attach mode it shows `R disabled (attached)` exactly as the footer does, and when the groups do not fit it ends in `… +N more` instead of dropping rows silently. Every footer bar, the limits and add-key prompts and the raw viewer's legend drop whole hints and count them (`… +N more`) when the terminal is too narrow. The facts, under the key grid: the build (version, daemon pid, port, uptime) on the left and the daemon (account count, raw-io capture state and store size — partitions, archives, spool, legacy — and the activity-log size) on the right, figures right-aligned on their last digit and `—` for a size not measured yet (sizes refresh at most every 30s); one column under the other on a narrow pane; the config path on its own row below.
 
 ## Install and launch details
 
