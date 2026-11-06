@@ -71,22 +71,6 @@ pub(crate) fn countdown_units(remaining: Duration) -> (String, Option<String>) {
     }
 }
 
-/// Fixed-width utilization bar, e.g. `▰▰▰▱▱▱▱▱` (utilization clamped 0..=1).
-pub(crate) fn gauge_bar(utilization: f64, width: usize) -> String {
-    let clamped = utilization.clamp(0.0, 1.0);
-    // Round so 0 < utilization is visible only from ~half a cell up; full
-    // width strictly at 100%.
-    let filled = ((clamped * width as f64).round() as usize).min(width);
-    let mut bar = String::with_capacity(width * 3);
-    for _ in 0..filled {
-        bar.push('▰');
-    }
-    for _ in filled..width {
-        bar.push('▱');
-    }
-    bar
-}
-
 /// Whole-number percentage label: "42%", clamped to 0–100. A non-finite
 /// utilization (a share of nothing) reads `—`, never `NaN%`. twolab-tui's
 /// [`twolab_tui::format::percent`].
@@ -413,16 +397,6 @@ mod tests {
     }
 
     // ---- bar / labels ----
-
-    #[test]
-    fn gauge_bar_fills_proportionally_and_clamps() {
-        assert_eq!(gauge_bar(0.0, 4), "▱▱▱▱");
-        assert_eq!(gauge_bar(0.5, 4), "▰▰▱▱");
-        assert_eq!(gauge_bar(1.0, 4), "▰▰▰▰");
-        assert_eq!(gauge_bar(7.0, 4), "▰▰▰▰", "clamped above 1.0");
-        assert_eq!(gauge_bar(-1.0, 4), "▱▱▱▱", "clamped below 0.0");
-        assert_eq!(gauge_bar(0.5, 0), "", "zero width degrades to empty");
-    }
 
     #[test]
     fn percent_rounds_and_clamps() {

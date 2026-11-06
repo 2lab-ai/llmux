@@ -116,8 +116,9 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   failure, and the accounts tab's detail pane always shows it.
 - **Models.** When two or more models fit side by side, the models strip packs
   them several to a line (for example, the top 5 on 3 lines): each entry
-  is the group, the model, the 10-cell share bar, requests, tokens, cost and
-  last use, aligned in columns, and the title row adds a dim
+  is the group, the model, the 10-cell share bar (the model's share of the
+  biggest model's tokens; `—` while no model has any), requests, tokens,
+  cost and last use, aligned in columns, and the title row adds a dim
   `group · model · share · req · tok · $ · last` legend when there is room.
   Counts take at most six cells and keep their unit: `999`, `1.2k`, `3.4M`,
   then `154.6G`, `T` and up, and a count that would read `1000.0k` reads

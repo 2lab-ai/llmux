@@ -102,6 +102,16 @@ fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
+/// `value`'s share of `max` as a twolab-tui mini bar (`▰▰▰▱▱▱`, empty cells
+/// dim) `width` cells wide. With nothing to compare against — `max` zero,
+/// every row empty — the share cannot be computed and the bar reads `—`
+/// instead of an empty bar that looks like 0 %.
+fn share_bar(value: u64, max: u64, width: usize) -> twolab_tui::mini_bar::MiniBar {
+    twolab_tui::mini_bar::MiniBar::new(value as f64, max as f64)
+        .width(u16::try_from(width).unwrap_or(u16::MAX))
+        .theme(KEYBAR_THEME)
+}
+
 /// `text` clipped with `…` to at most `max` display cells (twolab-tui
 /// `text::truncate`, owned for the call sites that keep the string).
 fn truncate_cells(text: &str, max: usize) -> String {
@@ -10151,13 +10161,7 @@ fn draw_models_strip_packed(
     let entries = &view.model_usage[..shown.min(view.model_usage.len())];
     let widths: Vec<StripWidths> = entries.iter().map(|m| strip_entry_widths(m, now)).collect();
     let columns = strip_columns(&widths, per_line);
-    let max_total = view
-        .model_usage
-        .iter()
-        .map(model_total)
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
     let frame_n = ctx.frame;
     let pad = |spans: &mut Vec<Span<'static>>, field: Vec<Span<'static>>, width: usize| {
         let w = Line::from(field.clone()).width();
@@ -10177,7 +10181,6 @@ fn draw_models_strip_packed(
                 let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
                 let (group, name) =
                     model_label_spans(m, active, frame_n, view.tui_effects, view.gradient);
-                let share = model_total(m) as f64 / max_total as f64;
                 let marker = model_active_marker(m, now, frame_n);
                 let fields: [Vec<Span<'static>>; STRIP_FIELDS] = [
                     vec![if j == 0 {
@@ -10190,10 +10193,9 @@ fn draw_models_strip_packed(
                     }],
                     vec![group],
                     name,
-                    vec![Span::styled(
-                        format::gauge_bar(share, MODEL_BAR_WIDTH),
-                        group_color(Some(m.group.as_str())),
-                    )],
+                    share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+                        .style(group_color(Some(m.group.as_str())))
+                        .spans(),
                     vec![Span::raw(format::human_count(m.requests))],
                     vec![Span::raw(format::human_count(model_total(m)))],
                     vec![Span::styled(
@@ -10269,13 +10271,7 @@ fn draw_models_strip(
     let visible = (area.height.saturating_sub(2)) as usize;
     let rows_data: Vec<&ModelUsageDoc> = view.model_usage.iter().take(visible).collect();
     let shown = rows_data.len();
-    let max_total = view
-        .model_usage
-        .iter()
-        .map(model_total)
-        .max()
-        .unwrap_or(0)
-        .max(1);
+    let max_total = view.model_usage.iter().map(model_total).max().unwrap_or(0);
     let wide = area.width >= SIDE_BY_SIDE_AT;
     // The strip marker rides the SAME shared animation frame as the rest of the
     // board (TUI UI-6 item 2a) — it was frozen at 0 before, so in-flight strip
@@ -10286,17 +10282,17 @@ fn draw_models_strip(
         let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
         let (group_cell, name_cell) =
             model_name_cells(m, active, frame_n, view.tui_effects, view.gradient);
-        let share = model_total(m) as f64 / max_total as f64;
         let mut cells = vec![
             Cell::from(model_active_marker(m, now, frame_n)),
             group_cell,
             name_cell,
         ];
         if wide {
-            cells.push(Cell::from(Span::styled(
-                format::gauge_bar(share, MODEL_BAR_WIDTH),
-                group_color(Some(m.group.as_str())),
-            )));
+            cells.push(Cell::from(
+                share_bar(model_total(m), max_total, MODEL_BAR_WIDTH)
+                    .style(group_color(Some(m.group.as_str())))
+                    .line(),
+            ));
         }
         cells.push(Cell::from(format::human_count(m.requests)));
         cells.push(Cell::from(format::human_count(model_total(m))));
@@ -10685,13 +10681,13 @@ fn draw_heatmap(
         dim().add_modifier(Modifier::BOLD),
     )));
 
-    let max_tokens = cells.iter().map(|c| c.tokens).max().unwrap_or(0).max(1);
+    let max_tokens = cells.iter().map(|c| c.tokens).max().unwrap_or(0);
     let shown = total.min(HEATMAP_MAX_ROWS);
     for c in &cells[..shown] {
-        let share = c.tokens as f64 / max_tokens as f64;
-        let bar = format::gauge_bar(share, HEATMAP_BAR_WIDTH);
-        let bar_color = level_color(format::gauge_level(share));
-        lines.push(Line::from(vec![
+        // Coloured by intensity on the gauge thresholds (green / yellow / red).
+        let bar = share_bar(c.tokens, max_tokens, HEATMAP_BAR_WIDTH)
+            .levels(format::GAUGE_YELLOW_AT, format::GAUGE_RED_AT);
+        let mut spans = vec![
             Span::styled(
                 format!(" {}", pad_cells(&c.group, 7)),
                 group_color(Some(c.group.as_str())),
@@ -10707,8 +10703,9 @@ fn draw_heatmap(
             Span::raw(format!(" {:>6}", format::human_count(c.requests))),
             Span::raw(format!(" {:>8}", format::human_count(c.tokens))),
             Span::raw("  "),
-            Span::styled(bar, Style::new().fg(bar_color)),
-        ]));
+        ];
+        spans.extend(bar.spans());
+        lines.push(Line::from(spans));
     }
     if total > shown {
         lines.push(Line::from(Span::styled(
@@ -12938,6 +12935,49 @@ mod tests {
             .expect("table row");
         assert!(row.contains(" 243.0G "), "{row}");
         assert!(row.contains(" 578.5M "), "{row}");
+    }
+
+    /// The share bar fills by `value / max`, clamped, and reads `—` when
+    /// there is no total to compare against (it was an empty bar, which
+    /// reads as 0 %).
+    #[test]
+    fn share_bar_fills_proportionally_and_reads_a_dash_without_a_total() {
+        let text = |value, max| share_bar(value, max, 4).text();
+        assert_eq!(text(0, 4), "▱▱▱▱");
+        assert_eq!(text(2, 4), "▰▰▱▱");
+        assert_eq!(text(4, 4), "▰▰▰▰");
+        assert_eq!(text(28, 4), "▰▰▰▰", "clamped above the max");
+        assert_eq!(text(0, 0), "—   ", "no total: the share is unknown");
+    }
+
+    /// Models that have not counted a token yet: the strip's share column
+    /// says `—` instead of drawing empty bars.
+    #[test]
+    fn strip_share_reads_a_dash_when_no_model_has_tokens() {
+        let idle = |group: &str, model: &str| ModelUsageDoc {
+            cache_read: None,
+            ..model_row(group, model, 0, 0)
+        };
+        let view = view_with(vec![
+            idle("codex", "gpt-5.5"),
+            idle("claude", "claude-sonnet-4-5"),
+        ]);
+        for w in [120, 179] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::None), w, 30);
+            let strip: Vec<&String> = rows
+                .iter()
+                .filter(|r| r.contains("gpt-5.5") || r.contains("claude-sonnet-4-5"))
+                .collect();
+            assert!(!strip.is_empty(), "{}", rows.join("\n"));
+            let strip = strip
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!strip.contains('▱') && !strip.contains('▰'), "{strip}");
+            // Two models, each with `—` for its share and for `last`.
+            assert_eq!(strip.matches('—').count(), 4, "{strip}");
+        }
     }
 
     #[test]
@@ -20542,9 +20582,13 @@ mod tests {
     /// steps past `M` to `G`: the strip's tok cells read `154.6G` / `40.8G`
     /// / `30.1G` / `14.1G` / `13.2G` (were `154581.1M` …) and the band title
     /// `in 5.0G` (was `in 5036.9M`; the rule after `detail` three cells
-    /// longer); styles and
-    /// every other cell unchanged (previous digest 9_289_721_260_446_823_680).
-    const FOLD_OFF_179X43_DIGEST: u64 = 5_486_511_068_981_384_955;
+    /// longer); styles and every other cell unchanged (previous digest
+    /// 9_289_721_260_446_823_680).
+    /// Re-pinned the same day for the strip's share bars on twolab-tui's
+    /// `mini_bar`: text unchanged; the empty `▱` cells are dim (DarkGray)
+    /// instead of the group colour, so the filled part stands out (previous
+    /// digest 5_486_511_068_981_384_955).
+    const FOLD_OFF_179X43_DIGEST: u64 = 7_483_902_083_238_678_069;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
