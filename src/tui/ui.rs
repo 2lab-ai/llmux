@@ -6232,7 +6232,7 @@ fn compact_word(
     }
 }
 
-/// The compact account list (`v` on the accounts tab; MAIN's own choice
+/// The compact account list (`V` on the accounts tab; MAIN's own choice
 /// when the table would show fewer than [`COMPACT_BELOW`] rows): a
 /// twolab-tui `agent_list` with one row per account — focus mark, state
 /// glyph, name, the state's word — in the table's order, running down and
@@ -6342,9 +6342,11 @@ fn draw_accounts_compact(
     let groups = accounts_title(sort, view, &ctx.order, "", 0);
     let grouped = format!("{} · ", groups.trim_end());
     let plain = format!(" accounts · sort {sort} · {n} · ");
+    // The rule draws its lead (`── `) and a space after the title; the
+    // lead's and `more`'s own outer spaces are those spaces.
     let room_for = |lead: &str| {
         area.width
-            .saturating_sub((cells::width(lead) + cells::width(&more)) as u16)
+            .saturating_sub((RULE_LEAD + cells::width(lead) + cells::width(&more)) as u16)
     };
     let tally_wide = cells::spans_width(&tally_line(u16::MAX)) as u16;
     let lead = if tally_wide <= room_for(&grouped) {
@@ -6352,26 +6354,22 @@ fn draw_accounts_compact(
     } else {
         plain
     };
-    let mut title = vec![Span::raw(lead.clone())];
-    title.extend(tally_line(room_for(&lead)));
+    // No room for any of the tally: the lead ends at the count, without a
+    // separator that leads to nothing.
+    let tally = tally_line(room_for(&lead));
+    let mut title = if tally.iter().all(|s| s.content.trim().is_empty()) {
+        vec![Span::raw(
+            lead.trim_end().trim_end_matches('·').trim_end().to_string(),
+        )]
+    } else {
+        let mut title = vec![Span::raw(lead.clone())];
+        title.extend(tally);
+        title
+    };
     title.push(Span::raw(more));
-    frame.render_widget(
-        Block::new()
-            .borders(Borders::TOP)
-            .title(cells::truncate_line(
-                Line::from(title),
-                usize::from(area.width),
-            )),
-        area,
-    );
-
     // Entries, column by column; each column holds exactly the rows it can
     // show, so the count of what is hidden lives in the title.
-    let body = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(1),
-        ..area
-    };
+    let body = section_line(frame, area, Line::from(title));
     let mut hits = Vec::new();
     for c in 0..cols {
         let from = start + usize::from(c) * rows;
@@ -22774,12 +22772,14 @@ mod tests {
                 assert_eq!(cells::width(&rows[y]), usize::from(w), "{w}x{h} row {y}");
                 assert!(!rows[y].trim_end().is_empty(), "{w}x{h} row {y}");
             }
-            // The rule clips a title too long for its row with `…`.
-            let accounts = &rows[row_of(&rows, " accounts · sort ")];
-            if w == 80 {
-                assert!(accounts.contains('…'), "{accounts}");
-            }
         }
+        // The rule clips a title too long for its row with `…` (the
+        // accounts tab's table title at 80 columns; MAIN's 80x24 pane draws
+        // the compact list, whose title is fitted to the row).
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 80, 24);
+        let accounts = &rows[row_of(&rows, " accounts · sort ")];
+        assert!(accounts.starts_with("── "), "{accounts}");
+        assert!(accounts.contains('…'), "{accounts}");
         // The strip's legend starts past the title as the rule draws it.
         let rows = render_rows(&view, &chrome, 179, 43);
         let models = &rows[row_of(&rows, " models — top ")];
@@ -22823,9 +22823,20 @@ mod tests {
                 !rules.is_empty(),
                 "{overlay:?} {w}x{h} has a rule:\n{frame}"
             );
+            // The two frames are drawn at two instants: an age (`6.0s`,
+            // `4s ago`) may tick between them, so digits are not compared.
+            let figures = |row: &str| -> String {
+                row.chars()
+                    .map(|c| if c.is_ascii_digit() { '0' } else { c })
+                    .collect()
+            };
             for (y, (before, after)) in narrow.iter().zip(&wide).enumerate() {
                 if !rules.contains(&y) {
-                    assert_eq!(before, after, "{overlay:?} {w}x{h} row {y}");
+                    assert_eq!(
+                        figures(before),
+                        figures(after),
+                        "{overlay:?} {w}x{h} row {y}"
+                    );
                     continue;
                 }
                 assert!(after.starts_with("-- "), "{overlay:?} row {y}:\n{frame}");
@@ -23949,7 +23960,7 @@ mod tests {
             "{frame}"
         );
         assert!(title.contains(" · +11 more "), "{frame}");
-        assert!(rows[accounts + 3].starts_with(" scheduler "), "{frame}");
+        assert!(rows[accounts + 3].starts_with("── scheduler "), "{frame}");
         let pane = rows[accounts + 1..accounts + 3].join("\n");
         assert!(
             !pane.contains("group") && !pane.contains("CLAUDE"),
@@ -23973,7 +23984,7 @@ mod tests {
         assert!(!rows[accounts].contains("✗ 1 error"), "{frame}");
     }
 
-    /// `v` on the accounts tab: one row per account with its state's glyph
+    /// `V` on the accounts tab: one row per account with its state's glyph
     /// — each one cell, on a CJK terminal too — its name and what it waits
     /// on, in the table's order; the title's tally names every state with
     /// its glyph. A tally slot two states share names both.
@@ -24139,7 +24150,7 @@ mod tests {
         }
         let rows = render_rows(&view, &chrome_attach(Overlay::Misc), 179, 43);
         assert!(
-            rows.iter().any(|r| r.contains(" v    compact ")),
+            rows.iter().any(|r| r.contains(" V    compact ")),
             "{}",
             rows.join("\n")
         );

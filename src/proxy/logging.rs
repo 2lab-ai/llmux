@@ -207,17 +207,20 @@ mod tests {
                 "=== RESPONSE 200 ===".to_string(),
             ],
         );
-        // The write is async; poll briefly for the file.
+        // The write is async; poll briefly for the whole file (it can exist
+        // before its last section is written).
         let mut content = String::new();
-        for _ in 0..50 {
+        for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             if let Some(entry) = std::fs::read_dir(&dir)
                 .ok()
                 .and_then(|mut it| it.next())
                 .and_then(Result::ok)
             {
-                content = std::fs::read_to_string(entry.path()).expect("read log");
-                break;
+                content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                if content.contains("=== RESPONSE 200 ===") {
+                    break;
+                }
             }
         }
         assert!(
