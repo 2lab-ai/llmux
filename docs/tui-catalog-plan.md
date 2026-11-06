@@ -42,7 +42,7 @@ catalog (27 + herdr) ─┬─ Batch 1  prompts ............ choice_form · sele
 | format | llmux | the models table shows `243578.5` for 243.6 billion tokens (unit clipped) | `243.6G`; `999_999` reads `1.0M` | 3 |
 | ledger | llmux | cost columns cut digits (`$112293.0`) | amounts line up on the decimal point and keep their cents | 3 |
 | menu | llmux | the right-click menu covers the clicked row near the bottom; items show no keys | opens above the row when there is no room below, shows each item's key, marks delete as destructive | done |
-| status_bar | fx | the header is cut after `llmux 0.2.26` at 80 columns; the settings bar is cut mid-segment | whole segments drop by importance; settings-bar clicks land on the segment that is drawn | 3 |
+| status_bar | fx | the header is cut after `llmux 0.2.26` at 80 columns; the settings bar is cut mid-segment | whole segments drop by importance; settings-bar clicks land on the segment that is drawn | done |
 | status_card | Codex | the account modal prints quota windows as `util 0.123 · eff …` | a bar per window with its reset time | 3 |
 | trend_chart | llmux | series are told apart only by colour; the tokens chart zero-fills days before history | `* + x o` per series without colour, gaps for missing days | 3 |
 | working | Codex | the attach screen is static yellow text | a spinner and how long it has been retrying | 3 |

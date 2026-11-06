@@ -137,8 +137,25 @@ colours, bold, dim, reversed and underline stay, and text that would be red
   tab row. There your home directory is shown as `~`, and the marker reads
   just `attached` when it names the same pid the header already shows
   (`attached → pid N` for another pid; `pid ?` and `reconnecting` are shown
-  as before). If the tab row has no room either, the tail is left out (the
-  header used to cut it off). When the whole header fits, nothing moves.
+  as before). If the tab row has no room either, the tail stays in the
+  header and competes for the row like everything else (next item). When
+  the whole header fits, nothing moves.
+- **Narrow header.** The header starts with the health verdict
+  (`[OK]`/`[WARN]`/`[FAIL]` and what it is about) and always keeps it
+  whole. On a row too narrow for the rest, whole items drop, least
+  important first: `cfg <path>`, the account count `·N`, the build tag
+  (`(preview …)`), the upstream, `pid`, the uptime, the port, the version;
+  the attach marker is kept longest. An item that does not fit whole gives
+  way to the next one that does, so nothing is cut in the middle — at 80
+  columns the header reads `[FAIL] … +2  llmux 0.2.26` and ends there,
+  where the terminal used to cut it off mid-item.
+- **Settings line.** One group per backend:
+  `sched <mode>  │  claude N acc  │  codex <model> effort:<e> fast:<f>  │  grok effort:<e>  │  gemini N acc`.
+  On a row too narrow for all of them, whole groups drop — the account
+  counts first, then grok, then codex; the scheduler mode stays — and `+N`
+  at the end says how many groups are not shown. A click on an underlined
+  value rotates the value drawn under the pointer (positions are measured
+  in terminal cells, so a wide model name does not shift them).
 - **Folding spent accounts (`z`).** Off by default. `z` on the dashboard
   turns it on or off for this session, the same way `u` works, and while
   it is on the key bar ends with `z fold`. It folds only the accounts the
