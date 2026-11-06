@@ -76,6 +76,22 @@ fn motion() -> twolab_tui::Motion {
     })
 }
 
+/// Whether the terminal draws East-Asian Ambiguous glyphs two cells wide
+/// (common with Korean, Japanese and Chinese locales): `LLMUX_AMBIGUOUS_WIDE=1`
+/// when the process started. Then the dashboard's section rules use their
+/// ASCII fallback (`-- accounts ---`), because `─` would take two cells and
+/// push each rule past the right edge. Read once, like `NO_COLOR`.
+fn ambiguous_wide() -> bool {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| ambiguous_wide_from(std::env::var_os("LLMUX_AMBIGUOUS_WIDE").as_deref()))
+}
+
+/// `LLMUX_AMBIGUOUS_WIDE`'s value as the setting: on for `1`, off for
+/// anything else (unset, empty, `0`).
+fn ambiguous_wide_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -782,6 +798,9 @@ pub(crate) struct Chrome {
     /// when closed. Like the input modal it stores only an identity; the body
     /// is rebuilt from the snapshot every frame.
     pub account_modal: Option<AccountModal>,
+    /// `LLMUX_AMBIGUOUS_WIDE=1` at startup: the terminal draws East-Asian
+    /// Ambiguous glyphs two cells wide, so section rules draw in ASCII.
+    pub ambiguous_wide: bool,
 }
 
 /// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
@@ -1186,7 +1205,7 @@ struct App {
     /// right-click target map.
     account_row_chrome: Vec<ui::AccountRowHit>,
     /// The rendered context menu's hit layout (UI-3 U11), when open.
-    menu_chrome: Option<ui::MenuChrome>,
+    menu_chrome: Option<twolab_tui::menu::MenuLayout>,
     /// Group-settings bar segments from the LAST rendered frame (UI-3 U9/U10).
     setting_chrome: Vec<ui::SettingHit>,
     /// Anchor cell of the open context menu (col, row).
@@ -1664,6 +1683,7 @@ impl App {
                 m
             }),
             account_modal: self.account_modal.clone(),
+            ambiguous_wide: ambiguous_wide(),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -2163,12 +2183,12 @@ impl App {
                 mouse.kind,
                 MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
             ) {
-                match self
-                    .menu_chrome
-                    .as_ref()
-                    .and_then(|m| m.hit_item(mouse.column, mouse.row))
-                {
+                let menu = self.menu_chrome.as_ref();
+                match menu.and_then(|m| m.hit(mouse.column, mouse.row)) {
                     Some(item) => self.run_menu_item(idx, item, view),
+                    // A dim (cannot-run) item or the border: nothing runs,
+                    // the menu stays.
+                    None if menu.is_some_and(|m| m.contains(mouse.column, mouse.row)) => {}
                     None => self.close_menu(),
                 }
                 return true;
@@ -3110,12 +3130,12 @@ impl App {
         }
     }
 
-    /// Number of context-menu entries (UI-3 U11): switch now / pause·resume /
-    /// set limit / delete.
-    const MENU_ITEMS: usize = 4;
-
-    /// Key handling for the context menu (UI-3 U11): ↑↓ move, Enter runs the
-    /// highlighted entry, Esc (or any other key) dismisses.
+    /// Key handling for the context menu (UI-3 U11), by the library's
+    /// `MenuState`: ↑/k ↓/j move over the items that can run, Home/End jump,
+    /// Enter runs the highlighted entry, an entry's own key (`p`, `L`, `r`)
+    /// runs it, Esc — or any other key — dismisses. The items (and which of
+    /// them can run) are rebuilt from the pinned account exactly as the
+    /// frame drew them (`ui::account_menu_items`).
     fn on_key_context_menu(
         &mut self,
         code: KeyCode,
@@ -3123,21 +3143,36 @@ impl App {
         item: usize,
         view: Option<&DashboardView>,
     ) {
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+        use twolab_tui::menu::{Menu, MenuAction, MenuState};
+        let pinned = self.menu_account.clone();
+        let order = view.map_or_else(Vec::new, |v| {
+            v.display_order(self.account_sort, SystemTime::now())
+        });
+        let target = view.map(|v| ui::menu_target(v, pinned.as_deref(), &order, idx));
+        let account = target.and_then(|t| t.ok().flatten());
+        let menu = Menu::new(ui::account_menu_items(account));
+        let mut state = MenuState {
+            selected: item,
+            ..MenuState::default()
+        };
+        match key_input(code).map(|key| state.on_key(&menu, key)) {
+            Some(MenuAction::Moved | MenuAction::Ignored) => {
                 self.mode = Mode::ContextMenu {
                     idx,
-                    item: item.saturating_sub(1),
+                    item: state.selected,
                 };
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.mode = Mode::ContextMenu {
-                    idx,
-                    item: (item + 1).min(Self::MENU_ITEMS - 1),
-                };
+            Some(MenuAction::Run(entry)) => self.run_menu_item(idx, entry, view),
+            Some(MenuAction::Close) | None => {
+                // Enter on a menu with nothing to run: the pinned account
+                // left the pool — say so instead of closing in silence.
+                self.close_menu();
+                if let (KeyCode::Enter, Some(Err(name))) = (code, target) {
+                    self.set_status(StatusMsg::warn(format!(
+                        "{name} is gone — menu action cancelled"
+                    )));
+                }
             }
-            KeyCode::Enter => self.run_menu_item(idx, item, view),
-            _ => self.close_menu(),
         }
     }
 
@@ -6990,6 +7025,19 @@ fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String>
 
 #[cfg(test)]
 mod tests {
+    /// `LLMUX_AMBIGUOUS_WIDE=1` turns the ASCII rules on; unset, empty,
+    /// `0` or any other value leaves the box-drawn rules.
+    #[test]
+    fn ambiguous_wide_is_on_only_for_1() {
+        use std::ffi::OsStr;
+        let on = super::ambiguous_wide_from;
+        assert!(on(Some(OsStr::new("1"))));
+        for off in ["", "0", "true", " 1"] {
+            assert!(!on(Some(OsStr::new(off))), "{off:?}");
+        }
+        assert!(!on(None));
+    }
+
     #[test]
     fn parse_limits_input_covers_percent_fraction_partial_and_clear() {
         let p = super::parse_limits_input;
@@ -7390,7 +7438,8 @@ mod tests {
             display_idx: 0,
         }];
         assert!(app.on_mouse(rclick, Some(&view)));
-        app.on_key(press(KeyCode::End), Some(&view)); // unknown key → closes
+        // A key that is no item's own (`x`) closes; End moves, it does not.
+        app.on_key(press(KeyCode::Char('x')), Some(&view));
         assert_eq!(app.mode, Mode::Normal, "unknown key dismisses");
         assert!(app.on_mouse(rclick, Some(&view)));
         for _ in 0..3 {
@@ -7406,14 +7455,14 @@ mod tests {
             display_idx: 0,
         }];
         assert!(app.on_mouse(rclick, Some(&view)));
-        app.menu_chrome = Some(ui::MenuChrome {
+        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
             area: ratatui::layout::Rect {
                 x: 10,
                 y: 6,
                 width: 14,
                 height: 5,
             },
-            items: vec![],
+            ..Default::default()
         });
         let lclick_outside = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -7423,6 +7472,110 @@ mod tests {
         };
         assert!(app.on_mouse(lclick_outside, Some(&view)));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// Catalog `menu` (plan batch 3): an item's own key runs it (`p`, `L`,
+    /// `r` — the switcher's keys), ↑↓ and Home/End skip what cannot run
+    /// (`switch now` on a paused account), and a click on a dim item or the
+    /// border keeps the menu open instead of dismissing it.
+    #[test]
+    fn context_menu_item_keys_run_and_dim_items_are_skipped() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut view = stats_view_with_account();
+        view.snapshot.accounts[0].paused = true;
+        let open = |app: &mut App| {
+            app.account_row_chrome = vec![ui::AccountRowHit {
+                area: ratatui::layout::Rect {
+                    x: 0,
+                    y: 5,
+                    width: 80,
+                    height: 1,
+                },
+                display_idx: 0,
+            }];
+            let rclick = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(app.on_mouse(rclick, Some(&view)));
+        };
+
+        // `switch now` is dim on a paused account: ↑ and Home stay on
+        // `resume`, End reaches `delete`, Enter on `resume` resumes.
+        let mut app = remote_app();
+        open(&mut app);
+        app.on_key(press(KeyCode::Up), Some(&view));
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 1 });
+        app.on_key(press(KeyCode::Home), Some(&view));
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 1 });
+        app.on_key(press(KeyCode::End), Some(&view));
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 3 });
+        app.on_key(press(KeyCode::Up), Some(&view));
+        app.on_key(press(KeyCode::Up), Some(&view));
+        app.on_key(press(KeyCode::Enter), Some(&view));
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:me@example.com".into(), false)),
+            "resume ran"
+        );
+        assert!(app.take_pending_control().is_none(), "no switch queued");
+
+        // Item keys: `p` resumes, `L` opens the limits editor, `r` opens
+        // the delete gate — never a silent delete.
+        let mut app = remote_app();
+        open(&mut app);
+        app.on_key(press(KeyCode::Char('p')), Some(&view));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.take_pending_pause(),
+            Some(("claude:me@example.com".into(), false))
+        );
+        open(&mut app);
+        app.on_key(press(KeyCode::Char('L')), Some(&view));
+        assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        open(&mut app);
+        app.on_key(press(KeyCode::Char('r')), Some(&view));
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
+
+        // A click inside the menu that hits no runnable item keeps it open;
+        // a click on an item rect runs that item.
+        let mut app = remote_app();
+        open(&mut app);
+        let rect = |y| ratatui::layout::Rect {
+            x: 10,
+            y,
+            width: 14,
+            height: 1,
+        };
+        app.menu_chrome = Some(twolab_tui::menu::MenuLayout {
+            area: ratatui::layout::Rect {
+                x: 9,
+                y: 6,
+                width: 16,
+                height: 6,
+            },
+            items: (1..4)
+                .map(|index| twolab_tui::menu::MenuHit {
+                    rect: rect(7 + index as u16),
+                    index,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let lclick = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(lclick(7), Some(&view)), "dim switch row");
+        assert_eq!(app.mode, Mode::ContextMenu { idx: 0, item: 0 });
+        assert!(app.take_pending_control().is_none());
+        assert!(app.on_mouse(lclick(10), Some(&view)), "delete row");
+        assert_eq!(app.mode, Mode::ConfirmRemove { idx: 0 });
     }
 
     /// req8.1: `m` rotates the codex quick-pick set, and `gpt-6-astra` is

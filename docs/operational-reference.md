@@ -25,7 +25,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `v` releases the mouse for the terminal's own selection ([Copy mode](#copy-mode)), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `v` releases the mouse for the terminal's own selection ([Copy mode](#copy-mode)), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. The context menu (right-click an accounts row on the dashboard) is titled with that account and opens on the row below the click — above it when there is no room below, so it never covers the row — with each item's switcher key: `switch now` (`⏎`), `pause`/`resume` (`p`), `set limit` (`L`) and `delete` (`r`, drawn destructive, behind the same confirmation card). `↑↓` move, `Enter` or a click runs the highlighted item, typing an item's key runs it, and any other key closes the menu. Items that cannot run are dim and skipped: `switch now` on a paused account (the scheduler refuses a paused target — resume it first), and every item once the account has left the pool. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Tab shortcut hints
 
@@ -81,6 +81,19 @@ it every 4 seconds. The band is weight only — dim at rest, bold at its crest �
 so it also shows under `NO_COLOR`; the words never change. With
 `LLMUX_REDUCED_MOTION` set to any non-empty value the label is plain bold and
 its spinner holds still.
+
+Each pane and overlay section opens with a rule: two cells of `─`, its
+title, then `─` to the right edge (`── accounts · sort name · … ────`). A
+title too long for its row ends in `…`. The scheduler and detail band's top
+border opens the same way. Some terminals draw East-Asian Ambiguous glyphs
+two cells wide (a common setting with Korean, Japanese and Chinese locales).
+There `─` takes two cells, so a rule would run past the right edge. Start
+the dashboard with `LLMUX_AMBIGUOUS_WIDE=1` and the rules draw ASCII `-`
+instead (`-- accounts · sort name · … ----`). Each rule also stops a few
+cells short, by the extra cells its own `·` and `—` take there, so it ends
+at the right edge. Any other value, or none, keeps `─`. The dashboard reads
+the variable once when it starts, like `NO_COLOR`. It changes only the
+rules: table rows, gauges and the popups' box borders draw as before.
 
 - **Heights.** The header, the tab row, the settings line and the two bottom
   rows take one row each. Accounts take one row per account plus two (title
@@ -160,8 +173,25 @@ its spinner holds still.
   tab row. There your home directory is shown as `~`, and the marker reads
   just `attached` when it names the same pid the header already shows
   (`attached → pid N` for another pid; `pid ?` and `reconnecting` are shown
-  as before). If the tab row has no room either, the tail is left out (the
-  header used to cut it off). When the whole header fits, nothing moves.
+  as before). If the tab row has no room either, the tail stays in the
+  header and competes for the row like everything else (next item). When
+  the whole header fits, nothing moves.
+- **Narrow header.** The header starts with the health verdict
+  (`[OK]`/`[WARN]`/`[FAIL]` and what it is about) and always keeps it
+  whole. On a row too narrow for the rest, whole items drop, least
+  important first: `cfg <path>`, the account count `·N`, the build tag
+  (`(preview …)`), the upstream, `pid`, the uptime, the port, the version;
+  the attach marker is kept longest. An item that does not fit whole gives
+  way to the next one that does, so nothing is cut in the middle — at 80
+  columns the header reads `[FAIL] … +2  llmux 0.2.26` and ends there,
+  where the terminal used to cut it off mid-item.
+- **Settings line.** One group per backend:
+  `sched <mode>  │  claude N acc  │  codex <model> effort:<e> fast:<f>  │  grok effort:<e>  │  gemini N acc`.
+  On a row too narrow for all of them, whole groups drop — the account
+  counts first, then grok, then codex; the scheduler mode stays — and `+N`
+  at the end says how many groups are not shown. A click on an underlined
+  value rotates the value drawn under the pointer (positions are measured
+  in terminal cells, so a wide model name does not shift them).
 - **Folding spent accounts (`z`).** Off by default. `z` on the dashboard
   turns it on or off for this session, the same way `u` works, and while
   it is on the key bar ends with `z fold`. It folds only the accounts the

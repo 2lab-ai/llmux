@@ -101,6 +101,111 @@ fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
+thread_local! {
+    /// This frame's [`Chrome::ambiguous_wide`], set by [`draw`] before it
+    /// draws anything, so every section rule reads it without the flag
+    /// riding through each pane's signature. Thread-local rather than a
+    /// global: a test frame drawn with it on never leaks into a frame drawn
+    /// beside it.
+    static AMBIGUOUS_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The cells of rule twolab-tui `Rule` draws before a title (`── accounts`).
+const RULE_LEAD: usize = 2;
+
+/// The cells a section rule's title takes beyond its text: the
+/// [`RULE_LEAD`] and a space each side (`── accounts ─`).
+const RULE_TITLE_PAD: usize = RULE_LEAD + 2;
+
+/// Draw a section heading on `area`'s first row — a twolab-tui `Rule` with
+/// `title` at its left in the default foreground, `─` switched to its ASCII
+/// fallback `-` where the terminal draws Ambiguous glyphs wide — and
+/// return the rows under it — what `Block::new().borders(Borders::TOP)`
+/// gave the section's body. On a terminal that draws Ambiguous glyphs wide
+/// the rule also stops short by the extra cells its title's own Ambiguous
+/// characters (`—`, `·`) take there, so the row ends at the right edge
+/// instead of wrapping.
+fn section(frame: &mut Frame, area: Rect, title: &str) -> Rect {
+    section_line(frame, area, Line::from(title.trim().to_string()))
+}
+
+/// [`section`] with a styled title — the sessions title carries the
+/// loading label's shimmer spans. Leading and trailing spaces of the title
+/// are trimmed, as [`section`] trims a plain one.
+fn section_line(frame: &mut Frame, area: Rect, title: Line<'static>) -> Rect {
+    if area.height == 0 {
+        return area;
+    }
+    let mut title = title;
+    if let Some(first) = title.spans.first_mut() {
+        first.content = first.content.trim_start().to_string().into();
+    }
+    if let Some(last) = title.spans.last_mut() {
+        last.content = last.content.trim_end().to_string().into();
+    }
+    let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+    let wide = AMBIGUOUS_WIDE.with(std::cell::Cell::get);
+    let width = if wide {
+        area.width.saturating_sub(ambiguous_extra(&text) as u16)
+    } else {
+        area.width
+    };
+    frame.render_widget(
+        twolab_tui::rule::Rule::new()
+            .label(title)
+            .ambiguous_wide(wide),
+        Rect {
+            width,
+            height: 1,
+            ..area
+        },
+    );
+    Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    }
+}
+
+/// Where Ambiguous glyphs draw two cells wide, blank the last cells of the
+/// rule `row` that `text` — everything on the row, its title included —
+/// pushes past the right edge: for a legend laid on a rule after
+/// [`section`] drew it (which stopped short by the title's alone).
+fn rule_stop_short(frame: &mut Frame, row: Rect, text: &str) {
+    if !AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        return;
+    }
+    let extra = (ambiguous_extra(text) as u16).min(row.width);
+    let buf = frame.buffer_mut();
+    for x in row.right() - extra..row.right() {
+        buf[(x, row.y)].reset();
+    }
+}
+
+/// The cells `text` takes beyond its width when Ambiguous glyphs are drawn
+/// two cells wide.
+fn ambiguous_extra(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width_cjk().saturating_sub(text.width())
+}
+
+/// Cells a section title takes on its rule: its text plus
+/// [`RULE_TITLE_PAD`] — what a legend drawn after the title starts past.
+fn section_title_width(title: &str) -> usize {
+    cells::width(title.trim()) + RULE_TITLE_PAD
+}
+
+/// `n` cells of the rule glyph for a hand-drawn rule (the band's top
+/// border): `─`, or `-` when Ambiguous glyphs are drawn wide.
+fn rule_fill(n: usize) -> String {
+    let glyph = if AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        twolab_tui::rule::ASCII
+    } else {
+        twolab_tui::rule::SOLID
+    };
+    std::iter::repeat_n(glyph, n).collect()
+}
+
 /// `value`'s share of `max` as a twolab-tui mini bar (`▰▰▰▱▱▱`, empty cells
 /// dim) `width` cells wide. With nothing to compare against — `max` zero,
 /// every row empty — the share cannot be computed and the bar reads `—`
@@ -250,6 +355,7 @@ pub(crate) fn draw(
     // No activity panel hit-targets until MAIN draws one this frame (cleared so
     // a stale layout from a previous frame can never mis-map a click).
     *hits = None;
+    AMBIGUOUS_WIDE.with(|wide| wide.set(chrome.ambiguous_wide));
     let Some(view) = view else {
         draw_connecting(frame, chrome);
         return;
@@ -553,10 +659,15 @@ fn draw_main(
     }
     let settings = draw_group_settings(frame, groups_area, view);
     // The context menu (UI-3 U11) draws last so it floats over every pane.
+    // Its bounds stop above the footer, which `draw` paints over everything.
+    let menu_bounds = Rect {
+        height: footer_area.y.saturating_sub(area.y),
+        ..area
+    };
     let menu = chrome
         .menu_anchor
         .filter(|_| matches!(chrome.mode, Mode::ContextMenu { .. }))
-        .map(|anchor| draw_context_menu(frame, view, ctx, chrome, anchor));
+        .map(|anchor| draw_context_menu(frame, menu_bounds, view, ctx, chrome, anchor));
     *hits = Some(MainChrome {
         activity,
         tabs,
@@ -576,7 +687,6 @@ fn draw_main(
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
     // last (over any overlay). Keep MAIN's bottom row clear here.
-    let _ = footer_area;
 }
 
 /// The group-settings bar (UI-3 U9/U10): one bottom row showing each backend
@@ -584,53 +694,84 @@ fn draw_main(
 /// setting (scheduler mode, codex model / effort / fast, grok effort).
 /// Effort `bypass` = the client's own value rides through (UI-3 U12).
 /// Claude and gemini have no live settings, so they show an account count.
+///
+/// Laid out by twolab-tui's `StatusBar`, one segment per group joined by
+/// `  │  `: on a row too narrow for all of them whole groups drop — the
+/// account counts first, then grok, then codex; the scheduler mode stays —
+/// and `+N` says how many went. The click rects come from
+/// `StatusBar::hits`, so a click lands on the value that is drawn there,
+/// measured in cells (a wide model name included).
 fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> Vec<SettingHit> {
+    use twolab_tui::status_bar::{Segment, StatusBar};
     if area.height == 0 {
         return Vec::new();
     }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut hits: Vec<SettingHit> = Vec::new();
-    let mut x = area.x;
-    let push_plain = |spans: &mut Vec<Span<'static>>, x: &mut u16, text: String, style| {
-        let w = text.chars().count() as u16;
-        spans.push(Span::styled(text, style));
-        *x += w;
-    };
+    let groups = settings_groups(view);
+    let bar = StatusBar::new(KEYBAR_THEME)
+        .style(dim())
+        .separator("  │  ")
+        .count_dropped(true)
+        .segments(groups.iter().map(|g| {
+            let text: String = g
+                .parts
+                .iter()
+                .map(|(span, _)| span.content.as_ref())
+                .collect();
+            Segment::new(text).priority(g.priority)
+        }));
+    let row = Rect { height: 1, ..area };
+    frame.render_widget(&bar, row);
+    let mut hits = Vec::new();
+    for (i, rect) in bar.hits(row) {
+        // The bar drew the group's text in one style; paint its own styles
+        // over exactly those cells, then map each value to where it is.
+        let parts = &groups[i].parts;
+        let spans: Vec<Span<'static>> = parts.iter().map(|(span, _)| span.clone()).collect();
+        let line = cells::truncate_line(Line::from(spans), usize::from(rect.width));
+        frame
+            .buffer_mut()
+            .set_line(rect.x, rect.y, &line, rect.width);
+        let mut x = rect.x;
+        for (span, action) in parts {
+            let right = x
+                .saturating_add(cells::width(&span.content) as u16)
+                .min(rect.right());
+            if let Some(action) = *action {
+                if right > x {
+                    hits.push(SettingHit {
+                        area: Rect::new(x, rect.y, right - x, 1),
+                        action,
+                    });
+                }
+            }
+            x = right;
+        }
+    }
+    hits
+}
+
+/// One group on the group-settings bar: its parts in their styles, each
+/// with the setting a click on it rotates, and how long it stays when the
+/// row is narrow (higher stays longer; equals drop from the right).
+struct SettingsGroup {
+    parts: Vec<(Span<'static>, Option<SettingAction>)>,
+    priority: u8,
+}
+
+/// The groups of the settings bar, left to right: the scheduler mode, then
+/// each backend group that is present.
+fn settings_groups(view: &DashboardView) -> Vec<SettingsGroup> {
     let clickable = Style::new()
         .fg(Color::Cyan)
         .add_modifier(Modifier::UNDERLINED);
-    let push_click = |spans: &mut Vec<Span<'static>>,
-                      hits: &mut Vec<SettingHit>,
-                      x: &mut u16,
-                      text: String,
-                      action: SettingAction| {
-        let w = text.chars().count() as u16;
-        hits.push(SettingHit {
-            area: Rect {
-                x: *x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-            action,
-        });
-        spans.push(Span::styled(text, clickable));
-        *x += w;
+    let plain = |text: String, style: Style| (Span::styled(text, style), None);
+    let click = |text: String, action: SettingAction| (Span::styled(text, clickable), Some(action));
+    let name = |group: &'static str| {
+        plain(
+            format!("{group} "),
+            group_color(Some(group)).add_modifier(Modifier::BOLD),
+        )
     };
-    let sep = |spans: &mut Vec<Span<'static>>, x: &mut u16| {
-        spans.push(Span::styled("  │  ", dim()));
-        *x += 5;
-    };
-
-    push_plain(&mut spans, &mut x, " sched ".into(), dim());
-    push_click(
-        &mut spans,
-        &mut hits,
-        &mut x,
-        view.select_params.mode.label().to_string(),
-        SettingAction::SchedMode,
-    );
-
     let count = |g: BackendGroup| {
         view.snapshot
             .accounts
@@ -638,79 +779,63 @@ fn draw_group_settings(frame: &mut Frame, area: Rect, view: &DashboardView) -> V
             .filter(|a| a.group == g)
             .count()
     };
+    let mut groups = vec![SettingsGroup {
+        parts: vec![
+            plain(" sched ".into(), dim()),
+            click(
+                view.select_params.mode.label().to_string(),
+                SettingAction::SchedMode,
+            ),
+        ],
+        priority: 3,
+    }];
     let claude_n = count(BackendGroup::Claude);
     if claude_n > 0 {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "claude ".into(),
-            group_color(Some("claude")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, format!("{claude_n} acc"), dim());
+        groups.push(SettingsGroup {
+            parts: vec![name("claude"), plain(format!("{claude_n} acc"), dim())],
+            priority: 1,
+        });
     }
     if view.codex.available {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "codex ".into(),
-            group_color(Some("codex")).add_modifier(Modifier::BOLD),
-        );
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.codex.model.clone(),
-            SettingAction::CodexModel,
-        );
-        push_plain(&mut spans, &mut x, " effort:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
-            SettingAction::CodexEffort,
-        );
-        push_plain(&mut spans, &mut x, " fast:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            if view.codex.fast { "on" } else { "off" }.into(),
-            SettingAction::CodexFast,
-        );
+        groups.push(SettingsGroup {
+            parts: vec![
+                name("codex"),
+                click(view.codex.model.clone(), SettingAction::CodexModel),
+                plain(" effort:".into(), dim()),
+                click(
+                    view.codex.effort.clone().unwrap_or_else(|| "bypass".into()),
+                    SettingAction::CodexEffort,
+                ),
+                plain(" fast:".into(), dim()),
+                click(
+                    if view.codex.fast { "on" } else { "off" }.into(),
+                    SettingAction::CodexFast,
+                ),
+            ],
+            priority: 2,
+        });
     }
     if view.grok.available {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "grok ".into(),
-            group_color(Some("grok")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, "effort:".into(), dim());
-        push_click(
-            &mut spans,
-            &mut hits,
-            &mut x,
-            view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
-            SettingAction::GrokEffort,
-        );
+        groups.push(SettingsGroup {
+            parts: vec![
+                name("grok"),
+                plain("effort:".into(), dim()),
+                click(
+                    view.grok.effort.clone().unwrap_or_else(|| "bypass".into()),
+                    SettingAction::GrokEffort,
+                ),
+            ],
+            priority: 2,
+        });
     }
     let gemini_n = count(BackendGroup::Gemini);
     if gemini_n > 0 {
-        sep(&mut spans, &mut x);
-        push_plain(
-            &mut spans,
-            &mut x,
-            "gemini ".into(),
-            group_color(Some("gemini")).add_modifier(Modifier::BOLD),
-        );
-        push_plain(&mut spans, &mut x, format!("{gemini_n} acc"), dim());
+        groups.push(SettingsGroup {
+            parts: vec![name("gemini"), plain(format!("{gemini_n} acc"), dim())],
+            priority: 1,
+        });
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    hits
+    groups
 }
 
 /// The tab strip (UI-3 U6): one row of clickable surface names right under
@@ -788,9 +913,9 @@ fn draw_accounts_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" detail "));
-        frame.render_widget(empty, detail_area);
+        )));
+        let body = section(frame, detail_area, " detail ");
+        frame.render_widget(empty, body);
     } else {
         draw_detail(frame, detail_area, view, ctx, chrome);
     }
@@ -959,15 +1084,13 @@ fn draw_daily_chart(
         .style(dim());
     let [plot_area, legend_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(
-            Block::new()
-                .borders(Borders::TOP)
-                .title(format!(" tokens per day — last {chart_days}d · d cycles ")),
-        )
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
+    let plot_body = section(
+        frame,
+        plot_area,
+        &format!(" tokens per day — last {chart_days}d · d cycles "),
+    );
+    let chart = Chart::new(datasets).x_axis(x_axis).y_axis(y_axis);
+    frame.render_widget(chart, plot_body);
     // Legend: ● model (share%) — one line, dim separators.
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     for (i, ((group, model), total)) in ranked.iter().enumerate() {
@@ -1030,9 +1153,9 @@ fn draw_clients_compact(frame: &mut Frame, area: Rect, view: &DashboardView) {
     let shown = total.min(CLIENT_PANEL_ROWS);
     let title = format!(" clients — top {shown} of {total} by requests (metadata.user_id) ");
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Rows the windowed heatmap panel needs: a title/header pair + one row per
@@ -1093,12 +1216,16 @@ fn draw_usage_overlay(
         let empty = Paragraph::new(Line::from(Span::styled(
             hint,
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(format!(
-            " usage — {} · {cost_warning} · ALL 0 buckets ",
-            gran.label()
         )));
-        frame.render_widget(empty, area);
+        let body = section(
+            frame,
+            area,
+            &format!(
+                " usage — {} · {cost_warning} · ALL 0 buckets ",
+                gran.label()
+            ),
+        );
+        frame.render_widget(empty, body);
         return (None, None);
     }
 
@@ -1148,14 +1275,17 @@ fn draw_usage_overlay(
     let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
     // Widest first. The last form is exactly as wide as the pre-scope title,
     // so any width that fit it still shows the warning, ALL and qualifier.
+    // Each is measured as its section rule draws it (lead included), and
+    // the short form joins tokens and cost with a space like the tight one,
+    // so an 80-column overlay keeps `N buckets` under the rule's lead.
     let full = format!(
         " usage — {label} · {cost_warning} · ALL {n} buckets · Σ {tok} tok · Σ {cost}{unpriced} "
     );
     let short = format!(
-        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok · {cost}{unpriced} "
+        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok {cost}{unpriced} "
     );
     let tight = format!(" ≈API est/NOT BILL · ALL {n} {label} · {tok} tok {cost}{unpriced} ");
-    let fits = |t: &str| cells::width(t) <= usize::from(area.width);
+    let fits = |t: &str| section_title_width(t) <= usize::from(area.width);
     let title = if fits(&full) {
         full
     } else if fits(&short) {
@@ -1252,9 +1382,8 @@ fn draw_usage_overlay(
         Constraint::Length(8),
         Constraint::Length(USAGE_COST_COL_WIDTH),
     ];
-    let block = Block::new().borders(Borders::TOP).title(title);
-    let (table_area, track) = table_scroll_split(block.inner(area), bar_pos);
-    frame.render_widget(block, area);
+    let body = section(frame, area, &title);
+    let (table_area, track) = table_scroll_split(body, bar_pos);
     let table = Table::new(trows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
     frame.render_widget(table, table_area);
@@ -1531,18 +1660,18 @@ fn draw_sessions_overlay(
             chrome.clock.saturating_sub(chrome.sessions_since),
             chrome.motion,
         ));
-        let loading = Paragraph::new(Line::from(spans))
-            .block(Block::new().borders(Borders::TOP).title(" sessions "));
-        frame.render_widget(loading, area);
+        let loading = Paragraph::new(Line::from(spans));
+        let body = section(frame, area, " sessions ");
+        frame.render_widget(loading, body);
         return;
     }
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no sessions yet — enable raw-io capture and send requests through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" sessions "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " sessions ");
+        frame.render_widget(empty, body);
         return;
     }
     let (table_chrome, bar) = if area.width >= SIDE_BY_SIDE_AT {
@@ -1660,9 +1789,8 @@ fn draw_sessions_table(
             cursor + 1
         ))
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
-    let (table_area, track) = table_scroll_split(block.inner(area), bar_pos);
-    frame.render_widget(block, area);
+    let body = section_line(frame, area, title);
+    let (table_area, track) = table_scroll_split(body, bar_pos);
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
     frame.render_widget(table, table_area);
@@ -1754,8 +1882,8 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
             Span::raw(session_span_label(s)),
         ]),
     ];
-    let detail = Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(" session "));
-    frame.render_widget(detail, area);
+    let body = section(frame, area, " session ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Display label for a session's grouping key: the user_id, or `(ungrouped)` for
@@ -1970,9 +2098,9 @@ fn draw_perf_overlay(
             "no perf data yet — collecting starts with this daemon version (metric v1); \
              send requests through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" perf "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " perf ");
+        frame.render_widget(empty, body);
         return;
     }
     let series = match chrome.perf_day_off {
@@ -2059,9 +2187,9 @@ fn draw_perf_chart(
         ranked
     };
     if ranked.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())))
-            .block(Block::new().borders(Borders::TOP).title(title.to_string()));
-        frame.render_widget(empty, area);
+        let empty = Paragraph::new(Line::from(Span::styled("no requests in this span", dim())));
+        let body = section(frame, area, title);
+        frame.render_widget(empty, body);
         return;
     }
     let span_days = days as usize;
@@ -2157,11 +2285,9 @@ fn draw_perf_chart(
         .style(dim());
     let [plot_area, legend_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
-    let chart = Chart::new(datasets)
-        .block(Block::new().borders(Borders::TOP).title(title.to_string()))
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-    frame.render_widget(chart, plot_area);
+    let plot_body = section(frame, plot_area, title);
+    let chart = Chart::new(datasets).x_axis(x_axis).y_axis(y_axis);
+    frame.render_widget(chart, plot_body);
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     for (i, ((group, model, fast), _)) in ranked.iter().enumerate() {
         if i > 0 {
@@ -2263,14 +2389,10 @@ fn draw_perf_health(
     }
     let mut constraints = vec![Constraint::Length(7)];
     constraints.extend(groups.iter().map(|_| Constraint::Fill(1)));
-    let block = Block::new().borders(Borders::TOP).title(match title {
-        Some(t) => t.to_string(),
-        None => " provider health (observed) ".to_string(),
-    });
+    let body = section(frame, area, title.unwrap_or(" provider health (observed) "));
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(block);
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    frame.render_widget(table, body);
 }
 
 /// Per-(group, model, fast) series table over the span: samples, error %,
@@ -2339,12 +2461,16 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
         Constraint::Length(8),
     ];
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(format!(
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(
+        frame,
+        area,
+        &format!(
             " series ({scope}) — {} of {total} · est = post-first-delta (measured only) ",
             cursor.saturating_add(1).min(total.max(1))
-        )));
-    frame.render_widget(table, area);
+        ),
+    );
+    frame.render_widget(table, body);
 }
 
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
@@ -2930,11 +3056,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
             bytes(f.activity_log_bytes),
         ))),
     ];
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" misc — keys · build · daemon ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = section(frame, area, " misc — keys · build · daemon ");
     // The facts keep their rows at the bottom; the key grid takes the rest
     // and, when it does not fit, ends in `… +N more` — never cut silently.
     let facts_h = (facts.len() as u16).min(inner.height.saturating_sub(2));
@@ -3673,11 +3795,11 @@ fn draw_config_overlay(
 ) {
     frame.render_widget(Clear, area);
     let rows = config_rows(view, chrome);
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" config — Enter/click value edits · read-only rows are skipped ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = section(
+        frame,
+        area,
+        " config — Enter/click value edits · read-only rows are skipped ",
+    );
     // The edit prompt takes the last two rows while a value is being typed.
     let editing = match chrome.mode {
         Mode::ConfigEdit { action } => Some(action),
@@ -3743,102 +3865,96 @@ fn draw_config_overlay(
     }
 }
 
-/// The right-click account context menu (UI-3 U11): a small floating list
-/// anchored at the click cell, clamped to the frame. Items mirror the key
-/// flows exactly: switch now (`Enter` in the switcher), pause/resume (`p`),
-/// set limit (`L`), delete (`r` + confirm). Returns the hit layout.
+/// What the open context menu acts on (UI-3 U11): the PINNED account id
+/// governs both what the menu says and what it runs (review R2/R3) — the
+/// account, or `Err(id)` when that account has left the pool. A vanished pin
+/// never falls back to whoever now occupies the row (execution would cancel
+/// while the menu named someone else). With no pin (keyboard-driven or test
+/// states) the display row `idx` of `order` is the target.
+pub(crate) fn menu_target<'a>(
+    view: &'a DashboardView,
+    pinned: Option<&'a str>,
+    order: &[usize],
+    idx: usize,
+) -> Result<Option<&'a AccountSnapshot>, &'a str> {
+    match pinned {
+        Some(name) => view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.id.0 == name)
+            .map(Some)
+            .ok_or(name),
+        None => Ok(order.get(idx).and_then(|&i| view.snapshot.accounts.get(i))),
+    }
+}
+
+/// The context menu's entries, in the order `App::run_menu_item` runs
+/// them: switch now, pause/resume, set limit, delete — each with the key
+/// that runs the same flow in the account switcher (typed while the menu is
+/// open, it runs the item too). What cannot run is shown dim and skipped:
+/// everything when there is no account to act on, and `switch now` on a
+/// paused account (the scheduler refuses a paused target — resume it
+/// first). Delete keeps its confirm gate; here it is only marked
+/// destructive.
+pub(crate) fn account_menu_items(
+    target: Option<&AccountSnapshot>,
+) -> Vec<twolab_tui::menu::MenuItem<'static>> {
+    use twolab_tui::menu::MenuItem;
+    let none = target.is_none();
+    let paused = target.is_some_and(|a| a.paused);
+    vec![
+        MenuItem::new("switch now")
+            .key("⏎")
+            .disabled(none || paused),
+        MenuItem::new(if paused { "resume" } else { "pause" })
+            .key("p")
+            .disabled(none),
+        MenuItem::new("set limit").key("L").disabled(none),
+        MenuItem::new("delete")
+            .key("r")
+            .destructive(true)
+            .disabled(none),
+    ]
+}
+
+/// The right-click account context menu (UI-3 U11), drawn by the library's
+/// `Menu`: anchored at the click cell, it opens on the row below — or above
+/// when there is no room below, so it never covers the clicked row — inside
+/// `bounds` (MAIN above the footer, which draws over everything). Titled
+/// with the pinned account; items mirror the key flows exactly (see
+/// [`account_menu_items`]). Returns where each runnable item was drawn.
 fn draw_context_menu(
     frame: &mut Frame,
+    bounds: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
     anchor: (u16, u16),
-) -> MenuChrome {
+) -> twolab_tui::menu::MenuLayout {
+    use twolab_tui::menu::{Menu, MenuState};
     let Mode::ContextMenu { idx, item } = chrome.mode else {
-        return MenuChrome::default();
+        return twolab_tui::menu::MenuLayout::default();
     };
-    // The PINNED account id governs what the menu says — the same identity
-    // execution acts on (review R2/R3). The explicit match keeps "no pin"
-    // (index fallback — keyboard-driven/test states) distinct from "pinned
-    // account VANISHED": a vanished pin must never fall back to whoever now
-    // occupies the row (execution would cancel while the menu named someone
-    // else) — it renders as gone instead.
-    let (target, gone) = match chrome.menu_account.as_deref() {
-        Some(name) => {
-            let found = view.snapshot.accounts.iter().find(|a| a.id.0 == name);
-            (found, found.is_none().then(|| name.to_string()))
-        }
-        None => (
-            ctx.order
-                .get(idx)
-                .and_then(|&i| view.snapshot.accounts.get(i)),
-            None,
-        ),
-    };
-    let paused = target.is_some_and(|a| a.paused);
-    let name = match (&gone, target) {
-        (Some(pinned), _) => format!(
+    let target = menu_target(view, chrome.menu_account.as_deref(), &ctx.order, idx);
+    let name = match target {
+        Err(pinned) => format!(
             "{} — gone",
             row_account_name(pinned, ctx.mask, &view.domain_abbrev)
         ),
-        (None, Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
-        (None, None) => "?".into(),
+        Ok(Some(a)) => row_account_name(&a.id.0, ctx.mask, &view.domain_abbrev),
+        Ok(None) => "?".into(),
     };
-    let items: [&str; 4] = [
-        "switch now",
-        if paused { "resume" } else { "pause" },
-        "set limit",
-        "delete",
-    ];
-    let width = (items
-        .iter()
-        .map(|i| i.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(name.chars().count() + 1) as u16
-        + 4)
-    .min(frame.area().width);
-    let height = items.len() as u16 + 1; // + title border row
-    let frame_area = frame.area();
-    let x = anchor
-        .0
-        .min(frame_area.right().saturating_sub(width))
-        .max(frame_area.x);
-    let y = anchor
-        .1
-        .saturating_add(1)
-        .min(frame_area.bottom().saturating_sub(height))
-        .max(frame_area.y);
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
+    let menu = Menu::new(account_menu_items(target.ok().flatten()))
+        .title(name)
+        .anchor(anchor.0, anchor.1)
+        .theme(KEYBAR_THEME);
+    let mut state = MenuState {
+        selected: item,
+        ..MenuState::default()
     };
-    frame.render_widget(Clear, area);
-    let mut lines: Vec<Line> = Vec::with_capacity(items.len());
-    let mut rects: Vec<Rect> = Vec::with_capacity(items.len());
-    for (i, label) in items.iter().enumerate() {
-        let style = if i == item {
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::new()
-        };
-        lines.push(Line::from(Span::styled(format!(" {label} "), style)));
-        rects.push(Rect {
-            x: area.x,
-            y: area.y + 1 + i as u16,
-            width: area.width,
-            height: 1,
-        });
-    }
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(format!(" {name} "));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-    MenuChrome { area, items: rects }
+    frame.render_stateful_widget(&menu, bounds, &mut state);
+    state.layout
 }
 
 /// The rect an overlay draws into. Rows left visible at the top: header + tab
@@ -5486,9 +5602,11 @@ fn header_tail_spans(
 /// review 2026-10-22), knowing the room the tab labels leave (`tabs_room`):
 /// the whole header fits → today's header; else the tabs-row form of the
 /// tail ([`header_tail_spans`]) fits that room → the header drops its tail
-/// and the tail is returned for [`draw_tabs_tail`]; else today's whole
-/// header, clipped by its row as before (cfg is never lost to a tail that
-/// had nowhere to go).
+/// and the tail is returned for [`draw_tabs_tail`]; else the whole header
+/// with its tail. Whatever the header keeps is laid out by
+/// [`draw_header_row`]: the verdict always, then whole identity segments by
+/// importance — never a segment cut mid-word (cfg is never lost to a tail
+/// that had nowhere to go: it competes for the row like the rest).
 fn draw_header(
     frame: &mut Frame,
     area: Rect,
@@ -5497,21 +5615,84 @@ fn draw_header(
     now: SystemTime,
     tabs_room: usize,
 ) -> Vec<Span<'static>> {
-    let lead = header_lead_spans(view, now);
-    let mut full = lead.clone();
-    if let Some(path) = &view.config_path {
-        full.push(Span::styled(format!(" cfg {path} "), dim()));
-    }
-    full.extend(attach_spans(chrome));
-    if Line::from(full.clone()).width() > usize::from(area.width) {
+    let verdict = header_verdict_spans(view, now);
+    let identity = header_identity_segments(view);
+    let mut full = identity.clone();
+    full.extend(header_tail_segments(view, chrome));
+    if header_width(&verdict, &full) > usize::from(area.width) {
         let tail = header_tail_spans(view, chrome, dirs::home_dir().as_deref());
         if !tail.is_empty() && Line::from(tail.clone()).width() <= tabs_room {
-            frame.render_widget(Paragraph::new(Line::from(lead)), area);
+            draw_header_row(frame, area, verdict, identity);
             return tail;
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(full)), area);
+    draw_header_row(frame, area, verdict, full);
     Vec::new()
+}
+
+/// What separates two header segments: one space, as the header always
+/// read (`llmux 0.2.26 :3456 pid 1 up 3h`).
+const HEADER_SEPARATOR: &str = " ";
+
+/// The cells between the verdict and the first identity segment.
+const HEADER_GAP: &str = "  ";
+
+/// The header's segments as twolab-tui `StatusBar` lays them out.
+fn header_bar(segments: Vec<twolab_tui::status_bar::Segment>) -> twolab_tui::status_bar::StatusBar {
+    twolab_tui::status_bar::StatusBar::new(KEYBAR_THEME)
+        .style(dim())
+        .separator(HEADER_SEPARATOR)
+        .segments(segments)
+}
+
+/// Cells the header takes with every segment on it.
+fn header_width(verdict: &[Span<'static>], segments: &[twolab_tui::status_bar::Segment]) -> usize {
+    let verdict = Line::from(verdict.to_vec()).width();
+    if segments.is_empty() {
+        return verdict;
+    }
+    let texts: usize = segments.iter().map(|s| cells::width(&s.text)).sum();
+    verdict + HEADER_GAP.len() + texts + HEADER_SEPARATOR.len() * (segments.len() - 1)
+}
+
+/// One header row: the verdict first and whole (cut with `…` only when the
+/// row is narrower than the verdict itself), then the segments that fit
+/// beside it — twolab-tui's `StatusBar` drops the least important ones
+/// whole. The bar would cut the last one standing; here a segment that
+/// does not fit whole goes too, and the next most important one that fits
+/// takes its place (a long attach marker gives way to the version).
+fn draw_header_row(
+    frame: &mut Frame,
+    area: Rect,
+    verdict: Vec<Span<'static>>,
+    mut segments: Vec<twolab_tui::status_bar::Segment>,
+) {
+    let width = usize::from(area.width);
+    let mut line = cells::truncate_line(Line::from(verdict), width);
+    let room = width.saturating_sub(line.width() + HEADER_GAP.len()) as u16;
+    while !segments.is_empty() {
+        let bar = header_bar(segments.clone());
+        let layout = bar.layout(room);
+        let cut = layout
+            .kept
+            .iter()
+            .zip(&layout.widths)
+            .find(|&(&i, &w)| cells::width(&segments[i].text) != w)
+            .map(|(&i, _)| i);
+        match cut {
+            Some(i) => {
+                segments.remove(i);
+            }
+            None => {
+                if !layout.kept.is_empty() {
+                    line.spans.push(Span::styled(HEADER_GAP, dim()));
+                    line.spans.extend(bar.line(room).spans);
+                }
+                break;
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Right-align the header tail at the end of the tabs row ([`draw_header`]
@@ -5529,9 +5710,10 @@ fn draw_tabs_tail(frame: &mut Frame, area: Rect, tail: Vec<Span<'static>>) {
     );
 }
 
-/// The header up to (and including) the upstream: health verdict, identity,
-/// upstream — everything but the movable tail.
-fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
+/// The header's verdict: the health tag and its headline condition (or
+/// `healthy` and the error rate). It always leads the row and is never
+/// dropped.
+fn header_verdict_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
     // glance-triage atom 1: the header row IS the health verdict — always
     // present (green included: a positive signal, never health-by-absence),
     // zero added height, [OK]/[WARN]/[FAIL] text first so the state survives
@@ -5575,21 +5757,56 @@ fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>
             ));
         }
     }
-    spans.push(Span::styled(
-        format!(
-            "  llmux {} :{} pid {} up {} ·{}",
-            view.display_version(),
-            view.port,
-            view.pid,
-            format::countdown(view.uptime),
-            view.snapshot.accounts.len()
-        ),
-        dim(),
-    ));
-    if let Some(upstream) = &view.upstream {
-        spans.push(Span::styled(format!(" → {upstream} "), dim()));
-    }
     spans
+}
+
+/// The header's identity after the verdict, as segments that drop whole —
+/// the least important first — when the row is too narrow. Highest stays
+/// longest: version, port, uptime, pid, upstream, the version's build tag
+/// (`(preview …)`), the account count (the accounts title repeats it).
+/// Joined by one space they read exactly as the header always did.
+fn header_identity_segments(view: &DashboardView) -> Vec<twolab_tui::status_bar::Segment> {
+    use twolab_tui::status_bar::Segment;
+    let version = view.display_version();
+    let (number, tag) = match version.split_once(' ') {
+        Some((number, tag)) => (number, Some(tag)),
+        None => (version, None),
+    };
+    let mut segments = vec![Segment::new(format!("llmux {number}")).priority(7)];
+    if let Some(tag) = tag {
+        segments.push(Segment::new(tag).priority(2));
+    }
+    segments.push(Segment::new(format!(":{}", view.port)).priority(6));
+    segments.push(Segment::new(format!("pid {}", view.pid)).priority(4));
+    segments.push(Segment::new(format!("up {}", format::countdown(view.uptime))).priority(5));
+    segments.push(Segment::new(format!("·{}", view.snapshot.accounts.len())).priority(1));
+    if let Some(upstream) = &view.upstream {
+        // The trailing space keeps the header's two-space step to `cfg`.
+        segments.push(Segment::new(format!("→ {upstream} ")).priority(3));
+    }
+    segments
+}
+
+/// The header's tail when it stays in the header row: ` cfg {path} ` (the
+/// least important segment of all — it goes first) and the attach marker
+/// (the most important — `reconnecting` must not be the part that drops).
+fn header_tail_segments(
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Vec<twolab_tui::status_bar::Segment> {
+    use twolab_tui::status_bar::Segment;
+    let mut segments = Vec::new();
+    if let Some(path) = &view.config_path {
+        segments.push(Segment::new(format!("cfg {path} ")).priority(0));
+    }
+    for span in attach_spans(chrome) {
+        segments.push(
+            Segment::new(span.content.trim_start())
+                .style(span.style)
+                .priority(8),
+        );
+    }
+    segments
 }
 
 /// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) `,
@@ -5823,14 +6040,13 @@ fn draw_accounts_with(
             hidden,
         )
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
+    let body = section(frame, area, &title);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(block);
-        frame.render_widget(empty, area);
+        )));
+        frame.render_widget(empty, body);
         return Vec::new();
     }
     let selected = cursor_pos(chrome, ctx.order.len());
@@ -5899,16 +6115,15 @@ fn draw_accounts_with(
     };
 
     let table_widget = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(block);
-    // With the fold, the table stops at its own rows so the block can take
-    // the lines below them.
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    // With the fold, the table stops at its own rows (and its header) so
+    // the fold block can take the lines below them.
     let table_area = match fold {
         Some(_) => Rect {
-            height: area.height.min((table.len() as u16).saturating_add(2)),
-            ..area
+            height: body.height.min((table.len() as u16).saturating_add(1)),
+            ..body
         },
-        None => area,
+        None => body,
     };
     frame.render_widget(table_widget, table_area);
     // Row hit map (UI-3 U11): table row `i` renders at area.y + 2 + i (top
@@ -7621,9 +7836,11 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
 
 /// The band's left title: today's `poller` and `totals` lines, word for
 /// word and style for style, joined with ` · `; `totals = None` leaves
-/// ` · totals …` for the mode row.
+/// ` · totals …` for the mode row. It opens with the same two-cell lead as
+/// every other section rule (`── scheduler · …`, [`section`]).
 fn band_title_spans_from(poller: &str, totals: Option<&[Span<'static>]>) -> Vec<Span<'static>> {
     let mut spans = vec![
+        Span::raw(rule_fill(RULE_LEAD)),
         Span::raw(" scheduler · "),
         Span::styled("poller ", dim()),
         Span::raw(poller.to_string()),
@@ -7740,14 +7957,22 @@ fn draw_band(
         (!geometry.totals_on_mode_row).then_some(summary.totals.as_slice()),
     );
     let title_w = Line::from(title.clone()).width();
-    title.push(Span::raw(
-        "─".repeat(geometry.detail_title_x.saturating_sub(title_w)),
-    ));
+    title.push(Span::raw(rule_fill(
+        geometry.detail_title_x.saturating_sub(title_w),
+    )));
     let detail_title_w = Line::from(BAND_DETAIL_TITLE).width();
     title.push(Span::raw(BAND_DETAIL_TITLE));
-    title.push(Span::raw("─".repeat(
-        width.saturating_sub(geometry.detail_title_x + detail_title_w),
-    )));
+    // Where Ambiguous glyphs draw wide, the titles' own (`·`, `…`) take
+    // extra cells: the tail stops short by them, as [`section`] does.
+    let wide_extra = if AMBIGUOUS_WIDE.with(std::cell::Cell::get) {
+        let text: String = title.iter().map(|span| span.content.as_ref()).collect();
+        ambiguous_extra(&text)
+    } else {
+        0
+    };
+    title.push(Span::raw(rule_fill(width.saturating_sub(
+        geometry.detail_title_x + detail_title_w + wide_extra,
+    ))));
     frame.render_widget(
         Paragraph::new(Line::from(title)),
         Rect { height: 1, ..area },
@@ -7850,8 +8075,8 @@ fn draw_summary(frame: &mut Frame, area: Rect, parts: &SummaryParts) {
     totals.extend(parts.totals.iter().cloned());
     lines.push(Line::from(totals));
     lines.extend(parts.tail.iter().cloned());
-    let block = Block::new().borders(Borders::TOP).title(" scheduler ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " scheduler ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Build the scheduler summary's parts (see [`SummaryParts`]).
@@ -8255,10 +8480,8 @@ fn draw_detail_parts(frame: &mut Frame, area: Rect, parts: &DetailParts) {
     ];
     lines.extend(parts.auth.clone());
     lines.extend(parts.reset.clone());
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(" detail · h / click account: full history ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " detail · h / click account: full history ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Build the selected account's [`DetailParts`]; `None` when the order is
@@ -8638,23 +8861,6 @@ pub(crate) struct AccountRowHit {
     pub display_idx: usize,
 }
 
-/// The rendered context menu's layout (UI-3 U11): the whole popup rect plus
-/// one row rect per item, for the click hit-test.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct MenuChrome {
-    pub area: Rect,
-    pub items: Vec<Rect>,
-}
-
-impl MenuChrome {
-    /// Which menu item a click lands on, if any.
-    pub(crate) fn hit_item(&self, col: u16, row: u16) -> Option<usize> {
-        self.items
-            .iter()
-            .position(|r| row == r.y && col >= r.x && col < r.right())
-    }
-}
-
 /// One rotatable setting on the group-settings bar (UI-3 U9/U10): a click on
 /// its segment cycles the setting to its next value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8684,7 +8890,7 @@ pub(crate) struct MainChrome {
     pub tabs: Vec<TabHit>,
     pub separators: Vec<SeparatorHit>,
     pub account_rows: Vec<AccountRowHit>,
-    pub menu: Option<MenuChrome>,
+    pub menu: Option<twolab_tui::menu::MenuLayout>,
     pub settings: Vec<SettingHit>,
     /// Sessions overlay table layout this frame (issue: sessions mouse
     /// select): the data-row rect + the index of its first visible session.
@@ -9286,7 +9492,6 @@ fn draw_activity(
     } else {
         format!(" activity — {} in flight ", in_flight.len())
     };
-    let block = Block::new().borders(Borders::TOP).title(title);
     // Paragraph styles graphemes, but resets wide-glyph continuation cells.
     // Apply the row background to the final buffer so both those cells and
     // the unused trailing width share the endpoint color.
@@ -9297,7 +9502,8 @@ fn draw_activity(
         .map(|(index, _)| body_top.saturating_add(index as u16))
         .filter(|y| *y < area.bottom())
         .collect();
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, &title);
+    frame.render_widget(Paragraph::new(lines), body);
     for y in openai_rows {
         frame.buffer_mut().set_style(
             Rect::new(area.x, y, area.width, 1),
@@ -10536,11 +10742,9 @@ fn draw_models_strip_packed(
         })
         .collect();
     let title = strip_title(view, shown);
-    let title_w = Line::from(title.as_str()).width();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(title)),
-        area,
-    );
+    let title_w = section_title_width(&title);
+    let body = section(frame, area, &title);
+    frame.render_widget(Paragraph::new(lines), body);
     let legend_w = Line::from(STRIP_LEGEND).width();
     if area.height > 0 && title_w + TITLE_GAP + legend_w <= usize::from(area.width) {
         frame.render_widget(
@@ -10551,6 +10755,12 @@ fn draw_models_strip_packed(
                 legend_w as u16,
                 1,
             ),
+        );
+        // The legend's own `·` push the rule's tail on a wide terminal.
+        rule_stop_short(
+            frame,
+            Rect { height: 1, ..area },
+            &format!("{title}{STRIP_LEGEND}"),
         );
     }
 }
@@ -10660,9 +10870,9 @@ fn draw_models_strip(
     };
     let title = strip_title(view, shown);
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Detailed model view body: the full scrollable table beside (or above) the
@@ -10678,9 +10888,9 @@ fn draw_models_full(
         let empty = Paragraph::new(Line::from(Span::styled(
             "no model usage yet — send a request through the proxy",
             Style::new().fg(Color::Yellow),
-        )))
-        .block(Block::new().borders(Borders::TOP).title(" models "));
-        frame.render_widget(empty, area);
+        )));
+        let body = section(frame, area, " models ");
+        frame.render_widget(empty, body);
         return;
     }
     if area.width >= SIDE_BY_SIDE_AT {
@@ -10812,9 +11022,9 @@ fn draw_models_table(
         view.data_quality.cost
     );
     let table = Table::new(rows, constraints)
-        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::new().borders(Borders::TOP).title(title));
-    frame.render_widget(table, area);
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)));
+    let body = section(frame, area, &title);
+    frame.render_widget(table, body);
 }
 
 /// Drill-down panel for the cursored model row: token + cache split, account
@@ -10936,8 +11146,8 @@ fn draw_model_detail(
         dim(),
     )));
 
-    let block = Block::new().borders(Borders::TOP).title(" model detail ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let body = section(frame, area, " model detail ");
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// The heatmap cells for `window`, or an empty slice when the doc carries no
@@ -10973,7 +11183,7 @@ fn draw_heatmap(
     let cells = heatmap_cells(view, window);
     let total = cells.len();
     let title = format!(" token heatmap — {} (best-effort) ", window.label());
-    let block = Block::new().borders(Borders::TOP).title(title);
+    let body = section(frame, area, &title);
 
     let mut lines: Vec<Line> = Vec::new();
     // The accuracy contract (mandatory): a visible best-effort qualifier so the
@@ -10987,7 +11197,7 @@ fn draw_heatmap(
             " no windowed activity yet",
             Style::new().fg(Color::Yellow),
         )));
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        frame.render_widget(Paragraph::new(lines), body);
         return;
     }
 
@@ -11032,7 +11242,7 @@ fn draw_heatmap(
             dim(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// A footer keybar fitted to `width` cells by twolab-tui's
@@ -13439,6 +13649,7 @@ mod tests {
             input_modal: None,
             raw_modal: None,
             account_modal: None,
+            ambiguous_wide: false,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -18166,6 +18377,135 @@ mod tests {
         assert!(text.contains("effort:high"), "grok effort value visible");
     }
 
+    /// Catalog `status_bar` (plan batch 3): the settings bar drops whole
+    /// groups — the account counts first, then grok — and says `+N`; every
+    /// click rect covers exactly the value drawn in it, measured in cells,
+    /// so with a wide (CJK) model name the effort and fast toggles still
+    /// land on `bypass` and `off` (char counting put them two cells left).
+    #[test]
+    fn group_settings_bar_drops_whole_groups_and_clicks_land_on_drawn_values() {
+        let (mut view, chrome) = recompose_view();
+        view.codex.model = "模型-一二".into();
+        let cells_of = |buf: &ratatui::buffer::Buffer, r: Rect| -> String {
+            (r.x..r.right()).map(|x| buf[(x, r.y)].symbol()).collect()
+        };
+        for w in [179u16, 100, 80, 60] {
+            let (rows, hits) = render_with_hits(&view, &chrome, w, 43);
+            let buf = render_buffer(&view, &chrome, w, 43);
+            let bar = row_of(&rows, " sched ");
+            let frame = rows[bar].clone();
+            for hit in &hits.settings {
+                assert_eq!(usize::from(hit.area.y), bar, "{frame}");
+                let drawn = cells_of(&buf, hit.area);
+                let want = match hit.action {
+                    SettingAction::SchedMode => view.select_params.mode.label().to_string(),
+                    SettingAction::CodexModel => "模型-一二".into(),
+                    SettingAction::CodexEffort => "bypass".into(),
+                    SettingAction::CodexFast => "off".into(),
+                    SettingAction::GrokEffort => "xhigh".into(),
+                };
+                // A wide glyph's second cell is blank in the buffer.
+                assert_eq!(
+                    drawn.replace(' ', ""),
+                    want,
+                    "{:?} at {w}:\n{frame}",
+                    hit.action
+                );
+                assert_eq!(
+                    usize::from(hit.area.width),
+                    cells::width(&want),
+                    "{:?} rect is the value's cells at {w}:\n{frame}",
+                    hit.action
+                );
+            }
+            let actions: Vec<SettingAction> = hits.settings.iter().map(|h| h.action).collect();
+            match w {
+                179 => {
+                    assert!(frame.contains("claude 14 acc") && frame.contains("gemini 1 acc"));
+                    assert_eq!(actions.len(), 5, "{frame}");
+                }
+                100 => {
+                    assert!(
+                        frame.trim_end().ends_with("grok effort:xhigh  │  +2"),
+                        "{frame}"
+                    );
+                    assert!(!frame.contains("claude 14"), "{frame}");
+                    assert_eq!(actions.len(), 5, "{frame}");
+                }
+                80 => {
+                    assert!(frame.trim_end().ends_with("fast:off  │  +3"), "{frame}");
+                    assert!(!actions.contains(&SettingAction::GrokEffort), "{frame}");
+                }
+                _ => {
+                    assert!(frame.trim_end().ends_with("default  │  +4"), "{frame}");
+                    assert_eq!(actions, vec![SettingAction::SchedMode], "{frame}");
+                }
+            }
+        }
+    }
+
+    /// Catalog `status_bar` (plan batch 3): the header keeps its verdict
+    /// and drops identity segments whole by importance. At 80 columns it
+    /// read `… +2  llmux 0.2.25 (p` (cut mid-segment); now it ends with the
+    /// whole version. At 120 the least important went (the build tag, the
+    /// account count, cfg, then pid) while the attach marker, port and
+    /// uptime stayed. At every width the row is the verdict followed by
+    /// whole segments only.
+    #[test]
+    fn header_drops_whole_segments_by_importance_and_keeps_the_verdict() {
+        let (view, chrome) = fold_view();
+        // The verdict's age ticks between renders: compare with digits masked.
+        let digits = |t: &str| -> String {
+            t.chars()
+                .map(|c| if c.is_ascii_digit() { '9' } else { c })
+                .collect()
+        };
+        let verdict: String = header_verdict_spans(&view, SystemTime::now())
+            .iter()
+            .map(|s| digits(&s.content))
+            .collect();
+        let row0 = |w: u16| {
+            let rows = render_rows(&view, &chrome, w, 24);
+            let (verdict_part, rest) = rows[0].split_at(verdict.len());
+            (digits(verdict_part), rest.to_string())
+        };
+        assert_eq!(
+            row0(80),
+            (
+                verdict.clone(),
+                "  llmux 0.2.25".to_string() + &" ".repeat(80 - verdict.len() - 14)
+            ),
+            "verdict whole, then the version whole"
+        );
+        let whole = [
+            "llmux 0.2.25",
+            "(preview 2026-10-16-0709-a162822a9215)",
+            ":3456",
+            "pid 1695",
+            "up 4d 13h",
+            "·21",
+            "→ https://api.anthropic.com",
+            "cfg /etc/llmux/llmux.json",
+            "attached → pid 1695",
+        ];
+        assert_eq!(
+            row0(120).1.trim_end(),
+            "  llmux 0.2.25 :3456 up 4d 13h attached → pid 1695",
+        );
+        for w in (verdict.len() as u16..=179).rev().step_by(3) {
+            let (kept, rest) = row0(w);
+            assert_eq!(kept, verdict, "verdict kept at {w}");
+            let rest = rest.trim();
+            let mut tail = rest;
+            for seg in whole {
+                if let Some(after) = tail.strip_prefix(seg) {
+                    tail = after.trim_start();
+                }
+            }
+            assert!(tail.is_empty(), "only whole segments at {w}: {rest:?}");
+        }
+    }
+
     #[test]
     fn group_settings_bar_counts_gemini_accounts_only_when_present() {
         use crate::routing::BackendGroup;
@@ -18257,6 +18597,85 @@ mod tests {
             !text.contains(" a@x.com — gone") && text.contains("gone@x.com"),
             "no fallback to the row occupant"
         );
+    }
+
+    /// Catalog `menu` (plan batch 3): right-clicked near the bottom of an
+    /// 80x24 MAIN the menu opens ABOVE the clicked row instead of covering
+    /// it; every item shows the key that runs it; delete is drawn
+    /// destructive; `switch now` on a paused account is dim and has no
+    /// click rect (the scheduler refuses a paused target).
+    #[test]
+    fn context_menu_opens_above_a_low_row_with_keys_and_states() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str, paused: bool| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            auth_failure_status: None,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![acct("claude:a@x.com", false), acct("claude:b@x.com", true)];
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.mode = Mode::ContextMenu { idx: 0, item: 0 };
+        chrome.menu_account = Some("claude:b@x.com".into());
+        // Clicked two rows above the 2-row footer: no room below.
+        chrome.menu_anchor = Some((30, 20));
+        let (rows, hits) = render_with_hits(&view, &chrome, 80, 24);
+        let frame = rows.join("\n");
+        let menu = hits.menu.expect("menu drawn");
+        assert!(menu.above, "opened above the clicked row:\n{frame}");
+        assert!(menu.area.bottom() <= 20, "row 20 stays visible:\n{frame}");
+        assert_eq!(menu.area.x, 30, "lines up with the click:\n{frame}");
+        let row = |label: &str| {
+            rows.iter()
+                .position(|r| r.contains(label))
+                .unwrap_or_else(|| panic!("{label} drawn:\n{frame}"))
+        };
+        assert_eq!(
+            row("┌ b@x.com "),
+            14,
+            "titled with the pinned account:\n{frame}"
+        );
+        for (label, key) in [
+            ("switch now", "⏎"),
+            ("resume", "p"),
+            ("set limit", "L"),
+            ("delete", "r"),
+        ] {
+            let line = &rows[row(label)];
+            let after = &line[line.find(label).expect("label") + label.len()..];
+            assert_eq!(
+                after.trim_start().chars().next(),
+                Some(key.chars().next().expect("key")),
+                "{label} shows its key {key}:\n{frame}"
+            );
+        }
+        let buf = render_buffer(&view, &chrome, 80, 24);
+        let delete = row("delete") as u16;
+        assert_eq!(buf[(menu.area.x + 2, delete)].fg, Color::Red, "destructive");
+        let switch = row("switch now") as u16;
+        assert_eq!(buf[(menu.area.x + 2, switch)].fg, Color::DarkGray, "dim");
+        // The dim item has no rect; the selection settled on `resume`.
+        assert_eq!(menu.hit(menu.area.x + 2, switch), None);
+        assert_eq!(menu.hit(menu.area.x + 2, row("resume") as u16), Some(1));
+        assert_eq!(menu.hit(menu.area.x + 2, delete), Some(3));
+        let resume = row("resume") as u16;
+        assert!(buf[(menu.area.x + 2, resume)]
+            .modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -20749,8 +21168,11 @@ mod tests {
         out
     }
 
+    // The title opens with the section rule's two-cell lead (`── `) like
+    // every other heading; ` detail `, set past the widest title the band
+    // can show, moves two cells right with it, and the tail is two shorter.
     const BAND_179_TITLE: &str =
-        " scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ──────────────────────────────";
+        "── scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ────────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -21075,7 +21497,7 @@ mod tests {
             );
             let detail_at: String = rows[sched].chars().skip(w as usize - 48).collect();
             assert_eq!(
-                detail_at.starts_with(" detail "),
+                detail_at.starts_with("── detail "),
                 w >= SIDE_BY_SIDE_AT,
                 "{w}x{h}:\n{frame}"
             );
@@ -21483,9 +21905,12 @@ mod tests {
         assert_eq!(tail(None), " cfg ~/.config/llmux.json ");
     }
 
-    /// Review item 1: when cfg fits the header and only the attach marker
-    /// overflows it, and the tabs row has no room for the moved tail, the
-    /// header renders exactly as before — cfg stays visible in row 0.
+    /// Review item 1, under the catalog `status_bar` (plan batch 3): when the
+    /// tabs row has no room for the moved tail, cfg is never moved to
+    /// nowhere — the tail stays in the header and competes for the row. At
+    /// a width that holds cfg but not cfg AND the attach marker, the least
+    /// important segment (cfg) drops WHOLE and the attach marker stays;
+    /// with room for both, both stay. Nothing is cut mid-segment.
     #[test]
     fn header_keeps_cfg_when_the_tabs_row_cannot_take_the_tail() {
         let mut view = view_with(Vec::new());
@@ -21497,7 +21922,8 @@ mod tests {
             }),
             ..chrome_overlay(Overlay::None)
         };
-        let lead = Line::from(header_lead_spans(&view, SystemTime::now())).width();
+        let verdict = header_verdict_spans(&view, SystemTime::now());
+        let lead = header_width(&verdict, &header_identity_segments(&view));
         let cfg = Line::from(format!(
             " cfg {} ",
             view.config_path.as_deref().unwrap_or("")
@@ -21507,8 +21933,17 @@ mod tests {
         let w = (lead + cfg + 2) as u16;
         let rows = render_rows(&view, &chrome, w, 30);
         assert!(
-            rows[0].contains(" cfg /opt/deep/"),
-            "cfg must stay in the header at {w}:\n{}\n{}",
+            rows[0].contains(" attached → pid 7 ") && !rows[0].contains("cfg"),
+            "cfg drops whole, the attach marker stays at {w}:\n{}\n{}",
+            rows[0],
+            rows[1]
+        );
+        assert!(!rows[1].contains("cfg"), "the tabs row took no tail");
+        let w = w + 18;
+        let rows = render_rows(&view, &chrome, w, 30);
+        assert!(
+            rows[0].contains(" cfg /opt/deep/") && rows[0].contains(" attached → pid 7 "),
+            "both stay in the header at {w}:\n{}\n{}",
             rows[0],
             rows[1]
         );
@@ -21617,11 +22052,14 @@ mod tests {
 
     /// Review item 6: a long poller back-off list pushes `totals …` out of
     /// the title onto the mode row, which then ends with the totals text,
-    /// carries its own `│` right of the block, and cuts nothing.
+    /// carries its own `│` right of the block, and cuts nothing. Two
+    /// backed-off accounts since the title took the section rule's two-cell
+    /// lead: with three, the bare title alone now needs 181 columns, and at
+    /// 179 MAIN keeps the plain scheduler and detail panes instead.
     #[test]
     fn totals_ride_the_mode_row_when_the_title_is_full() {
         let (mut view, chrome) = recompose_view();
-        for n in [1, 2, 3] {
+        for n in [1, 2] {
             if let Some(health) = view.poll_health.get_mut(&rid("claude", n)) {
                 health.consecutive_failures = 3;
             }
@@ -21852,7 +22290,16 @@ mod tests {
     /// key bar gains `v copy mode` after `↑↓ scroll` (the bottom row's text
     /// and its key cell's Cyan bold run); every other row unchanged
     /// (previous digest 11_178_084_734_170_114_220).
-    const FOLD_OFF_179X43_DIGEST: u64 = 16_419_190_790_333_588_667;
+    /// Re-pinned the same day for the section headings on twolab-tui's
+    /// `Rule`: the four rule rows in this frame (accounts, the band's top
+    /// border, models, activity) open with the rule's two-cell lead, so
+    /// each title reads `── accounts · …` (was ` accounts · …`), two cells
+    /// right; the band's ` detail ` (set past the widest band title) and
+    /// the strip legend move right with them, styles with their text, and
+    /// each row's closing fill is two cells shorter. Every row is still 179
+    /// cells, and every other cell is unchanged (previous digest
+    /// 16_419_190_790_333_588_667).
+    const FOLD_OFF_179X43_DIGEST: u64 = 8_543_463_821_239_879_891;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -21868,6 +22315,99 @@ mod tests {
             hash, FOLD_OFF_179X43_DIGEST,
             "fold-OFF frame changed:\n{frame}"
         );
+    }
+
+    /// Section headings are twolab-tui rules: each opens with the rule's
+    /// two-cell lead and a space, then its title, and runs the whole width
+    /// — on MAIN at 80×24 (the accounts title clipped with `…`, never
+    /// silently) and at 179×43, where the band's top border opens the same
+    /// way.
+    #[test]
+    fn section_headings_are_rules_with_a_lead_across_the_width() {
+        let (view, chrome) = recompose_view();
+        for (w, h) in [(80u16, 24u16), (179, 43)] {
+            let rows = render_rows(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let mut headings = vec![
+                row_of(&rows, " accounts · sort "),
+                row_of(&rows, " activity — "),
+            ];
+            if w == 179 {
+                headings.push(row_of(&rows, " scheduler · poller "));
+                headings.push(row_of(&rows, " models — top "));
+            }
+            for y in headings {
+                assert!(rows[y].starts_with("── "), "{w}x{h} row {y}:\n{frame}");
+                assert_eq!(cells::width(&rows[y]), usize::from(w), "{w}x{h} row {y}");
+                assert!(!rows[y].trim_end().is_empty(), "{w}x{h} row {y}");
+            }
+            // The rule clips a title too long for its row with `…`.
+            let accounts = &rows[row_of(&rows, " accounts · sort ")];
+            if w == 80 {
+                assert!(accounts.contains('…'), "{accounts}");
+            }
+        }
+        // The strip's legend starts past the title as the rule draws it.
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let models = &rows[row_of(&rows, " models — top ")];
+        assert!(
+            models.contains("(g: all) ── group · model · share"),
+            "{models}"
+        );
+    }
+
+    /// `LLMUX_AMBIGUOUS_WIDE=1` (`Chrome::ambiguous_wide`): on MAIN and on
+    /// every overlay with section headings, each rule draws ASCII `-` for
+    /// `─` and, measured as a terminal that draws East-Asian Ambiguous
+    /// glyphs two cells wide, ends at the right edge (its title's own `·`
+    /// and `—` included). Rows that are not rules draw exactly as before.
+    #[test]
+    fn ambiguous_wide_rules_draw_ascii_and_end_at_the_edge() {
+        use unicode_width::UnicodeWidthStr;
+        let (view, mut chrome) = recompose_view();
+        let surfaces = [
+            (Overlay::None, 80u16, 24u16),
+            (Overlay::None, 179, 43),
+            (Overlay::Accounts, 100, 30),
+            (Overlay::Stats, 100, 30),
+            (Overlay::Usage, 100, 30),
+            (Overlay::Sessions, 100, 30),
+            (Overlay::Perf, 100, 30),
+            (Overlay::Misc, 100, 30),
+            (Overlay::Config, 100, 30),
+        ];
+        for (overlay, w, h) in surfaces {
+            chrome.overlay = overlay;
+            chrome.ambiguous_wide = false;
+            let narrow = render_rows(&view, &chrome, w, h);
+            chrome.ambiguous_wide = true;
+            let wide = render_rows(&view, &chrome, w, h);
+            let frame = wide.join("\n");
+            let rules: Vec<usize> = (0..narrow.len())
+                .filter(|&y| narrow[y].starts_with("── "))
+                .collect();
+            assert!(
+                !rules.is_empty(),
+                "{overlay:?} {w}x{h} has a rule:\n{frame}"
+            );
+            for (y, (before, after)) in narrow.iter().zip(&wide).enumerate() {
+                if !rules.contains(&y) {
+                    assert_eq!(before, after, "{overlay:?} {w}x{h} row {y}");
+                    continue;
+                }
+                assert!(after.starts_with("-- "), "{overlay:?} row {y}:\n{frame}");
+                assert!(!after.contains('─'), "{overlay:?} row {y}: {after}");
+                assert!(
+                    after.trim_end().width_cjk() <= usize::from(w),
+                    "{overlay:?} {w}x{h} row {y} overflows a wide terminal: {after}"
+                );
+                let word = |row: &str| {
+                    let title: String = row.chars().skip(3).collect();
+                    title.split(' ').next().map(str::to_string)
+                };
+                assert_eq!(word(before), word(after), "{overlay:?} row {y}");
+            }
+        }
     }
 
     /// The backend group of fixture account `n`.
