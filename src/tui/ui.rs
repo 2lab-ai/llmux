@@ -118,7 +118,7 @@ mod palette {
     /// (`text_secondary`) in the terminal's default foreground — as before
     /// the move to KeyHints — because ANSI grey labels are near-invisible on
     /// a light-background terminal. Its `selected()` is reverse video, which
-    /// reads with and without colour.
+    /// reads with and without colour ([`super::selected_style`]).
     pub(super) const THEME: twolab_tui::Theme = twolab_tui::Theme {
         text_secondary: Color::Reset,
         ..twolab_tui::Theme::ansi()
@@ -195,6 +195,16 @@ use palette::{CHART_THEME, THEME};
 
 fn dim() -> Style {
     Style::new().fg(THEME.muted)
+}
+
+/// The one style of a selected row or item. llmux draws it on the cursor
+/// row of its own tables (accounts, models, sessions, perf); the twolab-tui
+/// widgets draw theirs with the same [`THEME`]`.selected()` — the compact
+/// list's focus, the fold's and the strip's cursor entry, the config, login
+/// and keys pickers, the menu. Reverse video on the ANSI theme: it needs no
+/// colour, so it reads the same under `NO_COLOR`.
+fn selected_style() -> Style {
+    THEME.selected()
 }
 
 thread_local! {
@@ -1830,7 +1840,7 @@ fn draw_sessions_table(
             ];
             let row = Row::new(cells);
             if idx == cursor {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
+                row.style(selected_style())
             } else {
                 row
             }
@@ -2454,7 +2464,7 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
             Cell::from(format!("{coverage:>7}")),
         ]);
         if idx == cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
+            row.style(selected_style())
         } else {
             row
         }
@@ -6081,7 +6091,7 @@ fn draw_accounts_with(
             layout.bar_width,
         );
         if cursor {
-            row.style(Style::new().add_modifier(Modifier::REVERSED))
+            row.style(selected_style())
         } else {
             row
         }
@@ -11028,7 +11038,7 @@ fn draw_models_table(
             cells.push(Cell::from(in_flight_span(m.in_flight)));
             let row = Row::new(cells);
             if idx == cursor {
-                row.style(Style::new().add_modifier(Modifier::REVERSED))
+                row.style(selected_style())
             } else {
                 row
             }
@@ -22857,6 +22867,120 @@ mod tests {
             "colour literals outside `mod palette` — name the theme field (or add a \
              palette const with its reason):\n{}",
             stray.join("\n")
+        );
+    }
+
+    /// One selected style: the cursor row of llmux's own tables (the
+    /// accounts table on MAIN, the models table on the stats tab) and the
+    /// focus a twolab-tui widget draws (the compact account list) all wear
+    /// [`selected_style`] — reverse video with no colour of its own, so it
+    /// reads the same under `NO_COLOR` — and the rows around them do not.
+    #[test]
+    fn a_selection_wears_the_one_selected_style_on_every_surface() {
+        let sel = selected_style();
+        assert_eq!(sel, THEME.selected(), "the widgets' selection too");
+        assert!(sel.add_modifier.contains(Modifier::REVERSED), "{sel:?}");
+        assert_eq!((sel.fg, sel.bg), (None, None), "no colour of its own");
+        let wears = |buf: &ratatui::buffer::Buffer, x: u16, y: usize| {
+            buf[(x, y as u16)].modifier.contains(sel.add_modifier)
+        };
+        // The cell where `needle` starts on `row`.
+        let at = |row: &str, needle: &str| {
+            let byte = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+            cells::width(&row[..byte]) as u16
+        };
+
+        // MAIN's accounts table: the `>` row, from the marker through the
+        // name, and not the row under it.
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let ctx = frame_ctx(&view, &chrome);
+        let second = view.snapshot.accounts[ctx.order[1]].id.0.clone();
+        let chrome = cursor_on(&view, &chrome, &second);
+        let buf = render_buffer(&view, &chrome, 179, 43);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let y = rows
+            .iter()
+            .position(|r| r.starts_with('>'))
+            .unwrap_or_else(|| panic!("{text}"));
+        for x in 0..12 {
+            assert!(wears(&buf, x, y), "accounts cursor row, cell {x}:\n{text}");
+            assert!(!wears(&buf, x, y - 1), "the row above, cell {x}:\n{text}");
+            assert!(!wears(&buf, x, y + 1), "the row below, cell {x}:\n{text}");
+        }
+
+        // The stats tab's models table: the cursor's row, not the other.
+        let view = view_with(vec![
+            model_row("codex", "gpt-5.5", 700, 300),
+            model_row("claude", "claude-sonnet-4-5", 100, 50),
+        ]);
+        let chrome = Chrome {
+            model_cursor: 1,
+            ..chrome_overlay(Overlay::Stats)
+        };
+        let buf = render_buffer(&view, &chrome, 160, 30);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let other = row_of(&rows, "gpt-5.5");
+        let x = at(&rows[other], "gpt-5.5");
+        let cursor = rows
+            .iter()
+            .position(|r| r.find("sonnet").is_some_and(|_| at(r, "sonnet") <= x + 7))
+            .unwrap_or_else(|| panic!("{text}"));
+        let name = at(&rows[cursor], "sonnet");
+        for dx in 0..6 {
+            assert!(wears(&buf, name + dx, cursor), "models cursor row:\n{text}");
+            assert!(!wears(&buf, x + dx, other), "models other row:\n{text}");
+        }
+
+        // The compact account list (twolab-tui `agent_list`, drawn with
+        // THEME): its focused entry, not the next.
+        let (view, _) = compact_view();
+        let chrome = Chrome {
+            compact_accounts: true,
+            mode: Mode::Select { idx: 0 },
+            ..chrome_overlay(Overlay::Accounts)
+        };
+        let buf = render_buffer(&view, &chrome, 40, 14);
+        let rows = buffer_rows(&buf);
+        let text = rows.join("\n");
+        let y = row_of(&rows, "›✗");
+        let x = at(&rows[y], "›✗");
+        for dx in 0..6 {
+            assert!(wears(&buf, x + dx, y), "compact focus:\n{text}");
+            assert!(!wears(&buf, x + dx, y + 1), "compact next entry:\n{text}");
+        }
+
+        // And no selection is built by hand: outside the copy-mode banner
+        // (a banner, not a selection) the drawing code never reverses a
+        // style itself.
+        let src = include_str!("ui.rs");
+        let code = &src[..src.find("\nmod tests {").expect("tests module")];
+        let banner = code
+            .find("\nfn copy_mode_banner(")
+            .expect("copy_mode_banner");
+        let banner = banner..banner + code[banner..].find("\n}\n").expect("its end");
+        let mut offset = 0;
+        let mut by_hand = Vec::new();
+        for (i, line) in code.split('\n').enumerate() {
+            if line.contains("Modifier::REVERSED")
+                && !line.trim_start().starts_with("//")
+                && !banner.contains(&offset)
+            {
+                by_hand.push(format!("ui.rs:{}: {}", i + 1, line.trim()));
+            }
+            offset += line.len() + 1;
+        }
+        assert!(
+            by_hand.is_empty(),
+            "a selection drawn by hand — use selected_style():\n{}",
+            by_hand.join("\n")
         );
     }
 
