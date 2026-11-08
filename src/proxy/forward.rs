@@ -1670,7 +1670,6 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
 }
 
 async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Response {
-    let params = state.select_params();
     let snapshot = state.pool.snapshot();
     let accounts = snapshot.accounts.len();
     // Claude Code's per-session "quota" status ping (classify kind `quota`)
@@ -1726,6 +1725,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     state.trigger_idle_probes(group);
 
     loop {
+        // Live params for every attempt: a setting changed while this request
+        // waited between attempts (save mode turned on, a ceiling moved) must
+        // bind its next lease, as a pause does through the pool state.
+        let params = state.select_params();
         // 1. Lease the current account for the group (evaluate on demand when
         // none).
         let lease = match acquire_lease(state, group, &params, scope) {
@@ -3051,11 +3054,14 @@ fn acquire_lease(
             // `Decision::Exhausted` predates the reason split; classify on a
             // fresh snapshot so a cooldown park answers with its own expiry.
             let snapshot = state.pool.snapshot();
+            let now = SystemTime::now();
             let (kind, eligible) =
-                select::classify_exhaustion(&snapshot, params, group, scope, SystemTime::now());
+                select::classify_exhaustion(&snapshot, params, group, scope, now);
             let retry_after = match kind {
                 select::ExhaustionKind::CooldownBlocked { min_expiry, .. } => Some(min_expiry),
-                select::ExhaustionKind::WindowBlocked => retry_after,
+                select::ExhaustionKind::WindowBlocked => {
+                    select::cap_at_save_cutoff(retry_after, params, now)
+                }
             };
             Err(ExhaustInfo {
                 retry_after,
