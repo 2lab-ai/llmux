@@ -1643,6 +1643,26 @@ impl AccountPool {
             .retain(|_, pin| !paused.contains(&pin.account.0));
     }
 
+    /// End the manual pins on every account save mode holds right now, as
+    /// [`Self::apply_paused`] does for a pause (issue #122 review M1): when
+    /// save mode is turned off inside the pin window, control goes back to
+    /// automatic scheduling, not to a stale override.
+    pub fn end_pins_held_by_save(&self, params: &select::SelectParams, now: SystemTime) {
+        let held: Vec<AccountId> = self
+            .snapshot()
+            .accounts
+            .iter()
+            .filter(|a| select::save_held(a, params, now))
+            .map(|a| a.id.clone())
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        self.write()
+            .manual_pin
+            .retain(|_, pin| !held.contains(&pin.account));
+    }
+
     /// Apply the per-account ceiling overrides (config `account_limits`) to
     /// the live pool — same config-is-SSOT convention as [`Self::apply_paused`].
     pub fn apply_limits(

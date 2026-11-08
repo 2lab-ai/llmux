@@ -231,8 +231,9 @@ pub struct SettingsLive {
     pub fable_weekly_max: AtomicU64,
     pub usage_max_age_secs: AtomicU64,
     /// Save mode cutoff, epoch seconds (config `scheduler.save_until`);
-    /// 0 = off.
-    pub save_until: AtomicU64,
+    /// 0 = off. Shared with the idle prober (it skips accounts save mode
+    /// holds for good).
+    pub save_until: Arc<AtomicU64>,
 }
 
 impl SettingsLive {
@@ -249,7 +250,7 @@ impl SettingsLive {
             seven_day_max: AtomicU64::new(config.scheduler.seven_day_max.to_bits()),
             fable_weekly_max: AtomicU64::new(config.scheduler.fable_weekly_max.to_bits()),
             usage_max_age_secs: AtomicU64::new(config.scheduler.usage_max_age_secs),
-            save_until: AtomicU64::new(config.scheduler.save_until.unwrap_or(0)),
+            save_until: Arc::new(AtomicU64::new(config.scheduler.save_until.unwrap_or(0))),
         }
     }
 
@@ -463,18 +464,23 @@ impl AppState {
             config.openrouter.upstream.clone(),
             config.openrouter.default_model.clone(),
         ));
+        let settings_live = Arc::new(SettingsLive::from_config(&config));
         // On-demand idle probe (issue #21): reuses the same client + provider
         // hooks the forward path uses to send one gated `max_tokens = 1` ping.
-        let idle_prober = Arc::new(IdleProber::new(
-            pool.clone(),
-            ReqwestProber::new(
-                client.clone(),
-                config.upstream.clone(),
-                codex.clone(),
-                config.codex.default_model.clone(),
-            ),
-            config.proxy.idle_probe,
-        ));
+        // It reads the live save-mode cutoff to skip accounts held for good.
+        let idle_prober = Arc::new(
+            IdleProber::new(
+                pool.clone(),
+                ReqwestProber::new(
+                    client.clone(),
+                    config.upstream.clone(),
+                    codex.clone(),
+                    config.codex.default_model.clone(),
+                ),
+                config.proxy.idle_probe,
+            )
+            .with_save_until(settings_live.save_until.clone()),
+        );
         // The classifier is built from config.routing whether or not routing
         // is enabled (it is simply not consulted on the forward path while
         // disabled — forward passes group = None).
@@ -519,7 +525,7 @@ impl AppState {
             raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             email_anonymous: Arc::new(AtomicBool::new(config.email_anonymous)),
-            settings_live: Arc::new(SettingsLive::from_config(&config)),
+            settings_live,
             round_robin: Arc::new(AtomicBool::new(
                 config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
             )),
@@ -577,16 +583,30 @@ impl AppState {
 
     /// Turn save mode on (`Some(epoch secs)`) or off (`None`) live, persisted
     /// to config `scheduler.save_until`. Persist first: a failed write leaves
-    /// the live scheduler untouched. The next evaluate tick moves a held
-    /// current account off cooperatively, like a pause.
+    /// the live scheduler untouched. Then every group is re-evaluated at once
+    /// (as a pause does through `apply_roster`), so a held current account is
+    /// moved off before the next request.
     pub fn set_save_until(&self, until: Option<u64>) -> Result<(), crate::config::ConfigError> {
         let Some(path) = &self.config_path else {
             return Err(crate::config::ConfigError::PersistenceUnavailable);
         };
+        // Persist and publish as one step: two concurrent calls must not leave
+        // the file holding one cutoff and the live scheduler the other.
+        static SAVE_MODE_WRITE: Mutex<()> = Mutex::new(());
+        let _serialized = SAVE_MODE_WRITE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::config::update_path(path, |c| c.scheduler.save_until = until)?;
         self.settings_live
             .save_until
             .store(until.unwrap_or(0), Ordering::Relaxed);
+        let params = self.select_params();
+        let now = SystemTime::now();
+        // A pin on a held account ends, as a pause ends it.
+        self.pool.end_pins_held_by_save(&params, now);
+        for group in eval_groups(&self.pool, self.config.routing.enabled) {
+            self.pool.evaluate(group, &params, now);
+        }
         tracing::info!(save_until = ?until, "save mode updated");
         Ok(())
     }
@@ -1371,11 +1391,17 @@ pub async fn serve(
     let tick_pool = state.pool.clone();
     let tick_events = state.events.clone();
     let tick_routing_enabled = state.config.routing.enabled;
+    // The tick reads the LIVE params every round: live settings (thresholds,
+    // scheduler mode, save mode) must reach the re-evaluation too, or a tick
+    // with the boot-time view would switch back onto an account the request
+    // path now refuses (e.g. one save mode holds).
+    let tick_state = state.clone();
     let tick_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(EVALUATE_TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            let params = tick_state.select_params();
             for group in eval_groups(&tick_pool, tick_routing_enabled) {
                 let slot = group.unwrap_or(crate::routing::BackendGroup::Claude);
                 let before = tick_pool.snapshot().current.get(&slot).cloned();
@@ -5103,6 +5129,67 @@ mod tests {
         let doc = response_json(status(State(state.clone())).await).await;
         assert_eq!(doc["save_mode"]["active"], false);
         assert_eq!(doc["save_mode"]["held"], 0);
+    }
+
+    #[tokio::test]
+    async fn save_mode_moves_a_held_current_off_at_once() {
+        // `a` is current and resets in 5 days; `b` resets tomorrow. Turning save
+        // mode on with a 3-day cutoff must move the slot to `b` in the same
+        // call — not at the next tick, and not after a refused request.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a"), oauth_account("b")]);
+        let now = SystemTime::now();
+        let weekly = |days: u64| crate::scheduler::usage::UsageSnapshot {
+            five_hour: None,
+            seven_day: Some(crate::scheduler::headers::WindowReading {
+                utilization: 0.10,
+                resets_at: now + Duration::from_secs(days * 86_400),
+            }),
+            scoped: Vec::new(),
+        };
+        state
+            .pool
+            .record_usage(&AccountId("a".into()), &weekly(5), now);
+        state
+            .pool
+            .record_usage(&AccountId("b".into()), &weekly(1), now);
+        state
+            .pool
+            .switch_to(&AccountId("a".into()), &state.select_params(), now)
+            .expect("switch to a");
+        assert_eq!(
+            state
+                .pool
+                .snapshot()
+                .representative_current()
+                .map(|c| c.0.clone()),
+            Some("a".to_string())
+        );
+
+        let until = epoch_secs(now) + 3 * 86_400;
+        state.set_save_until(Some(until)).expect("save mode on");
+        assert_eq!(
+            state
+                .pool
+                .snapshot()
+                .representative_current()
+                .map(|c| c.0.clone()),
+            Some("b".to_string()),
+            "the held current moved off in the same call"
+        );
+        // The manual pin on `a` ENDED, as a pause ends it: turning save mode
+        // off hands control back to the scheduler, not to the stale pin.
+        state.set_save_until(None).expect("save mode off");
+        assert_eq!(
+            state
+                .pool
+                .snapshot()
+                .representative_current()
+                .map(|c| c.0.clone()),
+            Some("b".to_string()),
+            "no stale pin retakes the slot"
+        );
     }
 
     #[tokio::test]

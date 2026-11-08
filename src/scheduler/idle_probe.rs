@@ -26,7 +26,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use http::HeaderMap;
@@ -113,6 +114,9 @@ pub struct IdleProber<P> {
     /// when the gate is acquired, BEFORE the send — so a slow/failing probe
     /// still consumes the cooldown and cannot be retried in a tight loop).
     last_probe_at: Mutex<HashMap<AccountId, SystemTime>>,
+    /// The live save-mode cutoff (epoch seconds, 0 = off), shared with the
+    /// server's live settings so a toggle reaches the prober at once.
+    save_until: Arc<AtomicU64>,
 }
 
 impl<P: Prober> IdleProber<P> {
@@ -122,6 +126,20 @@ impl<P: Prober> IdleProber<P> {
             prober,
             config,
             last_probe_at: Mutex::new(HashMap::new()),
+            save_until: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Read the save-mode cutoff from `cell` (epoch seconds, 0 = off).
+    pub fn with_save_until(mut self, cell: Arc<AtomicU64>) -> Self {
+        self.save_until = cell;
+        self
+    }
+
+    fn save_until(&self) -> Option<SystemTime> {
+        match self.save_until.load(AtomicOrdering::Relaxed) {
+            0 => None,
+            secs => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
         }
     }
 
@@ -154,9 +172,13 @@ impl<P: Prober> IdleProber<P> {
     /// ([`windows_need_probe`]) — AND it is not operator-paused. An account
     /// with a fresh window is already covered by headers/poll, and a paused
     /// account was explicitly benched by the operator (spending quota on it
-    /// would contradict the pause), so both are left alone.
+    /// would contradict the pause), so both are left alone. Save mode skips
+    /// an account it holds with a KNOWN reset after the cutoff for the same
+    /// reason; one held only because its reset is unknown is still probed,
+    /// since the probe may show it resets before the cutoff.
     fn probe_eligible(&self, account: &AccountId, now: SystemTime) -> bool {
         let stale_after = Duration::from_secs(self.config.stale_after_secs);
+        let save_until = self.save_until();
         self.pool
             .snapshot()
             .accounts
@@ -164,6 +186,7 @@ impl<P: Prober> IdleProber<P> {
             .find(|a| &a.id == account)
             .is_some_and(|a| {
                 !a.paused
+                    && !super::select::save_hold_is_final(a, save_until, now)
                     && windows_need_probe(
                         a.five_hour.as_ref(),
                         a.seven_day.as_ref(),
@@ -241,6 +264,7 @@ mod tests {
     use super::*;
     use crate::config::AccountConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const NOW_SECS: u64 = 1_000_000;
 
@@ -542,6 +566,49 @@ mod tests {
             "past stale_after: stale window re-probed"
         );
         assert_eq!(prober.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_mode_skips_a_held_account_whose_reset_is_known() {
+        // `known` has a stale 7d window that resets after the cutoff: a probe
+        // cannot release it, so spending quota on it would defeat save mode.
+        // `cold` has no window: its reset is unknown and a probe may show it
+        // resets before the cutoff, so it is still probed.
+        let pool = AccountPool::new(&[oauth_account("known"), oauth_account("cold")]);
+        pool.record_usage(
+            &id("known"),
+            &crate::scheduler::usage::UsageSnapshot {
+                five_hour: None,
+                seven_day: Some(rl_headers::WindowReading {
+                    utilization: 0.1,
+                    resets_at: at(NOW_SECS + 5 * 86_400),
+                }),
+                scoped: Vec::new(),
+            },
+            now(),
+        );
+        let later = at(NOW_SECS + 901); // past stale_after: `known` is stale
+        let cutoff = Arc::new(std::sync::atomic::AtomicU64::new(NOW_SECS + 3 * 86_400));
+        let prober = CountingProber::new(0.42);
+        let orch =
+            IdleProber::new(pool.clone(), &prober, cfg(true, 900)).with_save_until(cutoff.clone());
+
+        assert!(
+            !orch.probe_if_idle(&id("known"), later).await,
+            "held, reset known: no probe"
+        );
+        assert!(
+            orch.probe_if_idle(&id("cold"), later).await,
+            "held, reset unknown: probed"
+        );
+
+        // Save mode off: the stale account is probed as before.
+        cutoff.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            orch.probe_if_idle(&id("known"), later).await,
+            "save mode off: probed"
+        );
+        assert_eq!(prober.call_count(), 2);
     }
 
     #[test]

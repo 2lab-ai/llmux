@@ -275,6 +275,40 @@ pub fn save_held(account: &AccountSnapshot, params: &SelectParams, now: SystemTi
     save_reset_at(account, now).is_some_and(|reset| reset > until)
 }
 
+/// Save mode holds this account AND its weekly reset is already known (a live
+/// 7d reading after the cutoff), so nothing short of the cutoff releases it.
+/// The idle prober skips such an account: a probe would spend held quota and
+/// could not change the decision. An account held only because its reset is
+/// unknown is NOT final — a probe may show it resets before the cutoff.
+pub fn save_hold_is_final(
+    account: &AccountSnapshot,
+    save_until: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    let Some(until) = save_until.filter(|until| *until > now) else {
+        return false;
+    };
+    has_weekly_quota(account) && live_reset(&account.seven_day, now).is_some_and(|r| r > until)
+}
+
+/// A window-blocked `retry-after` capped at an active save-mode cutoff: the
+/// accounts save mode holds serve again then, so a 429 never tells a client to
+/// wait past it. Unchanged when save mode is off or its cutoff has passed.
+pub fn cap_at_save_cutoff(
+    retry_after: Option<Duration>,
+    params: &SelectParams,
+    now: SystemTime,
+) -> Option<Duration> {
+    let Some(left) = params
+        .save_until
+        .and_then(|until| until.duration_since(now).ok())
+        .filter(|left| !left.is_zero())
+    else {
+        return retry_after;
+    };
+    Some(retry_after.map_or(left, |r| r.min(left)))
+}
+
 /// True when the account's freshest LIVE (non-expired) window observation is
 /// older than `max_age`. An account with no live observations at all is cold,
 /// not stale — expired windows carry no constraint and old-but-expired data
@@ -1550,6 +1584,28 @@ mod tests {
         assert_eq!(eligibility(&after, &p, now(), false), None, "cutoff passed");
         p.save_until = None;
         assert_eq!(eligibility(&after, &p, now(), false), None, "off");
+    }
+
+    #[test]
+    fn save_mode_caps_retry_after_at_the_cutoff() {
+        // Held accounts serve again at the cutoff: a 429 never tells a client
+        // to wait past it.
+        let p = save_params(3 * HOUR);
+        let week = Some(Duration::from_secs(100 * HOUR));
+        assert_eq!(
+            cap_at_save_cutoff(week, &p, now()),
+            Some(Duration::from_secs(3 * HOUR))
+        );
+        assert_eq!(
+            cap_at_save_cutoff(None, &p, now()),
+            Some(Duration::from_secs(3 * HOUR))
+        );
+        let soon = Some(Duration::from_secs(600));
+        assert_eq!(cap_at_save_cutoff(soon, &p, now()), soon, "sooner wins");
+        assert_eq!(cap_at_save_cutoff(week, &params(), now()), week, "off");
+        let mut passed = params();
+        passed.save_until = Some(at(NOW_SECS - 1));
+        assert_eq!(cap_at_save_cutoff(week, &passed, now()), week, "passed");
     }
 
     #[test]
