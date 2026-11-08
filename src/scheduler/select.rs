@@ -275,11 +275,12 @@ pub fn save_held(account: &AccountSnapshot, params: &SelectParams, now: SystemTi
     save_reset_at(account, now).is_some_and(|reset| reset > until)
 }
 
-/// Save mode holds this account AND its weekly reset is already known (a live
-/// 7d reading after the cutoff), so nothing short of the cutoff releases it.
+/// Save mode holds this account AND its weekly reset is known — a 7d reading
+/// exists, live (it resets after the cutoff) or already reset (the next week
+/// opens a full week from now) — so nothing short of the cutoff releases it.
 /// The idle prober skips such an account: a probe would spend held quota and
-/// could not change the decision. An account held only because its reset is
-/// unknown is NOT final — a probe may show it resets before the cutoff.
+/// could not change the decision. An account never observed is NOT final — a
+/// probe may show it resets before the cutoff.
 pub fn save_hold_is_final(
     account: &AccountSnapshot,
     save_until: Option<SystemTime>,
@@ -288,7 +289,7 @@ pub fn save_hold_is_final(
     let Some(until) = save_until.filter(|until| *until > now) else {
         return false;
     };
-    has_weekly_quota(account) && live_reset(&account.seven_day, now).is_some_and(|r| r > until)
+    account.seven_day.is_some() && save_reset_at(account, now).is_some_and(|reset| reset > until)
 }
 
 /// A window-blocked `retry-after` capped at an active save-mode cutoff: the

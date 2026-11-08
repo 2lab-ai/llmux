@@ -601,6 +601,24 @@ mod tests {
             orch.probe_if_idle(&id("cold"), later).await,
             "held, reset unknown: probed"
         );
+        // A week that already reset is known too: the next one opens a full
+        // week from now, past the cutoff — a probe would only spend it.
+        pool.record_usage(
+            &id("known"),
+            &crate::scheduler::usage::UsageSnapshot {
+                five_hour: None,
+                seven_day: Some(rl_headers::WindowReading {
+                    utilization: 0.9,
+                    resets_at: at(NOW_SECS + 600),
+                }),
+                scoped: Vec::new(),
+            },
+            now(),
+        );
+        assert!(
+            !orch.probe_if_idle(&id("known"), later).await,
+            "held after its week reset: no probe"
+        );
 
         // Save mode off: the stale account is probed as before.
         cutoff.store(0, std::sync::atomic::Ordering::Relaxed);
