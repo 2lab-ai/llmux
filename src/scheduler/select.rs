@@ -26,6 +26,10 @@ pub struct SelectParams {
     /// accounts are stale, in which case selection falls back to
     /// headers-only mode (429-driven, the always-true path).
     pub usage_max_age: Duration,
+    /// Save mode cutoff (config `scheduler.save_until`). While it is in the
+    /// future, accounts whose weekly window resets after it are held
+    /// ([`IneligibleReason::Saved`]); `None` or a passed cutoff = off.
+    pub save_until: Option<SystemTime>,
 }
 
 impl From<&SchedulerConfig> for SelectParams {
@@ -36,6 +40,9 @@ impl From<&SchedulerConfig> for SelectParams {
             fable_weekly_max: cfg.fable_weekly_max,
             mode: cfg.mode,
             usage_max_age: Duration::from_secs(cfg.usage_max_age_secs),
+            save_until: cfg
+                .save_until
+                .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
         }
     }
 }
@@ -60,6 +67,10 @@ pub enum IneligibleReason {
     /// Operator pause (config `paused_accounts`): absolute — gates automatic
     /// selection, manual switch, and every degraded mode alike, until resumed.
     Paused,
+    /// Save mode (config `scheduler.save_until`): the account's weekly window
+    /// resets after the cutoff, so its quota is saved for after it. As
+    /// absolute as [`Self::Paused`] until the cutoff passes.
+    Saved,
     CoolingDown,
     FiveHourOverThreshold,
     SevenDayOverThreshold,
@@ -85,6 +96,7 @@ impl IneligibleReason {
             self,
             IneligibleReason::AuthUnhealthy
                 | IneligibleReason::Paused
+                | IneligibleReason::Saved
                 | IneligibleReason::CoolingDown
                 | IneligibleReason::FableCoolingDown
         )
@@ -160,6 +172,10 @@ pub fn gate(
     if account.paused {
         return Some(IneligibleReason::Paused);
     }
+    // Save mode is a pause by reset time: same strength, every mode.
+    if save_held(account, params, now) {
+        return Some(IneligibleReason::Saved);
+    }
     // A cooldown gates UNLESS we are in heuristic-degraded mode and this park
     // is a Heuristic one — a RetryAfter park is an explicit upstream
     // instruction and always gates.
@@ -227,6 +243,36 @@ pub fn gate_scoped(
         }
     }
     None
+}
+
+/// Whether the account's plan carries a weekly quota window — every
+/// subscription (Claude, Codex, Grok, Gemini). Save mode holds only these: a
+/// pay-as-you-go API key or openrouter account has no weekly quota to save.
+fn has_weekly_quota(account: &AccountSnapshot) -> bool {
+    !matches!(account.credential_kind, "apikey" | "openrouter")
+}
+
+/// When the account's weekly quota is next lost, as save mode reads it: the
+/// live 7d reset, or — with no reading, or a window that already reset — a
+/// full week from now, because the next request opens a fresh window. `None`
+/// for an account without a weekly quota.
+pub fn save_reset_at(account: &AccountSnapshot, now: SystemTime) -> Option<SystemTime> {
+    if !has_weekly_quota(account) {
+        return None;
+    }
+    live_reset(&account.seven_day, now).or_else(|| now.checked_add(SEVEN_DAY_PERIOD))
+}
+
+/// Save mode (config `scheduler.save_until`): while the cutoff is ahead, an
+/// account whose weekly quota is lost only AFTER it is held — that quota is
+/// still there after the cutoff, so it is saved; the accounts that reset by
+/// the cutoff serve. A reset exactly at the cutoff serves. Off once `now`
+/// reaches the cutoff.
+pub fn save_held(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> bool {
+    let Some(until) = params.save_until.filter(|until| *until > now) else {
+        return false;
+    };
+    save_reset_at(account, now).is_some_and(|reset| reset > until)
 }
 
 /// True when the account's freshest LIVE (non-expired) window observation is
@@ -433,6 +479,7 @@ pub fn pick_scoped(
             {
                 let hard_blocked = !acct.healthy
                     || acct.paused
+                    || save_held(acct, params, now)
                     || acct.cooldown_until.is_some_and(|until| until > now)
                     || (scope == RequestScope::Fable && acct.fable_cooldown_active(now));
                 if !hard_blocked {
@@ -1033,6 +1080,12 @@ pub fn blocking_reason(
             }
         }
         IneligibleReason::Paused => "paused".to_string(),
+        IneligibleReason::Saved => {
+            match save_reset_at(account, now).and_then(|reset| reset.duration_since(now).ok()) {
+                Some(left) => format!("saved · 7d resets in {}", compact_duration(left)),
+                None => "saved".to_string(),
+            }
+        }
         IneligibleReason::CoolingDown => {
             match account
                 .cooldown_until
@@ -1255,6 +1308,7 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
+            save_until: None,
         }
     }
 
@@ -1383,6 +1437,155 @@ mod tests {
         // Resumed → eligible again.
         a.paused = false;
         assert_eq!(eligibility(&a, &params(), now(), false), None);
+    }
+
+    // ---- save mode (config `scheduler.save_until`) ----
+
+    /// Save mode on, with the cutoff `secs_ahead` from now.
+    fn save_params(secs_ahead: u64) -> SelectParams {
+        let mut p = params();
+        p.save_until = Some(at(NOW_SECS + secs_ahead));
+        p
+    }
+
+    fn weekly(id: &str, resets_in_secs: u64) -> AccountSnapshot {
+        let mut a = account(id);
+        a.seven_day = Some(window(0.30, resets_in_secs));
+        a
+    }
+
+    #[test]
+    fn save_mode_holds_accounts_whose_weekly_reset_is_after_the_cutoff() {
+        // Cutoff 3 days out (Friday → Monday 15:00).
+        let p = save_params(72 * HOUR);
+        let before = weekly("before", 30 * HOUR);
+        let after = weekly("after", 100 * HOUR);
+        assert_eq!(eligibility(&before, &p, now(), false), None);
+        assert_eq!(
+            eligibility(&after, &p, now(), false),
+            Some(IneligibleReason::Saved)
+        );
+        // A reset exactly AT the cutoff is quota lost by the cutoff: it serves.
+        let on_the_cutoff = weekly("edge", 72 * HOUR);
+        assert_eq!(eligibility(&on_the_cutoff, &p, now(), false), None);
+        assert_eq!(
+            blocking_reason(&after, IneligibleReason::Saved, &p, now()),
+            "saved · 7d resets in 4d4h"
+        );
+    }
+
+    #[test]
+    fn save_mode_holds_in_every_degraded_mode_like_a_pause() {
+        let p = save_params(72 * HOUR);
+        let after = weekly("after", 100 * HOUR);
+        for (headers_only, degraded) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            assert_eq!(
+                gate(&after, &p, now(), headers_only, degraded),
+                Some(IneligibleReason::Saved),
+                "headers_only={headers_only} degraded={degraded}"
+            );
+        }
+        assert!(IneligibleReason::Saved.hard_failure(), "pause parity");
+    }
+
+    #[test]
+    fn save_mode_treats_an_unknown_or_passed_weekly_reset_as_a_fresh_week() {
+        // No 7d reading, or a 7d window that already reset: the next request
+        // opens a new window that resets a full week from now.
+        let cold = account("cold");
+        let mut passed = account("passed");
+        passed.seven_day = Some(QuotaWindow {
+            utilization: 0.80,
+            resets_at: at(NOW_SECS - HOUR),
+            fetched_at: at(NOW_SECS - 2 * HOUR),
+            source: WindowSource::UsagePoll,
+        });
+        let three_days = save_params(72 * HOUR);
+        assert_eq!(
+            eligibility(&cold, &three_days, now(), false),
+            Some(IneligibleReason::Saved)
+        );
+        assert_eq!(
+            eligibility(&passed, &three_days, now(), true),
+            Some(IneligibleReason::Saved)
+        );
+        // A cutoff more than a week out: a fresh week ends before it.
+        let eight_days = save_params(8 * 24 * HOUR);
+        assert_eq!(eligibility(&cold, &eight_days, now(), false), None);
+    }
+
+    #[test]
+    fn save_mode_leaves_accounts_without_a_weekly_quota_alone() {
+        let p = save_params(72 * HOUR);
+        // Pay-as-you-go: no weekly quota to save, even with no window at all.
+        for kind in ["apikey", "openrouter"] {
+            let mut a = account(kind);
+            a.credential_kind = kind;
+            assert_eq!(eligibility(&a, &p, now(), false), None, "{kind}");
+        }
+        // Every subscription carries a weekly window: held like Claude's.
+        for kind in ["codex", "grok", "gemini"] {
+            let mut a = weekly(kind, 100 * HOUR);
+            a.credential_kind = kind;
+            assert_eq!(
+                eligibility(&a, &p, now(), false),
+                Some(IneligibleReason::Saved),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn save_mode_ends_by_itself_at_the_cutoff() {
+        let after = weekly("after", 100 * HOUR);
+        let mut p = params();
+        p.save_until = Some(now());
+        assert_eq!(
+            eligibility(&after, &p, now(), false),
+            None,
+            "cutoff reached"
+        );
+        p.save_until = Some(at(NOW_SECS - HOUR));
+        assert_eq!(eligibility(&after, &p, now(), false), None, "cutoff passed");
+        p.save_until = None;
+        assert_eq!(eligibility(&after, &p, now(), false), None, "off");
+    }
+
+    #[test]
+    fn save_mode_picks_only_soon_resetting_accounts_and_breaks_a_pin() {
+        let p = save_params(72 * HOUR);
+        // The current account resets after the cutoff: move off it.
+        let snap = pool(
+            vec![weekly("monday", 100 * HOUR), weekly("saturday", 30 * HOUR)],
+            Some("monday"),
+        );
+        assert_eq!(
+            pick(&snap, &p, None, now()),
+            Decision::Switch { to: id("saturday") }
+        );
+        // A manual pin on a held account does not survive save mode.
+        let mut pinned = snap.clone();
+        pinned.manual_pin.insert(
+            BackendGroup::Claude,
+            crate::scheduler::ManualPin {
+                account: id("monday"),
+                until: at(NOW_SECS + 600),
+            },
+        );
+        assert_eq!(
+            pick(&pinned, &p, None, now()),
+            Decision::Switch { to: id("saturday") }
+        );
+        // Nothing resets before the cutoff: exhausted, exactly like a pause.
+        let all_held = pool(
+            vec![weekly("monday", 100 * HOUR), weekly("tuesday", 120 * HOUR)],
+            Some("monday"),
+        );
+        assert!(matches!(
+            pick(&all_held, &p, None, now()),
+            Decision::Exhausted { .. }
+        ));
     }
 
     /// Build a snapshot whose legacy current slot is `current` (the
@@ -2846,6 +3049,7 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
+            save_until: None,
         };
         for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {
             let a = {

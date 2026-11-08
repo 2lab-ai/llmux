@@ -952,6 +952,10 @@ pub struct SelectParamsDoc {
     #[serde(default)]
     pub mode: crate::config::SchedulerMode,
     pub usage_max_age_secs: u64,
+    /// Save mode cutoff, epoch seconds (config `scheduler.save_until`), so the
+    /// attach-mode view gates exactly like the daemon. Additive: absent = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_until: Option<u64>,
 }
 
 impl From<&SelectParams> for SelectParamsDoc {
@@ -962,6 +966,7 @@ impl From<&SelectParams> for SelectParamsDoc {
             fable_weekly_max: params.fable_weekly_max,
             mode: params.mode,
             usage_max_age_secs: params.usage_max_age.as_secs(),
+            save_until: params.save_until.map(epoch_secs),
         }
     }
 }
@@ -974,6 +979,9 @@ impl From<&SelectParamsDoc> for SelectParams {
             fable_weekly_max: doc.fable_weekly_max,
             mode: doc.mode,
             usage_max_age: Duration::from_secs(doc.usage_max_age_secs),
+            save_until: doc
+                .save_until
+                .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
         }
     }
 }
@@ -2385,6 +2393,7 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
+            save_until: None,
         }
     }
 

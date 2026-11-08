@@ -106,6 +106,7 @@ Each account tracks 5-hour and 7-day quota windows. The scheduler chooses among 
 | `usage_poll_secs` | `300` | Per-account OAuth usage poll interval. |
 | `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
 | `refresh_ahead_secs` | `25200` | Background refresh threshold; default 7 hours before token expiry. |
+| `save_until` | absent | [Save mode](schedulers.md#save-mode) cutoff, epoch seconds. Until then, subscription accounts whose 7-day window resets after it are held like a pause. Set it with `POST /llmux/save-mode`; it stops having any effect once the time passes. |
 
 See [the scheduler perishability design](../.prd/09-scheduler-perishability.md) for the derivation and edge cases.
 
