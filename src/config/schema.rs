@@ -1037,6 +1037,15 @@ pub struct SchedulerConfig {
     /// older configs load `default`.
     #[serde(default)]
     pub mode: SchedulerMode,
+    /// Save mode cutoff, epoch seconds (`POST /llmux/save-mode`). While it is
+    /// in the future, an account whose WEEKLY window resets after it is held
+    /// like a pause — its quota survives the cutoff, so it is saved for after
+    /// it — and only accounts whose weekly quota would be lost by then serve.
+    /// Inert once the cutoff passes. Pay-as-you-go accounts (API keys,
+    /// openrouter) have no weekly quota and are never held. Additive: absent
+    /// = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_until: Option<u64>,
 }
 
 /// Selection algorithm (config `scheduler.mode`).
@@ -1073,6 +1082,7 @@ impl Default for SchedulerConfig {
             refresh_ahead_secs: default_refresh_ahead_secs(),
             fable_weekly_max: default_fable_weekly_max(),
             mode: SchedulerMode::default(),
+            save_until: None,
         }
     }
 }

@@ -1725,6 +1725,7 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
+            save_until: None,
         }
     }
 

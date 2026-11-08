@@ -3345,6 +3345,23 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             action: None,
         },
         CfgRow {
+            section: "scheduler",
+            label: "save mode",
+            value: match p
+                .save_until
+                .and_then(|until| until.duration_since(SystemTime::now()).ok())
+            {
+                Some(left) if !left.is_zero() => format!(
+                    "on · ends in {}",
+                    crate::scheduler::select::compact_duration(left)
+                ),
+                _ => "off".into(),
+            },
+            state: CfgState::ReadOnly,
+            note: "POST /llmux/save-mode (scheduler.save_until)",
+            action: None,
+        },
+        CfgRow {
             section: "codex",
             label: "model",
             value: view.codex.model.clone(),
@@ -6324,7 +6341,8 @@ impl CompactKind {
             Some(IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown) => {
                 CompactKind::Cooling
             }
-            Some(IneligibleReason::Paused) => CompactKind::Paused,
+            // Save mode holds like a pause (its word says `saved`).
+            Some(IneligibleReason::Paused | IneligibleReason::Saved) => CompactKind::Paused,
             Some(IneligibleReason::UsageStale) => CompactKind::Stale,
         }
     }
@@ -6395,6 +6413,7 @@ fn compact_word(
             Some(t) => format!("cooling {t}"),
             None => "cooling".into(),
         },
+        (CompactKind::Paused, Some(IneligibleReason::Saved)) => "saved".into(),
         (kind, _) => kind.word().into(),
     }
 }
@@ -7164,7 +7183,7 @@ fn status_span(
             None,
             Style::new().fg(THEME.fail).add_modifier(Modifier::BOLD),
         ),
-        IneligibleReason::Paused => (None, Style::new().fg(THEME.wait)),
+        IneligibleReason::Paused | IneligibleReason::Saved => (None, Style::new().fg(THEME.wait)),
         IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
             Some(SpinnerKind::Breathe.glyph(frame)),
             Style::new().fg(THEME.crit),
@@ -7692,10 +7711,11 @@ const BOUND_SPANS: [Duration; 3] = [
 /// The statuses the detail line can show: eligible, or one of the reasons
 /// `select::eligibility` returns (select.rs `gate`, 147-193 at 7fddcc2 —
 /// the Fable reasons are scope-gated out of it).
-const DETAIL_GATES: [Option<IneligibleReason>; 7] = [
+const DETAIL_GATES: [Option<IneligibleReason>; 8] = [
     None,
     Some(IneligibleReason::AuthUnhealthy),
     Some(IneligibleReason::Paused),
+    Some(IneligibleReason::Saved),
     Some(IneligibleReason::CoolingDown),
     Some(IneligibleReason::FiveHourOverThreshold),
     Some(IneligibleReason::SevenDayOverThreshold),
@@ -12549,6 +12569,7 @@ mod tests {
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
                 usage_max_age: Duration::from_secs(600),
+                save_until: None,
             },
             refresh_ahead: Duration::from_secs(25_200),
             evaluate_tick: Duration::from_secs(60),
@@ -19638,6 +19659,7 @@ mod tests {
                 cache_creation: 1.25,
             },
         );
+        config.scheduler.save_until = Some(1_800_000_000);
         config.paused_accounts.insert("a@x.com".into());
         config.account_limits.insert(
             "a@x.com".into(),
@@ -19759,6 +19781,7 @@ mod tests {
                 refresh_ahead_secs: _,
                 fable_weekly_max: _,
                 mode: _,
+                save_until: _,
             } = scheduler;
             let crate::config::RoutingConfig {
                 enabled: _,
@@ -19841,6 +19864,7 @@ mod tests {
             "scheduler.usage_max_age_secs",
             "scheduler.usage_poll_secs",
             "scheduler.refresh_ahead_secs",
+            "scheduler.save_until",
             "claude_code.gpt_model_mapping.opus",
             "claude_code.gpt_model_mapping.sonnet",
             "claude_code.gpt_model_mapping.haiku",

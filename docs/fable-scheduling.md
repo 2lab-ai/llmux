@@ -80,6 +80,9 @@ Any 429 on a manually pinned account also releases the pin.
   both lanes, overrides thresholds.
 - **Pause** (`p` / `POST /llmux/pause-account`) — absolute bench, both
   lanes, until resumed.
+- **Save mode** (`POST /llmux/save-mode`) — a pause by reset time: every
+  account whose weekly window resets after the cutoff, both lanes, until
+  the cutoff ([schedulers](schedulers.md#save-mode)).
 - **`llmux reset-usage`** (`POST /llmux/reset-usage`) — force every gauge
   back to cold after a provider-side quota reset; feeds repopulate from
   headers/polls.

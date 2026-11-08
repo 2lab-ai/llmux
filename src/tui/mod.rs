@@ -7423,11 +7423,12 @@ mod tests {
         let editable: Vec<usize> = (0..60)
             .filter(|&i| ui::config_row_action(&view, &chrome, i).is_some())
             .collect();
-        // Rows 5 and 6 (per-account limits, paused accounts) are read-only.
-        assert!(!editable.contains(&5) && !editable.contains(&6));
+        // Rows 5, 6 and 7 (per-account limits, paused accounts, save mode)
+        // are read-only.
+        assert!(!editable.contains(&5) && !editable.contains(&6) && !editable.contains(&7));
         app.config_cursor = 4;
         app.on_key_config(KeyCode::Down, Some(&view));
-        assert_eq!(app.config_cursor, 7, "Down skips the read-only rows");
+        assert_eq!(app.config_cursor, 8, "Down skips the read-only rows");
         app.on_key_config(KeyCode::Char('k'), Some(&view));
         assert_eq!(app.config_cursor, 4, "k skips them going up");
         app.on_key_config(KeyCode::Home, Some(&view));
@@ -11447,6 +11448,7 @@ mod tests {
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
                 usage_max_age: Duration::from_secs(600),
+                save_until: None,
             },
             refresh_ahead: Duration::from_secs(25_200),
             evaluate_tick: Duration::from_secs(60),

@@ -239,7 +239,8 @@ fn tier(account: &AccountSnapshot, gate: Option<IneligibleReason>) -> u8 {
         None if account.five_hour.is_some() => 2,
         // Eligible but no 5h sample yet: "ready" — below the known rows.
         None => 3,
-        Some(IneligibleReason::Paused) => 4,
+        // Save mode holds like a pause: an operator decision, not a fault.
+        Some(IneligibleReason::Paused | IneligibleReason::Saved) => 4,
         // cold / unknown last — distinctly BELOW paused so a stale account
         // can't shadow an operator decision. (#33 keeps the label distinct.)
         Some(IneligibleReason::UsageStale) => 5,
@@ -547,6 +548,7 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
+            save_until: None,
         }
     }
 
