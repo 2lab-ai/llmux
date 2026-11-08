@@ -230,6 +230,10 @@ pub struct SettingsLive {
     pub seven_day_max: AtomicU64,
     pub fable_weekly_max: AtomicU64,
     pub usage_max_age_secs: AtomicU64,
+    /// Save mode cutoff, epoch seconds (config `scheduler.save_until`);
+    /// 0 = off. Shared with the idle prober (it skips accounts save mode
+    /// holds for good).
+    pub save_until: Arc<AtomicU64>,
 }
 
 impl SettingsLive {
@@ -246,6 +250,7 @@ impl SettingsLive {
             seven_day_max: AtomicU64::new(config.scheduler.seven_day_max.to_bits()),
             fable_weekly_max: AtomicU64::new(config.scheduler.fable_weekly_max.to_bits()),
             usage_max_age_secs: AtomicU64::new(config.scheduler.usage_max_age_secs),
+            save_until: Arc::new(AtomicU64::new(config.scheduler.save_until.unwrap_or(0))),
         }
     }
 
@@ -459,18 +464,23 @@ impl AppState {
             config.openrouter.upstream.clone(),
             config.openrouter.default_model.clone(),
         ));
+        let settings_live = Arc::new(SettingsLive::from_config(&config));
         // On-demand idle probe (issue #21): reuses the same client + provider
         // hooks the forward path uses to send one gated `max_tokens = 1` ping.
-        let idle_prober = Arc::new(IdleProber::new(
-            pool.clone(),
-            ReqwestProber::new(
-                client.clone(),
-                config.upstream.clone(),
-                codex.clone(),
-                config.codex.default_model.clone(),
-            ),
-            config.proxy.idle_probe,
-        ));
+        // It reads the live save-mode cutoff to skip accounts held for good.
+        let idle_prober = Arc::new(
+            IdleProber::new(
+                pool.clone(),
+                ReqwestProber::new(
+                    client.clone(),
+                    config.upstream.clone(),
+                    codex.clone(),
+                    config.codex.default_model.clone(),
+                ),
+                config.proxy.idle_probe,
+            )
+            .with_save_until(settings_live.save_until.clone()),
+        );
         // The classifier is built from config.routing whether or not routing
         // is enabled (it is simply not consulted on the forward path while
         // disabled — forward passes group = None).
@@ -515,7 +525,7 @@ impl AppState {
             raw_io_path: crate::cli::daemon::raw_io_path(),
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             email_anonymous: Arc::new(AtomicBool::new(config.email_anonymous)),
-            settings_live: Arc::new(SettingsLive::from_config(&config)),
+            settings_live,
             round_robin: Arc::new(AtomicBool::new(
                 config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
             )),
@@ -564,7 +574,41 @@ impl AppState {
         params.seven_day_max = f64::from_bits(live.seven_day_max.load(Ordering::Relaxed));
         params.fable_weekly_max = f64::from_bits(live.fable_weekly_max.load(Ordering::Relaxed));
         params.usage_max_age = Duration::from_secs(live.usage_max_age_secs.load(Ordering::Relaxed));
+        params.save_until = match live.save_until.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+        };
         params
+    }
+
+    /// Turn save mode on (`Some(epoch secs)`) or off (`None`) live, persisted
+    /// to config `scheduler.save_until`. Persist first: a failed write leaves
+    /// the live scheduler untouched. Then every group is re-evaluated at once
+    /// (as a pause does through `apply_roster`), so a held current account is
+    /// moved off before the next request.
+    pub fn set_save_until(&self, until: Option<u64>) -> Result<(), crate::config::ConfigError> {
+        let Some(path) = &self.config_path else {
+            return Err(crate::config::ConfigError::PersistenceUnavailable);
+        };
+        // Persist and publish as one step: two concurrent calls must not leave
+        // the file holding one cutoff and the live scheduler the other.
+        static SAVE_MODE_WRITE: Mutex<()> = Mutex::new(());
+        let _serialized = SAVE_MODE_WRITE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config::update_path(path, |c| c.scheduler.save_until = until)?;
+        self.settings_live
+            .save_until
+            .store(until.unwrap_or(0), Ordering::Relaxed);
+        let params = self.select_params();
+        let now = SystemTime::now();
+        // A pin on a held account ends, as a pause ends it.
+        self.pool.end_pins_held_by_save(&params, now);
+        for group in eval_groups(&self.pool, self.config.routing.enabled) {
+            self.pool.evaluate(group, &params, now);
+        }
+        tracing::info!(save_until = ?until, "save mode updated");
+        Ok(())
     }
 
     /// Flip the scheduler mode live + persist it (config `scheduler.mode`,
@@ -1347,11 +1391,17 @@ pub async fn serve(
     let tick_pool = state.pool.clone();
     let tick_events = state.events.clone();
     let tick_routing_enabled = state.config.routing.enabled;
+    // The tick reads the LIVE params every round: live settings (thresholds,
+    // scheduler mode, save mode) must reach the re-evaluation too, or a tick
+    // with the boot-time view would switch back onto an account the request
+    // path now refuses (e.g. one save mode holds).
+    let tick_state = state.clone();
     let tick_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(EVALUATE_TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            let params = tick_state.select_params();
             for group in eval_groups(&tick_pool, tick_routing_enabled) {
                 let slot = group.unwrap_or(crate::routing::BackendGroup::Claude);
                 let before = tick_pool.snapshot().current.get(&slot).cloned();
@@ -1995,6 +2045,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/reset-credits", get(reset_credits_endpoint))
         .route("/llmux/reset-credits/consume", post(consume_reset_endpoint))
         .route("/llmux/scheduler-mode", post(scheduler_mode_endpoint))
+        .route("/llmux/save-mode", post(save_mode_endpoint))
         .route("/llmux/events", post(events_endpoint))
         .route("/llmux/login/start", post(login_start_endpoint))
         .route("/llmux/login/status", get(login_status_endpoint))
@@ -2619,6 +2670,9 @@ pub fn status_json(
         "email_anonymous": meta.email_anonymous,
         "current": snapshot.representative_current().map(|c| c.0.clone()),
         "current_by_group": current_by_group,
+        // Save mode (additive): the cutoff, whether it is ahead, how many
+        // accounts it holds — each held account's `blocked` reads "saved …".
+        "save_mode": save_mode_json(snapshot, params, now),
         "accounts": accounts,
     })
 }
@@ -3918,6 +3972,74 @@ async fn account_limits_endpoint(
     }
 }
 
+/// The furthest save mode may reach. A weekly window is 7 days, so a cutoff
+/// past a week holds nothing; a month catches an epoch sent in milliseconds.
+const SAVE_MODE_MAX_AHEAD_SECS: u64 = 30 * 86_400;
+
+#[derive(serde::Deserialize)]
+struct SaveModeRequest {
+    /// Cutoff, epoch seconds; `null` / absent turns save mode off.
+    #[serde(default)]
+    until: Option<u64>,
+}
+
+/// The save mode block of `/llmux/status` and the save-mode ack: the cutoff,
+/// whether it is still ahead, and how many accounts it holds right now.
+fn save_mode_json(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+) -> serde_json::Value {
+    let held = snapshot
+        .accounts
+        .iter()
+        .filter(|a| crate::scheduler::select::save_held(a, params, now))
+        .count();
+    serde_json::json!({
+        "until": params.save_until.map(epoch_secs),
+        "active": params.save_until.is_some_and(|until| until > now),
+        "held": held,
+    })
+}
+
+/// `POST /llmux/save-mode` `{"until": <epoch secs> | null}` — save mode: until
+/// the cutoff, only accounts whose weekly quota resets by then serve; the rest
+/// are held like a pause (config `scheduler.save_until`, live + persisted).
+async fn save_mode_endpoint(
+    State(state): State<AppState>,
+    body: axum::extract::Json<SaveModeRequest>,
+) -> Response {
+    let now = SystemTime::now();
+    if let Some(until) = body.until {
+        let now_secs = epoch_secs(now);
+        if until <= now_secs {
+            return relay_error(StatusCode::BAD_REQUEST, "until must be in the future");
+        }
+        if until - now_secs > SAVE_MODE_MAX_AHEAD_SECS {
+            return relay_error(
+                StatusCode::BAD_REQUEST,
+                "until must be within 30 days (epoch seconds, not milliseconds)",
+            );
+        }
+    }
+    match state.set_save_until(body.until) {
+        Ok(()) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "ok": true,
+                "save_mode": save_mode_json(&state.pool.snapshot(), &state.select_params(), now),
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write failed: {err}"),
+        ),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct SchedulerModeRequest {
     /// `"default"` or `"round-robin"`.
@@ -4495,6 +4617,7 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             usage_max_age: Duration::from_secs(600),
+            save_until: None,
         }
     }
 
@@ -4952,6 +5075,140 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    // ---- POST /llmux/save-mode ----
+    #[tokio::test]
+    async fn save_mode_endpoint_persists_applies_live_and_reports_in_status() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+        let until = epoch_secs(SystemTime::now()) + 3 * 86_400;
+
+        let response = save_mode_endpoint(
+            State(state.clone()),
+            axum::extract::Json(SaveModeRequest { until: Some(until) }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["save_mode"]["until"], until);
+        assert_eq!(body["save_mode"]["active"], true);
+        // Live: the scheduler sees the cutoff with no restart.
+        assert_eq!(
+            state.select_params().save_until,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(until))
+        );
+        // Persisted read-merge-write: the cutoff is on disk, the account kept.
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.scheduler.save_until, Some(until));
+        assert_eq!(on_disk.accounts.len(), 1);
+
+        // Status: the mode at the top, the held account named with its reason.
+        let doc = response_json(status(State(state.clone())).await).await;
+        assert_eq!(doc["save_mode"]["until"], until);
+        assert_eq!(doc["save_mode"]["active"], true);
+        assert_eq!(
+            doc["save_mode"]["held"], 1,
+            "a cold account opens a fresh week"
+        );
+        let blocked = doc["accounts"][0]["blocked"].as_str().expect("blocked");
+        assert!(blocked.starts_with("saved"), "{blocked}");
+
+        // Off: cleared live and on disk.
+        let response = save_mode_endpoint(
+            State(state.clone()),
+            axum::extract::Json(SaveModeRequest { until: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.select_params().save_until, None);
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.scheduler.save_until, None);
+        let doc = response_json(status(State(state.clone())).await).await;
+        assert_eq!(doc["save_mode"]["active"], false);
+        assert_eq!(doc["save_mode"]["held"], 0);
+    }
+
+    #[tokio::test]
+    async fn save_mode_moves_a_held_current_off_at_once() {
+        // `a` is current and resets in 5 days; `b` resets tomorrow. Turning save
+        // mode on with a 3-day cutoff must move the slot to `b` in the same
+        // call — not at the next tick, and not after a refused request.
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a"), oauth_account("b")]);
+        let now = SystemTime::now();
+        let weekly = |days: u64| crate::scheduler::usage::UsageSnapshot {
+            five_hour: None,
+            seven_day: Some(crate::scheduler::headers::WindowReading {
+                utilization: 0.10,
+                resets_at: now + Duration::from_secs(days * 86_400),
+            }),
+            scoped: Vec::new(),
+        };
+        state
+            .pool
+            .record_usage(&AccountId("a".into()), &weekly(5), now);
+        state
+            .pool
+            .record_usage(&AccountId("b".into()), &weekly(1), now);
+        state
+            .pool
+            .switch_to(&AccountId("a".into()), &state.select_params(), now)
+            .expect("switch to a");
+        assert_eq!(
+            state
+                .pool
+                .snapshot()
+                .representative_current()
+                .map(|c| c.0.clone()),
+            Some("a".to_string())
+        );
+
+        let until = epoch_secs(now) + 3 * 86_400;
+        state.set_save_until(Some(until)).expect("save mode on");
+        assert_eq!(
+            state
+                .pool
+                .snapshot()
+                .representative_current()
+                .map(|c| c.0.clone()),
+            Some("b".to_string()),
+            "the held current moved off in the same call"
+        );
+        // The manual pin on `a` ENDED, as a pause ends it: turning save mode
+        // off hands control back to the scheduler, not to the stale pin.
+        state.set_save_until(None).expect("save mode off");
+        assert_eq!(
+            state
+                .pool
+                .snapshot()
+                .representative_current()
+                .map(|c| c.0.clone()),
+            Some("b".to_string()),
+            "no stale pin retakes the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_mode_endpoint_refuses_a_cutoff_in_the_past_or_in_milliseconds() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("a")]);
+        let now = epoch_secs(SystemTime::now());
+        for until in [now - 60, now, (now + 3 * 86_400) * 1000] {
+            let response = save_mode_endpoint(
+                State(state.clone()),
+                axum::extract::Json(SaveModeRequest { until: Some(until) }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "until={until}");
+        }
+        assert_eq!(state.select_params().save_until, None, "nothing applied");
+        let on_disk = crate::config::load_path(&path).expect("reload");
+        assert_eq!(on_disk.scheduler.save_until, None, "nothing persisted");
     }
 
     // ---- C10: POST /llmux/grok ----
