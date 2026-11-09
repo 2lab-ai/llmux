@@ -163,7 +163,7 @@ impl CompatibilityReport {
 
     /// Record a caveat that omits nothing (the value IS forwarded, its meaning
     /// upstream is not provably identical).
-    fn warn(&mut self, warning: &'static str) {
+    pub(crate) fn warn(&mut self, warning: &'static str) {
         self.warnings.push(warning);
     }
 
@@ -290,14 +290,14 @@ fn convert(
 
     let mut report = CompatibilityReport::default();
     let mut input: Vec<Value> = Vec::new();
-    // The codex endpoint rejects a `role:"system"` input item ("System
-    // messages are not allowed", verified live); grok has no such receipt —
-    // folding there is llmux's own bridge policy, kept uniform because
-    // `instructions` is the one channel both endpoints document for operator
-    // text. Anthropic top-level `system` and any mid-conversation
-    // `messages[].role:"system"` (Claude Code's operator / `<system-reminder>`
-    // channel) therefore both fold into `instructions`.
-    let mut folded_system: Vec<String> = Vec::new();
+    // Two channels, never mixed (spec §R8):
+    // - top-level `system` → `instructions`, the same bytes on every turn of
+    //   a conversation;
+    // - a mid-conversation `messages[].role:"system"` (Claude Code's operator
+    //   channel: environment and skill listings, nested CLAUDE.md, task
+    //   notifications, reminders) → a `developer` input item AT ITS POSITION.
+    // Folding the second into `instructions` lifted time-bound notes to the
+    // top and rewrote the cached prefix whenever one arrived.
     for (index, message) in messages.iter().enumerate() {
         convert_message(
             index,
@@ -305,11 +305,10 @@ fn convert(
             flavor,
             count_tokens,
             &mut input,
-            &mut folded_system,
             &mut report,
         )?;
     }
-    let instructions = build_instructions(body.get("system"), &folded_system)?;
+    let instructions = build_instructions(body.get("system"))?;
 
     let tools = match body.get("tools") {
         None | Some(Value::Null) => Vec::new(),
@@ -458,10 +457,10 @@ fn validate_thinking_config(thinking: &Value) -> Result<(), ProviderError> {
 }
 
 /// The role to stamp on a Responses `input` message item. Both endpoints accept
-/// `user`, `assistant` and `developer`; codex rejects `system` ("System messages
-/// are not allowed", verified live) and llmux applies the same folding on grok
-/// as policy (no grok receipt either way). System-role messages never reach
-/// here — they are folded into `instructions`.
+/// `user`, `assistant` and `developer` (live receipts 2026-11-09, spec §R8);
+/// codex rejects `system` ("System messages are not allowed", verified live).
+/// System-role messages never reach here — [`convert_message`] emits them as
+/// `developer` items in place.
 ///
 /// The allowlist is closed: an unknown role used to be rewritten to `user`,
 /// which silently changed WHO said something (a rewrite the client cannot see).
@@ -505,7 +504,6 @@ fn convert_message(
     flavor: ResponsesFlavor,
     count_tokens: bool,
     input: &mut Vec<Value>,
-    folded_system: &mut Vec<String>,
     report: &mut CompatibilityReport,
 ) -> Result<(), ProviderError> {
     let path = format!("messages[{index}]");
@@ -518,10 +516,12 @@ fn convert_message(
         Some(_) => return Err(invalid(&format!("{path}.role"), "expected a string")),
     };
     if role == "system" {
-        let text = system_message_text(&path, message)?;
-        if !text.is_empty() {
-            folded_system.push(text);
-        }
+        // One operator message = one `developer` item, where it was sent:
+        // never merged with a neighbour, deduplicated or moved.
+        let mut text = system_message_text(&path, message)?;
+        let mut parts = Vec::new();
+        flush_text(&mut parts, &mut text, "input_text");
+        flush_message(input, &mut parts, "developer");
         return Ok(());
     }
 
@@ -644,11 +644,11 @@ fn convert_message(
     Ok(())
 }
 
-/// Text of a `role: "system"` message, for folding into `instructions`. Only
-/// text blocks are foldable: an image (or anything else) in an operator message
-/// has no instructions representation, so it is an error rather than a
-/// disappearance.
-fn system_message_text(path: &str, message: &Value) -> Result<String, ProviderError> {
+/// Text of a `role: "system"` message (its text blocks joined by `\n`), for
+/// the in-place `developer` item. Only text is carried: an image (or anything
+/// else) in an operator message is an error rather than a disappearance.
+/// Shared with the gemini translator, which carries the same text in place.
+pub(crate) fn system_message_text(path: &str, message: &Value) -> Result<String, ProviderError> {
     match message.get("content") {
         None | Some(Value::Null) => Ok(String::new()),
         Some(Value::String(text)) => Ok(text.clone()),
@@ -686,18 +686,36 @@ fn system_message_text(path: &str, message: &Value) -> Result<String, ProviderEr
     }
 }
 
-/// Compose `instructions` from the top-level `system` field plus any
-/// system-role messages folded out of `messages[]`, in that order.
-fn build_instructions(
-    system: Option<&Value>,
-    folded_system: &[String],
-) -> Result<String, ProviderError> {
+/// The line Claude Code puts first in its top-level `system`:
+/// `x-anthropic-billing-header: cc_version=…; cc_entrypoint=…;`. It is
+/// Anthropic billing metadata, not an instruction, so the non-Anthropic
+/// translators leave it out (spec §R8).
+const BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
+
+/// `text` without a LEADING billing-header line. Only the first line is
+/// looked at, and only when it starts with [`BILLING_HEADER_PREFIX`]: the
+/// same words anywhere else (a quote, a later line) are client text and stay.
+/// A block that was only the header comes back empty.
+pub(crate) fn without_billing_header(text: &str) -> &str {
+    if !text.starts_with(BILLING_HEADER_PREFIX) {
+        return text;
+    }
+    text.split_once('\n').map_or("", |(_, rest)| rest)
+}
+
+/// Compose `instructions` from the top-level `system` field — and only from
+/// it, so the value is identical on every turn of a conversation (a
+/// mid-conversation `role:"system"` message is an in-place `developer` item,
+/// see [`convert_message`]). Text blocks join with `\n`; the billing-header
+/// line is left out ([`without_billing_header`]).
+fn build_instructions(system: Option<&Value>) -> Result<String, ProviderError> {
     let mut parts: Vec<String> = Vec::new();
     match system {
         None | Some(Value::Null) => {}
         Some(Value::String(text)) => {
+            let text = without_billing_header(text);
             if !text.is_empty() {
-                parts.push(text.clone());
+                parts.push(text.to_string());
             }
         }
         Some(Value::Array(blocks)) => {
@@ -710,6 +728,7 @@ fn build_instructions(
                         let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
                             invalid(&format!("{bpath}.text"), "expected a string")
                         })?;
+                        let text = without_billing_header(text);
                         if !text.is_empty() {
                             parts.push(text.to_string());
                         }
@@ -730,7 +749,6 @@ fn build_instructions(
             ))
         }
     }
-    parts.extend(folded_system.iter().filter(|s| !s.is_empty()).cloned());
     Ok(parts.join("\n"))
 }
 
@@ -2014,8 +2032,9 @@ mod tests {
         }
         let system = json!({"messages": [{"role": "system", "content": "note"}]});
         let upstream = build(&system, Codex);
-        assert_eq!(upstream["instructions"], "note");
-        assert!(upstream["input"].as_array().expect("input").is_empty());
+        assert_eq!(upstream["instructions"], "");
+        assert_eq!(upstream["input"][0]["role"], "developer");
+        assert_eq!(upstream["input"][0]["content"][0]["text"], "note");
     }
 
     #[test]
@@ -2401,29 +2420,202 @@ mod tests {
         let (upstream, client_stream) =
             build_responses_body(&body, &plan("sess-1"), Codex).expect("build");
         assert!(client_stream);
-        assert_eq!(upstream["instructions"], "be terse\noperator note");
+        assert_eq!(upstream["instructions"], "be terse");
         assert_eq!(upstream["store"], false);
         assert_eq!(upstream["stream"], true);
         assert_eq!(upstream["model"], "test-model");
         assert_eq!(upstream["prompt_cache_key"], "sess-1");
         let input = upstream["input"].as_array().expect("input");
-        assert_eq!(input.len(), 4, "user text, assistant text, call, output");
+        assert_eq!(
+            input.len(),
+            5,
+            "user text, operator note, assistant text, call, output"
+        );
         assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(input[1]["content"][0]["text"], "checking");
-        assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["call_id"], "call_1");
-        assert_eq!(input[2]["name"], "get_weather");
-        assert_eq!(input[2]["arguments"], "{\"city\":\"Seoul\"}");
-        assert_eq!(input[3]["type"], "function_call_output");
-        assert_eq!(input[3]["output"], "22C");
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[1]["content"][0]["text"], "operator note");
+        assert_eq!(input[2]["content"][0]["text"], "checking");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[3]["name"], "get_weather");
+        assert_eq!(input[3]["arguments"], "{\"city\":\"Seoul\"}");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["output"], "22C");
         assert!(
             !input.iter().any(|item| item["role"] == "system"),
-            "system folds into instructions, never an input item"
+            "codex refuses system items: operator text rides as developer"
         );
         let tools = upstream["tools"].as_array().expect("tools");
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["strict"], false);
         assert_eq!(tools[0]["parameters"]["type"], "object");
+    }
+
+    /// Claude Code sends operator text — environment and skill listings,
+    /// nested `CLAUDE.md` attachments, task notifications, reminders — as
+    /// `role:"system"` messages at the point in the transcript they apply to.
+    /// Each one stays at that point as a `developer` item: the role both
+    /// gateways take (codex refuses `system` items) with operator authority.
+    #[test]
+    fn mid_conversation_system_messages_stay_in_place_as_developer_items() {
+        for flavor in [Codex, Grok] {
+            let body = json!({
+                "system": "be terse",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "content": "environment note"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": "next"},
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "reminder a"},
+                        {"type": "text", "text": "reminder b"},
+                    ]},
+                ],
+            });
+            let upstream = build(&body, flavor);
+            assert_eq!(upstream["instructions"], "be terse", "{flavor:?}");
+            let input = upstream["input"].as_array().expect("input");
+            assert_eq!(input.len(), 5, "{flavor:?}: one item per message, in order");
+            assert_eq!(
+                input[1],
+                json!({"type": "message", "role": "developer",
+                       "content": [{"type": "input_text", "text": "environment note"}]}),
+                "{flavor:?}"
+            );
+            assert_eq!(input[2]["role"], "assistant");
+            assert_eq!(input[3]["role"], "user");
+            assert_eq!(input[4]["role"], "developer");
+            assert_eq!(input[4]["content"][0]["text"], "reminder a\nreminder b");
+            assert!(!input.iter().any(|item| item["role"] == "system"));
+        }
+    }
+
+    /// The prompt cache matches tools → instructions → input as one prefix.
+    /// A later turn must only APPEND input items: if a new system message
+    /// changed `instructions`, every input token behind it would be a miss
+    /// (measured: 26.6% median cache hit on codex, 1.9% on grok, for the turns
+    /// where the folded `instructions` grew).
+    #[test]
+    fn a_later_turn_only_appends_to_the_previous_request() {
+        let earlier = json!({
+            "system": "be terse",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "environment note"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "now", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"},
+                ]},
+            ],
+        });
+        let mut later = earlier.clone();
+        let messages = later["messages"].as_array_mut().expect("messages");
+        messages.push(json!({"role": "system", "content": "task 7 completed"}));
+        messages.push(json!({"role": "assistant", "content": "noted"}));
+        messages.push(json!({"role": "user", "content": "go on"}));
+        messages.push(json!({"role": "system", "content": "reminder"}));
+        for flavor in [Codex, Grok] {
+            let before = build(&earlier, flavor);
+            let after = build(&later, flavor);
+            assert_eq!(before["instructions"], after["instructions"], "{flavor:?}");
+            let before = before["input"].as_array().expect("input");
+            let after = after["input"].as_array().expect("input");
+            assert_eq!(
+                &after[..before.len()],
+                &before[..],
+                "{flavor:?}: prefix kept"
+            );
+            assert_eq!(after.len(), before.len() + 4, "{flavor:?}");
+        }
+    }
+
+    /// Edges of the in-place rule: first message, last message, back-to-back
+    /// operator messages (two items, never merged), a repeated reminder (kept
+    /// every time — its position IS its meaning), an empty one (no item), and
+    /// one between a call and its output (order kept: live receipt 2026-11-09,
+    /// codex and grok both answered 200).
+    #[test]
+    fn system_messages_keep_count_and_order_at_every_position() {
+        let body = json!({"messages": [
+            {"role": "system", "content": "first"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "now", "input": {}},
+            ]},
+            {"role": "system", "content": "between call and output"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"},
+            ]},
+            {"role": "system", "content": "reminder"},
+            {"role": "system", "content": "reminder"},
+            {"role": "system", "content": ""},
+            {"role": "system", "content": []},
+        ]});
+        for flavor in [Codex, Grok] {
+            let upstream = build(&body, flavor);
+            let shape: Vec<(String, String)> = upstream["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .map(|item| {
+                    let kind = item["role"]
+                        .as_str()
+                        .or(item["type"].as_str())
+                        .unwrap_or("");
+                    let text = item["content"][0]["text"]
+                        .as_str()
+                        .or(item["output"].as_str())
+                        .unwrap_or("");
+                    (kind.to_string(), text.to_string())
+                })
+                .collect();
+            let expected: Vec<(String, String)> = [
+                ("developer", "first"),
+                ("user", "hi"),
+                ("function_call", ""),
+                ("developer", "between call and output"),
+                ("function_call_output", "12:00"),
+                ("developer", "reminder"),
+                ("developer", "reminder"),
+            ]
+            .iter()
+            .map(|(kind, text)| (kind.to_string(), text.to_string()))
+            .collect();
+            assert_eq!(shape, expected, "{flavor:?}");
+            assert_eq!(upstream["instructions"], "", "{flavor:?}");
+        }
+    }
+
+    /// The billing-header line is Anthropic billing metadata. It is left out
+    /// as a whole block, or as the first line of a block — and only there.
+    #[test]
+    fn the_anthropic_billing_header_never_reaches_a_responses_backend() {
+        let header = "x-anthropic-billing-header: cc_version=2.1.284.a20; cc_entrypoint=sdk-ts;";
+        let blocks = json!({
+            "system": [
+                {"type": "text", "text": header},
+                {"type": "text", "text": "You are a Claude agent."},
+                {"type": "text", "text": format!("{header}\nkeep this line")},
+                {"type": "text", "text": format!("quoted: {header}")},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        for flavor in [Codex, Grok] {
+            assert_eq!(
+                build(&blocks, flavor)["instructions"],
+                format!("You are a Claude agent.\nkeep this line\nquoted: {header}"),
+                "{flavor:?}"
+            );
+        }
+        let string = json!({
+            "system": format!("{header}\nbe terse"),
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        assert_eq!(build(&string, Codex)["instructions"], "be terse");
+        assert_eq!(without_billing_header(header), "");
+        assert_eq!(without_billing_header("plain"), "plain");
     }
 
     #[test]
