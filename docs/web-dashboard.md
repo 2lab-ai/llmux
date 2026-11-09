@@ -41,8 +41,10 @@ opens both. Only soma-work admins (`ADMIN_USERS`) get in.
   - `⎿` results with `… +N lines`, `Update(file)` with its diff, `Update Todos`, `✻ Thinking…`;
   - the input box and status line at the bottom.
   Click a tool line to expand its full result; times are in the hover title.
-- 요청 (requests): the session's llmux requests, newest first, loaded one page at a time (25 to 200 per page,
-  filter by kind). Open one to see the raw record.
+- 요청 (requests): the session's llmux requests, newest first. The next older page loads by itself as you
+  scroll to the end of the list (25 to 200 at a time; filter by kind). A running session's new requests are
+  added on top without moving what you are reading. A session keeps its newest 4,000 requests; the end of
+  the list says so when older ones were let go. Open one to see the raw record.
 - Raw viewer: the web twin of the TUI raw viewer.
   - Legs: `Request`, `Upstream Req`, `Upstream Resp` and `Response`. The upstream pair appears only on translated
     exchanges.

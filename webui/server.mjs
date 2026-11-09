@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SessionIndex } from './lib/sessions.mjs';
+import { SessionIndex, requestPage } from './lib/sessions.mjs';
 import { parseResponse, recoverMessages } from './lib/transcript.mjs';
 import { buildOverview } from './lib/overview.mjs';
 
@@ -275,14 +275,12 @@ async function handler(req, res) {
       return sendJson({ v, card, chat, overview, meta: meta && !meta.missing ? { ...meta, prompts: undefined } : null, requestCount: requests.length, requestKinds: kinds });
     } catch (e) { return sendJson({ error: String(e.message || e) }, 500); }
   }
-  // One page of a session's llmux requests, newest first (the 요청 tab loads pages on demand).
+  // One page of a session's llmux requests, newest first. The 요청 tab loads the next older page with
+  // ?before=<cursor> as the list scrolls, and a running session's new requests with ?after=<cursor>.
   if ((m = /^\/api\/session\/([0-9a-f-]{36})\/requests$/.exec(url.pathname))) {
-    const all = sessions.rowsFor(m[1]);
-    const kind = url.searchParams.get('kind') || '';
-    const list = (kind ? all.filter(r => (r.msg_kind || 'other') === kind) : all).slice().reverse();
-    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 50));
-    const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
-    return sendJson({ total: list.length, offset, limit, rows: list.slice(offset, offset + limit).map(r => ({ ...r, cost: sessions.price(r) })) });
+    const q = Object.fromEntries(['kind', 'limit', 'before', 'after', 'offset'].map(k => [k, url.searchParams.get(k) || '']));
+    const page = requestPage(sessions.rowsFor(m[1]), q);
+    return sendJson({ ...page, dropped: sessions.droppedFor(m[1]), rows: page.rows.map(r => ({ ...r, cost: sessions.price(r) })) });
   }
   if ((m = /^\/api\/session\/([0-9a-f-]{36})\/agent\/([0-9a-z]+)$/.exec(url.pathname))) {
     const r = sessions.subagentChat(m[1], m[2]);

@@ -12,7 +12,8 @@ Contract: [`.prd/26-web-session-dashboard.md`](../.prd/26-web-session-dashboard.
 - `public/app.html`, `app.js`, `app.css` — the page, built from `@2lab.ai/ui` elements served at `/ui/*` from `UI_DIST`
   (default: the host's soma-work install; falls back to jsDelivr `@2lab.ai/ui@0.39.0`). `core.js`/`core.css` keep the
   activity and account renderers. `ccview.js`/`ccview.css` draw the Claude Code screen; `rawview.js` is the raw viewer
-  (`GET /api/raw-full`). Requests page through `GET /api/session/:sid/requests?offset=&limit=&kind=`.
+  (`GET /api/raw-full`). Requests page through `GET /api/session/:sid/requests?limit=&kind=` with cursor `before=<at_ms:id>` (the next
+  older page, loaded as the list scrolls) or `after=<at_ms:id>` (new requests of a running session); `offset=` still works.
 
 Run locally: `PORT=4780 node server.mjs` (no auth, 127.0.0.1). Behind the soma-work login: `deploy/` (LaunchAgent + Caddy).
 Tests: `node --test webui/test/`.

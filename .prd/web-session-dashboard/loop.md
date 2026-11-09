@@ -3,7 +3,8 @@
 SSOT: ./ssot.md (frozen) · Spec: ../26-web-session-dashboard.md · Done: ./loop.done.md · Repo: 2lab-ai/llmux ·
 Channel: Slack thread 1793996619.575599 · Started: 2026-11-09 (12:45 KST)
 
-Status: R1 closed (8/8 ✅), R2 closed (3/3 ✅). Runtime is live on both hosts from branch `feat/web-session-dashboard`.
+Status: R1 closed (8/8 ✅), R2 closed (3/3 ✅), R3 closed (3/3 ✅). Runtime is live on both hosts from branch
+`feat/web-session-dashboard`.
 Related fix outside this repo: soma-work side calls (workflow classifier, goal eval, guardian, titles/summaries) sent
 without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 (ssot 7; open, deploy pending).
 
@@ -37,6 +38,8 @@ without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 
 ## Next
 
 - PR review and merge to `main` (owner decision; runtime does not depend on it).
+- Very large sessions: the detail payload still carries every chat entry (21 MB for fable-m5max `cc71bd7d`), and the
+  first paint has one ~3.9 s task. Next step if it matters: send the newest entries and page older ones like 요청.
 - Candidates for a later round (not in SSOT scope): account/key write actions from the web page; raw-io meta for
   remote sessions older than 7 days is fetched only when the card is opened.
 
@@ -46,4 +49,4 @@ without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 
 |---|---|---|---|---|---|---|---|---|---|
 
 - Status: ✅ met · 🟡 partial · 🔴 to work · 🚪 gated · ⚫ out of scope
-- Accounting: universe 11 = 11✅ (loop.done.md R1 8 + R2 3) + 0 open
+- Accounting: universe 14 = 14✅ (loop.done.md R1 8 + R2 3 + R3 3) + 0 open

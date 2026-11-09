@@ -16,7 +16,9 @@
 6. 2026-11-09 — "1. 클로드 코드 화면 병신아 이게 뭐야. 진짜 클로드 코드 화면처럼 만들어줘 지금 뭐 완전 잘못 해놓음. (첨부 스샷 참조) 2. 세션 -> 요청의 개별 요청을 한번에 출력하지말고 on demand로 페이지 네이션 처리 3. 매 요청을 llmux tui에서는 실제로 raw 데이터를 모두 볼수 있는데 시발 여기서도 모두 볼수 있게 해줘. json 형태의 데이터니 한번에 전체 펼치지 말고 마지막 메세지만 펼쳐서 보여주되 (지금 니가 마지막 메세지만 보여주고 있는 중), 나머지도 json tree 형태로 원하는 부분을 펼쳐서 원본 메세지를 그대로 볼수 있게 해줘. (raw message로도 볼수 있도록. llmux tui에서 실제 메세지 보는 부분 참조)"
 7. 2026-11-09 — "그리고 지금 "키 없음"으로 요청이 오는 경우가 있는데 이거 확인해줘 soma-work에서 요청 왔다고 하는데 57525069-befb-4403-a946-43b001526165 이거네 이거 사용자가 slack에서 요청 보내면 해당 사용자의 key로 요청보내게 되어 있는데 왜 이렇게 됐는지 확인하고 이것도 픽스해줘" / "아 혹시 이거 haiku 워크플로우 확인하는 요청인가? 워크플로우 파악하는 요청에는 유저 키를 안넣고 있는 버그인가? 그러면 픽스해줘 아무튼" (fix lives in 2lab-ai/soma-work)
 
-## Fixed scope (from 1–7)
+8. 2026-11-09 — "요청에 대해서 페이지네이션은 잘했는데 자동으로 스크롤 내리면 다음 페이지 출력해줘"
+
+## Fixed scope (from 1–8)
 
 - Session = one Claude Code / Codex / SDK conversation through llmux; every soma-work task card is one
   session card; personal Claude Code consoles are session cards too.
@@ -32,3 +34,4 @@
 - The Claude Code screen looks like the Claude Code terminal (6). A session's requests load page by page on demand (6).
 - Every request's raw record is fully viewable like the TUI raw viewer: all legs, headers, JSON tree with only the last
   message expanded, raw text (6).
+- The 요청 list loads its next page by itself when it is scrolled to the end; no page buttons to press (8).

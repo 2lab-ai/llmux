@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { solveRates, priceRow } from '../lib/pricing.mjs';
 import { cleanPrompt, buildOverview } from '../lib/overview.mjs';
-import { promptOf, AUX_RE, SessionIndex } from '../lib/sessions.mjs';
+import { promptOf, AUX_RE, SessionIndex, requestPage, cursorOf } from '../lib/sessions.mjs';
 import { parseRawMeta, userPrompts } from '../lib/rawmeta.mjs';
 import { messagesToEntries } from '../lib/transcript.mjs';
 
@@ -104,4 +104,43 @@ test('tool inputs kept for the Claude Code screen are clipped and never the whol
   assert.ok(e.old_string.length < 4100 && e.old_string.includes('(+6000자)'));
   assert.equal(slimInput('Bash', { command: 'ls', description: 'list' }).command, 'ls');
   assert.ok(JSON.stringify(slimInput('mcp__x__y', { data: big })).length < 1600);
+});
+
+test('request pages walk older by cursor without repeats or gaps while new requests arrive', () => {
+  const row = (id, at_ms, msg_kind = 'user') => ({ id, at_ms, msg_kind });
+  // Two rows share a timestamp: the cursor still tells them apart.
+  const rows = [row(1, 1000), row(2, 2000, 'subagent'), row(3, 3000), row(4, 3000), row(5, 4000), row(6, 5000, 'subagent')];
+  const p1 = requestPage(rows, { limit: 2 });
+  assert.deepEqual(p1.rows.map(r => r.id), [6, 5]);
+  assert.equal(p1.total, 6); assert.equal(p1.more, true);
+  // Three requests land on top before the next scroll; the older page is unaffected.
+  const live = rows.concat([row(7, 6000), row(8, 7000), row(9, 8000)]);
+  const p2 = requestPage(live, { limit: 2, before: cursorOf(p1.rows.at(-1)) });
+  assert.deepEqual(p2.rows.map(r => r.id), [4, 3]);
+  const p3 = requestPage(live, { limit: 2, before: cursorOf(p2.rows.at(-1)) });
+  assert.deepEqual(p3.rows.map(r => r.id), [2, 1]);
+  assert.equal(p3.more, false);
+  assert.deepEqual(requestPage(live, { limit: 2, before: cursorOf(p3.rows.at(-1)) }).rows, []);
+  // The live top-up returns only what is newer than the top row, and flags a gap past one page.
+  const top = requestPage(live, { limit: 5, after: cursorOf(p1.rows[0]) });
+  assert.deepEqual(top.rows.map(r => r.id), [9, 8, 7]); assert.equal(top.gap, false);
+  assert.equal(requestPage(live, { limit: 2, after: cursorOf(p1.rows[0]) }).gap, true);
+  // A kind filter pages within the kind; limits are clamped.
+  assert.deepEqual(requestPage(live, { kind: 'subagent' }).rows.map(r => r.id), [6, 2]);
+  assert.equal(requestPage(live, { limit: 9999 }).limit, 200);
+});
+
+test('a session keeps its newest 4000 requests and counts the older ones it let go', () => {
+  const ix = new SessionIndex();
+  const sid = '33333333-3333-3333-3333-333333333333';
+  const uid = JSON.stringify({ device_id: 'dev1', account_uuid: '', session_id: sid });
+  for (let i = 1; i <= 4005; i++) ix.addRow({ id: i, at_ms: 1000 + i, tenant: 'local', user_id: uid, msg_kind: 'user', model: 'm', status: 200 });
+  const rows = ix.rowsFor(sid);
+  assert.equal(rows.length, 4000);
+  assert.equal(rows[0].id, 6);
+  assert.equal(ix.droppedFor(sid), 5);
+  // The oldest kept page ends the walk: ids 205 down to 6, nothing further.
+  const last = requestPage(rows, { limit: 200, before: cursorOf(rows[200]) });
+  assert.equal(last.rows[0].id, 205); assert.equal(last.rows.at(-1).id, 6); assert.equal(last.rows.length, 200);
+  assert.equal(last.more, false);
 });

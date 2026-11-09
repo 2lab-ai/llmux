@@ -149,3 +149,8 @@ details.rv-hd > summary { cursor: pointer; }
 .rpager { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin: 0 0 10px; flex-wrap: wrap; }
 .rpager .ui-btn { padding: 4px 10px; font-size: 12.5px; }
 .rpager select { font: inherit; font-size: 12.5px; }
+.rruns { padding: 6px 6px 4px; border: 1px solid var(--ui-ib-card-border); border-radius: 12px; background: var(--ui-ib-card); box-shadow: var(--ui-ib-shadow); }
+.rruns:empty { display: none; }
+.rruns > ui-task-runs + ui-task-runs { margin-top: 2px; }
+.rmore { display: flex; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap; min-height: 44px; margin: 6px 0 10px; }
+.rmore .ui-btn { padding: 4px 12px; font-size: 12.5px; }
