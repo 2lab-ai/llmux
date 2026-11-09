@@ -219,7 +219,8 @@ CompatibilityReport { omitted_fields: Vec<&'static str>, warnings: Vec<&'static 
 
 `omitted_fields` = fields NOT forwarded (`max_tokens`, `thinking`, `redacted_thinking`,
 `thinking_config`).
-`warnings` = that set plus caveats that omit nothing (today `max_tokens_semantics`). Both
+`warnings` = that set plus caveats that omit nothing (`max_tokens_semantics`; the gemini
+translator shares the type and adds `system_message_as_user`). Both
 are sorted and deduped, so a transcript with twenty thinking blocks reports `thinking`
 once and the header value is stable request to request.
 

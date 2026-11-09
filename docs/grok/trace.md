@@ -89,7 +89,7 @@
    `body.output_config.effort` → `responses::resolve_effort(…, clamp: none|minimal→low,
    xhigh|max|ultra→high)` → e.g. `"high"` ·
    `messages[]` → `responses::messages_to_input` → Responses `input[]` ·
-   `system` + folded system-role msgs → `instructions` ·
+   `system` → `instructions`; system-role msgs → in-place `developer` items (2026-11-09; were folded into `instructions`) ·
    `tools[]` → `responses::tools_to_functions` →
    upstream JSON `{model:"grok-4.5", instructions, input, tools,
    parallel_tool_calls:true, store:false, stream:true, prompt_cache_key:session_id,
@@ -201,7 +201,7 @@
 | C13 | Contract | status JSON: grok account row shape (group/type/gauges null) | T6 |
 | C14 | Contract | pricing: (grok, grok-4.5) → 2.0/6.0/0.5/0.0; (grok, unknown) → grok fallback | T6 §4 |
 | C15 | Contract | client `stream:false` through grok: upstream SSE aggregated to one Anthropic JSON response w/ usage (same path codex takes today) | T3 §3/§6 |
-| C16 | Contract | flavor-parameterized translation: system folding, tools_to_functions, tool_use/tool_result round trip, SSE→Anthropic events, usage extraction — asserted under the GROK flavor (not only codex) | T3 §3, R5 |
+| C16 | Contract | flavor-parameterized translation: system messages (in-place `developer` since 2026-11-09, folded before), tools_to_functions, tool_use/tool_result round trip, SSE→Anthropic events, usage extraction — asserted under the GROK flavor (not only codex) | T3 §3, R5 |
 | C17 | Regression | pre-grok config (no grok fields) parses + round-trips VALUE-stable (new default grok section serializes; old binaries ignore it) — additive-only guarantee | spec §Compatibility |
 
 Swift (islands) — unit-light per repo convention: provider(of:) mapping test if a test

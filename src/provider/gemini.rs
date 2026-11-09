@@ -441,7 +441,8 @@ impl GeminiProvider {
     /// What [`Self::build_request`] would leave out of `anthropic_body`,
     /// as the compatibility report codex/grok produce (header names
     /// `max_tokens`, `thinking`, `redacted_thinking`, `thinking_config`,
-    /// `server_tools`, `disable_parallel_tool_use`). Runs the SAME
+    /// `server_tools`, `disable_parallel_tool_use`, plus the caveat
+    /// `system_message_as_user`). Runs the SAME
     /// translation, so a body that validates here cannot fail there and
     /// vice versa — `Err` is the same [`ProviderError::InvalidRequest`]
     /// naming the JSON path. No project or credential is needed.
@@ -793,20 +794,28 @@ fn translate_messages(
             }
             None => return Err(invalid(&format!("{path}.role"), "expected a string")),
         };
-        let parts = message_parts(&path, message, &mut tool_names, report)?;
+        let mut parts = message_parts(&path, message, &mut tool_names, report)?;
         if parts.is_empty() {
             continue;
         }
-        // Held operator text lands after the user turn that answers the
-        // call — or, if the transcript moves on without one, before the
-        // next model turn, so nothing is dropped or pushed past it.
-        if role == "model" && !held_operator_parts.is_empty() {
-            push_turn(&mut turns, "user", std::mem::take(&mut held_operator_parts));
+        if !held_operator_parts.is_empty() {
+            if role == "user" {
+                // The function responses lead the user turn that answers
+                // the call (Anthropic puts tool_result blocks first); the
+                // held text goes right after them and BEFORE the rest of
+                // that message, which the transcript sent later.
+                let answered = parts
+                    .iter()
+                    .take_while(|part| part.get("functionResponse").is_some())
+                    .count();
+                parts.splice(answered..answered, std::mem::take(&mut held_operator_parts));
+            } else {
+                // The transcript moved on without an answer: the held text
+                // still lands before the next model turn, never dropped.
+                push_turn(&mut turns, "user", std::mem::take(&mut held_operator_parts));
+            }
         }
         push_turn(&mut turns, role, parts);
-        if role == "user" && !held_operator_parts.is_empty() {
-            push_turn(&mut turns, "user", std::mem::take(&mut held_operator_parts));
-        }
     }
     if !held_operator_parts.is_empty() {
         push_turn(&mut turns, "user", held_operator_parts);
@@ -2416,6 +2425,32 @@ mod tests {
             report.warnings.contains(&"system_message_as_user"),
             "{report:?}"
         );
+
+        // The answering message also carries text sent AFTER the held note:
+        // response first, then the held note, then that text — the
+        // transcript's own order, only the response moved up to the call.
+        let mixed = json!({"messages": [
+            {"role": "user", "content": "time?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "now", "input": {}},
+            ]},
+            {"role": "system", "content": "note A"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"},
+                {"type": "text", "text": "text B"},
+            ]},
+        ]});
+        let (_, upstream, _) = build(&provider, &mixed);
+        let answer = upstream["request"]["contents"][2]["parts"]
+            .as_array()
+            .expect("parts");
+        assert!(answer[0].get("functionResponse").is_some(), "{answer:?}");
+        assert_eq!(
+            answer[1]["text"],
+            "<system-reminder>\nnote A\n</system-reminder>"
+        );
+        assert_eq!(answer[2]["text"], "text B");
+        assert_eq!(answer.len(), 3);
     }
 
     #[test]
