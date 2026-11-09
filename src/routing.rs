@@ -577,6 +577,16 @@ mod tests {
         assert_eq!(builtin().classify(Some("astra")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("gpt-6-astra")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("gpt-6")), BackendGroup::Codex);
+        // `terra`'s owner since 2026-11-10 rides the `gpt-` prefix, `[1m]`
+        // twin included — no per-id rule needed.
+        assert_eq!(
+            builtin().classify(Some("gpt-6.1-terra")),
+            BackendGroup::Codex
+        );
+        assert_eq!(
+            builtin().classify(Some("gpt-6.1-terra[1m]")),
+            BackendGroup::Codex
+        );
         // Exact, case-insensitive like the rest.
         assert_eq!(builtin().classify(Some("SOL")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("ASTRA")), BackendGroup::Codex);
@@ -1116,6 +1126,10 @@ mod tests {
         // The 5.1 generation and its `[1m]` catalog id (2026-09-02 roll).
         assert!(is_fable_model(Some("claude-fable-5-1")));
         assert!(is_fable_model(Some("claude-fable-5-1[1m]")));
+        // The 5.2 generation and its `[1m]` catalog id (2026-11-10 roll).
+        assert!(is_fable_model(Some("claude-fable-5-2")));
+        assert!(is_fable_model(Some("claude-fable-5-2[1m]")));
+        assert!(is_fable_model(Some("fable-5-2")));
     }
 
     #[test]

@@ -116,8 +116,10 @@ use view::DashboardView;
 /// endpoint; this is the quick-pick set. `gpt-6-astra` added 2026-09-07: it is
 /// in [`crate::provider::codex`]'s passthrough list, so a pin set from here is
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
+/// `gpt-6.1-terra` added 2026-11-10 on the same terms.
 const CODEX_MODELS: &[&str] = &[
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -7805,7 +7807,9 @@ mod tests {
         // priority-1 default since 2026-09-29), and every entry is distinct (a
         // duplicate would make the modulo cycle skip a model forever).
         assert_eq!(CODEX_MODELS[0], "gpt-6.1-sol");
-        assert_eq!(CODEX_MODELS.len(), 9);
+        // gpt-6.1-terra (2026-11-10) sits next to its generation's flagship.
+        assert_eq!(CODEX_MODELS[1], "gpt-6.1-terra");
+        assert_eq!(CODEX_MODELS.len(), 10);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

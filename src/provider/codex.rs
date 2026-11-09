@@ -307,6 +307,10 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
 /// `gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna` each answered HTTP 200 with
 /// the slug echoed as `model` on a 2026-10-06 probe through the live daemon —
 /// one 16-token request per slug, pinned via `POST /llmux/codex`).
+/// `gpt-6.1-terra` (released 2026-10-26, openai/codex models.json @
+/// caae161dd0c8) is not yet probed through the daemon — a live probe follows
+/// the preview deploy; until then it is listed on the strength of models.json
+/// and the live Codex server list, which names it for a ChatGPT account.
 /// Requests naming one of these are forwarded VERBATIM; the bare generation
 /// ids map to their flagship ([`GENERATION_ALIASES`]; the backend rejects
 /// bare generation ids); any other requested model keeps the configured pin.
@@ -321,6 +325,9 @@ const PASSTHROUGH_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-6.1-sol",
+    // Not yet probed through the daemon (2026-11-10): a live probe follows
+    // the preview deploy.
+    "gpt-6.1-terra",
 ];
 
 /// Bare variant aliases → the NEWEST generation that ships that variant.
@@ -328,12 +335,13 @@ const PASSTHROUGH_MODELS: &[&str] = &[
 /// the ONE place to move an alias when a new generation ships the variant.
 /// Per openai/codex models.json @ d63a9b83 (2026-10-06): `sol` → `gpt-6.1-sol`
 /// (released 2026-09-29), `luna` → `gpt-6-luna` (2026-09-22), `astra` →
-/// `gpt-6-astra` (its only tier); `terra` has no generation-6 tier and stays
-/// on 5.6 — moving it would resolve to a slug that 404s upstream. Mirrors
-/// the alias ownership advertised by [`crate::catalog`].
+/// `gpt-6-astra` (its only tier). `terra` → `gpt-6.1-terra` since 2026-11-10
+/// (models.json @ caae161dd0c8, released 2026-10-26); generation 6 shipped no
+/// terra tier, so until then it stayed on `gpt-5.6-terra`. Mirrors the alias
+/// ownership advertised by [`crate::catalog`].
 const VARIANT_ALIASES: &[(&str, &str)] = &[
     ("sol", "gpt-6.1-sol"),
-    ("terra", "gpt-5.6-terra"),
+    ("terra", "gpt-6.1-terra"),
     ("luna", "gpt-6-luna"),
     ("astra", "gpt-6-astra"),
 ];
@@ -403,7 +411,7 @@ const CODEX_EFFORT_VALUES: &[&str] = &[
 /// `max` / `ultra` reasoning levels (openai/codex models.json): the gpt-5.6
 /// family, generation 6 (`gpt-6-astra` / `-sol` list low..ultra, `gpt-6-luna`
 /// low..max) and generation 6.1 (`gpt-6.1-sol`, low..ultra, catalog fetched
-/// 2026-10-06). Luna's missing `ultra` is enforced by the catalog's effort
+/// 2026-10-06; `gpt-6.1-terra`, low..ultra, fetched 2026-11-10). Luna's missing `ultra` is enforced by the catalog's effort
 /// menu, not here: this gate only decides whether `max`/`ultra` clamp.
 /// The boundary is exact-generation: `gpt-5.6` / `gpt-6` / `gpt-6.1`
 /// themselves or a `gpt-5.6-` / `gpt-6-` / `gpt-6.1-` variant. A bare
@@ -671,11 +679,13 @@ mod tests {
     fn bare_variant_aliases_resolve_to_latest_generation() {
         // Variant aliases map to the NEWEST generation shipping that variant
         // (models.json @ d63a9b83, 2026-10-06): `sol` → gpt-6.1-sol, `luna` →
-        // gpt-6-luna, `astra` → gpt-6-astra, `terra` stays on 5.6 (no gen-6
-        // terra). Case-insensitive, regardless of the configured pin.
+        // gpt-6-luna, `astra` → gpt-6-astra; `terra` → gpt-6.1-terra since
+        // 2026-11-10 (models.json @ caae161dd0c8). Case-insensitive,
+        // regardless of the configured pin.
         for (alias, expected) in [
             ("sol", "gpt-6.1-sol"),
-            ("terra", "gpt-5.6-terra"),
+            ("terra", "gpt-6.1-terra"),
+            ("TERRA", "gpt-6.1-terra"),
             ("luna", "gpt-6-luna"),
             ("LUNA", "gpt-6-luna"),
             ("astra", "gpt-6-astra"),
@@ -686,11 +696,77 @@ mod tests {
             ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-6-luna", "gpt-6-luna"),
             ("gpt-6.1-sol", "gpt-6.1-sol"),
+            ("gpt-6.1-terra", "gpt-6.1-terra"),
+            // The 5.6 terra stays addressable by its full id.
+            ("gpt-5.6-terra", "gpt-5.6-terra"),
         ] {
             let body = json!({ "model": alias, "messages": [{"role":"user","content":"hi"}] });
             let (upstream, _) =
                 translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
             assert_eq!(upstream["model"], expected, "alias {alias} → {expected}");
+        }
+    }
+
+    #[test]
+    fn gpt_6_1_terra_resolves_and_keeps_the_extended_effort_menu() {
+        // `terra` moved to gpt-6.1-terra on 2026-11-10. Every spelling a
+        // client may send — the bare alias, the full id, either with the
+        // `[1m]` context suffix — reaches upstream as `gpt-6.1-terra`, and is
+        // RECORDED as that slug (accounting prices off it), whatever the pin.
+        let provider = CodexProvider::with_shape(
+            "https://chatgpt.com/backend-api/codex",
+            CodexShape {
+                model: "gpt-5.6-sol".to_string(),
+                client_model: None,
+                fast: false,
+                effort: None,
+            },
+        );
+        for requested in [
+            "terra",
+            "terra[1m]",
+            "gpt-6.1-terra",
+            "gpt-6.1-terra[1m]",
+            "  GPT-6.1-Terra[1M] ",
+        ] {
+            assert_eq!(
+                resolve_upstream_model(Some(requested), CODEX_MODEL),
+                "gpt-6.1-terra",
+                "{requested}"
+            );
+            let body = json!({ "model": requested, "messages": [{"role":"user","content":"hi"}] });
+            let (upstream, _) =
+                translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+            assert_eq!(upstream["model"], "gpt-6.1-terra", "{requested}");
+            let (model, _, _) = provider.request_meta(body.to_string().as_bytes());
+            assert_eq!(model, "gpt-6.1-terra", "{requested} recorded");
+        }
+        // models.json lists low..ultra for gpt-6.1-terra, like 6.1-sol: `max`
+        // passes unclamped and `ultra` lands as `max` (the backend takes
+        // none..max only, probe 2026-11-02) — from the request and from a
+        // configured effort alike.
+        assert!(supports_extended_efforts("gpt-6.1-terra"));
+        for (sent, wire) in [("max", "max"), ("ultra", "max"), ("xhigh", "xhigh")] {
+            for model in ["terra", "gpt-6.1-terra[1m]"] {
+                let body = json!({
+                    "model": model,
+                    "output_config": { "effort": sent },
+                    "messages": [{"role":"user","content":"hi"}],
+                });
+                let (upstream, _) =
+                    translate_request_with(&body, "s", &CodexShape::default()).expect("translate");
+                assert_eq!(upstream["reasoning"]["effort"], wire, "{sent} on {model}");
+            }
+            let shape = CodexShape {
+                model: CODEX_MODEL.to_string(),
+                client_model: None,
+                fast: false,
+                effort: Some(sent.to_string()),
+            };
+            let body = json!({ "model": "terra", "messages": [{"role":"user","content":"hi"}] });
+            let (model, effort, _) = effective_request_meta(&body, &shape);
+            assert_eq!(model, "gpt-6.1-terra");
+            assert_eq!(effort.as_deref(), Some(wire), "configured {sent}");
         }
     }
 
@@ -704,6 +780,8 @@ mod tests {
             ("gpt-5.6-sol[1m]", "gpt-5.6-sol"),
             ("gpt-5.6-terra[1m]", "gpt-5.6-terra"),
             ("sol[1m]", "gpt-6.1-sol"),
+            ("terra[1m]", "gpt-6.1-terra"),
+            ("gpt-6.1-terra[1m]", "gpt-6.1-terra"),
             ("gpt-5.6[1m]", "gpt-5.6-sol"),
             ("gpt-5.5[1m]", "gpt-5.5"),
             ("  GPT-5.6-Sol[1M]  ", "gpt-5.6-sol"),
@@ -891,6 +969,7 @@ mod tests {
         // rejects `ultra` on the wire (probe 2026-11-02).
         for m in [
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
             "gpt-6-sol",
             "gpt-6-astra",
             "gpt-5.6-sol",

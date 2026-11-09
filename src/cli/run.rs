@@ -751,6 +751,12 @@ mod tests {
             .models;
         assert_eq!(rows.len(), entries.len());
         let json = model_picker_settings(&rows).unwrap();
+        // Fable 5.2 (2026-11-10) rides the picker exactly as Fable 5.1 does:
+        // its single `[1m]` id verbatim, first in catalog order.
+        assert!(
+            json.contains(r#"{"modelPicker":{"options":[{"model":"claude-fable-5-2[1m]","label":"Claude Fable 5.2","description":"claude · efforts low…max · ctx 1000000"},"#),
+            "{json}"
+        );
         assert!(
             json.contains(r#"{"model":"claude-fable-5-1[1m]","label":"Claude Fable 5.1","description":"claude · efforts low…max · ctx 1000000"}"#),
             "{json}"
@@ -803,7 +809,8 @@ mod tests {
     /// bare aliases, the plain rows own none, and `haiku` has no twin at all.
     fn claude_rows() -> Vec<CatalogRow> {
         vec![
-            aliased("claude-fable-5-1[1m]", &["fable", "fable-5-1"]),
+            aliased("claude-fable-5-2[1m]", &["fable", "fable-5-2"]),
+            aliased("claude-fable-5-1[1m]", &["fable-5-1"]),
             aliased("claude-fable-5[1m]", &[]),
             aliased("claude-opus-5-5[1m]", &["opus", "opus-5-5"]),
             aliased("claude-opus-5-5", &[]),
@@ -828,7 +835,7 @@ mod tests {
                 ("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-5-5[1m]".into()),
                 (
                     "ANTHROPIC_DEFAULT_FABLE_MODEL",
-                    "claude-fable-5-1[1m]".into()
+                    "claude-fable-5-2[1m]".into()
                 ),
                 (
                     "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -890,7 +897,7 @@ mod tests {
                 ("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-5-5[1m]".into()),
                 (
                     "ANTHROPIC_DEFAULT_FABLE_MODEL",
-                    "claude-fable-5-1[1m]".into()
+                    "claude-fable-5-2[1m]".into()
                 ),
                 (
                     "ANTHROPIC_DEFAULT_SONNET_MODEL",
