@@ -539,8 +539,13 @@ mod tests {
         assert_eq!(normalized_model("sonnet"), "claude-sonnet-5-5");
         assert_eq!(normalized_model("sonnet-5-5"), "claude-sonnet-5-5");
         assert_eq!(normalized_model("sonnet-5"), "claude-sonnet-5");
-        assert_eq!(normalized_model("fable"), "claude-fable-5-1");
+        // `fable` floats to Fable 5.2 since 2026-11-10; `fable-5-1` stays.
+        assert_eq!(normalized_model("fable"), "claude-fable-5-2");
+        assert_eq!(normalized_model("fable-5-2"), "claude-fable-5-2");
         assert_eq!(normalized_model("fable-5-1"), "claude-fable-5-1");
+        // A real catalog id is not rewritten, only suffix-stripped.
+        assert_eq!(normalized_model("claude-fable-5-2[1m]"), "claude-fable-5-2");
+        assert_eq!(normalized_model("claude-fable-5-1[1m]"), "claude-fable-5-1");
     }
 
     /// An alias may arrive with the Claude-Code-local `[1m]` suffix attached.
@@ -549,7 +554,7 @@ mod tests {
     /// 404'd at api.anthropic.com.
     #[test]
     fn normalize_body_resolves_an_alias_carrying_the_client_context_suffix() {
-        assert_eq!(normalized_model("fable[1m]"), "claude-fable-5-1");
+        assert_eq!(normalized_model("fable[1m]"), "claude-fable-5-2");
         assert_eq!(normalized_model("opus[1m]"), "claude-opus-5-5");
     }
 

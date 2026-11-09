@@ -14,7 +14,16 @@
 //! fable alias rolled to 5.1 on 2026-09-02; claude rows re-curated 2026-09-23
 //! to add the `claude-opus-5-5` pair and roll the floating `opus` alias off
 //! `claude-opus-5[1m]` onto `claude-opus-5-5[1m]`; grok rows re-probed
-//! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7):
+//! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7;
+//! fable alias rolled to 5.2 and `terra` to `gpt-6.1-terra` on 2026-11-10):
+//! - Fable 5.2: platform.claude.com/docs/en/models/fable-5-2/overview and
+//!   the pricing page, read 2026-11-10: `claude-fable-5-2` released
+//!   2026-11-09, 1,000,000 context (the default and the maximum; no 200K
+//!   mode), 128k output. One `[1m]` row like Fable 5.1, no bare twin: Claude
+//!   Code 2.1.321 accepts the suffix on Fable but ignores it (its baked record
+//!   has `native_1m` and no `supports_1m_suffix`), and resolves its own
+//!   `fable` alias to `claude-fable-5-2` — so the floating `fable` alias
+//!   moved off `claude-fable-5-1[1m]` here too (same roll as 2026-09-02).
 //! - Haiku 5.5: platform.claude.com/docs/en/models/haiku-5-5/overview,
 //!   read 2026-10-08: released 2026-10-07, 1M context, 128k output. The
 //!   `claude-haiku-4-5` row was retired 2026-10-23 (user decision): its ids
@@ -34,12 +43,15 @@
 //!   source.
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14, re-fetched
-//!   2026-09-07 for generation 6 and 2026-10-06 (commit d63a9b83) for
-//!   `gpt-6.1-sol` / `gpt-6-sol` / `gpt-6-luna`. `gpt-6.1-sol`, `gpt-6-astra`,
-//!   `gpt-6-sol` and `gpt-5.6-sol/terra` support low..ultra; `gpt-6-luna` and
+//!   2026-09-07 for generation 6, 2026-10-06 (commit d63a9b83) for
+//!   `gpt-6.1-sol` / `gpt-6-sol` / `gpt-6-luna` and 2026-11-10 (HEAD
+//!   caae161dd0c8; the entry landed in commit 126a0ee92ed2) for
+//!   `gpt-6.1-terra`. `gpt-6.1-sol/terra`, `gpt-6-astra`, `gpt-6-sol` and
+//!   `gpt-5.6-sol/terra` support low..ultra; `gpt-6-luna` and
 //!   `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh. Every generation-6 /
 //!   6.1 row carries the catalog's 272,000 base context (astra was the only
-//!   gen-6 tier until 2026-09-22). The `[1m]` rows are the codex side of the `[1m]` opt-in
+//!   gen-6 tier until 2026-09-22), except `gpt-6.1-terra`, whose models.json
+//!   entry says 500,000. The `[1m]` rows are the codex side of the `[1m]` opt-in
 //!   and carry OpenAI's published ~1,050,000-token window rather than the
 //!   catalog figure; live probes 2026-08-21 against the ChatGPT-account
 //!   backend corroborate it on SOL specifically (910,229 accepted, ~936k
@@ -103,8 +115,8 @@ const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 // ---- codex effort menus (openai/codex models.json, 2026-07-14;
 //      gpt-6-astra added from the 2026-09-07 fetch) ----
-/// The full six-level menu, shared by `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`
-/// and `gpt-5.6-sol/terra`.
+/// The full six-level menu, shared by `gpt-6.1-sol/terra`, `gpt-6-astra`,
+/// `gpt-6-sol` and `gpt-5.6-sol/terra`.
 const CODEX_EFFORTS_FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_EFFORTS_LUNA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
@@ -116,9 +128,19 @@ const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
 /// Adding a model = one row here; the alias follows automatically.
 /// Tuple = (id, aliases, display name, max_context).
 pub(crate) const CLAUDE_MODELS: &[(&str, &[&str], &str, u64)] = &[
+    // Fable 5.2 (released 2026-11-09): native 1M, so one `[1m]` row and no
+    // bare twin, the Fable 5.1 pattern. Owns the floating `fable` alias since
+    // 2026-11-10.
+    (
+        "claude-fable-5-2[1m]",
+        &["fable", "fable-5-2"],
+        "Claude Fable 5.2",
+        1_000_000,
+    ),
+    // `fable` moved to Fable 5.2 on 2026-11-10; the version alias stays.
     (
         "claude-fable-5-1[1m]",
-        &["fable", "fable-5-1"],
+        &["fable-5-1"],
         "Claude Fable 5.1",
         1_000_000,
     ),
@@ -544,7 +566,8 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // 2026-10-06; `gpt-6.1-sol` released 2026-09-29, catalog priority 1).
     // `sol` MOVED here from `gpt-5.6-sol` on 2026-10-06 — the family alias
     // floats to the newest generation of that variant; the bare `gpt-6.1`
-    // generation id resolves to its only tier. Same base/[1m] split as the
+    // generation id resolves to its flagship, sol (models.json priority 1;
+    // terra is the 6.1 mid tier since 2026-10-26). Same base/[1m] split as the
     // other codex rows: models.json says context_window 272000 /
     // max_context_window 872000, the OpenAI model page says 1,050,000 — the
     // base row carries the models.json figure, the twin the published 1M.
@@ -561,6 +584,28 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         CODEX_EFFORTS_FULL,
         Some(272_000),
         vec!["sol".into(), "gpt-6.1".into()],
+    ));
+    // `gpt-6.1-terra` (released 2026-10-26; openai/codex models.json @
+    // caae161dd0c8, entry added in commit 126a0ee92ed2: low..ultra, default
+    // low, minimal client 0.153.0). `terra` MOVED here from `gpt-5.6-terra`
+    // on 2026-11-10 — generation 6.1 now ships the variant. Same base/[1m]
+    // split, except that this models.json entry lists context_window 500000
+    // (max_context_window 872000), not the 272000 of the other 6.x entries,
+    // so the base row carries 500_000; the twin carries OpenAI's published
+    // 1,050,000 as 1_000_000. Not yet probed through the daemon.
+    entries.push(codex_entry(
+        "gpt-6.1-terra[1m]",
+        "GPT-6.1-Terra [1M]",
+        CODEX_EFFORTS_FULL,
+        Some(1_000_000),
+        Vec::new(),
+    ));
+    entries.push(codex_entry(
+        "gpt-6.1-terra",
+        "GPT-6.1-Terra",
+        CODEX_EFFORTS_FULL,
+        Some(500_000),
+        vec!["terra".into()],
     ));
     entries.push(codex_entry(
         "gpt-6-astra[1m]",
@@ -579,8 +624,10 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // Generation 6 grew sol/luna tiers on 2026-09-22 (models.json PR #47332;
     // the "single tier" note above predates them). `gpt-6-sol` supports
     // low..ultra, `gpt-6-luna` low..max (no ultra). `luna` MOVED here from
-    // `gpt-5.6-luna` on 2026-10-06; `terra` has no generation-6 tier and
-    // stays on 5.6. Base rows = models.json 272000, twins = published 1M.
+    // `gpt-5.6-luna` on 2026-10-06. Generation 6 has no terra tier; `terra`
+    // stayed on 5.6 until generation 6.1 shipped one (moved to
+    // `gpt-6.1-terra` on 2026-11-10). Base rows = models.json 272000, twins =
+    // published 1M.
     entries.push(codex_entry(
         "gpt-6-sol[1m]",
         "GPT-6-Sol [1M]",
@@ -637,7 +684,8 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "GPT-5.6-Terra",
         CODEX_EFFORTS_FULL,
         Some(272_000),
-        vec!["terra".into()],
+        // `terra` moved to gpt-6.1-terra (2026-11-10).
+        Vec::new(),
     ));
     entries.push(codex_entry(
         "gpt-5.6-luna",
@@ -802,8 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_50_entries() {
-        // The pinned (curated) case: exactly 50 rows, claude ids in order.
+    fn catalog_matches_user_contract_53_entries() {
+        // The pinned (curated) case: exactly 53 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
@@ -813,9 +861,10 @@ mod tests {
         // 33 before the sonnet-5-5 pair + the gpt-6.1-sol / gpt-6-sol /
         // gpt-6-luna pairs landed (2026-10-06); 41 before Haiku 5.5 (2026-10-08);
         // 43 before the 8 gemini rows landed (2026-10-15); 50 after the
-        // claude-haiku-4-5 row was retired (2026-10-23).
+        // claude-haiku-4-5 row was retired (2026-10-23); 53 after the
+        // claude-fable-5-2 row and the gpt-6.1-terra pair landed (2026-11-10).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 50);
+        assert_eq!(entries.len(), 53);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -824,6 +873,7 @@ mod tests {
         assert_eq!(
             claude_ids,
             vec![
+                "claude-fable-5-2[1m]",
                 "claude-fable-5-1[1m]",
                 "claude-fable-5[1m]",
                 "claude-opus-5-5[1m]",
@@ -956,9 +1006,23 @@ mod tests {
             );
         }
         // Curated aliases and 1M-vs-standard context windows.
+        // The `fable` alias MOVED off Fable 5.1 onto Fable 5.2 (2026-11-10,
+        // released 2026-11-09; Claude Code 2.1.321 resolves its own `fable`
+        // to claude-fable-5-2). The version alias `fable-5-1` stays on 5.1 —
+        // letting it drift would be silent model substitution.
+        assert_eq!(
+            find(&entries, "claude-fable-5-2[1m]").aliases,
+            vec!["fable", "fable-5-2"]
+        );
         assert_eq!(
             find(&entries, "claude-fable-5-1[1m]").aliases,
-            vec!["fable", "fable-5-1"]
+            vec!["fable-5-1"]
+        );
+        // Fable 5.2 is native 1M with no 200K mode: one `[1m]` row, no bare
+        // twin (the Fable 5.1 pattern).
+        assert!(
+            entries.iter().all(|e| e.id != "claude-fable-5-2"),
+            "no bare claude-fable-5-2 twin"
         );
         // The `fable` alias MOVED off Fable 5 onto Fable 5.1 (2026-09-02, Fable
         // 5 is legacy upstream) — same regression this guards for opus-4-8: a
@@ -1005,6 +1069,14 @@ mod tests {
         assert!(
             entries.iter().all(|e| e.id != "claude-haiku-4-5"),
             "the claude-haiku-4-5 row is retired"
+        );
+        assert_eq!(
+            find(&entries, "claude-fable-5-2[1m]").max_context,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            find(&entries, "claude-fable-5-2[1m]").name,
+            "Claude Fable 5.2"
         );
         assert_eq!(
             find(&entries, "claude-fable-5-1[1m]").max_context,
@@ -1108,7 +1180,7 @@ mod tests {
     fn resolve_claude_alias_accepts_client_context_suffix_on_alias() {
         assert_eq!(
             resolve_claude_alias("fable[1m]"),
-            Some("claude-fable-5-1[1m]")
+            Some("claude-fable-5-2[1m]")
         );
         assert_eq!(
             resolve_claude_alias("opus[1m]"),
@@ -1116,6 +1188,15 @@ mod tests {
         );
         assert_eq!(
             resolve_claude_alias("  FABLE[1m] "),
+            Some("claude-fable-5-2[1m]")
+        );
+        // The version-pinned aliases keep their own generation.
+        assert_eq!(
+            resolve_claude_alias("fable-5-2[1m]"),
+            Some("claude-fable-5-2[1m]")
+        );
+        assert_eq!(
+            resolve_claude_alias("fable-5-1[1m]"),
             Some("claude-fable-5-1[1m]")
         );
         // The row's own id carries no suffix — the alias still resolves.
@@ -1131,6 +1212,9 @@ mod tests {
     #[test]
     fn resolve_claude_alias_rejects_ids_and_foreign_slugs() {
         for slug in [
+            "claude-fable-5-2",
+            "claude-fable-5-2[1m]",
+            "claude-fable-5-1[1m]",
             "claude-opus-5-5",
             "claude-opus-5-5[1m]",
             "claude-opus-5",
@@ -1295,7 +1379,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 50, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 53, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
@@ -1342,14 +1426,14 @@ mod tests {
         // A curated pin: no synthesized row, alias on the row whose id IS the
         // pin — a base-slug pin never hands it to the `[1m]` twin (the
         // suffixed-pin case is in `grok_family_alias_follows_the_pin`),
-        // count 50.
+        // count 53.
         for (pin, owner) in [
             ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
-            assert_eq!(entries.len(), 50, "pin {pin}");
+            assert_eq!(entries.len(), 53, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1364,7 +1448,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 51);
+        assert_eq!(entries.len(), 54);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1391,7 +1475,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
-        assert_eq!(entries.len(), 51);
+        assert_eq!(entries.len(), 54);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));
@@ -1421,8 +1505,8 @@ mod tests {
         // (priority 1, low..ultra), gpt-6-sol (low..ultra), gpt-6-luna
         // (low..max). The base rows carry models.json's 272000 and the `[1m]`
         // twins the published 1,050,000 (advertised as 1_000_000, same as
-        // astra). Family aliases float: `sol` → 6.1-sol, `luna` → 6-luna,
-        // `terra` stays on 5.6 (no gen-6 terra).
+        // astra). Family aliases float: `sol` → 6.1-sol, `luna` → 6-luna;
+        // `terra` → 6.1-terra since 2026-11-10 (generation 6 has no terra).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
         let sol = find(&entries, "gpt-6.1-sol");
         assert_eq!(sol.aliases, vec!["sol".to_string(), "gpt-6.1".to_string()]);
@@ -1447,10 +1531,10 @@ mod tests {
             Some(1_000_000)
         );
         assert_eq!(
-            find(&entries, "gpt-5.6-terra").aliases,
+            find(&entries, "gpt-6.1-terra").aliases,
             vec!["terra".to_string()]
         );
-        for alias in ["sol", "luna", "gpt-6.1"] {
+        for alias in ["sol", "terra", "luna", "gpt-6.1"] {
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == alias))
@@ -1461,6 +1545,57 @@ mod tests {
                 1,
                 "alias {alias:?} must have one owner, got {owners:?}"
             );
+        }
+    }
+
+    #[test]
+    fn gpt_6_1_terra_owns_the_terra_alias() {
+        // openai/codex models.json @ caae161dd0c8 (entry added in commit
+        // 126a0ee92ed2, released 2026-10-26): context_window 500000,
+        // max_context_window 872000, low..ultra. The base row carries the
+        // models.json 500000 (not the 272000 of the other 6.x rows); the
+        // `[1m]` twin the published 1,050,000 as 1_000_000. `terra` moved
+        // here from gpt-5.6-terra on 2026-11-10.
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let terra = find(&entries, "gpt-6.1-terra");
+        assert_eq!(terra.name, "GPT-6.1-Terra");
+        assert_eq!(terra.aliases, vec!["terra".to_string()]);
+        assert_eq!(terra.max_context, Some(500_000));
+        assert_eq!(terra.efforts, CODEX_EFFORTS_FULL);
+        assert_eq!(terra.group, "codex");
+        let twin = find(&entries, "gpt-6.1-terra[1m]");
+        assert_eq!(twin.name, "GPT-6.1-Terra [1M]");
+        assert!(twin.aliases.is_empty(), "the [1m] twin is an opt-in");
+        assert_eq!(twin.max_context, Some(1_000_000));
+        assert_eq!(twin.efforts, CODEX_EFFORTS_FULL);
+        // The 5.6 terra rows stay addressable by full id but own no alias.
+        assert!(find(&entries, "gpt-5.6-terra").aliases.is_empty());
+        assert!(find(&entries, "gpt-5.6-terra[1m]").aliases.is_empty());
+        // Listed right after the gpt-6.1-sol pair, twin first.
+        let codex_ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "codex")
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert_eq!(
+            &codex_ids[..4],
+            &[
+                "gpt-6.1-sol[1m]",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra[1m]",
+                "gpt-6.1-terra"
+            ]
+        );
+        assert_eq!(codex_ids.len(), 16);
+        // Every codex alias has exactly one owner.
+        let mut aliases: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "codex")
+            .flat_map(|e| e.aliases.iter().map(String::as_str))
+            .collect();
+        aliases.sort_unstable();
+        for pair in aliases.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate codex alias {:?}", pair[0]);
         }
     }
 
