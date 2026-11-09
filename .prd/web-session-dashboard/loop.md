@@ -17,6 +17,15 @@ without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 
 - Deploy: `rsync` `webui/` → `~/llmux-webui/` (keeps `server.log`, `run.sh`, plists), then
   `launchctl kickstart -k gui/$UID/ai.2lab.llmux-webui` (fable-m5max) or `user/$UID/…` (iq-64, no GUI login).
 
+## Re-verification (2026-11-09 16:30 KST)
+
+- re-verified ✅: H3 · Playwright against both public URLs, viewer output compared with the raw-io record it was given
+  (`raw-verify.mjs`): iq-64 request #13467 (808 KB, 184 messages) and fable-m5max #12270 (1.79 MB, 566 messages) open with
+  only `/messages/<last>` expanded; `/system` and the previous message expand on demand; an expanded string equals the
+  record value; headers 21/21 with credentials redacted; raw view equals `request_body` (757,912 chars; 1,794,916 after
+  "나머지 더 보기"); pretty view equals `JSON.stringify(body, null, 2)`; the Response leg shows the message assembled from
+  342/348 SSE events and its raw view equals `response_body`; 0 page errors · branch e9cf725
+
 ## Next
 
 - PR review and merge to `main` (owner decision; runtime does not depend on it).
