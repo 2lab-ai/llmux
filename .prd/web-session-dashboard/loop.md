@@ -26,6 +26,14 @@ without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 
   "나머지 더 보기"); pretty view equals `JSON.stringify(body, null, 2)`; the Response leg shows the message assembled from
   342/348 SSE events and its raw view equals `response_body`; 0 page errors · branch e9cf725
 
+- re-verified ✅: H3 (upstream legs) · `up-verify.mjs` on iq-64 translated exchange #13638 (codex gpt-6-astra, subagent):
+  four legs Request / Upstream Req / Upstream Resp / Response; Upstream Req url = `upstream.url`, 7/7 headers equal with
+  credentials redacted, raw equals `upstream.request_body` (806,006 chars), tree opens only `/input/<last>`; Upstream Resp
+  33/33 headers equal, raw equals `upstream.response_body` (832,514 chars, 315 SSE events), tree opens the
+  `response.completed` object; client Request/Response raw and headers equal the record; upstream curl targets
+  `https://chatgpt.com/backend-api/codex/responses`; 0 page errors. Fix in the same pass: a Responses SSE leg opened its
+  last 20 events — it now opens the completed response instead.
+
 ## Next
 
 - PR review and merge to `main` (owner decision; runtime does not depend on it).
