@@ -145,7 +145,14 @@ client_model, user_agent }`.
   Client effort is NOT sent upstream: the level is baked into the variant id, and no
   `thinkingLevel` wire form is verified for Argon on this backend.
 - **Request** (`translate_request`): system (string or text blocks) →
-  `systemInstruction {role:"user", parts}`; `user`→`user`, `assistant`→`model`; text →
+  `systemInstruction {role:"user", parts}`, a leading `x-anthropic-billing-header:` line
+  left out; a mid-conversation `role:"system"` message (text only, else 400) → a user text
+  part `<system-reminder>\n…\n</system-reminder>` at its own position (left as is when
+  the client already tagged it; held until the user turn that answers a pending
+  `functionCall`, so the response still follows the call), reported as the warning
+  `system_message_as_user` — never folded into `systemInstruction`, so a new reminder does
+  not rewrite the cached prefix (2026-11-09; before that the role was a local 400);
+  `user`→`user`, `assistant`→`model`; text →
   `{text}`; base64 image (png/jpeg/webp/heic/heif) → `inlineData`; base64 PDF document →
   `inlineData application/pdf`; text document → `{text}`; URL sources, other media and
   unknown block types → local 400 (`ProviderError::InvalidRequest`, JSON path in the

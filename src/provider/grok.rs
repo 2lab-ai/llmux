@@ -686,7 +686,7 @@ mod tests {
 
     // ---- C16: flavor-parameterized translation through the shared core ----
     #[test]
-    fn c16_system_folding_tools_and_tool_round_trip_under_grok_flavor() {
+    fn c16_system_messages_tools_and_tool_round_trip_under_grok_flavor() {
         let b = json!({
             "model": "grok-4.5",
             "stream": true,
@@ -706,8 +706,13 @@ mod tests {
         });
         let (upstream, _) =
             translate_request_with(&b, "s", &shape("grok-4.5", None)).expect("translate");
-        assert_eq!(upstream["instructions"], "be terse\noperator note");
+        assert_eq!(upstream["instructions"], "be terse");
         let input = upstream["input"].as_array().unwrap();
+        assert_eq!(
+            input[1]["role"], "developer",
+            "operator note stays in place"
+        );
+        assert_eq!(input[1]["content"][0]["text"], "operator note");
         assert!(input
             .iter()
             .any(|i| i["type"] == "function_call" && i["call_id"] == "call_1"));

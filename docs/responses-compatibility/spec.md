@@ -74,7 +74,9 @@ Anthropic accepts, 2026-09-17) live with the rule they justify, in §R1a.
 | assistant `thinking` / `redacted_thinking` | omitted, order preserved | same | `thinking` / `redacted_thinking` |
 | `thinking` on a non-assistant message | **400** | **400** | — |
 | `role` outside user/assistant/developer/system | **400** | **400** | — |
-| `system` (string or text blocks), `role:"system"` messages | folded into `instructions` | same | — |
+| `system` (string or text blocks) | `instructions` (a leading `x-anthropic-billing-header:` line left out) | same | — |
+| `role:"system"` message (text only) | `developer` input item at its position | same | — |
+| `role:"system"` message with a non-text block | **400** | **400** | — |
 | non-null `temperature` / `top_p` / `top_k` | **400** | **400** | — |
 | non-empty `stop_sequences`; `stop_sequences` not an array | **400** | **400** | — |
 | empty `stop_sequences`, or explicit `null` sampling control | accepted, asks nothing | same | — |
@@ -259,6 +261,66 @@ not from this field; the proxy reads it only for an activity-log label.
 This rule closes the controls known today. It is not a claim that every future Anthropic
 request field is handled — a new one would land in whatever branch matches it, which is
 why unknown CONTENT is refused rather than ignored.
+
+### R8 — operator text (`system`)
+
+Two channels, never mixed:
+
+- Top-level `system` → `instructions`. It is the only input to `instructions`, so the
+  value is byte-identical on every turn of a conversation. A leading
+  `x-anthropic-billing-header: …` line (first line of a block, or a whole block) is left
+  out: it is Anthropic billing metadata, not an instruction. The same words anywhere else
+  stay.
+- A mid-conversation `messages[].role:"system"` message → one
+  `{"type":"message","role":"developer","content":[{"type":"input_text",…}]}` item **at
+  its own position**. Its text blocks join with `\n`. Never merged with a neighbour,
+  deduplicated or moved; an empty one produces no item; a non-text block is a 400.
+
+Why. Claude Code (Agent SDK 2.1.28x, beta `mid-conversation-system-2026-04-07`) sends
+operator text as system messages where it applies: environment and skill listings, agent
+types, nested `CLAUDE.md`, background-task notifications, TodoWrite reminders. Until
+2026-11-09 llmux folded all of them into `instructions`. Measured on owner-mac's
+raw-io store, 2026-11-09 15:00–17:00:
+
+| | codex (383 requests, 44 conversations) | grok (182 requests, 11 conversations) |
+| --- | --- | --- |
+| requests carrying mid-conversation system messages | 100% | 100% |
+| share of `instructions` bytes from them | 87.6% (median 24.5K chars vs 2.8K top-level) | 89.3% |
+| cache hit, next turn, `instructions` unchanged | median 97.7% | median 98.8% |
+| cache hit, next turn, `instructions` grew | median 26.6% | median 1.9% |
+| share of all uncached input tokens from those turns | 70% | 90% |
+
+The prompt cache matches tools → `instructions` → `input` as one prefix, so every new
+reminder turned the whole transcript behind it into a miss. Folding also lifted
+time-bound notes ("task 7 completed", "TodoWrite has not been used recently" ×9) out of
+time into standing instructions. Both backends' own clients append context changes as new
+items instead: codex-rs never sends `role:"system"` and appends `developer`/`user`
+context items (openai/codex `core/tests/suite/prompt_caching.rs`,
+`overrides_turn_context_but_keeps_cached_prefix_and_key_constant`); xAI's caching guide
+says "never edit, remove, or reorder earlier messages — only append new ones".
+
+Receipts (live, through the daemon, 2026-11-09, synthetic fixtures):
+
+| Probe | codex `gpt-6-astra` | grok `grok-4.7` |
+| --- | --- | --- |
+| `developer` item mid-conversation, rule "answer in ALL CAPS" | 200, followed | 200, followed |
+| `developer` item as the LAST input item (after a `function_call_output`) | 200, followed | 200, followed |
+| `developer` item between a `function_call` and its `function_call_output` | 200 | 200 |
+| `role:"system"` input item | 400 "System messages are not allowed" (earlier receipt) | not probed |
+
+Before/after on the wire (2026-11-09): one real Claude Code conversation (raw-io #12873)
+replayed as two consecutive turns (`messages[:28]` then `messages[:31]`, a new system
+message in between) straight to the codex gateway, `gpt-6-astra`, fresh cache key per
+arm. The old arm's bodies are the pre-fix translation, byte-identical to the recorded
+upstream body of #12873.
+
+| | `instructions` turn 1 → 2 | turn 2 cached / input |
+| --- | --- | --- |
+| folded (before) | 26,524 → 26,910 chars | 22,016 / 73,303 (30.0%) |
+| in place (after) | 2,756 → 2,756 chars | 72,704 / 73,295 (99.2%) |
+
+Gemini carries the same messages as tagged user text (no operator role in `contents`):
+[`gemini/spec.md`](../gemini/spec.md) §R3.
 
 ## 4. API
 
