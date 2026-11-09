@@ -48,6 +48,11 @@
     if (!msg && !blocks.length) return null;
     return { ...(msg || {}), content: blocks.filter(Boolean) };
   }
+  // OpenAI Responses SSE: the final `response.completed` event carries the whole response object.
+  function completedResponse(events) {
+    for (let i = events.length - 1; i >= 0; i--) { const d = events[i].data; if (d && typeof d === 'object' && d.type === 'response.completed' && d.response) return d.response; }
+    return null;
+  }
   function bodyModel(text, isResponse) {
     if (!text) return { kind: 'empty' };
     const t = text.trimStart();
@@ -58,7 +63,8 @@
     if (isResponse && /(^|\n)(event|data):/.test(text)) {
       const events = parseSSE(text);
       const message = assemble(events);
-      return { kind: 'sse', value: message ? { 'message (assembled)': message, events } : { events } };
+      const completed = message ? null : completedResponse(events);
+      return { kind: 'sse', value: message ? { 'message (assembled)': message, events } : completed ? { 'response (completed)': completed, events } : { events } };
     }
     return { kind: 'text' };
   }
@@ -82,6 +88,12 @@
       openDeep(set, ptr('/input', v.input.length - 1), v.input[v.input.length - 1], 4);
     } else if (v['message (assembled)']) {
       openDeep(set, ptr('', 'message (assembled)'), v['message (assembled)'], 3);
+    } else if (v['response (completed)']) {
+      const r = v['response (completed)'];
+      set.add(ptr('', 'response (completed)'));
+      if (Array.isArray(r.output)) { const o = ptr(ptr('', 'response (completed)'), 'output'); set.add(o); r.output.forEach((it, k) => openDeep(set, ptr(o, k), it, 2)); }
+    } else if (Array.isArray(v.events)) {
+      set.add('/events'); if (v.events.length) openDeep(set, ptr('/events', v.events.length - 1), v.events[v.events.length - 1], 2);
     } else if (/Resp|Response/.test(legLabel)) openDeep(set, '', v, 2);
     return set;
   }
