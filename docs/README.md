@@ -24,6 +24,7 @@ Pick the thing you want to do.
 - [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.
 - [Provider compatibility](provider-compatibility.md) — what each backend group actually honors: forwarded vs dropped vs refused request fields, the Codex/Grok `max_tokens` receipts, Gemini's thought-signature replay, diagnostic headers, known unknowns.
 - [Codex frontend](codex-frontend/README.md) — `llmux run --codex`, Responses API, model picker, Agent SDK prerequisites and limits. [Activity origin](codex-frontend/activity.md) covers endpoint coloring.
+- [Web dashboard](web-dashboard.md) — admin-only web page behind the soma-work login: each Claude Code / soma-work session as a task card owned by the person whose key sent it, per-user usage, and a detail card (instructions, work log, chat, raw requests).
 - [Remote daemon](remote.md) — one central daemon, other computers connect to it as clients, and usage is attributed per computer. A bonus, not the default setup. Also covers the remote-mode command matrix and transport security.
 - [Why llmux exists](why-llmux.md) — the harness-is-capital bet and the problems llmux removes.
 - [What ships today](features.md) — the complete feature list, with dates on behavior changes.
