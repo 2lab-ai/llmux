@@ -1085,12 +1085,12 @@ mod tests {
         assert_eq!(upstream["instructions"], "Line one.\nLine two.");
     }
 
-    /// The codex `responses` endpoint rejects any `role:"system"` input item
-    /// ("System messages are not allowed", verified live on :3477). A bare
-    /// system-role message (the original P3 repro shape) must NOT become an
-    /// input item — its text folds into `instructions` instead.
+    /// A system-role message (the original P3 repro shape) must never become a
+    /// `role:"system"` input item — codex 400s on it. It becomes a `developer`
+    /// item at its own position, and `instructions` stays the top-level
+    /// `system` alone (empty here).
     #[test]
-    fn translate_system_role_message_never_becomes_input_item() {
+    fn translate_system_role_message_becomes_developer_item_in_place() {
         let body = json!({
             "max_tokens": 40,
             "stream": true,
@@ -1101,10 +1101,12 @@ mod tests {
         });
         let (upstream, _) = translate_request(&body, "s").expect("translate");
         let input = upstream["input"].as_array().expect("input");
-        // The system message produced no input item; only the user message did.
-        assert_eq!(input.len(), 1, "system message must not emit an input item");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["text"], "say OK");
+        assert_eq!(input.len(), 2, "operator note, then the user turn");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "be brief");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "say OK");
         // No input item may carry role:"system" (the codex 400 trigger).
         for item in input {
             assert_ne!(
@@ -1112,17 +1114,16 @@ mod tests {
                 "no input item may have role:\"system\""
             );
         }
-        // The system text is preserved as an instruction, not dropped.
-        assert_eq!(upstream["instructions"], "be brief");
+        assert_eq!(upstream["instructions"], "");
     }
 
     /// The exact shape Claude Code emits via the mid-conversation system beta
     /// (`mid-conversation-system-2026-04-07`): user → assistant → system → user.
-    /// This was the live 400 repro; it must now translate cleanly with the
-    /// mid-conversation system text folded after the top-level system prompt
-    /// and zero `role:"system"` input items.
+    /// This was the live 400 repro; it must translate with the system text as
+    /// a `developer` item where it was sent, zero `role:"system"` items, and
+    /// `instructions` untouched by it (the prompt-cache prefix stays put).
     #[test]
-    fn translate_mid_conversation_system_message_folds_into_instructions() {
+    fn translate_mid_conversation_system_message_stays_in_place() {
         let body = json!({
             "system": "You are helpful.",
             "messages": [
@@ -1134,22 +1135,18 @@ mod tests {
         });
         let (upstream, _) = translate_request(&body, "s").expect("translate");
         let input = upstream["input"].as_array().expect("input");
-        assert_eq!(input.len(), 3, "user, assistant, user — system folded out");
         let roles: Vec<&str> = input
             .iter()
             .filter(|i| i["type"] == "message")
             .map(|i| i["role"].as_str().unwrap_or(""))
             .collect();
-        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert_eq!(roles, vec!["user", "assistant", "developer", "user"]);
+        assert_eq!(input[2]["content"][0]["text"], "Terse mode enabled.");
         assert!(
             input.iter().all(|i| i["role"] != "system"),
             "no role:\"system\" input item may survive"
         );
-        // Top-level system first, mid-conversation system appended after it.
-        assert_eq!(
-            upstream["instructions"],
-            "You are helpful.\nTerse mode enabled."
-        );
+        assert_eq!(upstream["instructions"], "You are helpful.");
     }
 
     /// Codex accepts `role:"developer"` (verified live: 200). A developer-role
@@ -1190,9 +1187,9 @@ mod tests {
     }
 
     /// A system-role message expressed as a content-block array (Anthropic's
-    /// other system shape) also folds into instructions, joining block text.
+    /// other system shape) joins its block text into ONE developer item.
     #[test]
-    fn translate_system_role_message_with_block_content_folds() {
+    fn translate_system_role_message_with_block_content_joins_blocks() {
         let body = json!({
             "messages": [
                 {"role": "system", "content": [
@@ -1203,10 +1200,12 @@ mod tests {
             ]
         });
         let (upstream, _) = translate_request(&body, "s").expect("translate");
-        assert_eq!(upstream["instructions"], "Rule one.\nRule two.");
+        assert_eq!(upstream["instructions"], "");
         let input = upstream["input"].as_array().expect("input");
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], "Rule one.\nRule two.");
+        assert_eq!(input[1]["role"], "user");
     }
 
     #[test]

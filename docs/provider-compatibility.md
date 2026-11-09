@@ -181,6 +181,8 @@ Gemini API, not the Antigravity backend llmux talks to.
 | tools / `tool_choice` / `disable_parallel_tool_use` | forwarded | forwarded | converted; unnamed or undeclared tool → **400** | same | converted to `functionDeclarations`, `tool_choice` → `AUTO` / `ANY` / `NONE`; a tool without `input_schema` is **dropped** (`server_tools`); `disable_parallel_tool_use: true` is **dropped** when tools are sent (Gemini cannot forbid parallel calls) |
 | `/v1/messages/count_tokens` | upstream count | **local chars/4 estimate** (upstream 404s) | local estimate; images → **400** | local estimate; images → **400** | local chars/4 estimate (no upstream count); Claude Code → the local **400** ([below](#gemini-no-cap-sent-thought-signatures-replayed)) |
 | `prompt_cache_key` | n/a | n/a | sent | not sent | n/a |
+| top-level `system` | forwarded | forwarded | `instructions`, identical on every turn; a leading `x-anthropic-billing-header:` line is left out | same | `systemInstruction`, same rule |
+| mid-conversation `role:"system"` message (Claude Code operator text: environment, skills, nested CLAUDE.md, task notifications, reminders) | forwarded | forwarded | a `developer` input item **at its own position** (never folded into `instructions`) — [spec §R8](responses-compatibility/spec.md#r8--operator-text-system) | same | user text `<system-reminder>…</system-reminder>` at its own position (held until a pending function call is answered); warning `system_message_as_user` — Gemini `contents` have no operator role |
 
 ¹ A `thinking` block with a missing or empty `signature` — what the Codex/Grok/Gemini translators
 synthesize, since they have nothing to sign with — is refused by the real Anthropic API with

@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest as _, Sha256};
 
 use super::responses::{self, unavailable_safeguard_results};
-use super::responses_request::CompatibilityReport;
+use super::responses_request::{system_message_text, without_billing_header, CompatibilityReport};
 use super::{ProviderError, ProviderRequest};
 use crate::config::{AccountCredential, GeminiConfig};
 use crate::proxy::sse::{SseTransform, StreamUsage};
@@ -441,7 +441,8 @@ impl GeminiProvider {
     /// What [`Self::build_request`] would leave out of `anthropic_body`,
     /// as the compatibility report codex/grok produce (header names
     /// `max_tokens`, `thinking`, `redacted_thinking`, `thinking_config`,
-    /// `server_tools`, `disable_parallel_tool_use`). Runs the SAME
+    /// `server_tools`, `disable_parallel_tool_use`, plus the caveat
+    /// `system_message_as_user`). Runs the SAME
     /// translation, so a body that validates here cannot fail there and
     /// vice versa — `Err` is the same [`ProviderError::InvalidRequest`]
     /// naming the JSON path. No project or credential is needed.
@@ -704,9 +705,58 @@ fn translate_request(
     Ok((envelope, client_stream, report.finish()))
 }
 
+/// Warning name for a mid-conversation `role:"system"` message carried as
+/// user text: the text arrives in place and in full, but Gemini `contents`
+/// have no operator role, so it does not carry operator authority.
+const SYSTEM_AS_USER_WARNING: &str = "system_message_as_user";
+
+/// Tag that marks operator text inside a user turn. Claude Code's own system
+/// prompt tells the model that `<system-reminder>` content is added by the
+/// system, so the tag carries the "who said it" Gemini's roles cannot.
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// Operator text as one user part, tagged unless the client already tagged it.
+fn operator_part(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.starts_with(SYSTEM_REMINDER_OPEN) && trimmed.ends_with(SYSTEM_REMINDER_CLOSE) {
+        json!({"text": text})
+    } else {
+        json!({"text": format!("{SYSTEM_REMINDER_OPEN}\n{text}\n{SYSTEM_REMINDER_CLOSE}")})
+    }
+}
+
+/// Append `parts` as a `role` turn, merging into the previous turn when it
+/// has the same role (Gemini wants alternating roles).
+fn push_turn(turns: &mut Vec<Turn>, role: &'static str, parts: Vec<Value>) {
+    match turns.last_mut() {
+        Some(last) if last.role == role => last.parts.extend(parts),
+        _ => turns.push(Turn { role, parts }),
+    }
+}
+
+/// Is the last turn a model turn whose function call still waits for its
+/// response? Gemini requires the response right after the call.
+fn awaits_function_response(turns: &[Turn]) -> bool {
+    turns.last().is_some_and(|turn| {
+        turn.role == "model"
+            && turn
+                .parts
+                .iter()
+                .any(|part| part.get("functionCall").is_some())
+    })
+}
+
 /// `messages[]` → Gemini turns: roles mapped, empty turns dropped, then
 /// adjacent same-role turns merged (drop BEFORE merge, so a thinking-only
 /// assistant turn never ships an empty `parts`).
+///
+/// A `role:"system"` message (Claude Code's operator channel) becomes tagged
+/// user text at its own position ([`operator_part`]) — never folded into
+/// `systemInstruction`, which stays the top-level `system` alone so a new
+/// reminder never rewrites the cached prefix. One that arrives while a model
+/// function call awaits its response is held until that response is in, so
+/// the response still follows the call.
 fn translate_messages(
     messages: Option<&Value>,
     report: &mut CompatibilityReport,
@@ -716,27 +766,59 @@ fn translate_messages(
         .ok_or_else(|| invalid("messages", "expected an array"))?;
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut turns: Vec<Turn> = Vec::new();
+    let mut held_operator_parts: Vec<Value> = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         let path = format!("messages[{index}]");
         let role = match message.get("role").and_then(Value::as_str) {
             Some("user") => "user",
             Some("assistant") => "model",
+            Some("system") => {
+                let text = system_message_text(&path, message)?;
+                if text.is_empty() {
+                    continue;
+                }
+                report.warn(SYSTEM_AS_USER_WARNING);
+                let part = operator_part(&text);
+                if awaits_function_response(&turns) {
+                    held_operator_parts.push(part);
+                } else {
+                    push_turn(&mut turns, "user", vec![part]);
+                }
+                continue;
+            }
             Some(other) => {
                 return Err(invalid(
                     &format!("{path}.role"),
-                    &format!("unsupported role `{other}` (user, assistant)"),
+                    &format!("unsupported role `{other}` (user, assistant, system)"),
                 ))
             }
             None => return Err(invalid(&format!("{path}.role"), "expected a string")),
         };
-        let parts = message_parts(&path, message, &mut tool_names, report)?;
+        let mut parts = message_parts(&path, message, &mut tool_names, report)?;
         if parts.is_empty() {
             continue;
         }
-        match turns.last_mut() {
-            Some(last) if last.role == role => last.parts.extend(parts),
-            _ => turns.push(Turn { role, parts }),
+        if !held_operator_parts.is_empty() {
+            if role == "user" {
+                // The function responses lead the user turn that answers
+                // the call (Anthropic puts tool_result blocks first); the
+                // held text goes right after them and BEFORE the rest of
+                // that message, which the transcript sent later.
+                let answered = parts
+                    .iter()
+                    .take_while(|part| part.get("functionResponse").is_some())
+                    .count();
+                parts.splice(answered..answered, std::mem::take(&mut held_operator_parts));
+            } else {
+                // The transcript moved on without an answer: the held text
+                // still lands before the next model turn, never dropped.
+                push_turn(&mut turns, "user", std::mem::take(&mut held_operator_parts));
+            }
         }
+        push_turn(&mut turns, role, parts);
+    }
+    if !held_operator_parts.is_empty() {
+        push_turn(&mut turns, "user", held_operator_parts);
     }
     if turns.is_empty() {
         return Err(invalid(
@@ -1010,17 +1092,22 @@ fn apply_replayed_calls(turns: &mut [Turn], snapshot: &HashMap<String, CachedCal
 }
 
 /// `system` (string or text blocks) → `systemInstruction`, or `None` when
-/// it carries no text.
+/// it carries no text. The billing-header line is left out
+/// ([`without_billing_header`]); mid-conversation system messages never land
+/// here (see [`translate_messages`]).
 fn system_instruction(system: Option<&Value>) -> Result<Option<Value>, ProviderError> {
     let mut parts = Vec::new();
     match system {
         None | Some(Value::Null) => {}
-        Some(Value::String(text)) => push_text(&mut parts, text),
+        Some(Value::String(text)) => push_text(&mut parts, without_billing_header(text)),
         Some(Value::Array(blocks)) => {
             for (index, block) in blocks.iter().enumerate() {
                 let path = format!("system[{index}]");
                 match block.get("type").and_then(Value::as_str) {
-                    Some("text") => push_text(&mut parts, str_field(&path, block, "text")?),
+                    Some("text") => push_text(
+                        &mut parts,
+                        without_billing_header(str_field(&path, block, "text")?),
+                    ),
                     Some(other) => {
                         return Err(invalid(
                             &format!("{path}.type"),
@@ -2196,7 +2283,7 @@ mod tests {
         ));
         assert!(build_err(&json!({"messages": []})).starts_with("messages:"));
         assert!(
-            build_err(&json!({"messages": [{"role": "system", "content": "x"}]}))
+            build_err(&json!({"messages": [{"role": "tool", "content": "x"}]}))
                 .starts_with("messages[0].role:")
         );
     }
@@ -2237,6 +2324,133 @@ mod tests {
                 {"role": "model", "parts": [{"text": "done"}]},
             ])
         );
+    }
+
+    /// Claude Code sends operator text as `role:"system"` messages mid-
+    /// transcript. Gemini contents take only `user`/`model`, so each one rides
+    /// at its own position as user text, tagged `<system-reminder>` — the tag
+    /// Claude Code's own system prompt tells the model marks system-added
+    /// text. `systemInstruction` stays the top-level `system` alone, so a new
+    /// reminder never rewrites the cached prefix.
+    #[test]
+    fn g3_mid_conversation_system_messages_ride_in_place_as_tagged_user_text() {
+        let provider = GeminiProvider::new("https://x");
+        let body = json!({"system": "be brief", "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "environment note"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": [{"type": "text", "text": "next"}]},
+            {"role": "system", "content": [
+                {"type": "text", "text": "<system-reminder>\nalready tagged\n</system-reminder>"},
+            ]},
+        ]});
+        let (_, upstream, _) = build(&provider, &body);
+        assert_eq!(
+            upstream["request"]["systemInstruction"],
+            json!({"role": "user", "parts": [{"text": "be brief"}]})
+        );
+        assert_eq!(
+            upstream["request"]["contents"],
+            json!([
+                {"role": "user", "parts": [
+                    {"text": "hi"},
+                    {"text": "<system-reminder>\nenvironment note\n</system-reminder>"},
+                ]},
+                {"role": "model", "parts": [{"text": "hello"}]},
+                {"role": "user", "parts": [
+                    {"text": "next"},
+                    {"text": "<system-reminder>\nalready tagged\n</system-reminder>"},
+                ]},
+            ])
+        );
+        // Operator text is text only: anything else is still a local 400.
+        let message = build_err(&json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "iVBORw0K"}}]},
+        ]}));
+        assert!(
+            message.starts_with("messages[1].content[0].type:"),
+            "{message}"
+        );
+    }
+
+    /// Operator text that arrives while a model function call waits for its
+    /// response is held until the response is in: Gemini requires the
+    /// response to follow the call. Nothing is dropped, and the carry is
+    /// reported (the text has no operator role on Gemini).
+    #[test]
+    fn g3_system_text_never_separates_a_function_call_from_its_response() {
+        let body = json!({
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.284.a20;"},
+                {"type": "text", "text": "be brief"},
+            ],
+            "messages": [
+                {"role": "user", "content": "time?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "now", "input": {}},
+                ]},
+                {"role": "system", "content": "held note"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"},
+                ]},
+                {"role": "system", "content": "after note"},
+            ],
+        });
+        let provider = GeminiProvider::new("https://x");
+        let (_, upstream, _) = build(&provider, &body);
+        assert_eq!(
+            upstream["request"]["systemInstruction"],
+            json!({"role": "user", "parts": [{"text": "be brief"}]}),
+            "billing header left out"
+        );
+        let contents = upstream["request"]["contents"]
+            .as_array()
+            .expect("contents");
+        assert_eq!(contents.len(), 3, "{contents:?}");
+        assert!(contents[1]["parts"][0].get("functionCall").is_some());
+        let answer = contents[2]["parts"].as_array().expect("parts");
+        assert!(answer[0].get("functionResponse").is_some(), "{answer:?}");
+        assert_eq!(
+            answer[1]["text"],
+            "<system-reminder>\nheld note\n</system-reminder>"
+        );
+        assert_eq!(
+            answer[2]["text"],
+            "<system-reminder>\nafter note\n</system-reminder>"
+        );
+        let report = provider.validate_request(&body).expect("validate");
+        assert!(
+            report.warnings.contains(&"system_message_as_user"),
+            "{report:?}"
+        );
+
+        // The answering message also carries text sent AFTER the held note:
+        // response first, then the held note, then that text — the
+        // transcript's own order, only the response moved up to the call.
+        let mixed = json!({"messages": [
+            {"role": "user", "content": "time?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_1", "name": "now", "input": {}},
+            ]},
+            {"role": "system", "content": "note A"},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "12:00"},
+                {"type": "text", "text": "text B"},
+            ]},
+        ]});
+        let (_, upstream, _) = build(&provider, &mixed);
+        let answer = upstream["request"]["contents"][2]["parts"]
+            .as_array()
+            .expect("parts");
+        assert!(answer[0].get("functionResponse").is_some(), "{answer:?}");
+        assert_eq!(
+            answer[1]["text"],
+            "<system-reminder>\nnote A\n</system-reminder>"
+        );
+        assert_eq!(answer[2]["text"], "text B");
+        assert_eq!(answer.len(), 3);
     }
 
     #[test]
