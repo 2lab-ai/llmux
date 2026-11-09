@@ -98,7 +98,9 @@ const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0);
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 /// gpt-5.6-sol (flagship, 2026-07-09 launch). developers.openai.com pricing,
 /// read 2026-10-06: $4 in / $0.40 cached / $5 cache write / $20 out
-/// ("promotional pricing … at least through November 21, 2026"). Corrected
+/// ("promotional pricing … at least through November 21, 2026"; the page
+/// read 2026-11-10 says "until November 30, 2026", post-promo price not
+/// published). Corrected
 /// from the launch-era $5/$30 row; OpenAI now lists a cache-write rate, so
 /// the "codex has no cache-creation charge" convention no longer holds for
 /// the rows re-read on 2026-10-06.
