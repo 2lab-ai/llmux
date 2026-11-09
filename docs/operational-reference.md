@@ -1018,7 +1018,7 @@ Image validation requires `source.type: "base64"`, nonempty valid base64, a deco
 **Compatibility policy and headers.** Omit `X-Llmux-Compatibility` or send `X-Llmux-Compatibility: compat` for the default policy. It permits only the enumerated semantic losses above; it does not make unsupported content acceptable. Successful translated responses advertise sorted, deduplicated field-name lists when relevant:
 
 - `X-Llmux-Omitted-Fields`: fields actually omitted (`max_tokens` on Codex, `thinking`, `redacted_thinking`, and `thinking_config` for top-level thinking configuration).
-- `X-Llmux-Compatibility-Warnings`: omission names plus `max_tokens_semantics` on Grok. Grok's forwarded limit is **not** listed as omitted.
+- `X-Llmux-Compatibility-Warnings`: omission names plus `max_tokens_semantics` on Grok. Grok's forwarded limit is **not** listed as omitted. On Gemini, `system_message_as_user` marks a mid-conversation `role:"system"` message carried as tagged user text (Gemini has no operator role); Codex/Grok carry it as an in-place `developer` item with no warning.
 - A structured WARN records provider, field list, and request id. These headers/logs are machine-readable diagnostics, **not a promise that Claude Code displays a warning**.
 
 Send `X-Llmux-Compatibility: strict` to reject any such issue with HTTP 400 **before upstream traffic or credential refresh**. Other header values and invalid/nonpositive/noninteger limits also return 400. Since normal Messages clients send `max_tokens`, strict mode will reject those Codex/Grok requests rather than pretend to enforce an equivalent budget.

@@ -141,7 +141,8 @@ fn accepted_image_media_types(flavor: ResponsesFlavor) -> String {
 ///
 /// `omitted_fields` names the request fields that are NOT forwarded;
 /// `warnings` is the superset the proxy reports: every omitted field plus
-/// semantic caveats that omit nothing (today only `max_tokens_semantics`).
+/// semantic caveats that omit nothing (`max_tokens_semantics` on grok,
+/// `system_message_as_user` on gemini).
 /// Both are sorted and deduped so the header value is stable across requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompatibilityReport {
