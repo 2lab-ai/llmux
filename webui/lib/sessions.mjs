@@ -35,6 +35,29 @@ const KEEP_HOURS = 72;
 export const FLAGS = { burstCostHour: 25, burstReq10m: 150, longRunMs: 3 * HOUR, errorBurst: 3, contextPct: 0.8 };
 
 export const shortName = (name) => String(name || '').replace(/\s*\(U[0-9A-Z]+\)\s*$/, '').trim() || name;
+
+// Request order and cursors: (at_ms, id) is unique per row, so a cursor "at_ms:id" pins a position that
+// new requests arriving on top cannot shift (offset paging would repeat or skip rows on a live session).
+const byTime = (a, b) => a.at_ms - b.at_ms || a.id - b.id;
+const parseCursor = (c) => { const m = /^(\d+):(\d+)$/.exec(String(c || '')); return m ? { at_ms: Number(m[1]), id: Number(m[2]) } : null; };
+export const cursorOf = (r) => `${r.at_ms}:${r.id}`;
+
+// One page of a session's requests, newest first. `before` = the next older page (scrolling down),
+// `after` = requests newer than the top row (a running session); `gap` says more arrived than one page holds.
+export function requestPage(rows, { kind = '', limit = 50, before = '', after = '', offset = 0 } = {}) {
+  limit = Math.min(200, Math.max(1, Number(limit) || 50));
+  const list = (kind ? rows.filter(r => (r.msg_kind || 'other') === kind) : rows).slice().sort(byTime).reverse();
+  const total = list.length;
+  const a = parseCursor(after), b = parseCursor(before);
+  if (a) {
+    const newer = list.filter(r => byTime(r, a) > 0);
+    return { total, limit, rows: newer.slice(0, limit), gap: newer.length > limit, more: true };
+  }
+  const start = b ? list.findIndex(r => byTime(r, b) < 0) : Math.max(0, Number(offset) || 0);
+  if (start < 0) return { total, limit, rows: [], more: false };
+  const page = list.slice(start, start + limit);
+  return { total, limit, rows: page, more: start + page.length < total };
+}
 const slackOf = (name) => { const m = /\((U[0-9A-Z]+)\)\s*$/.exec(String(name || '')); return m ? m[1] : null; };
 
 export class SessionIndex {
@@ -144,7 +167,8 @@ export class SessionIndex {
       }
     }
     this.touch(s, r.at_ms, r.at_ms - (r.duration_ms || 0));
-    if (s.rows.size > 4000) s.rows.delete(s.rows.keys().next().value);
+    // Memory bound: a session keeps its newest 4000 requests; `dropped` counts the older ones let go.
+    if (s.rows.size > 4000) { s.rows.delete(s.rows.keys().next().value); s.dropped = (s.dropped || 0) + 1; }
   }
 
   agg(r) {
@@ -371,9 +395,11 @@ export class SessionIndex {
     try { await this.loadMeta(this.metaQueue.shift()); } catch (e) { console.error('[sessions] meta', e.message); } finally { this.metaBusy = false; }
   }
 
+  droppedFor(sid) { const s = this.sessions.get(sid); return (s && s.dropped) || 0; }
+
   rowsFor(sid) {
     const s = this.sessions.get(sid); if (!s) return [];
-    return [...s.rows.values()].sort((a, b) => a.at_ms - b.at_ms);
+    return [...s.rows.values()].sort(byTime);
   }
 
   // Per-user view for the 사용자 tab: window usage comes from /llmux/keys/usage (exact); live state,

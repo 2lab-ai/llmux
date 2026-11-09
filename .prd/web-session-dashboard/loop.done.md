@@ -46,3 +46,25 @@ Loop: ./loop.md · Each round close appends one block at the bottom; nothing abo
   pagination; `/api/raw-full` + rawview.js tree/raw viewer modelled on src/tui/ui.rs `raw_content_from_record`.
 - Log: first raw capture showed 100 collapsed message rows above the open last message → messages/input start with the
   last 6 drawn, "앞쪽 N개 더 보기" loads earlier ones.
+
+## R3 — closed 2026-11-09 18:10 KST
+
+- measured 3✅ 0🟡 0🔴 0🚪 0⚫ · result: the 요청 list loads its next page by itself as it scrolls; a very large session opens without freezing; Escape closes only the raw sheet · closed rows: H4 H5 H6 · commit/PR: next commit on `feat/web-session-dashboard` (PR #238)
+
+### Closed rows
+
+| ID | Source | Universe Item | Observable Acceptance | AS-IS Evidence | Status | Gap | Dispatch | Verification Evidence | Last Measured |
+|---|---|---|---|---|---|---|---|---|---|
+| H4 | ssot 8 | 요청 list loads the next page on scroll | mouse-wheel scrolling the drawer grows the list page by page with no button; no repeated or skipped row while new requests arrive; end of list says when older rows are not kept | prev/next page buttons only (R2 H2) | ✅ | — | R3 | `scroll-verify.mjs`, public URLs, mouse wheel: team-host `de9ec083` 50→200→350→450→600→750→850, longest task per wheel burst ≤ 105 ms; at 200 per load the walk ends at 4,000/4,000 in 20 s with "그보다 오래된 12,790건은 보관하지 않습니다"; owner-mac `028af32d` 50→200→…→851, 4,000/4,000 unique, newest first; kind filter `응답 (2024)` restarts at 200/2,024 with only that kind; a row in the last block opens its raw sheet; cursor walk via API 80 pages × 50 = 4,000 unique on both hosts; 0 page errors (one expected 404: the raw-io record of an 11-05 request is past retention and the sheet says so) | 2026-11-09 18:00 |
+| H5 | found in H4 | a very large session opens | the detail of the largest live session opens and its tabs respond | owner-mac Codex `cc71bd7d` (21 MB detail, 14,800 steps, 4,604 tool calls in one instruction): page unresponsive for minutes on open | ✅ | — | R3 | work log draws the newest 400 steps of a group and tool cards for its newest 40 tools: same session shows its title after 13 s, all six tabs respond; longest task 3.9 s on first paint (open: `loop.md` Next) | 2026-11-09 17:45 |
+| H6 | found in H4 | Escape closes the top layer only | Escape with the raw sheet open closes the sheet and keeps the session drawer | Escape closed both | ✅ | — | R3 | team-host: after Escape `sheetOpen:false`, `panelOpen:true`, URL keeps `?session=` | 2026-11-09 18:00 |
+
+### Round section (as it was in loop.md)
+
+- Plan: cursor pages `GET /api/session/:sid/requests?before=|after=<at_ms:id>` (`requestPage` in lib/sessions.mjs,
+  unit-tested); IntersectionObserver on the end of the list, rooted in the drawer's scroll box (`.dr-body`), 800 px early;
+  each page appended as its own `ui-task-runs`; a running session's new requests put on top with the reading position kept.
+- Log: one list of 2,000+ rows took ~270 ms per redraw (551 ms at 4,000), so every appended page stalled the scroll →
+  one `ui-task-runs` per page. The index keeps the newest 4,000 rows per session → the end of the list now says how many
+  older rows were let go instead of "all loaded". At the end of a running session's list, newer requests are pulled in
+  so the count matches.

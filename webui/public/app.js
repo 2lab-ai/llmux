@@ -24,7 +24,7 @@ const st = {
   detail: null,     // /api/session/:sid
   openGroups: new Set(),
   ccOpen: new Set(), ccLimit: 400,
-  req: { offset: 0, limit: 50, kind: '', total: 0, rows: [] },
+  req: { limit: 50, kind: '', total: 0, dropped: 0, rows: [], more: false, busy: '', error: '', gen: 0 },
 };
 
 function viewFromPath() {
@@ -246,11 +246,13 @@ function closePanel() {
   $('main').style.marginRight = ''; $('main').classList.remove('docked');
   const u = new URL(location.href); u.searchParams.delete('session'); history.replaceState(null, '', u.pathname + u.search);
 }
-addEventListener('keydown', (e) => { if (e.key === 'Escape' && (st.sel || st.selUser)) closePanel(); });
+// Escape closes the top layer only: with the raw sheet open it closes the sheet (ui-drawer's own key), not the session too.
+// Capture phase, so the sheet is still open when this looks.
+addEventListener('keydown', (e) => { if (e.key === 'Escape' && (st.sel || st.selUser) && !$('raw-sheet').hasAttribute('open')) closePanel(); }, true);
 
 async function openSession(sid) {
   if (!sid) return;
-  if (st.sel !== sid) { st.sel = sid; st.selUser = null; st.detail = null; st.tab = 'ov'; st.openGroups = new Set(); st.ccOpen = new Set(); st.ccLimit = 400; st.req = { offset: 0, limit: 50, kind: '', total: 0, rows: [] }; $('p-raw').innerHTML = ''; $('p-agent').innerHTML = ''; }
+  if (st.sel !== sid) { st.sel = sid; st.selUser = null; st.detail = null; st.tab = 'ov'; st.openGroups = new Set(); st.ccOpen = new Set(); st.ccLimit = 400; st.req = newReq(st.req && st.req.limit); $('p-raw').innerHTML = ''; $('p-agent').innerHTML = ''; }
   const u = new URL(location.href); u.searchParams.set('session', sid); history.replaceState(null, '', u.pathname + u.search);
   showPanel('session');
   const c = st.data && st.data.sessions.find(x => x.sid === sid);
@@ -311,10 +313,10 @@ function paintDetail(first) {
   if (st.tab === 'log' || first) paintWorkLog(d, ov);
   if (st.tab === 'conv' || first) paintConversation(d, c);
   if (st.tab === 'cc') paintCC();
-  if (st.tab === 'req' && (first || st.req.offset === 0)) loadRequests();
+  if (st.tab === 'req') { if (!st.req.rows.length) loadRequests(); else refreshRequests(); }
   if (st.tab === 'agents' || first) paintAgents(d, c, subs);
 }
-$('p-tabs').addEventListener('ui-change', (e) => { st.tab = e.detail.value; paintDetail(false); if (st.tab === 'req') loadRequests(); });
+$('p-tabs').addEventListener('ui-change', (e) => { st.tab = e.detail.value; paintDetail(false); });
 
 /* Claude Code screen (ccview.js) */
 function paintCC() {
@@ -407,6 +409,10 @@ function groupsOf(entries) {
   return [...groups.values()].sort((a, b) => a.i - b.i);
 }
 const TOOL_ICON = { Bash: 'terminal', Read: 'file', Write: 'edit', Edit: 'edit', MultiEdit: 'edit', NotebookEdit: 'edit', Grep: 'search', Glob: 'search', WebFetch: 'globe', WebSearch: 'globe', Agent: 'agent', Task: 'agent', TodoWrite: 'list' };
+// One instruction can hold thousands of steps (a long Codex run had 11,000, with 4,600 tool calls): drawing them all,
+// each with a tool card, froze the page. The log draws the newest WL_ENTRIES steps of a group and full tool cards for
+// the newest WL_CARDS tools of an open group; the Claude Code screen still has every step.
+const WL_ENTRIES = 400, WL_CARDS = 40;
 function paintWorkLog(d, ov) {
   const entries = (d.chat && d.chat.entries) || [];
   const groups = groupsOf(entries);
@@ -416,16 +422,21 @@ function paintWorkLog(d, ov) {
   const wl = groups.map(g => {
     const info = byI.get(g.i);
     const open = st.openGroups.has(g.id) || g === last;
-    const items = [];
-    g.entries.forEach((e, k) => {
-      const id = `${g.id}-${k}`;
+    const skipped = Math.max(0, g.entries.length - WL_ENTRIES);
+    const shown = skipped ? g.entries.slice(skipped) : g.entries;
+    let budget = WL_CARDS;
+    const carded = new Set();
+    for (let k = shown.length - 1; k >= 0 && budget > 0 && open; k--) if (shown[k].kind === 'tool' && shown[k].name !== 'Agent' && shown[k].name !== 'Task') { carded.add(k); budget--; }
+    const items = skipped ? [{ id: g.id + '-skip', kind: 'notice', at: shown[0].ts, text: `앞선 ${skipped.toLocaleString()}개 단계는 줄였습니다 · 전체는 Claude Code 화면에서 볼 수 있습니다` }] : [];
+    shown.forEach((e, k) => {
+      const id = `${g.id}-${k + skipped}`;
       if (e.kind === 'tool') {
         const status = e.result ? (e.is_error ? 'error' : 'success') : 'running';
         if (e.name === 'Agent' || e.name === 'Task') {
           items.push({ id, kind: 'agent', at: e.ts, agent: { id, name: e.summary || 'agent', status: e.result ? (e.is_error ? 'failed' : 'done') : 'running', startedAt: e.ts, duration: e.done_ts && e.ts ? e.done_ts - e.ts : undefined, activity: e.prompt ? e.prompt.text.slice(0, 160) : undefined } });
         } else {
           items.push({ id, kind: 'tool', at: e.ts, tool: { name: e.name, status, summary: e.summary } });
-          if (open) cards.push({ id, data: { id, name: e.name, summary: e.summary, icon: TOOL_ICON[e.name] || (e.name.startsWith('mcp__') ? 'plug' : 'wrench'), status, args: e.edit ? { file: e.summary, lines: e.edit } : e.summary, result: e.result ? e.result.text + (e.result.more ? `\n… (+${e.result.more}자)` : '') : undefined, at: e.ts, duration: e.done_ts && e.ts ? e.done_ts - e.ts : undefined, maxCodeHeight: 320, openOnError: true, note: e.req ? `${X.short(e.req.account)} · ${X.ms(e.req.duration_ms)} · ${usd(e.req.cost_usd)}` : undefined } });
+          if (carded.has(k)) cards.push({ id, data: { id, name: e.name, summary: e.summary, icon: TOOL_ICON[e.name] || (e.name.startsWith('mcp__') ? 'plug' : 'wrench'), status, args: e.edit ? { file: e.summary, lines: e.edit } : e.summary, result: e.result ? e.result.text + (e.result.more ? `\n… (+${e.result.more}자)` : '') : undefined, at: e.ts, duration: e.done_ts && e.ts ? e.done_ts - e.ts : undefined, maxCodeHeight: 320, openOnError: true, note: e.req ? `${X.short(e.req.account)} · ${X.ms(e.req.duration_ms)} · ${usd(e.req.cost_usd)}` : undefined } });
         }
       } else if (e.kind === 'agentmsg') {
         items.push({ id, kind: 'notice', at: e.ts, text: X.clean(e.text).slice(0, 600) });
@@ -438,7 +449,7 @@ function paintWorkLog(d, ov) {
     const lastNarr = [...items].reverse().find(x => x.kind === 'narration' && !x.label);
     if (lastNarr && (g !== last || (st.detail.card && st.detail.card.status !== 'running'))) lastNarr.kind = 'final';
     return {
-      id: g.id, ref: g.i ? '#' + g.i : undefined, title: g.text ? g.text.slice(0, 160) : '지시 이전 작업', at: g.at, count: items.length, open,
+      id: g.id, ref: g.i ? '#' + g.i : undefined, title: g.text ? g.text.slice(0, 160) : '지시 이전 작업', at: g.at, count: g.entries.length, open,
       meta: info ? [info.durationMs != null ? { label: '소요', value: dur(info.durationMs) } : null, { label: '도구', value: String(info.toolCount) }, { label: '요청', value: String(info.requests) }, { label: '비용', value: usd(info.cost) }].filter(Boolean) : undefined,
       entries: g.text ? [{ id: g.id + '-i', kind: 'instruction', at: g.at, text: g.text }, ...items] : items,
     };
@@ -446,10 +457,10 @@ function paintWorkLog(d, ov) {
   const log = $('p-log');
   log.data = { groups: wl, live: st.detail.card && st.detail.card.status === 'running', emptyText: '기록된 작업이 없습니다', startText: d.chat && d.chat.source === 'raw-io' ? 'llmux 원문에서 다시 만든 기록입니다' : undefined };
   // tool cards for open groups only (hundreds of closed cards would cost more than they show)
-  const want = new Set(cards.map(c => c.id));
-  for (const el of [...log.querySelectorAll('ui-tool-call-card')]) if (!want.has(el.dataset.id)) el.remove();
+  const want = new Set(cards.map(c => c.id)), have = new Map();
+  for (const el of [...log.querySelectorAll('ui-tool-call-card')]) { if (want.has(el.dataset.id)) have.set(el.dataset.id, el); else el.remove(); }
   for (const c of cards) {
-    let el = log.querySelector(`ui-tool-call-card[data-id="${c.id}"]`);
+    let el = have.get(c.id);
     if (!el) { el = document.createElement('ui-tool-call-card'); el.setAttribute('lang', 'ko'); el.slot = 'tool-' + c.id; el.dataset.id = c.id; log.appendChild(el); }
     el.data = c.data;
   }
@@ -481,51 +492,114 @@ function paintConversation(d, c) {
   $('p-conv').data = { turns: turns.slice(-200), hasMore: turns.length > 200, assistantName: 'Claude', emptyText: '대화 기록이 없습니다', live: c.status === 'running' };
 }
 
-/* 요청: one page at a time, newest first (GET /api/session/:sid/requests) */
-async function loadRequests() {
-  const sid = st.sel; if (!sid) return;
-  const q = st.req;
-  const r = await fetch(`/api/session/${sid}/requests?offset=${q.offset}&limit=${q.limit}${q.kind ? '&kind=' + encodeURIComponent(q.kind) : ''}`, { cache: 'no-store' });
-  if (!r.ok || st.sel !== sid) return;
-  const page = await r.json();
-  Object.assign(st.req, { total: page.total, rows: page.rows });
-  paintRuns();
+/* 요청: newest first. The first page loads with the tab; the next older page loads by itself when the end of the
+   list scrolls into view (GET /api/session/:sid/requests?before=<cursor>); a running session's new requests are
+   put on top (?after=<cursor>). Cursors are "at_ms:id", so rows arriving on top never repeat or skip a row. */
+function newReq(limit) { return { limit: limit || 50, kind: '', total: 0, dropped: 0, rows: [], more: false, busy: '', error: '', gen: 0 }; }
+const cursorOf = (r) => `${r.at_ms}:${r.id}`;
+const reqSeen = (rows) => new Set(rows.map(cursorOf));
+async function fetchReq(sid, q, extra) {
+  const r = await fetch(`/api/session/${sid}/requests?limit=${q.limit}${q.kind ? '&kind=' + encodeURIComponent(q.kind) : ''}${extra}`, { cache: 'no-store' });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
 }
-function paintRuns() {
+// One request at a time per list; a filter change (new gen) or another session drops a late answer.
+async function reqJob(kind, extra, apply) {
+  const sid = st.sel, q = st.req; if (!sid || (q.busy && kind !== 'first')) return;
+  const gen = kind === 'first' ? ++q.gen : q.gen;
+  q.busy = kind; q.error = ''; if (kind !== 'top') paintReqFoot();
+  let page = null, err = '';
+  try { page = await fetchReq(sid, q, extra); } catch (e) { err = String(e.message || e); }
+  if (st.sel !== sid || st.req !== q || q.gen !== gen) return;
+  q.busy = '';
+  if (err) { if (kind !== 'top') q.error = err; paintReqFoot(); return; }
+  apply(page);
+  paintReqHead(); paintReqFoot();
+  requestAnimationFrame(fillView);
+}
+function loadRequests() {
+  const q = st.req; Object.assign(q, { rows: [], total: 0, more: false }); $('p-runs').replaceChildren(); paintReqHead();
+  watchReqEnd();
+  return reqJob('first', '', (p) => { Object.assign(q, { rows: p.rows, total: p.total, more: p.more, dropped: p.dropped || 0 }); addRuns(p.rows, 'append'); });
+}
+function loadMoreRequests() {
+  const q = st.req; if (q.busy || q.error || !q.more || !q.rows.length) return;
+  return reqJob('more', '&before=' + cursorOf(q.rows[q.rows.length - 1]), (p) => {
+    const seen = reqSeen(q.rows), add = p.rows.filter(r => !seen.has(cursorOf(r)));
+    q.rows = q.rows.concat(add); addRuns(add, 'append');
+    Object.assign(q, { total: p.total, more: p.more, dropped: p.dropped || 0 });
+  }).then(() => { if (st.req === q && !q.more && q.total > q.rows.length) refreshRequests(); }); // at the end, newer requests that came in on top
+}
+function refreshRequests() {
+  const q = st.req; if (q.busy || !q.rows.length) return;
+  return reqJob('top', '&after=' + cursorOf(q.rows[0]), (p) => {
+    if (p.gap) { loadRequests(); return; }
+    const seen = reqSeen(q.rows), add = p.rows.filter(r => !seen.has(cursorOf(r)));
+    q.total = p.total; if (!add.length) return;
+    // Keep what the reader is looking at in place while rows are added above it.
+    const b = reqScroller(), h0 = b ? b.scrollHeight : 0;
+    q.rows = add.concat(q.rows); addRuns(add, 'prepend');
+    if (b && b.scrollTop > 0) b.scrollTop += b.scrollHeight - h0;
+  });
+}
+// The drawer body is the scroll box (open shadow root of ui-drawer).
+const reqScroller = () => (panel.shadowRoot && panel.shadowRoot.querySelector('.dr-body')) || null;
+const END_MARGIN = 800;
+let reqIO = null;
+function watchReqEnd() {
+  if (reqIO || !('IntersectionObserver' in window)) return;
+  reqIO = new IntersectionObserver((es) => { if (st.tab === 'req' && es.some(e => e.isIntersecting)) loadMoreRequests(); }, { root: reqScroller(), rootMargin: `0px 0px ${END_MARGIN}px 0px` });
+  reqIO.observe($('p-more'));
+}
+// The observer only reports changes: when a page leaves the end still in view (short rows, tall drawer), go on.
+function fillView() {
+  const b = reqScroller(), end = $('p-more');
+  if (st.tab !== 'req' || !b || !end.offsetParent) return;
+  if (end.getBoundingClientRect().top < b.getBoundingClientRect().bottom + END_MARGIN) loadMoreRequests();
+}
+function paintReqFoot() {
+  const q = st.req, left = Math.max(0, q.total - q.rows.length);
+  $('p-more').innerHTML = q.error ? `<span class="hint">불러오지 못했습니다 (${E(q.error)})</span><button type="button" class="ui-btn" data-rmore>다시 시도</button>`
+    : q.busy === 'first' || q.busy === 'more' ? '<span class="hint"><span class="ui-spinner is-sm" aria-hidden="true"></span> 불러오는 중…</span>'
+    : q.more ? `<button type="button" class="ui-btn" data-rmore>${Math.min(q.limit, left).toLocaleString()}건 더 보기</button><span class="hint">남은 요청 ${left.toLocaleString()}건 · 스크롤하면 이어서 불러옵니다</span>`
+    : q.total && q.dropped ? `<span class="hint">보관된 최근 요청까지 모두 불러왔습니다 · ${q.rows.length.toLocaleString()}건. ${q.kind ? '이 화면은 세션당 최근 4,000건까지만 보관합니다' : `그보다 오래된 ${q.dropped.toLocaleString()}건은 보관하지 않습니다 (세션당 최근 4,000건까지)`}</span>`
+    : q.total ? `<span class="hint">마지막 요청까지 모두 불러왔습니다 · ${q.rows.length.toLocaleString()}건</span>`
+    : q.gen ? '<span class="hint">이 세션에 기록된 llmux 요청이 없습니다</span>' : '';
+}
+function paintReqHead() {
   const q = st.req;
   const kinds = (st.detail && st.detail.requestKinds) || {};
-  const from = q.total ? q.offset + 1 : 0, to = Math.min(q.total, q.offset + q.limit);
-  const pager = `<span class="hint">최신순 · ${from.toLocaleString()}–${to.toLocaleString()} / ${q.total.toLocaleString()}</span>
+  $('p-pager').innerHTML = `<span class="hint" aria-live="polite">최신순 · ${q.rows.length.toLocaleString()} / ${q.total.toLocaleString()}건 불러옴</span>
     <span class="rv-acts"><select class="ui-select-chip" data-rk aria-label="종류"><option value="">모든 종류 (${Object.values(kinds).reduce((a, b) => a + b, 0)})</option>${Object.entries(kinds).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<option value="${E(k)}" ${q.kind === k ? 'selected' : ''}>${E(KIND_LABEL[k] || k)} (${n})</option>`).join('')}</select>
-    <select class="ui-select-chip" data-rl aria-label="페이지 크기">${[25, 50, 100, 200].map(n => `<option ${q.limit === n ? 'selected' : ''}>${n}</option>`).join('')}</select>
-    <button type="button" class="ui-btn" data-rp="first" ${q.offset ? '' : 'disabled'}>« 최신</button><button type="button" class="ui-btn" data-rp="prev" ${q.offset ? '' : 'disabled'}>‹ 이전</button><button type="button" class="ui-btn" data-rp="next" ${to < q.total ? '' : 'disabled'}>다음 ›</button><button type="button" class="ui-btn" data-rp="last" ${to < q.total ? '' : 'disabled'}>가장 오래된 »</button></span>`;
-  $('p-pager').innerHTML = pager; $('p-pager2').innerHTML = q.total > 10 ? pager : '';
-  $('p-runs').data = {
-    runs: q.rows.map(r => ({
-      id: `${r.id}:${r.at_ms}`,
-      title: `${KIND_LABEL[r.msg_kind] || r.msg_kind || '요청'} · ${modelShort(r.model)}${r.effort ? ' · ' + r.effort : ''} · #${r.id}`,
-      status: r.status >= 400 || r.aborted ? 'failed' : 'done',
-      startedAt: r.at_ms - (r.duration_ms || 0), endedAt: r.at_ms, durationMs: r.duration_ms,
-      tokens: r.tokens ? { input: r.tokens.input, output: r.tokens.output, cacheRead: r.tokens.cache_read, cacheWrite: r.tokens.cache_creation } : undefined,
-      costUsd: r.cost, approx: r.cost_usd == null,
-      canOpen: true,
-      notes: [{ label: '계정', value: X.short(r.account) }, { label: '첫 바이트', value: X.ms(r.ttfb_ms) }, r.status >= 400 ? { label: '상태', value: String(r.status) } : null].filter(Boolean),
-    })),
-    totals: false,
-  };
+    <select class="ui-select-chip" data-rl aria-label="한 번에 불러올 개수">${[25, 50, 100, 200].map(n => `<option value="${n}" ${q.limit === n ? 'selected' : ''}>${n}건씩</option>`).join('')}</select></span>`;
 }
-for (const id of ['p-pager', 'p-pager2']) {
-  $(id).addEventListener('click', (e) => {
-    const b = e.target.closest('[data-rp]'); if (!b || b.disabled) return;
-    const q = st.req;
-    q.offset = { first: 0, prev: Math.max(0, q.offset - q.limit), next: q.offset + q.limit, last: Math.max(0, Math.floor((q.total - 1) / q.limit) * q.limit) }[b.dataset.rp];
-    loadRequests();
-  });
-  $(id).addEventListener('change', (e) => {
-    if (e.target.matches('[data-rk]')) { st.req.kind = e.target.value; st.req.offset = 0; loadRequests(); }
-    if (e.target.matches('[data-rl]')) { st.req.limit = Number(e.target.value); st.req.offset = 0; loadRequests(); }
-  });
+const runOf = (r) => ({
+  id: `${r.id}:${r.at_ms}`,
+  title: `${KIND_LABEL[r.msg_kind] || r.msg_kind || '요청'} · ${modelShort(r.model)}${r.effort ? ' · ' + r.effort : ''} · #${r.id}`,
+  status: r.status >= 400 || r.aborted ? 'failed' : 'done',
+  startedAt: r.at_ms - (r.duration_ms || 0), endedAt: r.at_ms, durationMs: r.duration_ms,
+  tokens: r.tokens ? { input: r.tokens.input, output: r.tokens.output, cacheRead: r.tokens.cache_read, cacheWrite: r.tokens.cache_creation } : undefined,
+  costUsd: r.cost, approx: r.cost_usd == null,
+  canOpen: true,
+  notes: [{ label: '계정', value: X.short(r.account) }, { label: '첫 바이트', value: X.ms(r.ttfb_ms) }, r.status >= 400 ? { label: '상태', value: String(r.status) } : null].filter(Boolean),
+});
+// Each loaded page is its own <ui-task-runs>: adding a page draws only that page, never the whole list again
+// (one list of 2,000 rows takes ~270 ms to redraw, which stalls the scroll on every page).
+function addRuns(rows, where) {
+  if (!rows.length) return;
+  const el = document.createElement('ui-task-runs');
+  el.setAttribute('lang', 'ko'); el.setAttribute('flush', '');
+  el.data = { title: '', runs: rows.map(runOf), totals: false };
+  $('p-runs')[where](el);
 }
+$('p-pager').addEventListener('change', (e) => {
+  if (e.target.matches('[data-rk]')) { st.req.kind = e.target.value; loadRequests(); }
+  if (e.target.matches('[data-rl]')) { st.req.limit = Number(e.target.value); loadRequests(); }
+});
+$('p-more').addEventListener('click', (e) => {
+  if (!e.target.closest('[data-rmore]')) return;
+  st.req.error = ''; if (st.req.rows.length) loadMoreRequests(); else loadRequests();
+});
 $('p-runs').addEventListener('ui-open', (e) => {
   const [id, at] = String(e.detail.id).split(':').map(Number);
   const row = st.req.rows.find(r => r.id === id && r.at_ms === at) || { id, at_ms: at };
