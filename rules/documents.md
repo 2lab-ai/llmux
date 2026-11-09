@@ -23,6 +23,7 @@ feature is incomplete.
 | Islands app behavior, install channel and first-launch onboarding | [`docs/llmux-islands.md`](../docs/llmux-islands.md) |
 | Native multi-model agents in Claude Code (per-agent `model:` recipe, verification, limits) | [`docs/multi-model-agents.md`](../docs/multi-model-agents.md) |
 | Remote daemon scope: transport, key scopes, Islands HTTPS rule, per-computer attribution | [`docs/remote.md`](../docs/remote.md) |
+| Web dashboard (`webui/`): sessions, per-user usage, detail card, SSO deploy | [`docs/web-dashboard.md`](../docs/web-dashboard.md) (+ [`webui/README.md`](../webui/README.md) for settings) |
 | Raw request viewer as the expert entry (what reached the model, copy as curl, boundaries) | [`docs/ai-debugger.md`](../docs/ai-debugger.md) |
 | Captured Claude Code / multi-model **system prompt** wire text | [`docs/system-prompts/`](../docs/system-prompts/) — especially [`samples/`](../docs/system-prompts/samples/); never replace real samples with meta-only prose |
 | Product/architecture *decisions* (not how-to) | [`.prd/`](../.prd/) |

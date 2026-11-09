@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Copy to ~/Library/LaunchAgents/ai.2lab.llmux-webui.plist, replace HOME_DIR / PARENT_DOMAIN, then
+     launchctl bootstrap gui/$(id -u) (or user/$(id -u) on a host with no GUI login) ~/Library/LaunchAgents/ai.2lab.llmux-webui.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.2lab.llmux-webui</string>
+  <key>ProgramArguments</key><array><string>/opt/homebrew/bin/node</string><string>server.mjs</string></array>
+  <key>WorkingDirectory</key><string>HOME_DIR/llmux-webui</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>HOME_DIR</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>BIND</key><string>127.0.0.1</string>
+    <key>PORT</key><string>4780</string>
+    <key>AUTH</key><string>soma</string>
+    <key>SOMA_AUTH_ME</key><string>http://127.0.0.1:33000/auth/me</string>
+    <key>SSO_ORIGIN</key><string>https://agents.PARENT_DOMAIN</string>
+    <key>PUBLIC_ORIGIN</key><string>https://llmux.PARENT_DOMAIN</string>
+    <key>COOKIE_DOMAIN</key><string>PARENT_DOMAIN</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>3</integer>
+  <key>StandardOutPath</key><string>HOME_DIR/llmux-webui/server.log</string>
+  <key>StandardErrorPath</key><string>HOME_DIR/llmux-webui/server.log</string>
+</dict>
+</plist>
