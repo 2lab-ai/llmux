@@ -1,0 +1,25 @@
+# On the host that serves the soma-work dashboard (agents.PARENT_DOMAIN → soma-work :33000).
+agents.PARENT_DOMAIN {
+	# After a soma-work login started from llmux (llmux_next cookie set by the bridge), go back through the bridge.
+	@llmuxReturn {
+		path /dashboard /dashboard/*
+		header Cookie *llmux_next=*
+	}
+	redir @llmuxReturn /__llmux/bridge 302
+	handle /__llmux/* {
+		reverse_proxy 127.0.0.1:4780
+	}
+	# Logging out of soma-work also ends the llmux session.
+	handle /auth/logout {
+		reverse_proxy 127.0.0.1:33000 {
+			header_down +Set-Cookie "llmux_sso=; Domain=PARENT_DOMAIN; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:33000
+	}
+}
+
+llmux.PARENT_DOMAIN {
+	reverse_proxy 127.0.0.1:4780
+}
