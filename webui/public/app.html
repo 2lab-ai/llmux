@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>llmux · 세션</title>
+<link rel="stylesheet" href="/ui/tokens.css">
+<link rel="stylesheet" href="/ui/ui-kit.css">
+<link rel="stylesheet" href="core.css">
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="ccview.css">
+<script>try { const t = localStorage.getItem('llmux-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch {}</script>
+<script type="module" src="/ui/app-bar.js"></script>
+<script type="module" src="/ui/agent-inbox.js"></script>
+<script type="module" src="/ui/drawer.js"></script>
+<script type="module" src="/ui/tabs.js"></script>
+<script type="module" src="/ui/status-bar.js"></script>
+<script type="module" src="/ui/stat-strip.js"></script>
+<script type="module" src="/ui/work-log.js"></script>
+<script type="module" src="/ui/tool-call-card.js"></script>
+<script type="module" src="/ui/conversation.js"></script>
+<script type="module" src="/ui/context-window.js"></script>
+<script type="module" src="/ui/task-runs.js"></script>
+<script type="module" src="/ui/agent-tree.js"></script>
+<script type="module" src="/ui/compact-breakdown.js"></script>
+<script type="module" src="/ui/bar-chart.js"></script>
+<script type="module" src="/ui/segmented.js"></script>
+</head>
+<body>
+<ui-app-bar id="bar" lang="ko"></ui-app-bar>
+<div class="offline" id="offline" role="status" hidden></div>
+<main id="main">
+  <section id="v-sessions" class="view">
+    <div class="tb">
+      <div class="tb-row">
+        <h1 class="crumb">세션 <small id="s-count"></small></h1>
+        <span class="sp"></span>
+        <ui-segmented id="s-origin" lang="ko" label="출처"></ui-segmented>
+        <input class="ui-input search" id="s-q" type="search" placeholder="제목·폴더·지시 검색" aria-label="세션 검색">
+      </div>
+      <div class="chips" id="s-users" role="toolbar" aria-label="사용자"></div>
+      <div class="attn" id="s-attn" hidden></div>
+      <div class="auxline" id="s-aux"></div>
+    </div>
+    <ui-agent-inbox id="board" view="board" lang="ko"></ui-agent-inbox>
+  </section>
+  <section id="v-users" class="view" hidden>
+    <div class="tb"><div class="tb-row"><h1 class="crumb">사용자 <small id="u-count"></small></h1><span class="sp"></span><span class="hint" id="u-src"></span></div></div>
+    <ui-stat-strip id="u-stats" lang="ko"></ui-stat-strip>
+    <div class="u-grid">
+      <div class="ui-card u-list" id="u-list"></div>
+      <div class="u-side">
+        <ui-compact-breakdown id="u-break" lang="ko"></ui-compact-breakdown>
+        <ui-bar-chart id="u-chart" lang="ko"></ui-bar-chart>
+      </div>
+    </div>
+  </section>
+  <section id="v-activity" class="view" hidden><div class="x-panel" id="acts"></div><div class="x-panel" id="act-raw"></div></section>
+  <section id="v-accounts" class="view" hidden><div id="accounts"></div></section>
+</main>
+
+<ui-drawer id="panel" dock-at="1180" width="760" min-width="460" max-width="1200" resizable lang="ko" label="세션 상세">
+  <div slot="header" class="ph" id="ph"></div>
+  <div class="pbody" id="pbody">
+    <ui-status-bar id="p-status" lang="ko"></ui-status-bar>
+    <ui-tabs id="p-tabs" lang="ko" panel-focus="none">
+      <div slot="ov" id="t-ov" class="tpanel"></div>
+      <div slot="log" id="t-log" class="tpanel"><ui-work-log id="p-log" lang="ko"></ui-work-log></div>
+      <div slot="conv" id="t-conv" class="tpanel"><ui-conversation id="p-conv" lang="ko" layout="page"></ui-conversation></div>
+      <div slot="cc" id="t-cc" class="tpanel"><div id="p-cc"></div></div>
+      <div slot="req" id="t-req" class="tpanel"><div class="rpager" id="p-pager"></div><div id="p-runs" class="rruns"></div><div class="rmore" id="p-more"></div><div id="p-raw" class="rawbox"></div></div>
+      <div slot="agents" id="t-agents" class="tpanel"><ui-agent-tree id="p-tree" lang="ko"></ui-agent-tree><div class="x-chat" id="p-agent"></div></div>
+    </ui-tabs>
+  </div>
+  <div class="pbody" id="ubody" hidden></div>
+</ui-drawer>
+<ui-drawer id="raw-sheet" mode="sheet" width="1180" min-width="600" max-width="1500" resizable lang="ko" label="요청 원문"><span slot="header" id="raw-head">요청 원문</span><div id="raw-body"></div></ui-drawer>
+
+<script src="core.js"></script>
+<script src="ccview.js"></script>
+<script src="rawview.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
