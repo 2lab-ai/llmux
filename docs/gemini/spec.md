@@ -151,7 +151,10 @@ client_model, user_agent }`.
   the client already tagged it; held until the user turn that answers a pending
   `functionCall`, so the response still follows the call), reported as the warning
   `system_message_as_user` — never folded into `systemInstruction`, so a new reminder does
-  not rewrite the cached prefix (2026-11-09; before that the role was a local 400);
+  not rewrite the cached prefix (2026-11-09; before that the role was a local 400). Live
+  receipts 2026-11-09 (`gemini-3.8-flash-high`, synthetic): a mid-conversation rule → 200,
+  followed; operator text held across a call, sent as `model[functionCall]` →
+  `user[functionResponse, text, text]` → 200;
   `user`→`user`, `assistant`→`model`; text →
   `{text}`; base64 image (png/jpeg/webp/heic/heif) → `inlineData`; base64 PDF document →
   `inlineData application/pdf`; text document → `{text}`; URL sources, other media and
