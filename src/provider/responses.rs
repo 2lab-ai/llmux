@@ -69,18 +69,28 @@ pub struct RequestPlan<'a> {
     pub priority_tier: bool,
     /// `include: ["reasoning.encrypted_content"]` (OpenAI-specific; grok off).
     pub include_encrypted_reasoning: bool,
-    /// Stable per-process id sent as `prompt_cache_key` (cache hint, not
-    /// conversation state).
+    /// Sent as `prompt_cache_key` (codex only): the per-conversation key from
+    /// [`conversation_key`], so one conversation keeps one cache route across
+    /// its turns. A cache hint, not conversation state.
     pub session_id: &'a str,
 }
 
 /// Total UTF-8 characters of every string anywhere under `value` (recurses
 /// arrays and object values). The atom of the chars/4 token estimate.
+///
+/// A `signature` value is skipped: it is opaque ciphertext the model never
+/// reads as text. An llmux reasoning signature is ~8K characters for a few
+/// dozen reasoning tokens (spec §R4), so counting it would inflate the
+/// estimate by thousands of tokens per assistant turn.
 fn section_chars(value: &Value) -> u64 {
     match value {
         Value::String(s) => s.chars().count() as u64,
         Value::Array(items) => items.iter().map(section_chars).sum(),
-        Value::Object(map) => map.values().map(section_chars).sum(),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| key.as_str() != "signature")
+            .map(|(_, value)| section_chars(value))
+            .sum(),
         _ => 0,
     }
 }
@@ -191,6 +201,11 @@ struct AggBlock {
     emitted: usize,
     /// Upstream `output_item.done` seen — no further content will arrive.
     done: bool,
+    /// `thinking.signature` for a block carrying the backend's own reasoning
+    /// ([`super::responses_request::reasoning_signature`]); empty otherwise.
+    signature: String,
+    /// The streamed `signature_delta` for [`Self::signature`] went out.
+    signature_sent: bool,
 }
 
 impl AggBlock {
@@ -216,14 +231,92 @@ impl AggBlock {
 pub fn requests_tool_use_review(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|b| {
-            b.get("safeguards")?.as_array().map(|entries| {
-                entries
-                    .iter()
-                    .any(|e| e.get("type").and_then(Value::as_str) == Some("dangerous_tool_use"))
-            })
+        .is_some_and(|body| requests_tool_use_review_value(&body))
+}
+
+/// [`requests_tool_use_review`] over an already-parsed body.
+pub fn requests_tool_use_review_value(body: &Value) -> bool {
+    body.get("safeguards")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| e.get("type").and_then(Value::as_str) == Some("dangerous_tool_use"))
         })
-        .unwrap_or(false)
+}
+
+/// Whether the client asked for thinking (`thinking.type` `enabled` or
+/// `adaptive`). Only such a client gets the backend's reasoning back as a
+/// `thinking` block (spec §R4) — the Anthropic API never sends a thinking
+/// block to a client that did not ask, and a simple client reading
+/// `content[0].text` must not find one there.
+pub fn requests_thinking(body: &Value) -> bool {
+    matches!(
+        body.pointer("/thinking/type").and_then(Value::as_str),
+        Some("enabled" | "adaptive")
+    )
+}
+
+/// Per-conversation cache key: a UUID-shaped SHA-256 over Claude Code's
+/// session id (`metadata.user_id` → `session_id`, or the raw `user_id` when it
+/// is not that JSON) and the conversation's FIRST message, with every
+/// `cache_control` marker removed (Claude Code moves them turn to turn).
+///
+/// Both inputs stay fixed while a conversation grows, so every turn of one
+/// conversation gets the same key, and two conversations — a session's main
+/// thread and each of its subagents, which share the session id but not the
+/// first message — get different ones. That is the codex CLI's own policy
+/// (one key per thread, sent as both `prompt_cache_key` and `session-id`).
+/// Measured on owner-mac raw-io, 2026-11-10: 133 of 133 requests that
+/// continued an earlier one kept its key. `None` when there is no message.
+pub fn conversation_key(body: &Value) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let first = body.get("messages")?.as_array()?.first()?;
+    let session = body
+        .pointer("/metadata/user_id")
+        .and_then(Value::as_str)
+        .map(|user_id| {
+            serde_json::from_str::<Value>(user_id)
+                .ok()
+                .and_then(|id| id.get("session_id")?.as_str().map(str::to_string))
+                .unwrap_or_else(|| user_id.to_string())
+        })
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"llmux-conversation-key-v1\0");
+    hasher.update(session.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(without_cache_control(first).to_string().as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 9562 version 8 (custom) + variant bits: a well-formed UUID, which is
+    // what the codex CLI sends in both places.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// `value` with every `cache_control` key removed, at any depth.
+fn without_cache_control(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "cache_control")
+                .map(|(key, value)| (key.clone(), without_cache_control(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_cache_control).collect()),
+        other => other.clone(),
+    }
 }
 
 /// The per-call `reason` on a translated backend's `unavailable` tool use: no
@@ -319,6 +412,9 @@ pub struct ResponsesSseConverter {
     /// Tool ids announced in a streamed `content_block_start`, in order — the
     /// exact set the streamed `safeguard_results` must cover.
     announced_tool_ids: Vec<String>,
+    /// Hand the backend's reasoning back as signed `thinking` blocks; see
+    /// [`Self::with_reasoning_replay`].
+    reasoning_flavor: Option<ResponsesFlavor>,
 }
 
 impl Default for ResponsesSseConverter {
@@ -355,6 +451,7 @@ impl ResponsesSseConverter {
             events_seen: 0,
             safeguards_requested: false,
             announced_tool_ids: Vec::new(),
+            reasoning_flavor: None,
         }
     }
 
@@ -379,6 +476,17 @@ impl ResponsesSseConverter {
     /// response byte-shape unchanged for clients that did not ask.
     pub fn with_safeguards_requested(mut self, requested: bool) -> Self {
         self.safeguards_requested = requested;
+        self
+    }
+
+    /// Return each upstream `reasoning` item that carries `encrypted_content`
+    /// as a `thinking` block (empty text, the ciphertext in its `signature`,
+    /// spec §R4) at the item's position, so the client sends it back and the
+    /// next request replays it. `None` (default) keeps the response shape
+    /// unchanged: set only for a client that asked for thinking
+    /// ([`requests_thinking`]).
+    pub fn with_reasoning_replay(mut self, flavor: Option<ResponsesFlavor>) -> Self {
+        self.reasoning_flavor = flavor;
         self
     }
 
@@ -483,6 +591,8 @@ impl ResponsesSseConverter {
             wired: false,
             emitted: 0,
             done: false,
+            signature: String::new(),
+            signature_sent: false,
         });
         self.blocks.len() - 1
     }
@@ -528,7 +638,7 @@ impl ResponsesSseConverter {
         let block = &self.blocks[pos];
         let content_block = match block.kind {
             BlockKind::Text => json!({"type": "text", "text": ""}),
-            BlockKind::Thinking => json!({"type": "thinking", "thinking": ""}),
+            BlockKind::Thinking => json!({"type": "thinking", "thinking": "", "signature": ""}),
             BlockKind::ToolUse => json!({
                 "type": "tool_use",
                 "id": block.tool_id,
@@ -577,6 +687,17 @@ impl ResponsesSseConverter {
         };
         self.pump(out, pos);
         if let Some(index) = self.blocks[pos].wire_index.take() {
+            // The signature closes its block, as on the Anthropic wire: once,
+            // and only after every thinking delta.
+            if !self.blocks[pos].signature.is_empty() && !self.blocks[pos].signature_sent {
+                self.blocks[pos].signature_sent = true;
+                let signature = self.blocks[pos].signature.clone();
+                self.delta(
+                    out,
+                    index,
+                    json!({"type": "signature_delta", "signature": signature}),
+                );
+            }
             Self::emit(
                 out,
                 "content_block_stop",
@@ -884,7 +1005,13 @@ impl ResponsesSseConverter {
             .iter()
             .filter_map(|block| match block.kind {
                 BlockKind::Text => Some(json!({"type": "text", "text": block.text})),
-                BlockKind::Thinking => Some(json!({"type": "thinking", "thinking": block.text})),
+                BlockKind::Thinking => {
+                    let mut thinking = json!({"type": "thinking", "thinking": block.text});
+                    if !block.signature.is_empty() {
+                        thinking["signature"] = Value::String(block.signature.clone());
+                    }
+                    Some(thinking)
+                }
                 BlockKind::ToolUse => {
                     // Reaching here on a NORMAL completion means the arguments
                     // already passed `tool_args_executable` in `complete` — a
@@ -1154,6 +1281,31 @@ impl SseTransform for ResponsesSseConverter {
             }
             "response.output_item.done" => {
                 let item_key = Self::item_key(&value);
+                // The backend's own reasoning, for a client that asked for
+                // thinking: one signed block per reasoning item, finished at
+                // birth, queued in item order like any other block.
+                if let Some(flavor) = self.reasoning_flavor {
+                    let encrypted = value
+                        .get("item")
+                        .filter(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                        })
+                        .and_then(|item| item.get("encrypted_content"))
+                        .and_then(Value::as_str)
+                        .filter(|encrypted| !encrypted.is_empty());
+                    if let Some(encrypted) = encrypted {
+                        self.ensure_started(&mut out);
+                        let key = item_key.as_deref().map(|item| format!("{item}#signature"));
+                        let pos = self.push_block(key, item_key.clone(), BlockKind::Thinking);
+                        self.blocks[pos].signature =
+                            super::responses_request::reasoning_signature(flavor, encrypted);
+                        self.blocks[pos].done = true;
+                        if item_key.is_none() {
+                            self.flush_pending(&mut out);
+                            return out;
+                        }
+                    }
+                }
                 // Resolve the FINISHED item, not "whatever is open": with
                 // interleaved items a `done` routinely arrives for an item that
                 // is not the live one, and closing the live block there would
@@ -1300,6 +1452,84 @@ mod tests {
             5,
             "20 characters of property name = 5 tokens"
         );
+    }
+
+    /// A `signature` is opaque ciphertext, not prompt text: an llmux
+    /// reasoning signature (~8K chars for a few dozen tokens) must not inflate
+    /// the estimate.
+    #[test]
+    fn estimate_input_tokens_skips_signatures() {
+        let bare = json!({"messages": [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "abcd"}]},
+        ]});
+        let mut signed = bare.clone();
+        signed["messages"][0]["content"][0]["signature"] =
+            json!(format!("llmux-rs1:codex:{}", "g".repeat(8000)));
+        assert_eq!(estimate_input_tokens(&signed), estimate_input_tokens(&bare));
+    }
+
+    /// #240's key: UUID-shaped, stable while the conversation grows and while
+    /// `cache_control` markers move, distinct per session and per first
+    /// message, absent without a message.
+    #[test]
+    fn conversation_key_is_stable_per_conversation() {
+        let uid = |session: &str| {
+            json!(format!(
+                r#"{{"device_id":"d","account_uuid":"","session_id":"{session}"}}"#
+            ))
+        };
+        let first = json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
+        let mut marked = first.clone();
+        marked["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+        let key = |user_id: Value, messages: Value| {
+            conversation_key(&json!({"metadata": {"user_id": user_id}, "messages": messages}))
+        };
+        let a = key(uid("s1"), json!([first])).expect("key");
+        assert_eq!(a.len(), 36);
+        assert_eq!(a.matches('-').count(), 4);
+        assert_eq!(&a[14..15], "8", "RFC 9562 version 8");
+        assert_eq!(
+            key(
+                uid("s1"),
+                json!([marked, {"role": "assistant", "content": "x"}])
+            ),
+            Some(a.clone()),
+            "later turn, moved cache_control"
+        );
+        assert_ne!(
+            key(uid("s2"), json!([first])),
+            Some(a.clone()),
+            "other session"
+        );
+        assert_ne!(
+            key(uid("s1"), json!([{"role": "user", "content": "other"}])),
+            Some(a.clone()),
+            "other first message"
+        );
+        assert_ne!(key(json!("raw-user-id"), json!([first])), Some(a.clone()));
+        assert!(
+            conversation_key(&json!({"messages": [first]})).is_some(),
+            "no metadata"
+        );
+        assert_eq!(conversation_key(&json!({"messages": []})), None);
+        assert_eq!(conversation_key(&json!({})), None);
+    }
+
+    #[test]
+    fn requests_thinking_reads_the_thinking_type() {
+        for (thinking, expected) in [
+            (json!({"type": "adaptive"}), true),
+            (json!({"type": "enabled", "budget_tokens": 1024}), true),
+            (json!({"type": "disabled"}), false),
+            (Value::Null, false),
+        ] {
+            assert_eq!(
+                requests_thinking(&json!({"thinking": thinking})),
+                expected,
+                "{thinking}"
+            );
+        }
+        assert!(!requests_thinking(&json!({})));
     }
 
     #[test]
