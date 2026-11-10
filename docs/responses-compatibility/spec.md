@@ -71,7 +71,8 @@ Anthropic accepts, 2026-09-17) live with the rule they justify, in §R1a.
 | `max_tokens` (positive integer) | omitted | `max_output_tokens` | `max_tokens` (codex) / `max_tokens_semantics` (grok) |
 | `max_tokens` 0, negative, fractional, string, explicit `null` | **400** | **400** | — |
 | `max_tokens` absent | no cap sent | no cap sent | — |
-| assistant `thinking` / `redacted_thinking` | omitted, order preserved | same | `thinking` / `redacted_thinking` |
+| assistant `thinking` signed `llmux-rs1:<this backend>:…` (the backend's own reasoning, R4) | a `reasoning` item at its position | same | — |
+| any other assistant `thinking` / `redacted_thinking` (Anthropic-signed, the other backend's, unsigned) | omitted, order preserved | same | `thinking` / `redacted_thinking` |
 | `thinking` on a non-assistant message | **400** | **400** | — |
 | `role` outside user/assistant/developer/system | **400** | **400** | — |
 | `system` (string or text blocks) | `instructions` (a leading `x-anthropic-billing-header:` line left out) | same | — |
@@ -200,16 +201,70 @@ class of loss this module exists to stop.
 
 ### R4 — prior reasoning
 
-Assistant `thinking` / `redacted_thinking` blocks are omitted and reported; the rest of the
-turn keeps its order and its text. An Anthropic `signature` is not either backend's
-reasoning ciphertext, and **llmux implements no replay or provenance bridge in v1** —
-neither backend's own encrypted reasoning is stored or replayed here. Consequence, stated
-plainly: **there is no reasoning continuity across turns on codex/grok.** Ordinary
-multi-turn text and tool transcripts are unaffected.
+**The backend's own reasoning is carried across turns (issue #239, 2026-11-10).** Every
+codex response carries a `reasoning` output item with `encrypted_content` (codex asks for it
+with `include: ["reasoning.encrypted_content"]`; grok returns it unasked). llmux hands it to
+the client and takes it back:
 
-`prompt_cache_key` (a process-wide id) is sent on codex only. cli-chat-proxy documents no
-routing scope for the key, so grok no longer asserts a session grouping llmux cannot back
-with evidence. This is a claim-avoidance choice, not a report of a leak.
+1. **Response.** For a client that asked for thinking (`thinking.type` `enabled` or
+   `adaptive`), each reasoning item that carries `encrypted_content` becomes one `thinking`
+   block at the item's position: empty `thinking`, and `signature`
+   `llmux-rs1:<codex|grok>:<encrypted_content>`, streamed as a `signature_delta` before the
+   block closes and present in the non-stream aggregate. A client that did not ask for
+   thinking gets no thinking block, as on the Anthropic API.
+2. **Request.** An assistant `thinking` block whose signature carries THIS backend's
+   ciphertext goes upstream as `{"type":"reasoning","summary":[],"encrypted_content":…}` at
+   its position, before the call it reasoned about. Every other `thinking` /
+   `redacted_thinking` block (an Anthropic signature, the other backend's ciphertext, an
+   unsigned summary) is omitted and reported, as before.
+3. **Native Messages.** A `/model` switch back to Claude or OpenRouter strips any
+   `llmux-rs1:` thinking block with the unsigned ones (`anthropic::strip_foreign_thinking`):
+   it is not an Anthropic signature.
+
+Claude Code sends every thinking block back (`context_management.edits[0]` is
+`clear_thinking_20251015` with `keep: "all"` on 347 of 347 sampled conversations,
+2026-11-10), so the replayed items are a stable part of the prompt prefix.
+
+Live receipts (2026-11-10, synthetic). Turn 1 asks the model to choose a secret codeword in
+its reasoning, never show it, call a tool, then print `<time> <codeword>`; turn 2 sends the
+tool result.
+
+| Turn 2 on | codex `gpt-6-astra` | grok `grok-4.7` |
+| --- | --- | --- |
+| reasoning replayed (with or without the item `id`) | `quincunx` ×3, 0 new reasoning tokens | `narthex` ×2, 41 and 74 reasoning tokens |
+| reasoning not replayed (before this change) | `oubliette`, then `orrery`: invented each time, 33 reasoning tokens | `catafalque`, then `apricity`; 631 and 1,494 reasoning tokens |
+| replayed to another model (`gpt-6-sol`, `gpt-6.1-sol`) | used (`quincunx`) | not probed |
+| replayed under another codex account | 200, silently ignored (same input tokens as no replay) | not probed |
+
+A second codex probe removes word-choice bias: turn 1 picks a random 8-digit number in its
+reasoning. Replayed, turn 2 answered `58392017` three times out of three with 0 new
+reasoning tokens; not replayed, it answered `58391627`, `72941683`, `58392017`, reasoning
+anew each time (26, 23, 32 tokens). Replayed items do not break the prompt cache: the
+repeated replay requests read 1,536 of 1,628 input tokens from cache.
+
+End to end through this code (`CodexProvider::build_request` → codex → the converter with
+replay on → the next turn), a Claude Code-shaped tool loop: turn 1 came back as
+`[thinking(signature llmux-rs1:codex:…), tool_use]`; turn 2 went upstream as
+`[user, reasoning, function_call, function_call_output]`; all three turns sent one
+`session-id` equal to `prompt_cache_key`.
+
+Cost, stated plainly: a replayed item is real context. It counted +35 input tokens for 33
+reasoning tokens, and still counted after a later user message (codex probe, same day) —
+the same as the codex CLI, which replays every reasoning item, and as Claude itself under
+`keep: "all"`. The ciphertext is ~8K characters per turn (median 7,928 over 91 codex
+items); the local `count_tokens` estimate skips `signature` values so it is not inflated.
+
+**`prompt_cache_key` and `session-id` are per conversation (issue #240, 2026-11-10).** codex
+sends one key as both: `responses::conversation_key`, a UUID-shaped SHA-256 over Claude
+Code's session id (`metadata.user_id` → `session_id`) and the conversation's first message
+with every `cache_control` removed. Every turn of one conversation keeps the key; the main
+thread and each subagent get their own. That is the codex CLI's policy — its source notes
+that "ChatGPT derives cache affinity from the Responses session-id header" — where llmux
+used to send one id per daemon process for every conversation. On fable-m5max raw-io
+(2026-11-10, 183 codex/grok requests), 133 of 133 requests that continued an earlier one
+kept its key. The native Responses frontend keeps the client's own `prompt_cache_key` and
+now routes the `session-id` header with it too. Grok still sends no `prompt_cache_key`:
+its cache hit rate is already 97.4% (2026-11-09), so there is no measured need.
 
 ### R5 — the report
 

@@ -4102,22 +4102,35 @@ fn translate_converter(
     ctx: &ForwardContext,
     served: BackendGroup,
 ) -> TranslateConverter {
+    // Parsed once for every per-request knob below.
+    let body =
+        serde_json::from_slice::<serde_json::Value>(&ctx.body).unwrap_or(serde_json::Value::Null);
+    // The backend's reasoning goes back to the client only when it asked for
+    // thinking (spec §R4); the classifier's pinned route never does.
+    let replay = |flavor| responses::requests_thinking(&body).then_some(flavor);
     let converter = match served {
-        BackendGroup::Grok => TranslateConverter::from(state.grok.converter()),
+        BackendGroup::Grok => TranslateConverter::from(
+            state
+                .grok
+                .converter()
+                .with_reasoning_replay(replay(responses::ResponsesFlavor::Grok)),
+        ),
         BackendGroup::Gemini => {
-            let (stamp, session_id) = ctx.gemini_converter.clone().unwrap_or_else(|| {
-                let body = serde_json::from_slice::<serde_json::Value>(&ctx.body)
-                    .unwrap_or(serde_json::Value::Null);
-                gemini_converter_keys(state, &body)
-            });
+            let (stamp, session_id) = ctx
+                .gemini_converter
+                .clone()
+                .unwrap_or_else(|| gemini_converter_keys(state, &body));
             TranslateConverter::from(state.gemini.converter(stamp, session_id))
         }
         _ => TranslateConverter::from(match &ctx.auto_classifier {
             Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
-            None => state.codex.converter(),
+            None => state
+                .codex
+                .converter()
+                .with_reasoning_replay(replay(responses::ResponsesFlavor::Codex)),
         }),
     };
-    converter.with_safeguards_requested(responses::requests_tool_use_review(&ctx.body))
+    converter.with_safeguards_requested(responses::requests_tool_use_review_value(&body))
 }
 
 /// `(client model stamp, sessionId)` for the gemini converter answering a

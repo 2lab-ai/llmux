@@ -270,8 +270,11 @@ fn is_quota_content(content: &serde_json::Value) -> bool {
 /// without a signature (it has nothing to sign them with), the client stores
 /// them in session history, and after a mid-session model switch the replay
 /// reaches api.anthropic.com, which rejects the request with 400
-/// `Invalid signature in thinking block`. Anthropic-signed blocks carry a
-/// non-empty signature and pass through untouched; `redacted_thinking`
+/// `Invalid signature in thinking block`. The same holds for a block whose
+/// signature llmux minted to carry a Responses backend's own reasoning
+/// (`llmux-rs1:…`, issue #239): it is not an Anthropic signature, so it is
+/// stripped too. Anthropic-signed blocks carry any other non-empty signature
+/// and pass through untouched; `redacted_thinking`
 /// (signed inside its `data`, no `signature` field by design) is never
 /// touched. A message whose content array is left EMPTY by the strip is
 /// dropped whole — a foreign thinking-only turn has nothing valid to replay,
@@ -297,7 +300,12 @@ pub(crate) fn strip_foreign_thinking(value: &mut serde_json::Value) -> bool {
                 || block
                     .get("signature")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|signature| !signature.is_empty())
+                    .is_some_and(|signature| {
+                        !signature.is_empty()
+                            && !crate::provider::responses_request::is_reasoning_signature(
+                                signature,
+                            )
+                    })
         });
         if content.len() == before {
             return true;
@@ -307,8 +315,8 @@ pub(crate) fn strip_foreign_thinking(value: &mut serde_json::Value) -> bool {
     });
     if changed {
         tracing::info!(
-            "stripped unsigned (translate-synthesized) thinking blocks from an \
-             anthropic-bound request (issue #116)"
+            "stripped unsigned or llmux-signed (translate-synthesized) thinking \
+             blocks from an anthropic-bound request (issues #116, #239)"
         );
     }
     changed
@@ -1050,5 +1058,35 @@ mod tests {
         .expect("auth");
         assert_eq!(req.headers.get(X_API_KEY).unwrap(), "sk-ant-api03-k");
         assert!(req.headers.get(AUTHORIZATION).is_none());
+    }
+
+    /// #239: a thinking block llmux signed to carry a Responses backend's
+    /// reasoning is not an Anthropic signature: stripped like an unsigned one,
+    /// so a `/model` switch back to Claude never sends it upstream. A real
+    /// Anthropic signature passes untouched.
+    #[test]
+    fn strip_foreign_thinking_removes_llmux_reasoning_signatures() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "llmux-rs1:codex:gAAAAA"},
+                {"type": "text", "text": "a"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "", "signature": "llmux-rs1:grok:enc"},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": "EqQBCkgIBhABGAIiQL"},
+                {"type": "text", "text": "b"},
+            ]},
+        ]});
+        assert!(strip_foreign_thinking(&mut body));
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3, "the thinking-only turn is dropped whole");
+        assert_eq!(
+            messages[1]["content"],
+            serde_json::json!([{"type": "text", "text": "a"}])
+        );
+        assert_eq!(messages[2]["content"][0]["signature"], "EqQBCkgIBhABGAIiQL");
     }
 }
