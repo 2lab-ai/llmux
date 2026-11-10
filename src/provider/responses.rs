@@ -77,27 +77,55 @@ pub struct RequestPlan<'a> {
 
 /// Total UTF-8 characters of every string anywhere under `value` (recurses
 /// arrays and object values). The atom of the chars/4 token estimate.
-///
-/// A `thinking` block's `signature` is skipped: opaque ciphertext the model
-/// never reads as text. An llmux reasoning signature is ~8K characters for a
-/// few dozen reasoning tokens (spec §R4), so counting it would inflate the
-/// estimate by thousands of tokens per assistant turn. Any other field named
-/// `signature` (a tool argument, say) is ordinary input and still counts.
 fn section_chars(value: &Value) -> u64 {
     match value {
         Value::String(s) => s.chars().count() as u64,
         Value::Array(items) => items.iter().map(section_chars).sum(),
-        Value::Object(map) => {
-            let thinking = matches!(
-                map.get("type").and_then(Value::as_str),
-                Some("thinking" | "redacted_thinking")
-            );
-            map.iter()
-                .filter(|(key, _)| !(thinking && key.as_str() == "signature"))
-                .map(|(_, value)| section_chars(value))
-                .sum()
-        }
+        Value::Object(map) => map.values().map(section_chars).sum(),
         _ => 0,
+    }
+}
+
+/// [`section_chars`] for a Messages `messages` array, minus the `signature`
+/// of every `thinking` / `redacted_thinking` CONTENT BLOCK: opaque ciphertext
+/// the model never reads as text. An llmux reasoning signature is ~8K
+/// characters for a few dozen reasoning tokens (spec §R4), so counting it
+/// would inflate the estimate by thousands of tokens per assistant turn.
+///
+/// Only a block in a message's `content` array qualifies — never a value
+/// inside a tool's arbitrary `input`, however it is shaped.
+fn messages_chars(messages: &Value) -> u64 {
+    let Some(messages) = messages.as_array() else {
+        return section_chars(messages);
+    };
+    messages
+        .iter()
+        .map(|message| match message {
+            Value::Object(map) => map
+                .iter()
+                .map(|(key, value)| match (key.as_str(), value) {
+                    ("content", Value::Array(blocks)) => blocks.iter().map(block_chars).sum(),
+                    _ => section_chars(value),
+                })
+                .sum(),
+            other => section_chars(other),
+        })
+        .sum()
+}
+
+/// One content block's characters; a thinking block's own `signature` skipped.
+fn block_chars(block: &Value) -> u64 {
+    let thinking = matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("thinking" | "redacted_thinking")
+    );
+    match block {
+        Value::Object(map) if thinking => map
+            .iter()
+            .filter(|(key, _)| key.as_str() != "signature")
+            .map(|(_, value)| section_chars(value))
+            .sum(),
+        other => section_chars(other),
     }
 }
 
@@ -114,6 +142,12 @@ fn serialized_chars(value: &Value) -> u64 {
 /// per part. NOT floored — sum the parts, then floor the total if needed.
 pub fn estimate_section_tokens(value: &Value) -> u64 {
     section_chars(value) / 4
+}
+
+/// [`estimate_section_tokens`] for the `messages` section: thinking-block
+/// signatures are not counted ([`messages_chars`]).
+pub fn estimate_messages_tokens(messages: &Value) -> u64 {
+    messages_chars(messages) / 4
 }
 
 /// Naive input-token estimate for `/v1/messages/count_tokens` on a Responses
@@ -137,7 +171,7 @@ pub fn estimate_input_tokens(body: &Value) -> u64 {
         total += section_chars(system);
     }
     if let Some(messages) = body.get("messages") {
-        total += section_chars(messages);
+        total += messages_chars(messages);
     }
     if let Some(tools) = body.get("tools") {
         total += serialized_chars(tools);
@@ -1489,15 +1523,27 @@ mod tests {
         signed["messages"][0]["content"][0]["signature"] =
             json!(format!("llmux-rs1:codex:{}", "g".repeat(8000)));
         assert_eq!(estimate_input_tokens(&signed), estimate_input_tokens(&bare));
-        // A tool argument that happens to be named `signature` is input.
+        // A tool argument that happens to be named `signature` is input —
+        // even inside a value shaped like a thinking block.
         let tool = |input: Value| {
             json!({"messages": [{"role": "assistant", "content": [
                 {"type": "tool_use", "id": "t", "name": "sign", "input": input},
             ]}]})
         };
-        assert!(
-            estimate_input_tokens(&tool(json!({"signature": "x".repeat(4000)})))
-                > estimate_input_tokens(&tool(json!({})))
+        let empty = estimate_input_tokens(&tool(json!({})));
+        for input in [
+            json!({"signature": "x".repeat(4000)}),
+            json!({"type": "thinking", "signature": "x".repeat(4000)}),
+            json!({"nested": {"type": "thinking", "signature": "x".repeat(4000)}}),
+        ] {
+            assert!(
+                estimate_input_tokens(&tool(input.clone())) >= empty + 1000,
+                "{input}"
+            );
+        }
+        assert_eq!(
+            estimate_messages_tokens(&signed["messages"]),
+            estimate_messages_tokens(&bare["messages"])
         );
     }
 
