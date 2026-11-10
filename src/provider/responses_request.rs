@@ -284,9 +284,10 @@ pub fn build_responses_body(
     if plan.priority_tier {
         upstream["service_tier"] = json!("priority");
     }
-    // `prompt_cache_key` is a codex cache hint. It is a PROCESS-wide id, so on
-    // grok — whose cli-chat-proxy routing scope for the key is undocumented —
-    // it would assert a session grouping llmux cannot back with evidence.
+    // `prompt_cache_key` is a codex cache hint: the conversation's own key
+    // (`responses::conversation_key`, spec §R4). Grok gets none — its cache
+    // already hits 97.4% (2026-11-09) and cli-chat-proxy documents no routing
+    // scope for the key, so there is nothing measured to gain.
     if flavor == ResponsesFlavor::Codex {
         upstream["prompt_cache_key"] = json!(plan.session_id);
     }

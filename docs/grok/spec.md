@@ -283,8 +283,10 @@ v1's image-drop and ignored-choice behavior. Anthropic/OpenRouter paths are unch
   Neither `budget_tokens` nor disabled reasoning is enforced. Counts carry no inference-only
   omission warnings. This closes known controls, not every present or future Messages field.
 - Prior assistant `thinking`/`redacted_thinking` are omitted with matching issues; retain other
-  transcript content/order. No private-reasoning continuity, encrypted replay, or ciphertext
-  cache. Those block types on other roles are invalid. Returned summaries remain output,
+  transcript content/order. Exception since 2026-11-10: a `thinking` block signed
+  `llmux-rs1:grok:…` (grok's own reasoning, handed to a client that asked for thinking) is
+  replayed as a `reasoning` item in place — responses-compatibility spec §R4. No ciphertext
+  cache: the client carries it. Those block types on other roles are invalid. Returned summaries remain output,
   not a replay mechanism; legitimate text/thinking/tool output is not heuristically scrubbed.
 - Absent / `X-Llmux-Compatibility: compat` permits only these enumerated losses. Emit relevant
   `X-Llmux-Omitted-Fields` and `X-Llmux-Compatibility-Warnings` plus structured WARN

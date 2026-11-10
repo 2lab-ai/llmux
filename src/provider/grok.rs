@@ -524,9 +524,8 @@ mod tests {
         );
         assert!(upstream.get("service_tier").is_none(), "no service tier");
         assert_eq!(upstream["store"], false);
-        // `prompt_cache_key` is a PROCESS-wide id; cli-chat-proxy documents no
-        // routing scope for it, so grok no longer asserts a session grouping
-        // llmux cannot back with evidence (codex keeps sending it).
+        // Codex sends a per-conversation `prompt_cache_key`; grok sends none
+        // (spec §R4: no measured need, routing scope undocumented).
         assert!(upstream.get("prompt_cache_key").is_none());
     }
 

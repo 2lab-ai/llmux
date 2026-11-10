@@ -335,14 +335,20 @@ Gemini is the Antigravity subscription backend, translated Messages ↔ Cloud Co
   proxies violates the Antigravity ToS, and it has suspended accounts for it; see
   [account types](configuration.md#account-types) before you add one.
 
-## No reasoning continuity on Codex/Grok
+## Reasoning continuity on Codex/Grok
 
 This section applies to **incoming Messages**. Native Codex Responses preserves
-caller-supplied encrypted reasoning and history. For Messages translation, prior
-assistant `thinking` blocks are dropped, and neither gateway's own encrypted reasoning
-is stored or replayed by llmux. Multi-turn text and tool transcripts are unaffected, but a
-`gpt-*` or `grok-*` turn does not resume the previous turn's private reasoning. A top-level
-`thinking` config is validated and then dropped: `budget_tokens` bounds nothing upstream and
+caller-supplied encrypted reasoning and history. For Messages translation (since
+2026-11-10, [spec §R4](responses-compatibility/spec.md#r4--prior-reasoning)), each
+gateway's own encrypted reasoning **is** carried across turns: when the request asks for
+thinking (`thinking.type` `enabled` or `adaptive`), the response carries it as a `thinking`
+block with empty text and a `llmux-rs1:<codex|grok>:…` signature, and the next request
+replays that block to the same gateway as a `reasoning` item, so a `gpt-*` or `grok-*`
+turn resumes the previous turn's private reasoning. Other prior `thinking` blocks
+(Anthropic-signed, the other gateway's) are still dropped; multi-turn text and tool
+transcripts are unaffected. A request that does not ask for thinking gets no thinking
+block and replays nothing. Beyond that switch, the top-level `thinking` config is
+validated and then dropped: `budget_tokens` bounds nothing upstream and
 `{"type":"disabled"}` does not stop these models from reasoning. Reasoning effort on these
 groups comes from llmux's own resolution (`config.codex` / `config.grok`, `/effort`), not
 from the Messages body — see [models](models.md) for the per-model effort menus. **Codex
