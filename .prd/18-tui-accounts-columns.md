@@ -68,3 +68,17 @@ in #210): the gauge shows the bare reset countdown again under its `RESET`
 header. The `rst` reset-credit column (`.prd/16`), the `five_hour` data in
 `/llmux/status` and `/llmux/dashboard`, the `five_hour_max` config knob and
 the `5h,7d,fbl` limits editor are untouched.
+
+## Amendment 2026-11-10 — the 5h window leaves llmux entirely
+
+2026-11-10 owner: "5시간 사용량 삭제해달라고 llmux에서도 완전히 삭제해줘" —
+the 2026-11-04 amendment kept the data and the gate; this one removes them.
+llmux no longer reads a 5h window from any source (unified `5h` headers, a
+short codex window, a usage-poll `five_hour`, the API-key / grok token-bucket
+headers that fed the 5h slot), stores one, gates on one or serves one:
+`five_hour` is gone from `/llmux/status`, `/llmux/dashboard` and
+`accounts --json`, `five_hour_max` is gone from `select_params`, the config
+(an older config that still has the key loads and drops it on the next
+write), `/llmux/settings` and `/llmux/account-limits`. The `5h ceiling`
+config row and the `FiveHourOverThreshold` reason are gone, and the limits
+editor takes `7d,fbl`. Scoring is `servable_now = 7d headroom` (`.prd/09`).
