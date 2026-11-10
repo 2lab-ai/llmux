@@ -149,9 +149,8 @@ rules: table rows, gauges and the popups' box borders draw as before.
   The same pane is used when the middle row gets fewer than 7 rows — dragged
   shorter, or squeezed on a short terminal — so the band never loses a row.
   With 27-character account ids the band fits 179 columns for every switch
-  reason: an automatic switch (`SevenDayOverThreshold` /
-  `FiveHourOverThreshold`) needs 172 columns on the Claude side and 160 on
-  the Codex side. The detail `reset`
+  reason: an automatic switch (`SevenDayOverThreshold`) needs 172 columns
+  on the Claude side and 160 on the Codex side. The detail `reset`
   line and an account's `last failure …` lines never take a band row of the
   automatic height; they appear in the rows you add by dragging the band
   taller, when they fit (failure lines first). The 8-row pane shows the
@@ -212,8 +211,7 @@ rules: table rows, gauges and the popups' box borders draw as before.
   it is on the key bar ends with `z fold`. It folds only the accounts the
   scheduler holds back because their 7d usage is over the ceiling — the
   ones whose status reads `7d 100.0% > 99%`. A `!` for any other reason (a
-  5h limit, a Fable limit, an auth failure) keeps the account in the
-  table. The table keeps every other account in its usual order and
+  Fable limit, an auth failure) keeps the account in the table. The table keeps every other account in its usual order and
   format, and each keeps its own `#`, so the numbers skip the folded ones.
   The folded accounts are listed directly under the table, from its left
   edge: one dim line of column names, then the accounts several to a line,
@@ -248,7 +246,7 @@ rules: table rows, gauges and the popups' box borders draw as before.
 - **Compact account list (`V`).** One row per account: a focus mark, a
   glyph for what the account is doing, its name and, when the column has
   room for every name, the state's word — `✗ error 401` (auth failed),
-  `◌ 7d spent` / `5h spent` (over a ceiling until the window resets),
+  `◌ 7d spent` (over a ceiling until the window resets),
   `◉ cooling 45m10s` (parked by a cooldown), `⠋ active` (the scheduler's
   current account; the glyph turns, and holds still under
   `LLMUX_REDUCED_MOTION`), `◦ ok` (eligible), `ǁ paused` and
@@ -280,8 +278,8 @@ rules: table rows, gauges and the popups' box borders draw as before.
 optional `7d Fbl` gauges put `RESET` on the left of the header and the
 active meaning above the percentage on the right. These labels follow both
 the configured `quota_display` mode and the session-local `u` toggle. There
-is no `5h` column: no provider reports a 5h window any more (the scheduler's
-5h ceiling still applies when a window is reported).
+is no `5h` column: no provider reports a 5h window any more, and since
+2026-11-10 llmux neither reads, stores nor gates on one.
 
 The time inside a weekly gauge is its reset countdown, shown bare and
 centered (`7d 10h`, or the absolute stamp under `t`); the header's `RESET`
@@ -714,7 +712,6 @@ See [configuration.md](configuration.md) for the full config reference.
   "proxy": { "port": 3456, "api_key": "lm-..." },
   "upstream": "https://api.anthropic.com",
   "scheduler": {
-    "five_hour_max": 0.90,
     "seven_day_max": 0.99,
     "usage_poll_secs": 300,
     "usage_max_age_secs": 600,
@@ -748,7 +745,6 @@ Scheduler knobs:
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `five_hour_max` | `0.90` | Max 5-hour utilization before an account is ineligible. |
 | `seven_day_max` | `0.99` | Max 7-day utilization before an account is ineligible. |
 | `usage_poll_secs` | `300` | Per-account OAuth usage poll interval. |
 | `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
@@ -893,10 +889,10 @@ the configured size/redaction limits.
 
 ## Scheduling model
 
-Each account tracks two quota windows: 5-hour session and 7-day weekly. Anthropic accounts get passive data from upstream response headers plus active OAuth usage polling; Codex accounts ingest `x-codex-*` headers when present; Gemini accounts get one 7-day window from a Cloud Code `fetchAvailableModels` poll. Selection is pure and deterministic over a snapshot, re-evaluated when the current account becomes ineligible and on a 60-second tick — never per request.
+Each account tracks one quota window: the 7-day weekly window (no provider reports a 5-hour window any more; since 2026-11-10 llmux ignores one if it arrives). Anthropic accounts get passive data from upstream response headers plus active OAuth usage polling; Codex accounts ingest `x-codex-*` headers when present; Gemini accounts get one 7-day window from a Cloud Code `fetchAvailableModels` poll. Selection is pure and deterministic over a snapshot, re-evaluated when the current account becomes ineligible and on a 60-second tick — never per request.
 
-1. **Eligibility gate.** Keep accounts with healthy auth, no active 429 park, both windows under their thresholds, and fresh-enough usage data. A degraded headers-only mode kicks in if every account's usage is stale. While [save mode](schedulers.md#save-mode) is on (`POST /llmux/save-mode`), an account whose weekly window resets after the cutoff is held like a pause and reads `saved · 7d resets in …`.
-2. **Score = usable burst now × perishability.** `servable_now = min(5h headroom, 7d headroom)` is what an account can serve before it next gates on either limit. `urgency` ramps up the closer an account is to its 7-day reset, linearly across the week and capped at 4×. So `score = servable_now × urgency` prefers quota that is **about to reset and would otherwise evaporate unused**, but only while it is still usable.
+1. **Eligibility gate.** Keep accounts with healthy auth, no active 429 park, the weekly window under its threshold, and fresh-enough usage data. A degraded headers-only mode kicks in if every account's usage is stale. While [save mode](schedulers.md#save-mode) is on (`POST /llmux/save-mode`), an account whose weekly window resets after the cutoff is held like a pause and reads `saved · 7d resets in …`.
+2. **Score = usable burst now × perishability.** `servable_now = 7d headroom` is what an account can serve before it next gates on its weekly limit. `urgency` ramps up the closer an account is to its 7-day reset, linearly across the week and capped at 4×. So `score = servable_now × urgency` prefers quota that is **about to reset and would otherwise evaporate unused**, but only while it is still usable.
 3. **Sticky, with a perishability override.** Stay on the current account while it is eligible — unless another account is clearly worth more, currently 25% above the current score. This protects upstream prompt-cache locality while still burning soon-to-reset quota.
 4. **Backend grouping.** With routing on by default, only same-group accounts compete and each group keeps its own sticky pick. With routing off, Codex accounts rank last as a cross-group overflow pool.
 5. **Exhaustion.** Honor `retry-after` on 429. If every account is exhausted, return 429 with the soonest window reset as `retry-after`.

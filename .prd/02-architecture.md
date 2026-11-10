@@ -122,7 +122,7 @@ Codex x-codex-* headers ─────┼──> headers.rs ─────┐
                          select.rs::pick(snapshot, now) — pure, deterministic
                          1 gates: health, cooldown, thresholds, staleness
                          2 stickiness + perishability override (SWITCH_MARGIN)
-                         3 rank: max score (servable×urgency) → min 5h → min 7d reset → id
+                         3 rank: max score (servable×urgency) → min 7d reset → id
                                                                │
                          switch_to(expected_current, target)  # CAS-ish, lease guard
 ```
@@ -203,7 +203,6 @@ has no usage poller, so staleness does not gate it; quota thresholds still gate 
     "fast": false
   },
   "scheduler": {
-    "five_hour_max": 0.90,
     "seven_day_max": 0.99,
     "usage_poll_secs": 300,
     "usage_max_age_secs": 600,

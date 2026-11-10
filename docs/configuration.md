@@ -27,7 +27,6 @@ whatever `activity.jsonl` still holds); everything else keeps working.
   "proxy": { "port": 3456, "api_key": "lm-..." },
   "upstream": "https://api.anthropic.com",
   "scheduler": {
-    "five_hour_max": 0.90,
     "seven_day_max": 0.99,
     "usage_poll_secs": 300,
     "usage_max_age_secs": 600,
@@ -97,11 +96,10 @@ Ownership: the daemon host owns accounts, routing, scheduling and the SDK runtim
 
 ## Scheduler knobs
 
-Each account tracks 5-hour and 7-day quota windows. The scheduler chooses among eligible accounts with a perishability-aware score: burn quota that will reset soon while preserving long-runway accounts.
+Each account tracks its 7-day quota window. There is no 5-hour window: no provider reports one any more (2026-11-10). A `five_hour_max` key left in an older config (global or under `account_limits`) is ignored on load and dropped on the next write. The scheduler chooses among eligible accounts with a perishability-aware score: burn quota that will reset soon while preserving long-runway accounts.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `five_hour_max` | `0.90` | Max 5-hour utilization before an account is ineligible. |
 | `seven_day_max` | `0.99` | Max 7-day utilization before an account is ineligible. |
 | `usage_poll_secs` | `300` | Per-account OAuth usage poll interval. |
 | `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
@@ -112,10 +110,12 @@ See [the scheduler perishability design](../.prd/09-scheduler-perishability.md) 
 
 ## Idle probe (cold-account refresh)
 
-The usage poller covers Claude subscription (`oauth`), Grok and Gemini accounts: Claude through `/api/oauth/usage`, Grok through its billing endpoint, Gemini through Cloud Code `fetchAvailableModels` (`src/scheduler/usage.rs`, `refresh_schedule`). Codex and
-API-key accounts get their 5h/7d gauges from a gated `max_tokens = 1` probe
+The usage poller covers Claude subscription (`oauth`), Grok and Gemini accounts: Claude through `/api/oauth/usage`, Grok through its billing endpoint, Gemini through Cloud Code `fetchAvailableModels` (`src/scheduler/usage.rs`, `refresh_schedule`). Codex
+accounts get their 7d gauge from a gated `max_tokens = 1` probe
 through their own credential (`proxy.idle_probe`), delivered on demand (real
-traffic to the group) and by a background timer sweep. Since 2026-07-15 the
+traffic to the group) and by a background timer sweep. API-key accounts are
+not probed: their responses carry only per-key token buckets, which fed the
+retired 5h gauge and are no longer read (2026-11-10). Since 2026-07-15 the
 probe also re-fires when an account's freshest window observation goes
 **stale**, so cold subscriptions keep live gauges instead of freezing at
 their first reading.

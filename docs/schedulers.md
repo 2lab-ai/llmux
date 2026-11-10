@@ -26,17 +26,18 @@ An account can be picked only when ALL of these hold — the same pure gate driv
 - auth healthy, not operator-**paused** (`p` in the TUI switcher, context menu in llmux-islands)
 - not held by [save mode](#save-mode) (weekly reset after the save-mode cutoff)
 - not cooling down (429 `retry-after` park)
-- 5h utilization ≤ `scheduler.five_hour_max` (default **0.90**)
 - 7d utilization ≤ `scheduler.seven_day_max` (default **0.99**)
 - usage data fresh (≤ `usage_max_age_secs`; if ALL accounts are stale, the gate degrades to headers-only mode instead of stalling)
 
-Per-account overrides: `account_limits` in the config (TUI: `L` in the switcher, `"90,98,98"` = 5h,7d,fbl percents) replace any of the three ceilings for that account.
+Per-account overrides: `account_limits` in the config (TUI: `L` in the switcher, `"98,98"` = 7d,fbl percents) replace either ceiling for that account.
+
+There is no 5-hour window (2026-11-10): no provider reports one any more, so llmux neither reads nor gates on it. A `five_hour` value in a usage response or a `five_hour_max` key in an older config is ignored.
 
 **Fable scope:** Fable-family requests are additionally refused an account whose Fable weekly bucket is constraining (≥ `scheduler.fable_weekly_max`, default **0.98**, reset-aware) or Fable-cooling. Non-Fable traffic ignores Fable state entirely — a Fable-exhausted account still serves everything else. Full Fable lane mechanics: [fable-scheduling.md](fable-scheduling.md).
 
 ## `default` — quota-maximizing
 
-Ranks eligible accounts by `score = servable_now × urgency`: `servable_now` = min(5h, 7d headroom below the ceilings) — the binding limit wins; `urgency` = 1–4× as the 7d reset approaches — soon-to-reset budget is perishable, so it burns first, while long-runway accounts are preserved as reservoirs. Sticky on the current account, but proactively switches when another account scores >25% higher (`SWITCH_MARGIN`) — it trades some cache locality for not letting quota expire unused.
+Ranks eligible accounts by `score = servable_now × urgency`: `servable_now` = the 7d headroom below the ceiling; `urgency` = 1–4× as the 7d reset approaches — soon-to-reset budget is perishable, so it burns first, while long-runway accounts are preserved as reservoirs. Sticky on the current account, but proactively switches when another account scores >25% higher (`SWITCH_MARGIN`) — it trades some cache locality for not letting quota expire unused.
 
 ## `round-robin` — sequential exhaust (fewest switches)
 

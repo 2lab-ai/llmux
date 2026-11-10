@@ -12,7 +12,7 @@ Code: `src/scheduler/select.rs` (`pick_scoped`, `fable_score`,
 ## Why a separate lane
 
 Anthropic subscriptions carry a model-scoped **Fable weekly bucket** on top
-of the account-wide 5h/7d windows. An account can be Fable-exhausted while
+of the account-wide 7d window. An account can be Fable-exhausted while
 perfectly serviceable for every other model, so Fable traffic keeps its own
 sticky slot (`fable_current`) and its own gates — benching an account for
 Fable never benches it for the rest.
@@ -46,8 +46,8 @@ never-observed bucket is **cold** — unknown, not zero and not exhausted.
    errors." A recorded 429 / auth failure clears it immediately; otherwise
    it lapses on its own.
 3. **Perishability ranking** — `fable_score = servable_now × urgency`:
-   - `servable_now = min(5h headroom, 7d headroom, Fable headroom)` — a
-     Fable request burns all three budgets, the binding one wins.
+   - `servable_now = min(7d headroom, Fable headroom)` — a Fable request
+     burns both budgets, the binding one wins.
    - `urgency = week / time-to-Fable-reset` (hyperbolic, clamped to 100×):
      the *required burn rate*. A **full bucket resetting in 3h (≈56×) is
      burned before a 93% bucket resetting in 1d14h (≈4.4×)** —
@@ -70,7 +70,7 @@ never-observed bucket is **cold** — unknown, not zero and not exhausted.
 
 A 429 on a Fable request without `retry-after` parks the **Fable scope
 only** (the account keeps serving non-Fable traffic); it escalates to an
-account-wide park only when the 5h/7d windows themselves corroborate. A
+account-wide park only when the 7d window itself corroborates. A
 `retry-after` 429 is an upstream mandate and always parks account-wide.
 Any 429 on a manually pinned account also releases the pin.
 
