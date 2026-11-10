@@ -4,7 +4,7 @@ llmux is a local proxy between your coding CLI and your model accounts. Claude C
 
 ## 1. You have more than one Claude subscription
 
-Islands shows every account's 5-hour and 7-day windows and their reset timers in one place. You no longer log in and out to find out which account still has room. If you stop here, this alone is worth the install.
+Islands shows every account's 7-day window and its reset timer in one place. You no longer log in and out to find out which account still has room. If you stop here, this alone is worth the install.
 
 ## 2. Add a Codex subscription and Claude can delegate to GPT
 

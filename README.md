@@ -10,11 +10,11 @@ Then let Claude, GPT and Grok work in the same Claude Code session.
 
 ---
 
-![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with 5h/7d usage bars and reset timers](screenshots/llmux-islands-workspace.png)
+![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with usage bars and reset timers (captured before the 5-hour window was retired on 2026-11-10)](screenshots/llmux-islands-workspace.png)
 
 <sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>
 
-llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 5-hour and 7-day windows is left, and when each window resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex session can also reach Gemini accounts (Claude Code cannot select gemini models).
+llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 7-day window is left, and when it resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex session can also reach Gemini accounts (Claude Code cannot select gemini models).
 
 ## Start with Islands
 

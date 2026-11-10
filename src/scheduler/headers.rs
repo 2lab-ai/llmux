@@ -79,9 +79,11 @@ const CODEX_SHORT_WINDOW_MAX_MINUTES: u64 = 1440;
 /// chosen by `window-minutes` (the 2026-09-11 capture has the weekly window
 /// in `primary`, so position says nothing). When no window states its
 /// minutes, the observed weekly role is assumed: `secondary` (the 2026-06-12
-/// shape) else a lone `primary` (the 2026-09-11 shape). Exact header names
-/// only — `x-codex-bengalfox-*` model-specific variants are deliberately not
-/// read.
+/// shape) else a LONE `primary` (the 2026-09-11 shape) — lone meaning no
+/// secondary header at all: a secondary that is there but unreadable leaves
+/// the slot empty rather than handing it to the session window. Exact header
+/// names only — `x-codex-bengalfox-*` model-specific variants are deliberately
+/// not read.
 fn codex_weekly(headers: &HeaderMap) -> Option<WindowReading> {
     let windows = [
         codex_window(headers, "primary"),
@@ -96,9 +98,12 @@ fn codex_weekly(headers: &HeaderMap) -> Option<WindowReading> {
         w.filter(|(_, minutes)| minutes.is_none())
             .map(|(reading, _)| reading)
     };
+    let secondary_absent = ["used-percent", "reset-at", "window-minutes"]
+        .iter()
+        .all(|field| !headers.contains_key(format!("x-codex-secondary-{field}").as_str()));
     by_minutes
         .or_else(|| unlabeled(&windows[1]))
-        .or_else(|| unlabeled(&windows[0]))
+        .or_else(|| unlabeled(&windows[0]).filter(|_| secondary_absent))
 }
 
 /// One codex window needs BOTH a parseable `used-percent` and a parseable
@@ -490,6 +495,28 @@ mod tests {
             ("x-codex-primary-reset-at", "1789442251"),
         ]));
         assert_eq!(parsed.seven_day.unwrap().utilization, 0.43);
+    }
+
+    #[test]
+    fn codex_lone_primary_fallback_needs_the_secondary_absent_not_broken() {
+        // review-of-legends P2 (PR #273): a secondary that is there but unreadable (weekly by its
+        // minutes, reset missing) must not hand the weekly slot to an unlabeled primary — that is
+        // the session window, and a 100% session reading would mark the account weekly-exhausted.
+        let parsed = parse(&map(&[
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-reset-at", "1781284314"),
+            ("x-codex-secondary-used-percent", "2"),
+            ("x-codex-secondary-window-minutes", "10080"),
+        ]));
+        assert!(parsed.is_empty(), "{parsed:?}");
+        // Same with a garbage secondary reset.
+        let parsed = parse(&map(&[
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-reset-at", "1781284314"),
+            ("x-codex-secondary-used-percent", "2"),
+            ("x-codex-secondary-reset-at", "soon"),
+        ]));
+        assert!(parsed.is_empty(), "{parsed:?}");
     }
 
     #[test]
