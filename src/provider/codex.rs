@@ -97,10 +97,10 @@ impl CodexShape {
 ///
 /// Every translated request sends ONE key as both `session-id` and
 /// `prompt_cache_key` — the codex CLI's source notes that ChatGPT derives cache
-/// affinity from the `session-id` header. The key is the request's shared
-/// prefix ([`responses::prefix_cache_key`]: its tools, else its system), so
-/// requests that can reuse one cached prefix share a route. The per-process id
-/// remains the native Responses frontend's fallback.
+/// affinity from the `session-id` header. The key is the translated request's
+/// shared prefix ([`responses::prefix_cache_key`]: its upstream tools, else its
+/// instructions), so requests that can reuse one cached prefix share a route.
+/// The per-process id remains the native Responses frontend's fallback.
 ///
 /// The shape is behind an `RwLock` so the dashboard can toggle fast/model/
 /// effort on a running daemon (req8.1) without a restart: requests take a
@@ -201,8 +201,11 @@ impl CodexProvider {
         let body: Value = serde_json::from_slice(anthropic_body).map_err(|err| {
             ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
         })?;
-        let cache_key = responses::prefix_cache_key(&body);
-        let (upstream_body, client_stream) = translate_request_with(&body, &cache_key, shape)?;
+        let (mut upstream_body, client_stream) =
+            translate_request_with(&body, &self.session_id, shape)?;
+        // Keyed by what goes on the wire: the translated tools/instructions.
+        let cache_key = responses::prefix_cache_key(&upstream_body);
+        upstream_body["prompt_cache_key"] = Value::String(cache_key.clone());
 
         let mut headers = HeaderMap::new();
         let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))
@@ -1433,8 +1436,8 @@ mod tests {
         assert_eq!(sent["prompt_cache_key"], session, "cache key = session id");
         assert_eq!(
             session,
-            responses::prefix_cache_key(&body),
-            "both carry the prefix key"
+            responses::prefix_cache_key(&sent),
+            "both carry the prefix key of the translated body"
         );
     }
 
@@ -1478,6 +1481,26 @@ mod tests {
         assert_eq!(keys(&subagent), key, "same tools: one shared route");
         assert_ne!(keys(&other_tools), key, "another tool set gets its own");
         assert_ne!(key, provider.session_id, "never the per-process id");
+        // Spelled differently by the client, identical on the wire: one key.
+        let bare = json!({"tools": [{"name": "read"}], "messages": [
+            {"role": "user", "content": "x"},
+        ]});
+        let explicit = json!({"tools": [{"name": "read", "input_schema":
+            {"type": "object", "properties": {}}, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "y"}]});
+        assert_eq!(
+            keys(&bare),
+            keys(&explicit),
+            "default schema, cache_control"
+        );
+        let string_system = json!({"system": "be terse", "messages": [
+            {"role": "user", "content": "x"},
+        ]});
+        let block_system = json!({"system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=9.9.9;"},
+            {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}},
+        ], "messages": [{"role": "user", "content": "x"}]});
+        assert_eq!(keys(&string_system), keys(&block_system), "system spelling");
     }
 
     /// #239: a reasoning item that carries `encrypted_content` comes back to a

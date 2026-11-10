@@ -69,9 +69,10 @@ pub struct RequestPlan<'a> {
     pub priority_tier: bool,
     /// `include: ["reasoning.encrypted_content"]` (OpenAI-specific; grok off).
     pub include_encrypted_reasoning: bool,
-    /// Sent as `prompt_cache_key` (codex only): the prefix key from
-    /// [`prefix_cache_key`], shared by every request that can share a cached
-    /// prefix. A cache hint, not conversation state.
+    /// Sent as `prompt_cache_key` (codex only). The codex provider overwrites
+    /// it with [`prefix_cache_key`] of the translated body; callers that build
+    /// a body directly (tests, probes) get this value. A cache hint, not
+    /// conversation state.
     pub session_id: &'a str,
 }
 
@@ -297,16 +298,20 @@ pub fn requests_thinking(body: &Value) -> bool {
     )
 }
 
-/// The cache routing key for a request: a UUID-shaped SHA-256 over the start of
-/// the prompt it will share with other requests — the client's `tools` (every
-/// `cache_control` marker removed), or its `system` when it sends no tools.
+/// The cache routing key for a translated Responses request: a UUID-shaped
+/// SHA-256 over the start of the prompt it can share with other requests — the
+/// UPSTREAM `tools`, or `instructions` when it sends no tools. Hashing what goes
+/// on the wire (not the client JSON) gives every request whose cached prefix is
+/// identical the same key, however the client spelled it (a string or a block
+/// `system`, a tool with or without a default schema, a billing-header line).
 ///
 /// The backend caches the rendered prefix tools → instructions → input, and
 /// `prompt_cache_key` / `session-id` pick the route that holds it. Keying by
-/// the prefix gives every request that CAN share a cached prefix the same
-/// route — a session's main thread, its subagents, a new conversation with the
-/// same tool set — while one conversation keeps its key on every turn (its
-/// tools do not change) and different tool sets spread across routes.
+/// the prefix gives every request that CAN reuse a cached prefix the same
+/// route — each turn of a conversation, a session's subagents, a new
+/// conversation with the same tool set — and spreads different tool sets
+/// across routes. The key changes only when that prefix itself changes (new
+/// tools mid-conversation), when there is no cached prefix to keep anyway.
 ///
 /// Measured on the live codex gateway, 2026-11-10 (spec §R4): a new
 /// conversation under its OWN key read 0 of a 17K-token shared prefix from
@@ -314,9 +319,9 @@ pub fn requests_thinking(body: &Value) -> bool {
 /// different instructions: 16,640 of 16,845 cached under a shared key, 0
 /// under its own — the tools part is shared before the instructions differ.
 /// A per-conversation key (#275) therefore threw that prefix away.
-pub fn prefix_cache_key(body: &Value) -> String {
+pub fn prefix_cache_key(upstream: &Value) -> String {
     use sha2::{Digest as _, Sha256};
-    let tools = body
+    let tools = upstream
         .get("tools")
         .filter(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
     let mut hasher = Sha256::new();
@@ -324,12 +329,12 @@ pub fn prefix_cache_key(body: &Value) -> String {
     match tools {
         Some(tools) => {
             hasher.update(b"tools\0");
-            hasher.update(without_cache_control(tools).to_string().as_bytes());
+            hasher.update(tools.to_string().as_bytes());
         }
         None => {
-            hasher.update(b"system\0");
-            let system = body.get("system").unwrap_or(&Value::Null);
-            hasher.update(without_cache_control(system).to_string().as_bytes());
+            hasher.update(b"instructions\0");
+            let instructions = upstream.get("instructions").unwrap_or(&Value::Null);
+            hasher.update(instructions.to_string().as_bytes());
         }
     }
     let digest = hasher.finalize();
@@ -348,20 +353,6 @@ pub fn prefix_cache_key(body: &Value) -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-/// `value` with every `cache_control` key removed, at any depth.
-fn without_cache_control(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .filter(|(key, _)| key.as_str() != "cache_control")
-                .map(|(key, value)| (key.clone(), without_cache_control(value)))
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(without_cache_control).collect()),
-        other => other.clone(),
-    }
 }
 
 /// The per-call `reason` on a translated backend's `unavailable` tool use: no
@@ -1552,40 +1543,28 @@ mod tests {
         );
     }
 
-    /// The prefix key: UUID-shaped; the same for every request that shares the
-    /// tool set (any conversation, session, instructions or turn, wherever
-    /// `cache_control` sits); different for another tool set; keyed by
-    /// `system` when no tools are sent.
+    /// The prefix key over a translated body: UUID-shaped; the same for every
+    /// request with the same upstream tools (any instructions or input);
+    /// different for another tool set; keyed by `instructions` without tools.
     #[test]
     fn prefix_cache_key_follows_the_shared_prefix() {
-        let tool = |name: &str| json!({"name": name, "input_schema": {"type": "object"}});
-        let body = |tools: Value, system: &str, first: &str| {
-            json!({"tools": tools, "system": system,
-                   "metadata": {"user_id": first},
-                   "messages": [{"role": "user", "content": first}]})
-        };
+        let tool = |name: &str| json!({"type": "function", "name": name, "parameters": {}});
+        let body = |tools: Value, instructions: &str, input: &str| json!({"tools": tools, "instructions": instructions, "input": [input]});
         let key = prefix_cache_key(&body(json!([tool("a"), tool("b")]), "main", "one"));
         assert_eq!(key.len(), 36);
         assert_eq!(key.matches('-').count(), 4);
         assert_eq!(&key[14..15], "8", "RFC 9562 version 8");
-        let mut marked = json!([tool("a"), tool("b")]);
-        marked[1]["cache_control"] = json!({"type": "ephemeral"});
-        for same in [
-            body(
-                json!([tool("a"), tool("b")]),
-                "subagent persona",
-                "another task",
-            ),
-            body(marked, "main", "one"),
-        ] {
-            assert_eq!(prefix_cache_key(&same), key, "{same}");
-        }
+        assert_eq!(
+            prefix_cache_key(&body(json!([tool("a"), tool("b")]), "persona", "two")),
+            key
+        );
         assert_ne!(
             prefix_cache_key(&body(json!([tool("a")]), "main", "one")),
-            key,
-            "another tool set"
+            key
         );
-        let no_tools = |system: &str| prefix_cache_key(&json!({"system": system, "messages": []}));
+        let no_tools = |instructions: &str| {
+            prefix_cache_key(&json!({"instructions": instructions, "input": []}))
+        };
         assert_eq!(
             no_tools("s1"),
             prefix_cache_key(&body(json!([]), "s1", "x"))
