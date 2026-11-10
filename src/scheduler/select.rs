@@ -14,8 +14,6 @@ use crate::routing::BackendGroup;
 /// Selection thresholds, derived from `SchedulerConfig`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SelectParams {
-    /// 5h utilization ceiling (default 0.90).
-    pub five_hour_max: f64,
     /// 7d utilization ceiling (default 0.99).
     pub seven_day_max: f64,
     /// Fable-weekly utilization ceiling for FABLE requests (default 0.98).
@@ -35,7 +33,6 @@ pub struct SelectParams {
 impl From<&SchedulerConfig> for SelectParams {
     fn from(cfg: &SchedulerConfig) -> Self {
         Self {
-            five_hour_max: cfg.five_hour_max,
             seven_day_max: cfg.seven_day_max,
             fable_weekly_max: cfg.fable_weekly_max,
             mode: cfg.mode,
@@ -72,7 +69,6 @@ pub enum IneligibleReason {
     /// absolute as [`Self::Paused`] until the cutoff passes.
     Saved,
     CoolingDown,
-    FiveHourOverThreshold,
     SevenDayOverThreshold,
     UsageStale,
     /// A Fable request only: the account holds a live Fable-scoped cooldown
@@ -123,11 +119,10 @@ pub enum RequestScope {
 /// Boundary semantics: a window AT the threshold is still eligible
 /// (`utilization <= max`); only strictly-over crosses the gate. A missing
 /// window is a cold account — utilization 0, immediately eligible.
-/// The 5h/7d/Fable ceilings that apply to THIS account: the per-account
+/// The 7d/Fable ceilings that apply to THIS account: the per-account
 /// override (config `account_limits`) when set, else the global params.
-pub fn effective_limits(account: &AccountSnapshot, params: &SelectParams) -> (f64, f64, f64) {
+pub fn effective_limits(account: &AccountSnapshot, params: &SelectParams) -> (f64, f64) {
     (
-        account.limits.five_hour_max.unwrap_or(params.five_hour_max),
         account.limits.seven_day_max.unwrap_or(params.seven_day_max),
         account
             .limits
@@ -149,7 +144,7 @@ pub fn eligibility(
 /// `headers_only` drops the staleness gate (all-stale fallback), and
 /// `heuristic_degraded` drops the cooldown gate for accounts parked SOLELY by
 /// a [`CooldownSource::Heuristic`] cooldown (retry-after-less 429 lockout
-/// fallback). RetryAfter parks, auth failure, and the 5h/7d quota ceilings
+/// fallback). RetryAfter parks, auth failure, and the 7d quota ceiling
 /// STILL gate in either mode — only the transient heuristic guess is bypassed.
 ///
 /// `eligibility` is the public, non-degraded-cooldown form (`heuristic_degraded
@@ -184,13 +179,7 @@ pub fn gate(
     {
         return Some(IneligibleReason::CoolingDown);
     }
-    let (five_max, seven_max, _) = effective_limits(account, params);
-    let five = account
-        .five_hour
-        .map_or(0.0, |w| w.effective_utilization(now));
-    if five > five_max {
-        return Some(IneligibleReason::FiveHourOverThreshold);
-    }
+    let (seven_max, _) = effective_limits(account, params);
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
@@ -212,7 +201,7 @@ pub fn gate(
 /// the Fable-scope checks ON TOP of the account-wide [`gate`], so:
 ///
 /// - The account-wide gate runs first and unchanged: no AccountWide cooldown,
-///   auth-healthy, under the 5h/7d ceilings, not stale.
+///   auth-healthy, under the 7d ceiling, not stale.
 /// - THEN, for a [`RequestScope::Fable`] request ONLY, the account is also
 ///   refused if it holds a live Fable-scoped cooldown ([`IneligibleReason::
 ///   FableCoolingDown`]) or its Fable weekly bucket is preemptively
@@ -238,7 +227,7 @@ pub fn gate_scoped(
         if account.fable_cooldown_active(now) {
             return Some(IneligibleReason::FableCoolingDown);
         }
-        if account.fable_weekly_exhausted(now, effective_limits(account, params).2) {
+        if account.fable_weekly_exhausted(now, effective_limits(account, params).1) {
             return Some(IneligibleReason::FableWeeklyExhausted);
         }
     }
@@ -327,12 +316,10 @@ fn usage_is_stale(account: &AccountSnapshot, now: SystemTime, max_age: Duration)
 /// the timestamp staleness is judged against, also surfaced as "usage stale
 /// Xm" in blocking reasons.
 pub fn freshest_live_fetch(account: &AccountSnapshot, now: SystemTime) -> Option<SystemTime> {
-    [account.five_hour, account.seven_day]
-        .into_iter()
-        .flatten()
+    account
+        .seven_day
         .filter(|w| !w.is_expired(now))
         .map(|w| w.fetched_at)
-        .max()
 }
 
 /// Headers-only degraded mode (FR3 staleness fallback): active when NO
@@ -371,7 +358,7 @@ pub fn headers_only_mode(
 /// the group scope, NO account passes the full gate AND at least one account is
 /// blocked SOLELY by a [`CooldownSource::Heuristic`] cooldown — i.e. it would
 /// be eligible if that one heuristic park were dropped (healthy, not
-/// RetryAfter-parked, 5h/7d under threshold, not stale).
+/// RetryAfter-parked, 7d under threshold, not stale).
 ///
 /// A retry-after-less upstream 429 is a transient server-side blip, not the
 /// account's quota; the heuristic park exists only to rotate off a momentarily
@@ -380,7 +367,7 @@ pub fn headers_only_mode(
 /// (upstream will 429 again if it is still limited, which the forward loop
 /// surfaces as a prompt transient 502 rather than a hard pool lockout). So in
 /// this mode the heuristic cooldown gate is dropped. RetryAfter parks,
-/// AuthUnhealthy, and real-quota (5h/7d over threshold) STILL gate.
+/// AuthUnhealthy, and real-quota (7d over threshold) STILL gate.
 ///
 /// `group` scopes the decision exactly like [`headers_only_mode`]: a heuristic
 /// lockout in one backend group must not flip another group into degraded mode.
@@ -419,7 +406,7 @@ pub fn heuristic_degraded_mode(
 /// heuristic cooldowns were ignored — i.e. how many accounts a retry-after-less
 /// 429 burst can sweep before the pool is genuinely out of candidates. Counts
 /// via [`gate_scoped`] with `heuristic_degraded = true`, so paused / auth-dead /
-/// real-quota (5h/7d) / RetryAfter-parked accounts are naturally excluded (they
+/// real-quota (7d) / RetryAfter-parked accounts are naturally excluded (they
 /// still gate in degraded mode) — only the Heuristic cooldown is looked through.
 ///
 /// The forward loop uses this to detect "I have now 429-swept every candidate in
@@ -452,11 +439,10 @@ fn in_group(account: &AccountSnapshot, group: Option<BackendGroup>) -> bool {
 }
 
 /// THE selection algorithm (FR3): gate, then rank eligible accounts by
-/// soonest 7d `resets_at` (use-it-or-lose-it), tiebreak lower 5h effective
-/// utilization, then stable id order.
+/// soonest 7d `resets_at` (use-it-or-lose-it), then stable id order.
 ///
 /// Stickiness contract: if the group's `current` is still eligible this
-/// returns `Stay` even when another account would rank higher. A missing 5h
+/// returns `Stay` even when another account would rank higher. A missing 7d
 /// window means a cold account (utilization 0, immediately eligible).
 ///
 /// `group` scopes selection to one backend group when `Some` (routing on):
@@ -746,31 +732,24 @@ const SWITCH_MARGIN: f64 = 0.25;
 /// The scheduler's value for an account — higher is preferred. Derivation in
 /// `.prd/09-scheduler-perishability.md` (supersedes `07`).
 ///
-/// `servable_now = min(5h headroom, 7d headroom)` is the work the account can
-/// serve before it next gates on EITHER limit. The 5h window rate-caps the 7d
-/// budget, so an account rich in weekly quota but near its 5h cap is worth
-/// little right now, and one with a full 5h window but little weekly budget is
-/// likewise capped — the binding limit wins.
+/// `servable_now = 7d headroom` is the work the account can serve before it
+/// next gates on its weekly limit. (Before 2026-11-10 it was the smaller of
+/// the 5h and 7d headrooms; no provider has a 5h window any more.)
 ///
 /// `urgency` scales with how far an account is through its weekly window: budget
 /// that resets soon refreshes regardless, so it is perishable and should be
 /// burned first, while a long-runway account is preserved as a reservoir. The
 /// ramp is linear across the whole `SEVEN_DAY_PERIOD` — a reset ~1 day out gets
 /// ≈3.5×, ~6 days out ≈1.4×, and a just-reset / no-live-7d (cold) account 1.0×
-/// (least perishable, used last). The boost is gated by `servable_now`: a maxed
-/// 5h window or drained weekly budget drives it toward 0, so an
-/// urgent-but-unusable account cannot win — it would gate immediately.
+/// (least perishable, used last). The boost is gated by `servable_now`: a
+/// drained weekly budget drives it toward 0, so an urgent-but-unusable account
+/// cannot win — it would gate immediately.
 pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> f64 {
-    let five = account
-        .five_hour
-        .map_or(0.0, |w| w.effective_utilization(now));
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    let (five_max, seven_max, _) = effective_limits(account, params);
-    let r5 = (five_max - five).max(0.0);
-    let r7 = (seven_max - seven).max(0.0);
-    let servable_now = r5.min(r7);
+    let (seven_max, _) = effective_limits(account, params);
+    let servable_now = (seven_max - seven).max(0.0);
     let urgency = match live_reset(&account.seven_day, now) {
         Some(reset) => {
             let secs_left = reset
@@ -789,8 +768,8 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
 
 /// [`account_score`] for the FABLE lane (issue #121 follow-up): the same
 /// servable × urgency shape with the Fable weekly bucket taking the 7d
-/// window's roles. `servable_now = min(5h, 7d, Fable headroom)` — a Fable
-/// request burns all three budgets, so the binding one wins.
+/// window's roles. `servable_now = min(7d, Fable headroom)` — a Fable
+/// request burns both budgets, so the binding one wins.
 ///
 /// `urgency` is HYPERBOLIC (`week / time-left`, clamped), not the main
 /// lane's linear ramp: the linear ramp under-discriminates near the reset
@@ -803,19 +782,15 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
 /// COLD bucket (never observed) has no known perishability and scores 1.0×
 /// — held by anchoring, never hunted.
 pub fn fable_score(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> f64 {
-    let five = account
-        .five_hour
-        .map_or(0.0, |w| w.effective_utilization(now));
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
     let fable_window = account.fable_weekly().map(|s| s.window);
     let fable = fable_window.map_or(0.0, |w| w.effective_utilization(now));
-    let (five_max, seven_max, fable_max) = effective_limits(account, params);
-    let r5 = (five_max - five).max(0.0);
+    let (seven_max, fable_max) = effective_limits(account, params);
     let r7 = (seven_max - seven).max(0.0);
     let rf = (fable_max - fable).max(0.0);
-    let servable_now = r5.min(r7).min(rf);
+    let servable_now = r7.min(rf);
     let urgency = match live_reset(&fable_window, now) {
         Some(reset) => {
             let secs_left = reset
@@ -836,8 +811,7 @@ pub fn fable_score(account: &AccountSnapshot, params: &SelectParams, now: System
 const FABLE_URGENCY_CAP: f64 = 100.0;
 
 /// [`rank`] for the FABLE lane: higher [`fable_score`] first, then soonest
-/// live Fable reset (known before unknown), then lower 5h utilization, then
-/// stable id. The codex tier rule is irrelevant here (fable models route to
+/// live Fable reset (known before unknown), then stable id. The codex tier rule is irrelevant here (fable models route to
 /// the claude group).
 fn fable_ranked(
     a: &AccountSnapshot,
@@ -855,11 +829,6 @@ fn fable_ranked(
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
         })
-        .then_with(|| {
-            let five =
-                |x: &AccountSnapshot| x.five_hour.map_or(0.0, |w| w.effective_utilization(now));
-            five(a).total_cmp(&five(b))
-        })
         .then_with(|| a.id.cmp(&b.id))
 }
 
@@ -868,8 +837,7 @@ fn fable_ranked(
 /// over a healthy anthropic account; manual TUI switch still works), then
 /// **higher [`account_score`]** (usable burst now × weekly-quota perishability,
 /// so among usable accounts the soonest-to-reset is preferred and a long-runway
-/// account is preserved), then lower 5h effective utilization, then soonest 7d
-/// reset as a deep tiebreak (known reset before unknown), then stable id.
+/// account is preserved), then soonest 7d reset as a deep tiebreak (known reset before unknown), then stable id.
 ///
 /// Under a group filter (`group.is_some()`, routing on) the codex `tier`-last
 /// rule is a NO-OP: every candidate is already in the same group, so there is
@@ -917,11 +885,6 @@ fn rank(
     // Higher score first (descending).
     account_score(b, params, now)
         .total_cmp(&account_score(a, params, now))
-        .then_with(|| {
-            let five_a = a.five_hour.map_or(0.0, |w| w.effective_utilization(now));
-            let five_b = b.five_hour.map_or(0.0, |w| w.effective_utilization(now));
-            five_a.total_cmp(&five_b)
-        })
         .then_with(
             || match (live_reset(&a.seven_day, now), live_reset(&b.seven_day, now)) {
                 (Some(x), Some(y)) => x.cmp(&y),
@@ -1130,16 +1093,6 @@ pub fn blocking_reason(
                 None => "cooldown".to_string(),
             }
         }
-        IneligibleReason::FiveHourOverThreshold => {
-            let util = account
-                .five_hour
-                .map_or(0.0, |w| w.effective_utilization(now));
-            format!(
-                "5h {:.1}% > {:.0}%",
-                util * 100.0,
-                effective_limits(account, params).0 * 100.0
-            )
-        }
         IneligibleReason::SevenDayOverThreshold => {
             let util = account
                 .seven_day
@@ -1147,7 +1100,7 @@ pub fn blocking_reason(
             format!(
                 "7d {:.1}% > {:.0}%",
                 util * 100.0,
-                effective_limits(account, params).1 * 100.0
+                effective_limits(account, params).0 * 100.0
             )
         }
         IneligibleReason::UsageStale => {
@@ -1206,10 +1159,9 @@ pub fn soonest_reset(snapshot: &PoolSnapshot, now: SystemTime) -> Option<Duratio
         .iter()
         .filter(|a| a.healthy)
         .flat_map(|a| {
-            a.five_hour
+            a.seven_day
                 .map(|w| w.resets_at)
                 .into_iter()
-                .chain(a.seven_day.map(|w| w.resets_at))
                 .chain(a.cooldown_until)
         })
         .filter_map(|t| t.duration_since(now).ok())
@@ -1338,7 +1290,6 @@ mod tests {
 
     fn params() -> SelectParams {
         SelectParams {
-            five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
@@ -1368,7 +1319,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -1427,19 +1377,19 @@ mod tests {
 
     #[test]
     fn per_account_limit_overrides_beat_the_global_ceilings() {
-        // Global 5h ceiling is 0.90; this account overrides it down to 0.50.
+        // Global 7d ceiling is 0.99; this account overrides it down to 0.50.
         let mut a = account("alpha");
-        a.five_hour = Some(window(0.60, 3_600));
-        a.limits.five_hour_max = Some(0.50);
+        a.seven_day = Some(window(0.60, 3_600));
+        a.limits.seven_day_max = Some(0.50);
         assert_eq!(
             eligibility(&a, &params(), now(), false),
-            Some(IneligibleReason::FiveHourOverThreshold),
-            "0.60 > per-account 0.50 even though the global ceiling is 0.90"
+            Some(IneligibleReason::SevenDayOverThreshold),
+            "0.60 > per-account 0.50 even though the global ceiling is 0.99"
         );
         // The blocking reason reports the EFFECTIVE ceiling.
         let reason = blocking_reason(
             &a,
-            IneligibleReason::FiveHourOverThreshold,
+            IneligibleReason::SevenDayOverThreshold,
             &params(),
             now(),
         );
@@ -1448,7 +1398,7 @@ mod tests {
             "effective ceiling in text: {reason}"
         );
         // Clearing the override restores the global ceiling.
-        a.limits.five_hour_max = None;
+        a.limits.seven_day_max = None;
         assert_eq!(eligibility(&a, &params(), now(), false), None);
     }
 
@@ -1672,23 +1622,6 @@ mod tests {
     }
 
     #[test]
-    fn five_hour_threshold_boundary() {
-        let mut a = account("a");
-        a.five_hour = Some(window(0.90, HOUR));
-        assert_eq!(
-            eligibility(&a, &params(), now(), false),
-            None,
-            "exactly at threshold is eligible"
-        );
-        a.five_hour = Some(window(0.9000001, HOUR));
-        assert_eq!(
-            eligibility(&a, &params(), now(), false),
-            Some(IneligibleReason::FiveHourOverThreshold),
-            "just over threshold is ineligible"
-        );
-    }
-
-    #[test]
     fn seven_day_threshold_boundary() {
         let mut a = account("a");
         a.seven_day = Some(window(0.99, 24 * HOUR));
@@ -1704,7 +1637,7 @@ mod tests {
     fn expired_window_reads_as_cold() {
         let mut a = account("a");
         // 100% utilized, but the reset timestamp already passed.
-        a.five_hour = Some(QuotaWindow {
+        a.seven_day = Some(QuotaWindow {
             utilization: 1.0,
             resets_at: at(NOW_SECS - 1),
             fetched_at: at(NOW_SECS - 10),
@@ -1717,7 +1650,7 @@ mod tests {
     fn auth_unhealthy_gates_first() {
         let mut a = account("a");
         a.healthy = false;
-        a.five_hour = Some(window(1.0, HOUR));
+        a.seven_day = Some(window(1.0, HOUR));
         a.cooldown_until = Some(at(NOW_SECS + 60));
         assert_eq!(
             eligibility(&a, &params(), now(), false),
@@ -1742,7 +1675,7 @@ mod tests {
     fn stale_usage_gates_unless_headers_only() {
         let mut a = account("a");
         // Fetched 601s ago (max age 600), still-live window.
-        a.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 601));
+        a.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 601));
         assert_eq!(
             eligibility(&a, &params(), now(), false),
             Some(IneligibleReason::UsageStale)
@@ -1762,7 +1695,7 @@ mod tests {
         // (and legitimately old) window source.
         let mut codex = account("cx");
         codex.credential_kind = "codex";
-        codex.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 601));
+        codex.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 601));
         assert_eq!(eligibility(&codex, &params(), now(), false), None);
         // The quota gates themselves still apply to codex.
         codex.seven_day = Some(window_fetched(0.995, 24 * HOUR, NOW_SECS - 601));
@@ -1776,7 +1709,7 @@ mod tests {
     fn stale_but_expired_data_degrades_to_cold_not_stale() {
         let mut a = account("a");
         // Old observation whose window already reset: carries no constraint.
-        a.five_hour = Some(QuotaWindow {
+        a.seven_day = Some(QuotaWindow {
             utilization: 1.0,
             resets_at: at(NOW_SECS - HOUR),
             fetched_at: at(NOW_SECS - 2 * HOUR),
@@ -1797,16 +1730,17 @@ mod tests {
         assert_eq!(decision, Decision::Switch { to: id("b") });
     }
 
+    /// No provider has a 5h window any more (2026-11-10): two accounts with
+    /// identical weekly windows tie on score and fall to the id order — no
+    /// hidden 5h tiebreak in between.
     #[test]
-    fn tiebreaks_by_lower_five_hour_utilization() {
+    fn equal_weekly_windows_tie_to_stable_id_order() {
         let mut a = account("a");
         a.seven_day = Some(window(0.5, 24 * HOUR));
-        a.five_hour = Some(window(0.60, HOUR));
         let mut b = account("b");
         b.seven_day = Some(window(0.5, 24 * HOUR));
-        b.five_hour = Some(window(0.20, HOUR));
-        let decision = pick(&pool(vec![a, b], None), &params(), None, now());
-        assert_eq!(decision, Decision::Switch { to: id("b") });
+        let decision = pick(&pool(vec![b, a], None), &params(), None, now());
+        assert_eq!(decision, Decision::Switch { to: id("a") });
     }
 
     #[test]
@@ -1820,22 +1754,20 @@ mod tests {
         assert_eq!(decision, Decision::Switch { to: id("alpha") });
     }
 
-    // ---- score-based ranking (5h-rate-aware, .prd/07-scheduler-research.md) ----
+    // ---- score-based ranking (.prd/09-scheduler-perishability.md) ----
 
     #[test]
     fn account_score_is_servable_now_times_urgency() {
         // Reset 6 days out (frac_left = 6/7) → mild urgency 1 + 3*(1 - 6/7) =
-        // 10/7; servable = min(r5 0.70, r7 0.89) = 0.70 → score 0.70 * 10/7 = 1.0.
+        // 10/7; servable = r7 = 0.99 - 0.29 = 0.70 → score 0.70 * 10/7 = 1.0.
         let mut comfy = account("c");
-        comfy.five_hour = Some(window(0.20, HOUR)); // r5 = 0.70
-        comfy.seven_day = Some(window(0.10, 6 * 24 * HOUR)); // r7 = 0.89
+        comfy.seven_day = Some(window(0.29, 6 * 24 * HOUR)); // r7 = 0.70
         assert!((account_score(&comfy, &params(), now()) - 1.0).abs() < 1e-9);
 
         // Resets in 1h (frac_left = 1/168) → urgency 1 + 3*(167/168) = 669/168;
         // servable 0.70 → score 0.70 * 669/168 = 2.7875.
         let mut urgent = account("u");
-        urgent.five_hour = Some(window(0.20, HOUR)); // r5 = 0.70
-        urgent.seven_day = Some(window(0.10, HOUR)); // r7 = 0.89, resets in 1h
+        urgent.seven_day = Some(window(0.29, HOUR)); // r7 = 0.70, resets in 1h
         assert!((account_score(&urgent, &params(), now()) - 2.7875).abs() < 1e-9);
     }
 
@@ -1858,10 +1790,10 @@ mod tests {
 
     #[test]
     fn urgent_perishable_quota_is_burned_first() {
-        // An account whose 7d resets within one 5h window, still has weekly
+        // An account whose 7d resets within two hours, still has weekly
         // budget, and is usable now → its salvageable slice is perishable, so it
         // beats the fuller-but-safe account (use-it-or-lose-it, but targeted).
-        let safe = account("safe"); // cold → score 0.90, urgency 1
+        let safe = account("safe"); // cold → score 0.99, urgency 1
         let mut urgent = account("urgent");
         urgent.seven_day = Some(window(0.5, 2 * HOUR)); // resets <1 window → urgency max → 1.47
         let decision = pick(&pool(vec![safe, urgent], None), &params(), None, now());
@@ -1873,38 +1805,35 @@ mod tests {
     }
 
     #[test]
-    fn urgent_but_5h_gated_quota_is_not_chased() {
-        // Same imminent 7d reset, but the 5h window is maxed: no usable burst
-        // remains, so the urgency boost cannot rescue it (servable_now → 0). A
-        // usable account is preferred over stalling on an unusable urgent one.
+    fn urgent_but_drained_quota_is_not_chased() {
+        // An imminent 7d reset, but the weekly budget is at its ceiling: no
+        // usable budget remains, so the urgency boost cannot rescue it
+        // (servable_now → 0). A usable account is preferred over stalling on
+        // an unusable urgent one.
         let mut urgent = account("urgent");
-        urgent.seven_day = Some(window(0.5, 2 * HOUR)); // perishable
-        urgent.five_hour = Some(window(0.90, HOUR)); // r5 = 0 → servable_now = 0 → score 0
-        let usable = account("usable"); // cold → score 0.90
+        urgent.seven_day = Some(window(0.99, 2 * HOUR)); // r7 = 0 → servable_now = 0 → score 0
+        let usable = account("usable"); // cold → score 0.99
         let decision = pick(&pool(vec![urgent, usable], None), &params(), None, now());
         assert_eq!(
             decision,
             Decision::Switch { to: id("usable") },
-            "an urgent account with no usable burst left does not win"
+            "an urgent account with no usable budget left does not win"
         );
     }
 
+    /// A 5h reading can no longer exist on a snapshot, so it can never cap
+    /// an account: the weekly headroom alone is what it can serve now.
     #[test]
-    fn five_hour_rate_caps_an_account_rich_in_weekly_budget() {
-        // a: lots of 7d budget but a nearly-full 5h window → can serve almost
-        // nothing now. b: less 7d budget but a fresh 5h window. servable_now =
-        // min(r5, r7) prefers the account usable right now.
+    fn weekly_headroom_alone_decides_servable_now() {
         let mut a = account("a");
         a.seven_day = Some(window(0.0, 24 * HOUR)); // r7 = 0.99
-        a.five_hour = Some(window(0.88, HOUR)); // r5 = 0.02 → servable 0.02
         let mut b = account("b");
         b.seven_day = Some(window(0.7, 24 * HOUR)); // r7 = 0.29
-        b.five_hour = Some(window(0.10, HOUR)); // r5 = 0.80 → servable 0.29
         let decision = pick(&pool(vec![a, b], None), &params(), None, now());
         assert_eq!(
             decision,
-            Decision::Switch { to: id("b") },
-            "the account you can actually burst from now beats a 5h-gated one"
+            Decision::Switch { to: id("a") },
+            "more weekly headroom at the same reset wins"
         );
     }
 
@@ -1993,7 +1922,7 @@ mod tests {
     fn codex_is_picked_when_every_anthropic_account_is_ineligible() {
         let codex = codex_account("codex");
         let mut over = account("anthropic");
-        over.five_hour = Some(window(0.95, HOUR));
+        over.seven_day = Some(window(0.995, HOUR));
         let decision = pick(&pool(vec![codex, over], None), &params(), None, now());
         assert_eq!(
             decision,
@@ -2118,16 +2047,15 @@ mod tests {
 
     #[test]
     fn proactively_switches_off_eligible_current_for_clearly_more_perishable() {
-        // The current account is eligible but low-value (5h 0.80 → servable 0.10,
-        // reset 2 days out → score ≈ 0.31). Another account resets within the hour
-        // with a fresh 5h window (servable 0.49 → score ≈ 1.95) — over 6× the
-        // current, well past SWITCH_MARGIN, so the scheduler moves to burn it.
+        // The current account is eligible but low-value (7d 0.89 → servable
+        // 0.10, reset 2 days out → score ≈ 0.31). Another account resets within
+        // the hour with half its week left (servable 0.49 → score ≈ 1.95) — over
+        // 6× the current, well past SWITCH_MARGIN, so the scheduler moves to
+        // burn it.
         let mut current = account("a");
-        current.seven_day = Some(window(0.5, 48 * HOUR));
-        current.five_hour = Some(window(0.80, HOUR));
+        current.seven_day = Some(window(0.89, 48 * HOUR));
         let mut better = account("b");
         better.seven_day = Some(window(0.5, HOUR));
-        better.five_hour = Some(window(0.10, HOUR));
         let decision = pick(
             &pool(vec![current, better], Some("a")),
             &params(),
@@ -2139,13 +2067,13 @@ mod tests {
 
     #[test]
     fn stays_on_eligible_current_within_switch_margin() {
-        // The alternative outranks the current, but only by ~6% (0.85 vs 0.80),
+        // The alternative outranks the current, but only by ~6% (0.94 vs 0.89),
         // under SWITCH_MARGIN (25%). Not worth a prompt-cache-busting hand-off —
         // stickiness holds.
         let mut current = account("a");
-        current.five_hour = Some(window(0.10, HOUR)); // servable 0.80, urgency 1
+        current.seven_day = Some(window(0.10, 6 * 24 * HOUR)); // servable 0.89
         let mut alt = account("b");
-        alt.five_hour = Some(window(0.05, HOUR)); // servable 0.85, urgency 1
+        alt.seven_day = Some(window(0.05, 6 * 24 * HOUR)); // servable 0.94
         let decision = pick(&pool(vec![current, alt], Some("a")), &params(), None, now());
         assert_eq!(decision, Decision::Stay);
     }
@@ -2153,7 +2081,7 @@ mod tests {
     #[test]
     fn switches_when_current_crosses_threshold() {
         let mut current = account("a");
-        current.five_hour = Some(window(0.95, HOUR)); // over 0.90
+        current.seven_day = Some(window(0.995, HOUR)); // over 0.99
         let fallback = account("b");
         let decision = pick(
             &pool(vec![current, fallback], Some("a")),
@@ -2203,9 +2131,9 @@ mod tests {
     #[test]
     fn all_stale_enables_headers_only_mode() {
         let mut a = account("a");
-        a.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
+        a.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let mut b = account("b");
-        b.five_hour = Some(window_fetched(0.50, HOUR, NOW_SECS - 5000));
+        b.seven_day = Some(window_fetched(0.50, HOUR, NOW_SECS - 5000));
         let snapshot = pool(vec![a, b], None);
         assert!(headers_only_mode(&snapshot, &params(), None, now()));
         // Staleness gate dropped: scheduling proceeds on the stale data.
@@ -2218,7 +2146,7 @@ mod tests {
     #[test]
     fn stale_account_loses_to_fresh_cold_account() {
         let mut stale = account("a");
-        stale.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
+        stale.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let cold = account("b");
         let snapshot = pool(vec![stale, cold], None);
         assert!(!headers_only_mode(&snapshot, &params(), None, now()));
@@ -2233,9 +2161,9 @@ mod tests {
         // A is genuinely over threshold, B is merely stale: serving B beats
         // refusing service (upstream 429 is the corrective backstop).
         let mut over = account("a");
-        over.five_hour = Some(window(0.95, HOUR));
+        over.seven_day = Some(window(0.995, HOUR));
         let mut stale = account("b");
-        stale.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
+        stale.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let snapshot = pool(vec![over, stale], None);
         assert!(headers_only_mode(&snapshot, &params(), None, now()));
         assert_eq!(
@@ -2247,9 +2175,9 @@ mod tests {
     #[test]
     fn sticky_current_survives_in_headers_only_mode() {
         let mut a = account("a");
-        a.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
+        a.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         let mut b = account("b");
-        b.five_hour = Some(window_fetched(0.05, HOUR, NOW_SECS - 5000));
+        b.seven_day = Some(window_fetched(0.05, HOUR, NOW_SECS - 5000));
         let decision = pick(&pool(vec![a, b], Some("a")), &params(), None, now());
         assert_eq!(decision, Decision::Stay);
     }
@@ -2328,13 +2256,13 @@ mod tests {
     }
 
     #[test]
-    fn five_hour_over_threshold_is_not_bypassed_by_degraded_mode() {
-        // A heuristic-parked account that is ALSO over its 5h quota would still
+    fn seven_day_over_threshold_is_not_bypassed_by_degraded_mode() {
+        // A heuristic-parked account that is ALSO over its 7d quota would still
         // gate on the quota after the cooldown is dropped — so it does not make
         // the pool degradable. With it the only blocker besides nothing, the
         // pool exhausts (real quota, not a transient blip).
         let mut over = parked("a", CooldownSource::Heuristic, 5);
-        over.five_hour = Some(window(0.95, HOUR)); // over 0.90 even if unparked
+        over.seven_day = Some(window(0.995, HOUR)); // over 0.99 even if unparked
         let snapshot = pool(vec![over], None);
         assert!(
             !heuristic_degraded_mode(&snapshot, &params(), None, now()),
@@ -2393,11 +2321,9 @@ mod tests {
     #[test]
     fn all_exhausted_reports_soonest_reset() {
         let mut a = account("a");
-        a.five_hour = Some(window(0.95, 3 * HOUR));
-        a.seven_day = Some(window(0.5, 48 * HOUR));
+        a.seven_day = Some(window(0.995, 3 * HOUR));
         let mut b = account("b");
-        b.five_hour = Some(window(0.99, 2 * HOUR)); // soonest future reset
-        b.seven_day = Some(window(0.5, 24 * HOUR));
+        b.seven_day = Some(window(1.0, 2 * HOUR)); // soonest future reset
         let decision = pick(&pool(vec![a, b], None), &params(), None, now());
         assert_eq!(
             decision,
@@ -2410,7 +2336,7 @@ mod tests {
     #[test]
     fn short_cooldown_park_wins_soonest_reset() {
         let mut a = account("a");
-        a.five_hour = Some(window(0.95, 3 * HOUR));
+        a.seven_day = Some(window(0.995, 3 * HOUR));
         a.cooldown_until = Some(at(NOW_SECS + 2)); // 429 retry-after: 2
         let snapshot = pool(vec![a], None);
         assert_eq!(
@@ -2425,7 +2351,7 @@ mod tests {
     fn unhealthy_accounts_do_not_contribute_resets() {
         let mut dead = account("a");
         dead.healthy = false;
-        dead.five_hour = Some(window(1.0, 60)); // would be the soonest
+        dead.seven_day = Some(window(1.0, 60)); // would be the soonest
         let mut parked = account("b");
         parked.cooldown_until = Some(at(NOW_SECS + 300));
         let snapshot = pool(vec![dead, parked], None);
@@ -2478,7 +2404,7 @@ mod tests {
         // The current account just crossed a threshold: the scheduler will
         // move off it on the next evaluation, but it IS still current.
         let mut current = account("cur");
-        current.five_hour = Some(window(0.95, HOUR));
+        current.seven_day = Some(window(0.995, HOUR));
         let other = account("other");
         let snapshot = pool(vec![other, current], Some("cur"));
         assert_eq!(ordered_ids(&snapshot), vec!["cur", "other"]);
@@ -2513,10 +2439,8 @@ mod tests {
         // All accounts stale → staleness gate drops; both stay "eligible"
         // and are ranked instead of dumped into the ineligible tail.
         let mut a = account("a");
-        a.five_hour = Some(window_fetched(0.50, HOUR, NOW_SECS - 5000));
         a.seven_day = Some(window_fetched(0.5, 48 * HOUR, NOW_SECS - 5000));
         let mut b = account("b");
-        b.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 5000));
         b.seven_day = Some(window_fetched(0.5, 12 * HOUR, NOW_SECS - 5000));
         let snapshot = pool(vec![a, b], None);
         assert_eq!(ordered_ids(&snapshot), vec!["b", "a"], "ranked, not parked");
@@ -2533,18 +2457,6 @@ mod tests {
             "cooldown 3m12s"
         );
 
-        let mut over5 = account("b");
-        over5.five_hour = Some(window(0.95, HOUR));
-        assert_eq!(
-            blocking_reason(
-                &over5,
-                IneligibleReason::FiveHourOverThreshold,
-                &params(),
-                now()
-            ),
-            "5h 95.0% > 90%"
-        );
-
         let mut over7 = account("c");
         over7.seven_day = Some(window(0.994, 24 * HOUR));
         assert_eq!(
@@ -2558,7 +2470,7 @@ mod tests {
         );
 
         let mut stale = account("d");
-        stale.five_hour = Some(window_fetched(0.10, HOUR, NOW_SECS - 14 * 60));
+        stale.seven_day = Some(window_fetched(0.10, HOUR, NOW_SECS - 14 * 60));
         assert_eq!(
             blocking_reason(&stale, IneligibleReason::UsageStale, &params(), now()),
             "usage stale 14m00s"
@@ -2634,45 +2546,44 @@ mod tests {
     #[test]
     fn past_resets_are_ignored_by_soonest_reset() {
         let mut a = account("a");
-        a.five_hour = Some(QuotaWindow {
+        a.seven_day = Some(QuotaWindow {
             utilization: 1.0,
             resets_at: at(NOW_SECS - 100),
             fetched_at: at(NOW_SECS - 200),
             source: WindowSource::Headers,
         });
-        a.seven_day = Some(window(0.5, 500));
+        let mut b = account("b");
+        b.seven_day = Some(window(0.5, 500));
         assert_eq!(
-            soonest_reset(&pool(vec![a], None), now()),
+            soonest_reset(&pool(vec![a, b], None), now()),
             Some(Duration::from_secs(500))
         );
     }
 
     // ---- perishability policy verification (.prd/09-scheduler-perishability.md) ----
 
-    /// Account with both windows live: 5h `u5`, 7d `u7`, 7d resets `reset_h`
-    /// hours out. The 5h window's own reset is parked far enough out to never
-    /// expire during a test.
-    fn acct7(id_: &str, u5: f64, u7: f64, reset_h: u64) -> AccountSnapshot {
+    /// Account with a live weekly window: 7d `u7`, resetting `reset_h` hours
+    /// out.
+    fn acct7(id_: &str, u7: f64, reset_h: u64) -> AccountSnapshot {
         let mut a = account(id_);
-        a.five_hour = Some(window(u5, 12 * HOUR));
         a.seven_day = Some(window(u7, reset_h * HOUR));
         a
     }
 
     /// The live fleet from the bug report: six idle Claude accounts, all far
     /// under their limits, 7d resets spread 1.3d–6.4d. The OLD scheduler picked
-    /// dev1 (most 5h headroom) and camped ai2 — both with the LONGEST runway —
+    /// dev1 (most headroom) and camped ai2 — both with the LONGEST runway —
     /// while ai3/notify (barely-used quota, resets ~1 day) sat unused. The fix
     /// must pick the soonest-resetting *usable* account and proactively leave
     /// the long-runway current.
     fn owner_fleet() -> Vec<AccountSnapshot> {
         vec![
-            acct7("ai2", 0.17, 0.04, 101),   // 4d5h
-            acct7("dev1", 0.03, 0.02, 136),  // 5d16h
-            acct7("info", 0.04, 0.04, 147),  // 6d3h
-            acct7("notify", 0.05, 0.03, 38), // 1d14h
-            acct7("ai3", 0.06, 0.06, 30),    // 1d6h  (soonest)
-            acct7("ai", 0.17, 0.04, 154),    // 6d10h
+            acct7("ai2", 0.04, 101),   // 4d5h
+            acct7("dev1", 0.02, 136),  // 5d16h
+            acct7("info", 0.04, 147),  // 6d3h
+            acct7("notify", 0.03, 38), // 1d14h
+            acct7("ai3", 0.06, 30),    // 1d6h  (soonest)
+            acct7("ai", 0.04, 154),    // 6d10h
         ]
     }
 
@@ -2702,8 +2613,8 @@ mod tests {
 
     #[test]
     fn owner_fleet_burn_down_sequence_visits_accounts_in_perishability_order() {
-        // Drain the fleet: each round pick the best, then max its 5h window so it
-        // can no longer serve (servable → 0), and pick again. The SEQUENCE of
+        // Drain the fleet: each round pick the best, then drive its 7d window to
+        // the ceiling so it can no longer serve (servable → 0), and pick again. The SEQUENCE of
         // first picks must be soonest-reset-among-usable throughout — never a
         // long-runway account while a more-perishable usable one remains.
         let mut accts = owner_fleet();
@@ -2718,8 +2629,11 @@ mod tests {
                 .iter()
                 .position(|a| a.id == to)
                 .expect("picked account");
-            // Gate its 5h window (still eligible at the boundary, but servable 0).
-            accts[idx].five_hour = Some(window(0.90, 12 * HOUR));
+            // Drain its week (still eligible at the boundary, but servable 0).
+            accts[idx].seven_day = accts[idx].seven_day.map(|w| QuotaWindow {
+                utilization: 0.99,
+                ..w
+            });
         }
         assert_eq!(
             sequence,
@@ -2730,21 +2644,18 @@ mod tests {
 
     // ---- comparator invariants ----
 
-    /// A deliberately diverse fleet: cold, mixed util/reset, 5h-only, 7d-only,
+    /// A deliberately diverse fleet: cold, mixed util/reset, drained,
     /// fully-gated, and a codex overflow account — to stress the comparator.
     fn diverse_fleet() -> Vec<AccountSnapshot> {
-        let mut five_only = account("five_only");
-        five_only.five_hour = Some(window(0.30, 12 * HOUR));
         let mut seven_only = account("seven_only");
         seven_only.seven_day = Some(window(0.40, 50 * HOUR));
         vec![
             account("cold"),
-            acct7("soon_light", 0.10, 0.10, 6),
-            acct7("mid", 0.40, 0.50, 60),
-            acct7("far_light", 0.05, 0.02, 150),
-            acct7("gated5", 0.90, 0.10, 20),
-            acct7("full7", 0.10, 1.00, 20),
-            five_only,
+            acct7("soon_light", 0.10, 6),
+            acct7("mid", 0.50, 60),
+            acct7("far_light", 0.02, 150),
+            acct7("drained", 0.99, 20),
+            acct7("full7", 1.00, 20),
             seven_only,
             codex_account("cx"),
         ]
@@ -2782,10 +2693,11 @@ mod tests {
 
     #[test]
     fn a_gated_account_never_outranks_a_usable_one() {
-        // gated resets very soon (max perishability) but its 5h window is maxed,
-        // so servable → 0: it must still rank AFTER a usable, far-reset account.
-        let usable = acct7("usable", 0.10, 0.10, 120);
-        let gated = acct7("gated", 0.90, 0.10, 1);
+        // gated resets very soon (max perishability) but its week is drained to
+        // the ceiling, so servable → 0: it must still rank AFTER a usable,
+        // far-reset account.
+        let usable = acct7("usable", 0.10, 120);
+        let gated = acct7("gated", 0.99, 1);
         assert!(account_score(&gated, &params(), now()) <= f64::EPSILON);
         assert_eq!(
             rank(&usable, &gated, &params(), None, now()),
@@ -2798,8 +2710,8 @@ mod tests {
     fn more_perishable_outranks_equally_usable_less_perishable() {
         // Identical except 7d reset time: the sooner-resetting account scores
         // higher (more urgency, same servable) and ranks first.
-        let sooner = acct7("sooner", 0.20, 0.20, 24);
-        let later = acct7("later", 0.20, 0.20, 120);
+        let sooner = acct7("sooner", 0.20, 24);
+        let later = acct7("later", 0.20, 120);
         assert!(account_score(&sooner, &params(), now()) > account_score(&later, &params(), now()));
         assert_eq!(
             rank(&sooner, &later, &params(), None, now()),
@@ -2833,8 +2745,8 @@ mod tests {
         grok.credential_kind = "grok";
         grok.group = BackendGroup::Grok;
         let fleet = vec![
-            acct7("c-far", 0.05, 0.02, 150),
-            acct7("c-soon", 0.10, 0.10, 6),
+            acct7("c-far", 0.02, 150),
+            acct7("c-soon", 0.10, 6),
             codex_account("cx-a"),
             codex_account("cx-b"),
             grok,
@@ -2943,7 +2855,7 @@ mod tests {
         let claude = BackendGroup::Claude;
 
         // (a) No current: the head is the switch target (the best account).
-        let fleet = vec![acct7("far", 0.05, 0.02, 150), acct7("soon", 0.10, 0.10, 6)];
+        let fleet = vec![acct7("far", 0.02, 150), acct7("soon", 0.10, 6)];
         let snap = pool_groups(fleet, &[]);
         assert_eq!(
             group_order_vs_pick(&snap, &params(), claude, "no current"),
@@ -2951,7 +2863,7 @@ mod tests {
         );
 
         // (b) Current eligible AND best: pick stays, the head is the current.
-        let fleet = vec![acct7("far", 0.05, 0.02, 150), acct7("soon", 0.10, 0.10, 6)];
+        let fleet = vec![acct7("far", 0.02, 150), acct7("soon", 0.10, 6)];
         let snap = pool_groups(fleet, &[(claude, "soon")]);
         assert_eq!(pick(&snap, &params(), Some(claude), now()), Decision::Stay);
         assert_eq!(
@@ -2962,8 +2874,8 @@ mod tests {
         // (c) Current eligible but a CLEARLY better challenger (score gap >
         //     SWITCH_MARGIN): pick switches, so the head is the challenger and
         //     the still-eligible current follows it.
-        let cur = acct7("cur", 0.50, 0.10, 150);
-        let chal = acct7("chal", 0.05, 0.05, 6);
+        let cur = acct7("cur", 0.10, 150);
+        let chal = acct7("chal", 0.05, 6);
         assert!(
             account_score(&chal, &params(), now())
                 > account_score(&cur, &params(), now()) * (1.0 + SWITCH_MARGIN),
@@ -2982,12 +2894,9 @@ mod tests {
         // (d) Current auth-broken: the selector abandons it, so the head is the
         //     eligible challenger and the broken current sinks to the tail —
         //     the display no longer pins an ineligible current to row 0.
-        let mut dead = acct7("cur", 0.05, 0.05, 6);
+        let mut dead = acct7("cur", 0.05, 6);
         dead.healthy = false;
-        let snap = pool_groups(
-            vec![dead, acct7("alive", 0.10, 0.10, 100)],
-            &[(claude, "cur")],
-        );
+        let snap = pool_groups(vec![dead, acct7("alive", 0.10, 100)], &[(claude, "cur")]);
         assert_eq!(
             pick(&snap, &params(), Some(claude), now()),
             Decision::Switch { to: id("alive") }
@@ -3029,10 +2938,7 @@ mod tests {
         // (f) Manual pin alive (issue #122): the operator's choice heads the
         //     list even though it is not the best-ranked account.
         let mut snap = pool_groups(
-            vec![
-                acct7("best", 0.05, 0.05, 6),
-                acct7("pinned", 0.10, 0.10, 150),
-            ],
+            vec![acct7("best", 0.05, 6), acct7("pinned", 0.10, 150)],
             &[],
         );
         snap.manual_pin.insert(
@@ -3074,22 +2980,20 @@ mod tests {
 
     // ---- wasted-quota simulation (the core claim, measured) ----
 
-    /// Phase = one 5h window. Score with the SAME shape production uses, for the
+    /// Phase = five hours. Score with the SAME shape production uses, for the
     /// new (linear-over-7d) vs the old (15h-cliff) urgency. `seven_max = 1.0`
     /// keeps weekly budgets clean (0.5 steps); see `sim_score_matches_production`.
     const PHASE_SECS: f64 = 5.0 * 3600.0;
     const SEVEN_SECS: f64 = 7.0 * 24.0 * 3600.0;
 
     fn sim_score(new_policy: bool, u7: f64, reset_secs: f64) -> f64 {
-        let r5 = 0.90_f64; // 5h fresh in this low-utilization regime
-        let r7 = (1.0 - u7).max(0.0);
-        let servable = r5.min(r7);
+        let servable = (1.0 - u7).max(0.0);
         let urgency = if new_policy {
             let frac_left = (reset_secs / SEVEN_SECS).clamp(0.0, 1.0);
             1.0 + (URGENCY_MAX - 1.0) * (1.0 - frac_left)
         } else {
             // The replaced policy: urgency = clamp(3 / windows_left, 1, 3),
-            // dormant until the reset is within 3 five-hour windows (15h).
+            // dormant until the reset is within 3 phases (15h).
             let windows_left = (reset_secs / PHASE_SECS).max(1.0);
             (3.0 / windows_left).clamp(1.0, 3.0)
         };
@@ -3099,9 +3003,8 @@ mod tests {
     #[test]
     fn sim_score_matches_production() {
         // The simulation's new-policy scorer must equal the real account_score
-        // (with five_max 0.90, seven_max 1.0, a fresh 5h window).
+        // (with seven_max 1.0).
         let p = SelectParams {
-            five_hour_max: 0.90,
             seven_day_max: 1.0,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
@@ -3111,7 +3014,6 @@ mod tests {
         for &(u7, reset_h) in &[(0.0, 30u64), (0.5, 10), (0.9, 1), (0.2, 150)] {
             let a = {
                 let mut a = account("x");
-                a.five_hour = Some(window(0.0, 100 * HOUR));
                 a.seven_day = Some(window(u7, reset_h * HOUR));
                 a
             };
@@ -3123,7 +3025,7 @@ mod tests {
 
     /// Greedy single-consumer simulation: each phase route demand to the
     /// argmax-score account (isolating the RANKING effect — stickiness is tested
-    /// separately), serve up to the 5h RATE and the account's weekly budget,
+    /// separately), serve up to the per-phase RATE and the account's weekly budget,
     /// drop the rest. Returns total dropped demand.
     fn simulate(new_policy: bool, demand: &[f64], resets: &[Vec<usize>]) -> f64 {
         const RATE: f64 = 0.5;
@@ -3472,12 +3374,12 @@ mod tests {
 
     #[test]
     fn burst_fable_cooldowns_classify_as_cooldown_blocked_with_seconds_expiry() {
-        // Two fable-parked accounts (8s + 5s) with 5h/7d resets HOURS away:
+        // Two fable-parked accounts (8s + 5s) with 7d resets HOURS away:
         // the answer must be the 5s park, never a window-reset-scale value.
         let mut a = fable_cooling("a", 8);
-        a.five_hour = Some(window(0.10, 2 * HOUR));
+        a.seven_day = Some(window(0.10, 2 * HOUR));
         let mut b = fable_cooling("b", 5);
-        b.five_hour = Some(window(0.10, 2 * HOUR));
+        b.seven_day = Some(window(0.10, 2 * HOUR));
         let snap = pool(vec![a, b], Some("a"));
         let (kind, eligible) =
             classify_exhaustion(&snap, &params(), None, RequestScope::Fable, now());

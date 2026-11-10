@@ -199,7 +199,6 @@ impl DashboardView {
                 auth_failure_status: a.auth_failure_status,
                 credential_kind: kind_static(&a.kind),
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
-                five_hour: window_from_doc(&a.five_hour),
                 seven_day: window_from_doc(&a.seven_day),
                 // Scoped (`limits[]`) windows are rebuilt from the document so
                 // the shared renderer's `account.fable_weekly()` resolves in
@@ -709,17 +708,16 @@ mod tests {
             "current": "a",
             "upstream": "https://api.anthropic.com",
             "config_path": "/home/u/.config/llmux/llmux.json",
-            "select_params": { "five_hour_max": 0.90, "seven_day_max": 0.99, "usage_max_age_secs": 600 },
+            "select_params": { "seven_day_max": 0.99, "usage_max_age_secs": 600 },
             "refresh_ahead_secs": 25200,
             "evaluate_tick_secs": 60,
             "accounts": [
                 {
                     "name": "a", "type": "oauth", "status": "active", "order": 1,
                     "blocked": null, "healthy": true,
-                    "five_hour": { "utilization": 0.42, "resets_at": 1_003_600u64,
+                    "seven_day": { "utilization": 0.42, "resets_at": 1_003_600u64,
                                    "resets_in_secs": 3600, "fetched_at_ms": 1_000_000_000u64,
                                    "source": "headers" },
-                    "seven_day": null,
                     "cooldown_until": null, "cooldown_source": null,
                     "in_flight": 1,
                     "token_expires_at_ms": 1_003_600_000u64, "last_refresh_ms": 999_820_000u64,
@@ -729,7 +727,7 @@ mod tests {
                 {
                     "name": "b", "type": "apikey", "status": "cooldown", "order": 2,
                     "blocked": "cooldown 2m00s", "healthy": true,
-                    "five_hour": null, "seven_day": null,
+                    "seven_day": null,
                     "cooldown_until": 1_000_120u64, "cooldown_source": "retry_after",
                     "in_flight": 0,
                     "token_expires_at_ms": null, "last_refresh_ms": null,
@@ -836,7 +834,7 @@ mod tests {
             .push(serde_json::json!({
                 "name": "c", "type": "codex", "status": "active", "order": 3,
                 "blocked": null, "healthy": true,
-                "five_hour": null, "seven_day": null,
+                "seven_day": null,
                 "cooldown_until": null, "cooldown_source": null,
                 "in_flight": 0,
                 "token_expires_at_ms": null, "last_refresh_ms": null,
@@ -965,6 +963,31 @@ mod tests {
         assert_eq!(view.snapshot.current_for_group(BackendGroup::Codex), None);
     }
 
+    /// Attach to a daemon from before 2026-11-10: its document still carries
+    /// `five_hour` windows and `select_params.five_hour_max`. Both are
+    /// ignored — the doc parses and the view has no trace of them.
+    #[test]
+    fn a_doc_from_an_older_daemon_with_five_hour_fields_still_parses() {
+        let mut json = doc_json();
+        json["select_params"]["five_hour_max"] = serde_json::json!(0.90);
+        json["accounts"][0]["five_hour"] = serde_json::json!({
+            "utilization": 1.0, "resets_at": 1_003_600u64, "resets_in_secs": 3600,
+            "fetched_at_ms": 1_000_000_000u64, "source": "headers"
+        });
+        let doc: DashboardDoc = serde_json::from_value(json).expect("an old doc still parses");
+        let view = DashboardView::from_doc(&doc);
+        assert_eq!(
+            crate::scheduler::select::eligibility(
+                &view.snapshot.accounts[0],
+                &view.select_params,
+                now(),
+                false
+            ),
+            None,
+            "an old daemon's 5h reading never gates the attached view"
+        );
+    }
+
     #[test]
     fn view_model_builds_from_fetched_json() {
         let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
@@ -982,11 +1005,11 @@ mod tests {
         let a = &view.snapshot.accounts[0];
         assert_eq!(a.credential_kind, "oauth");
         assert!(a.healthy);
-        let five = a.five_hour.expect("window");
-        assert!((five.utilization - 0.42).abs() < 1e-9);
-        assert_eq!(five.resets_at, UNIX_EPOCH + Duration::from_secs(1_003_600));
-        assert_eq!(five.fetched_at, now());
-        assert_eq!(five.source, WindowSource::Headers);
+        let seven = a.seven_day.expect("window");
+        assert!((seven.utilization - 0.42).abs() < 1e-9);
+        assert_eq!(seven.resets_at, UNIX_EPOCH + Duration::from_secs(1_003_600));
+        assert_eq!(seven.fetched_at, now());
+        assert_eq!(seven.source, WindowSource::Headers);
         assert_eq!(a.token_expires_at_ms, Some(1_003_600_000));
         assert_eq!(a.in_flight, 1);
 

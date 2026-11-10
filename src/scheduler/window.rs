@@ -1,5 +1,6 @@
-//! `QuotaWindow` — one rate-limit window (5h session or 7d weekly) with
-//! wall-clock expiry: once `resets_at` passes, the window reads as empty.
+//! `QuotaWindow` — one rate-limit window (the 7d weekly window or a scoped
+//! weekly bucket) with wall-clock expiry: once `resets_at` passes, the window
+//! reads as empty.
 
 use std::time::{Duration, SystemTime};
 

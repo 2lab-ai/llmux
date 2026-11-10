@@ -322,7 +322,7 @@ fn a_uuid_matched_relogin_keeps_the_established_name_and_its_user_state() {
     config.account_limits.insert(
         "claude:old@x.com".into(),
         llmux::config::AccountLimits {
-            five_hour_max: Some(0.5),
+            seven_day_max: Some(0.5),
             ..Default::default()
         },
     );

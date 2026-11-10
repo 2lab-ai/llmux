@@ -1,4 +1,4 @@
-//! ratatui dashboard (FR6): per-account quota gauges (5h/7d) with reset
+//! ratatui dashboard (FR6): per-account weekly quota gauges with reset
 //! countdowns, active/cooldown status, activity log, totals.
 //!
 //! IA (issue #5): a wall-clock MAIN view that is ALWAYS rendered (header ·
@@ -363,7 +363,7 @@ pub(crate) enum Mode {
     },
     /// Editing per-account ceiling overrides for the switcher's highlighted
     /// row (`L`). The typed text lives in [`App::field`]; format
-    /// `5h,7d,fbl` percents, empty = back to the global ceilings.
+    /// `7d,fbl` percents, empty = back to the global ceilings.
     EditLimits {
         idx: usize,
     },
@@ -3631,7 +3631,6 @@ impl App {
                     let f = &v.config_facts;
                     let p = &v.select_params;
                     match action {
-                        A::Ceiling5h => format!("{:.0}", p.five_hour_max * 100.0),
                         A::Ceiling7d => format!("{:.0}", p.seven_day_max * 100.0),
                         A::CeilingFbl => format!("{:.0}", p.fable_weekly_max * 100.0),
                         A::UsageMaxAge => p.usage_max_age.as_secs().to_string(),
@@ -3768,10 +3767,8 @@ impl App {
                         let needs = action.needs_confirm()
                             || matches!(
                                 action,
-                                ui::ConfigAction::Ceiling5h
-                                    | ui::ConfigAction::Ceiling7d
-                                    | ui::ConfigAction::CeilingFbl
-                            ) && [req.five_hour_max, req.seven_day_max, req.fable_weekly_max]
+                                ui::ConfigAction::Ceiling7d | ui::ConfigAction::CeilingFbl
+                            ) && [req.seven_day_max, req.fable_weekly_max]
                                 .iter()
                                 .flatten()
                                 .any(|v| *v == 0.0)
@@ -4781,7 +4778,6 @@ impl App {
         let url = format!("{}/llmux/account-limits", remote.base_url);
         let mut request = remote.client.post(&url).json(&serde_json::json!({
             "account": account,
-            "five_hour_max": limits.five_hour_max,
             "seven_day_max": limits.seven_day_max,
             "fable_weekly_max": limits.fable_weekly_max,
         }));
@@ -4799,7 +4795,7 @@ impl App {
     }
 
     /// Open the limits editor for the switcher's highlighted row (`L` in
-    /// `Mode::Select`). Input format: `5h,7d,fbl` as percents (`90,98,98`),
+    /// `Mode::Select`). Input format: `7d,fbl` as percents (`98,98`),
     /// missing/empty positions keep no override, empty input = all-global.
     fn open_limits_editor(&mut self, idx: usize, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
@@ -4812,9 +4808,8 @@ impl App {
         self.field = ComposerState::new().single_line();
         self.mode = Mode::EditLimits { idx };
         self.set_status(StatusMsg::ok(format!(
-            "limits for {} — enter `5h,7d,fbl` percents (now {}, {}, {}); empty = global; Enter apply, Esc cancel",
+            "limits for {} — enter `7d,fbl` percents (now {}, {}); empty = global; Enter apply, Esc cancel",
             target.id,
-            fmt(target.limits.five_hour_max),
             fmt(target.limits.seven_day_max),
             fmt(target.limits.fable_weekly_max),
         )));
@@ -5917,7 +5912,7 @@ fn key_event_input(key: &KeyEvent) -> Option<twolab_tui::KeyInput> {
     Some(input)
 }
 
-/// What the limits field takes: `5h,7d,fbl` percents or fractions.
+/// What the limits field takes: `7d,fbl` percents or fractions.
 fn limits_char(c: char) -> bool {
     c.is_ascii_digit() || c == ',' || c == '.' || c == ' '
 }
@@ -7060,10 +7055,6 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
     });
 }
 
-/// Parse the limits-editor input: comma/space-separated percents in order
-/// `5h, 7d, fbl` — `"90,98,98"`, `"90"` (5h only), `"90,,98"` (skip 7d),
-/// `""` (all global). Values are percents; `>1` divides by 100, `<=1` is
-/// taken as a fraction, so `0.9` and `90` mean the same ceiling.
 /// Human status line for a settings apply: live fields vs restart-required —
 /// a wrote-but-needs-restart change must never read as applied (contract C6).
 ///
@@ -7148,10 +7139,6 @@ fn confirm_prompt(
             format!("Set codex upstream: {old} → {}?", text(&req.codex_upstream)),
             "Restart required.".to_string(),
         ),
-        A::Ceiling5h => (
-            format!("Set 5h ceiling: {old} → {}?", pct(req.five_hour_max)),
-            "A 0% ceiling locks that window's scheduling.".to_string(),
-        ),
         A::Ceiling7d => (
             format!("Set 7d ceiling: {old} → {}?", pct(req.seven_day_max)),
             "A 0% ceiling locks that window's scheduling.".to_string(),
@@ -7194,7 +7181,6 @@ fn parse_config_input(
         Ok(v / 100.0)
     };
     match action {
-        A::Ceiling5h => req.five_hour_max = Some(pct()?),
         A::Ceiling7d => req.seven_day_max = Some(pct()?),
         A::CeilingFbl => req.fable_weekly_max = Some(pct()?),
         A::UsageMaxAge => {
@@ -7227,13 +7213,17 @@ fn parse_config_input(
     Ok(req)
 }
 
+/// Parse the limits-editor input: comma/space-separated percents in order
+/// `7d, fbl` — `"98,98"`, `"98"` (7d only), `",98"` (skip 7d), `""` (all
+/// global). Values are percents; `>1` divides by 100, `<=1` is taken as a
+/// fraction, so `0.98` and `98` mean the same ceiling.
 fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String> {
-    let mut vals: [Option<f64>; 3] = [None, None, None];
+    let mut vals: [Option<f64>; 2] = [None, None];
     let cleaned = raw.trim();
     if !cleaned.is_empty() {
         let parts: Vec<&str> = cleaned.split(',').collect();
-        if parts.len() > 3 {
-            return Err("at most 3 values: 5h,7d,fbl".into());
+        if parts.len() > 2 {
+            return Err("at most 2 values: 7d,fbl".into());
         }
         for (i, part) in parts.iter().enumerate() {
             let part = part.trim();
@@ -7251,9 +7241,8 @@ fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String>
         }
     }
     Ok(crate::config::AccountLimits {
-        five_hour_max: vals[0],
-        seven_day_max: vals[1],
-        fable_weekly_max: vals[2],
+        seven_day_max: vals[0],
+        fable_weekly_max: vals[1],
     })
 }
 
@@ -7275,23 +7264,25 @@ mod tests {
     #[test]
     fn parse_limits_input_covers_percent_fraction_partial_and_clear() {
         let p = super::parse_limits_input;
-        let l = p("90,98,98").unwrap();
-        assert_eq!(l.five_hour_max, Some(0.90));
+        let l = p("98,97").unwrap();
         assert_eq!(l.seven_day_max, Some(0.98));
-        assert_eq!(l.fable_weekly_max, Some(0.98));
+        assert_eq!(l.fable_weekly_max, Some(0.97));
         // Fractions work too; positions may be skipped.
-        let l = p("0.5,,97").unwrap();
-        assert_eq!(l.five_hour_max, Some(0.5));
+        let l = p("0.5").unwrap();
+        assert_eq!(l.seven_day_max, Some(0.5));
+        assert_eq!(l.fable_weekly_max, None);
+        let l = p(",97").unwrap();
         assert_eq!(l.seven_day_max, None);
         assert_eq!(l.fable_weekly_max, Some(0.97));
         // Empty = clear all overrides.
         assert!(p("").unwrap().is_empty());
         assert!(p("  ").unwrap().is_empty());
-        // Errors: junk, out of range, too many.
+        // Errors: junk, out of range, too many (the retired 5h slot is gone,
+        // so an old three-value `5h,7d,fbl` entry is refused, not misread).
         assert!(p("abc").is_err());
         assert!(p("0").is_err());
         assert!(p("101").is_err());
-        assert!(p("1,2,3,4").is_err());
+        assert!(p("90,98,98").is_err());
     }
 
     use super::*;
@@ -7425,14 +7416,14 @@ mod tests {
         let editable: Vec<usize> = (0..60)
             .filter(|&i| ui::config_row_action(&view, &chrome, i).is_some())
             .collect();
-        // Rows 5, 6 and 7 (per-account limits, paused accounts, save mode)
+        // Rows 4, 5 and 6 (per-account limits, paused accounts, save mode)
         // are read-only.
-        assert!(!editable.contains(&5) && !editable.contains(&6) && !editable.contains(&7));
-        app.config_cursor = 4;
+        assert!(!editable.contains(&4) && !editable.contains(&5) && !editable.contains(&6));
+        app.config_cursor = 3;
         app.on_key_config(KeyCode::Down, Some(&view));
-        assert_eq!(app.config_cursor, 8, "Down skips the read-only rows");
+        assert_eq!(app.config_cursor, 7, "Down skips the read-only rows");
         app.on_key_config(KeyCode::Char('k'), Some(&view));
-        assert_eq!(app.config_cursor, 4, "k skips them going up");
+        assert_eq!(app.config_cursor, 3, "k skips them going up");
         app.on_key_config(KeyCode::Home, Some(&view));
         assert_eq!(app.config_cursor, editable[0]);
         app.on_key_config(KeyCode::Up, Some(&view));
@@ -7926,7 +7917,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -8000,7 +7990,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -8417,20 +8406,20 @@ mod tests {
         let mut app = remote_app();
         app.overlay = Overlay::Config;
         app.mode = Mode::ConfigEdit {
-            action: ui::ConfigAction::Ceiling5h,
+            action: ui::ConfigAction::Ceiling7d,
         };
         app.field = ComposerState::with_text("0").single_line();
-        app.on_key_config_edit(press(KeyCode::Enter), ui::ConfigAction::Ceiling5h, None);
+        app.on_key_config_edit(press(KeyCode::Enter), ui::ConfigAction::Ceiling7d, None);
         assert!(
             matches!(app.mode, Mode::ConfigConfirm { .. }),
             "ceiling→0 needs confirm"
         );
-        app.on_key_config_confirm(KeyCode::Esc, ui::ConfigAction::Ceiling5h, None);
+        app.on_key_config_confirm(KeyCode::Esc, ui::ConfigAction::Ceiling7d, None);
         app.mode = Mode::ConfigEdit {
-            action: ui::ConfigAction::Ceiling5h,
+            action: ui::ConfigAction::Ceiling7d,
         };
         app.field = ComposerState::with_text("80").single_line();
-        app.on_key_config_edit(press(KeyCode::Enter), ui::ConfigAction::Ceiling5h, None);
+        app.on_key_config_edit(press(KeyCode::Enter), ui::ConfigAction::Ceiling7d, None);
         assert_eq!(app.mode, Mode::Normal, "a normal percent applies directly");
     }
 
@@ -10457,29 +10446,30 @@ mod tests {
         app.mode = Mode::Select { idx: 0 };
         app.on_key(press(KeyCode::Char('L')), Some(&view));
         assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
-        type_text(&mut app, &view, "8090x");
-        assert_eq!(app.field.text(), "8090", "a letter is refused");
+        type_text(&mut app, &view, "8095x");
+        assert_eq!(app.field.text(), "8095", "a letter is refused");
         app.on_key(press(KeyCode::Left), Some(&view));
         app.on_key(press(KeyCode::Left), Some(&view));
         type_text(&mut app, &view, ",");
-        assert_eq!(app.field.text(), "80,90");
+        assert_eq!(app.field.text(), "80,95");
         app.on_key(press(KeyCode::End), Some(&view));
-        assert!(app.on_paste(",9x5\n", Some(&view)));
-        assert_eq!(app.field.text(), "80,90,95", "the paste keeps what fits");
+        app.on_key(press(KeyCode::Backspace), Some(&view));
+        assert!(app.on_paste("x5\n", Some(&view)));
+        assert_eq!(app.field.text(), "80,95", "the paste keeps what fits");
         let frame = render_tracked(&mut app, &view, 80, 24);
-        assert!(frame.contains("limits (5h,7d,fbl %) ❯ 80,90,95"), "{frame}");
+        assert!(frame.contains("limits (7d,fbl %) ❯ 80,95"), "{frame}");
         // Home + Ctrl+K cuts it all, Ctrl+Y puts it back.
         app.on_key(press(KeyCode::Home), Some(&view));
         app.on_key(ctrl('k'), Some(&view));
         assert_eq!(app.field.text(), "");
         app.on_key(ctrl('y'), Some(&view));
-        assert_eq!(app.field.text(), "80,90,95");
+        assert_eq!(app.field.text(), "80,95");
         // An out-of-range value: an error, and the text stays to be fixed.
         app.on_key(press(KeyCode::Home), Some(&view));
         type_text(&mut app, &view, "1");
         app.on_key(press(KeyCode::Enter), Some(&view));
         assert_eq!(app.mode, Mode::EditLimits { idx: 0 });
-        assert_eq!(app.field.text(), "180,90,95");
+        assert_eq!(app.field.text(), "180,95");
         app.on_key(press(KeyCode::Home), Some(&view));
         app.on_key(press(KeyCode::Delete), Some(&view));
         app.on_key(press(KeyCode::Enter), Some(&view));
@@ -10489,8 +10479,7 @@ mod tests {
             Backend::Remote(remote) => {
                 let (name, limits) = remote.pending_limits.clone().expect("queued");
                 assert_eq!(name, "claude:me@example.com");
-                assert_eq!(limits.five_hour_max, Some(0.80));
-                assert_eq!(limits.seven_day_max, Some(0.90));
+                assert_eq!(limits.seven_day_max, Some(0.80));
                 assert_eq!(limits.fable_weekly_max, Some(0.95));
             }
             Backend::Local(_) => unreachable!("remote app"),
@@ -10523,14 +10512,14 @@ mod tests {
     #[test]
     fn config_value_edits_mid_value() {
         let mut view = stats_view_with_account();
-        view.select_params.five_hour_max = 0.9;
+        view.select_params.seven_day_max = 0.9;
         let mut app = remote_app();
         app.overlay = Overlay::Config;
-        app.activate_config_action(ui::ConfigAction::Ceiling5h, Some(&view));
+        app.activate_config_action(ui::ConfigAction::Ceiling7d, Some(&view));
         assert_eq!(
             app.mode,
             Mode::ConfigEdit {
-                action: ui::ConfigAction::Ceiling5h
+                action: ui::ConfigAction::Ceiling7d
             }
         );
         assert_eq!(app.field.text(), "90");
@@ -10545,7 +10534,7 @@ mod tests {
         match &app.backend {
             Backend::Remote(remote) => {
                 let (req, _) = remote.pending_settings.as_ref().expect("queued");
-                assert_eq!(req.five_hour_max, Some(0.7));
+                assert_eq!(req.seven_day_max, Some(0.7));
             }
             Backend::Local(_) => unreachable!("remote app"),
         }
@@ -11412,7 +11401,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -11447,7 +11435,6 @@ mod tests {
             upstream: None,
             config_path: None,
             select_params: crate::scheduler::select::SelectParams {
-                five_hour_max: 0.9,
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
@@ -11500,7 +11487,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: kind,
             group,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -11674,7 +11660,7 @@ mod tests {
         let now = SystemTime::now();
         // Cached 100% on the codex account — the pre-.prd/16 client refused
         // this switch outright.
-        view.snapshot.accounts[1].five_hour = Some(QuotaWindow {
+        view.snapshot.accounts[1].seven_day = Some(QuotaWindow {
             utilization: 1.0,
             resets_at: now + Duration::from_secs(3_600),
             fetched_at: now,
@@ -12052,22 +12038,22 @@ mod tests {
 
         // Reopening starts on Apply again; a ceiling driven to 0 names both values.
         app.mode = Mode::ConfigEdit {
-            action: ui::ConfigAction::Ceiling5h,
+            action: ui::ConfigAction::Ceiling7d,
         };
         app.field = ComposerState::with_text("0").single_line();
         app.on_key_config_edit(
             press(KeyCode::Enter),
-            ui::ConfigAction::Ceiling5h,
+            ui::ConfigAction::Ceiling7d,
             Some(&view),
         );
         assert_eq!(app.confirm_choice, 0);
-        let p = (view.select_params.five_hour_max * 100.0).round();
+        let p = (view.select_params.seven_day_max * 100.0).round();
         let frame = render_app(&app, &view, 80, 24);
         assert!(
-            frame.contains(&format!("Set 5h ceiling: {p}% → 0%?")),
+            frame.contains(&format!("Set 7d ceiling: {p}% → 0%?")),
             "{frame}"
         );
-        app.on_key_config_confirm(KeyCode::Char('2'), ui::ConfigAction::Ceiling5h, Some(&view));
+        app.on_key_config_confirm(KeyCode::Char('2'), ui::ConfigAction::Ceiling7d, Some(&view));
         assert_eq!(app.mode, Mode::Normal, "2 cancels");
     }
 

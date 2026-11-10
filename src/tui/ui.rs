@@ -3192,7 +3192,6 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ConfigAction {
     SchedMode,
-    Ceiling5h,
     Ceiling7d,
     CeilingFbl,
     UsageMaxAge,
@@ -3236,9 +3235,7 @@ impl ConfigAction {
     /// Input hint for the edit prompt (`None` = toggle/cycle, no text entry).
     pub(crate) fn input_hint(self) -> Option<&'static str> {
         match self {
-            ConfigAction::Ceiling5h | ConfigAction::Ceiling7d | ConfigAction::CeilingFbl => {
-                Some("percent 0-100")
-            }
+            ConfigAction::Ceiling7d | ConfigAction::CeilingFbl => Some("percent 0-100"),
             ConfigAction::UsageMaxAge => Some("seconds 5-3600"),
             ConfigAction::GradientSpeed => Some("0.01-10.0"),
             ConfigAction::RoutingDefaultGroup => {
@@ -3295,14 +3292,6 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             state: CfgState::Live,
             note: "confirm",
             action: Some(ConfigAction::SchedMode),
-        },
-        CfgRow {
-            section: "scheduler",
-            label: "5h ceiling",
-            value: pct(p.five_hour_max),
-            state: CfgState::Live,
-            note: "",
-            action: Some(ConfigAction::Ceiling5h),
         },
         CfgRow {
             section: "scheduler",
@@ -4477,7 +4466,7 @@ fn account_modal_lines(
             ));
         }
     }
-    let fable_ceiling = select::effective_limits(account, params).2;
+    let fable_ceiling = select::effective_limits(account, params).1;
     if account.scoped_limits.is_empty() {
         rows.push(ModalRow::field("scoped", format!("{dash} (none recorded)")));
     }
@@ -4531,7 +4520,7 @@ fn account_modal_lines(
     }
 
     // --- ceilings ----------------------------------------------------------
-    let (five_max, seven_max, fable_max) = select::effective_limits(account, params);
+    let (seven_max, fable_max) = select::effective_limits(account, params);
     let override_of = |value: Option<f64>, global: f64| match value {
         Some(v) => format!("{} (override)", format::percent(v)),
         None => format!("{dash} (global {})", format::percent(global)),
@@ -4540,8 +4529,7 @@ fn account_modal_lines(
     rows.push(ModalRow::field(
         "override",
         format!(
-            "5h {} · 7d {} · fbl {}",
-            override_of(account.limits.five_hour_max, params.five_hour_max),
+            "7d {} · fbl {}",
             override_of(account.limits.seven_day_max, params.seven_day_max),
             override_of(account.limits.fable_weekly_max, params.fable_weekly_max),
         ),
@@ -4549,8 +4537,7 @@ fn account_modal_lines(
     rows.push(ModalRow::field(
         "effective",
         format!(
-            "5h {} · 7d {} · fbl {}",
-            format::percent(five_max),
+            "7d {} · fbl {}",
             format::percent(seven_max),
             format::percent(fable_max),
         ),
@@ -6210,7 +6197,7 @@ fn draw_accounts_with(
     // ONLY when `show_fable_weekly` is on — off renders the table with no
     // column, no width taken. It is a FULL gauge column in both sets (.prd/18
     // rule 3). There is no `5h` column (owner 2026-11-04: no provider reports
-    // a 5h window any more); the 5h ceiling still gates in the scheduler.
+    // a 5h window any more; 2026-11-10 removed it from the scheduler too).
     let quota_label = match ctx.quota_display {
         crate::config::QuotaDisplay::Remaining => "LEFT",
         crate::config::QuotaDisplay::Used => "USED",
@@ -6313,7 +6300,7 @@ fn table_crowded(accounts: usize, fold: Option<&FoldPlan>, height: u16) -> bool 
 enum CompactKind {
     /// Authentication failed (`✗`).
     Error,
-    /// Over a 5h / 7d / Fable ceiling until the window resets (`◌`).
+    /// Over a 7d / Fable ceiling until the window resets (`◌`).
     Spent,
     /// Parked by a cooldown (`◉`).
     Cooling,
@@ -6334,9 +6321,7 @@ impl CompactKind {
             None => CompactKind::Ok,
             Some(IneligibleReason::AuthUnhealthy) => CompactKind::Error,
             Some(
-                IneligibleReason::FiveHourOverThreshold
-                | IneligibleReason::SevenDayOverThreshold
-                | IneligibleReason::FableWeeklyExhausted,
+                IneligibleReason::SevenDayOverThreshold | IneligibleReason::FableWeeklyExhausted,
             ) => CompactKind::Spent,
             Some(IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown) => {
                 CompactKind::Cooling
@@ -6400,7 +6385,6 @@ fn compact_word(
         (CompactKind::Error, _) => account
             .auth_failure_status
             .map_or_else(|| "auth error".to_string(), |s| format!("error {s}")),
-        (CompactKind::Spent, Some(IneligibleReason::FiveHourOverThreshold)) => "5h spent".into(),
         (CompactKind::Spent, Some(IneligibleReason::FableWeeklyExhausted)) => "fbl spent".into(),
         (CompactKind::Spent, _) => "7d spent".into(),
         (CompactKind::Cooling, Some(IneligibleReason::FableCoolingDown)) => {
@@ -6743,7 +6727,7 @@ fn account_row_parts(
             consecutive_failures,
             ctx.quota_display,
             ctx.reset_absolute,
-            select::effective_limits(account, params).2,
+            select::effective_limits(account, params).1,
         )
     });
     // Reset inventory (.prd/16), in the same slot the header/constraints
@@ -6859,7 +6843,7 @@ fn spent_note(count: usize, shared_status: Option<&str>) -> String {
 /// layout because the accounts pane's height depends on it. Members are the
 /// accounts the scheduler holds back for `SevenDayOverThreshold` — the ones
 /// whose status reads `7d N% > N%` — and only those: a `!` for any other
-/// reason (5h, Fable, auth) keeps its table row. Membership is recomputed
+/// reason (Fable, auth) keeps its table row. Membership is recomputed
 /// every frame. Every value the member's table row shows stays on screen,
 /// as text (owner contract 2026-09: 기존에 보였던 모든 정보는 그대로).
 struct FoldPlan {
@@ -7184,7 +7168,7 @@ fn status_span(
             Style::new().fg(THEME.fail).add_modifier(Modifier::BOLD),
         ),
         IneligibleReason::Paused | IneligibleReason::Saved => (None, Style::new().fg(THEME.wait)),
-        IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
+        IneligibleReason::SevenDayOverThreshold => (
             Some(SpinnerKind::Breathe.glyph(frame)),
             Style::new().fg(THEME.crit),
         ),
@@ -7711,13 +7695,12 @@ const BOUND_SPANS: [Duration; 3] = [
 /// The statuses the detail line can show: eligible, or one of the reasons
 /// `select::eligibility` returns (select.rs `gate`, 147-193 at 7fddcc2 —
 /// the Fable reasons are scope-gated out of it).
-const DETAIL_GATES: [Option<IneligibleReason>; 8] = [
+const DETAIL_GATES: [Option<IneligibleReason>; 7] = [
     None,
     Some(IneligibleReason::AuthUnhealthy),
     Some(IneligibleReason::Paused),
     Some(IneligibleReason::Saved),
     Some(IneligibleReason::CoolingDown),
-    Some(IneligibleReason::FiveHourOverThreshold),
     Some(IneligibleReason::SevenDayOverThreshold),
     Some(IneligibleReason::UsageStale),
 ];
@@ -7890,10 +7873,8 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
                 auth_failure_status: Some(599),
                 paused: true,
                 cooldown_until: Some(now + span),
-                five_hour: Some(window),
                 seven_day: Some(window),
                 limits: crate::config::AccountLimits {
-                    five_hour_max: Some(1.0),
                     seven_day_max: Some(1.0),
                     fable_weekly_max: None,
                 },
@@ -12311,7 +12292,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) -> Op
         Mode::Select { .. } => keybar(None, &SELECT_KEYS, area.width),
         Mode::EditLimits { .. } => {
             let (bar, width) = field_bar(
-                " limits (5h,7d,fbl %)",
+                " limits (7d,fbl %)",
                 &chrome.field,
                 "empty = global",
                 &field_keys("apply"),
@@ -12564,7 +12545,6 @@ mod tests {
             upstream: None,
             config_path: None,
             select_params: select::SelectParams {
-                five_hour_max: 0.9,
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
@@ -13379,7 +13359,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: kind,
             group,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -14174,12 +14153,12 @@ mod tests {
         use crate::scheduler::AccountId;
 
         let mut account = fable_account();
-        account.seven_day = account.five_hour;
-        account
-            .seven_day
-            .as_mut()
-            .expect("weekly window")
-            .utilization = 0.25;
+        account.seven_day = Some(crate::scheduler::window::QuotaWindow {
+            utilization: 0.25,
+            resets_at: SystemTime::now() + Duration::from_secs(3_600),
+            fetched_at: SystemTime::now(),
+            source: crate::scheduler::window::WindowSource::UsagePoll,
+        });
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = (0..20)
             .map(|idx| {
@@ -14189,13 +14168,11 @@ mod tests {
             })
             .collect();
 
-        // `five` is the 5h window's percent in this mode: it must not show
-        // anywhere in a row (owner 2026-11-04 removed the 5h column).
-        for (configured, override_mode, label, five, seven, fable) in [
-            (Remaining, None, "LEFT", "58%", "75%", "3%!"),
-            (Used, None, "USED", "42%", "25%", "97%!"),
-            (Remaining, Some(Used), "USED", "42%", "25%", "97%!"),
-            (Used, Some(Remaining), "LEFT", "58%", "75%", "3%!"),
+        for (configured, override_mode, label, seven, fable) in [
+            (Remaining, None, "LEFT", "75%", "3%!"),
+            (Used, None, "USED", "25%", "97%!"),
+            (Remaining, Some(Used), "USED", "25%", "97%!"),
+            (Used, Some(Remaining), "LEFT", "75%", "3%!"),
         ] {
             view.quota_display = configured;
             let mut chrome = chrome_overlay(Overlay::None);
@@ -14220,7 +14197,6 @@ mod tests {
                     row.contains(&format!("{idx:02}@example.com")),
                     "all 20 accounts keep their order:\n{frame}"
                 );
-                assert!(!row.contains(five), "no 5h value `{five}`: {row}");
                 assert_eq!(slice(row, 83, 5).trim(), seven, "{row}");
                 assert_eq!(slice(row, 122, 5).trim(), fable, "{row}");
             }
@@ -16127,17 +16103,16 @@ mod tests {
             "current": "a",
             "upstream": "https://api.anthropic.com",
             "config_path": "/home/u/.config/llmux/llmux.json",
-            "select_params": { "five_hour_max": 0.90, "seven_day_max": 0.99, "usage_max_age_secs": 600 },
+            "select_params": { "seven_day_max": 0.99, "usage_max_age_secs": 600 },
             "refresh_ahead_secs": 25200,
             "evaluate_tick_secs": 60,
             "accounts": [
                 {
                     "name": "a", "type": "oauth", "status": "active", "order": 1,
                     "blocked": null, "healthy": true,
-                    "five_hour": { "utilization": 0.42, "resets_at": 1_003_600u64,
+                    "seven_day": { "utilization": 0.42, "resets_at": 1_003_600u64,
                                    "resets_in_secs": 3600, "fetched_at_ms": 1_000_000_000u64,
                                    "source": "headers" },
-                    "seven_day": null,
                     "cooldown_until": null, "cooldown_source": null,
                     "in_flight": 0,
                     "token_expires_at_ms": 1_003_600_000u64, "last_refresh_ms": 999_820_000u64,
@@ -18222,12 +18197,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: Some(QuotaWindow {
-                utilization: 0.42,
-                resets_at: now + Duration::from_secs(3_600),
-                fetched_at: now - Duration::from_secs(180),
-                source: WindowSource::UsagePoll,
-            }),
             seven_day: Some(QuotaWindow {
                 utilization: 0.61,
                 resets_at: now + Duration::from_secs(400_000),
@@ -18258,7 +18227,6 @@ mod tests {
             last_refresh_ms: Some(1_779_000_000_000),
             paused: false,
             limits: crate::config::AccountLimits {
-                five_hour_max: None,
                 seven_day_max: Some(0.95),
                 fable_weekly_max: None,
             },
@@ -18366,12 +18334,11 @@ mod tests {
         );
     }
 
-    /// Owner 2026-11-04 ("5h 사용량 삭제해줘"): the 5h usage line is gone from
-    /// the detail pane (MAIN side by side and the Accounts overlay), the
-    /// scheduler + detail band and the account modal — the account's 5h
-    /// window (42% used, `util 0.420`) shows in none of them, while its 7d
-    /// line (61%, `util 0.610`) stays. The modal's ceilings row (`5h … · 7d …
-    /// · fbl …`) is a limit, not usage, and keeps its 5h entry.
+    /// Owner 2026-11-04 ("5h 사용량 삭제해줘") and 2026-11-10 ("완전히
+    /// 삭제"): no 5h line in the detail pane (MAIN side by side and the
+    /// Accounts overlay), the scheduler + detail band or the account modal —
+    /// the 7d line (61%, `util 0.610`) stays, and no row (usage or ceiling)
+    /// is labeled `5h`.
     #[test]
     fn detail_pane_band_and_modal_carry_no_five_hour_line() {
         let (view, name) = rich_account_view();
@@ -18450,14 +18417,13 @@ mod tests {
         let now = SystemTime::now();
         let mut view = view_with(Vec::new());
         let acct =
-            |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+            |name: &str, kind: &'static str, group, seven: Option<QuotaWindow>| AccountSnapshot {
                 id: AccountId(name.into()),
                 healthy: true,
                 auth_failure_status: None,
                 credential_kind: kind,
                 group,
-                five_hour: five,
-                seven_day: None,
+                seven_day: seven,
                 scoped_limits: Vec::new(),
                 scoped_cooldowns: Vec::new(),
                 cooldown_until: None,
@@ -18563,7 +18529,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: kind,
             group,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -19373,7 +19338,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "gemini",
             group: BackendGroup::Gemini,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -19417,7 +19381,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -19471,7 +19434,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -19664,7 +19626,6 @@ mod tests {
         config.account_limits.insert(
             "a@x.com".into(),
             crate::config::AccountLimits {
-                five_hour_max: Some(0.5),
                 seven_day_max: Some(0.5),
                 fable_weekly_max: Some(0.5),
             },
@@ -19774,7 +19735,6 @@ mod tests {
                 trace: _,
             } = gemini;
             let crate::config::SchedulerConfig {
-                five_hour_max: _,
                 seven_day_max: _,
                 usage_poll_secs: _,
                 usage_max_age_secs: _,
@@ -19858,7 +19818,6 @@ mod tests {
             "gemini.client_secret",
             "gemini.trace",
             "scheduler.mode",
-            "scheduler.five_hour_max",
             "scheduler.seven_day_max",
             "scheduler.fable_weekly_max",
             "scheduler.usage_max_age_secs",
@@ -20143,8 +20102,8 @@ mod tests {
 
     // --- fable-usage U9a: Fbl gauge column, opt-in toggle (default ON) -------
 
-    /// An account carrying a Fable weekly window (critical/active) plus a 5h
-    /// window, used to prove the Fbl gauge appears with the toggle ON and is
+    /// An account carrying a Fable weekly window (critical/active), used to
+    /// prove the Fbl gauge appears with the toggle ON and is
     /// fully absent (columns unchanged) with it OFF.
     fn fable_account() -> crate::scheduler::AccountSnapshot {
         use crate::routing::BackendGroup;
@@ -20159,12 +20118,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: Some(QuotaWindow {
-                utilization: 0.42,
-                resets_at: now + Duration::from_secs(3_600),
-                fetched_at: now,
-                source: WindowSource::UsagePoll,
-            }),
             seven_day: None,
             // Test helpers default `scoped_limits` empty; this one carries a
             // live, engaged Fable weekly bucket at 97%.
@@ -20223,16 +20176,10 @@ mod tests {
             on.contains("3%!"),
             "toggle ON: Fable remaining-percent label carries the critical `!`:\n{on}"
         );
-        // The 7d gauge is still present alongside it; the account's 5h window
-        // (42% used, 58% left) shows nowhere — owner 2026-11-04 removed the
-        // 5h column and the 5h detail line.
+        // The 7d gauge is still present alongside it.
         assert!(
             on.contains("7d RESET"),
             "toggle ON: 7d gauge still rendered"
-        );
-        assert!(
-            !on.contains("58%") && !on.contains("42%"),
-            "toggle ON: no 5h percent anywhere:\n{on}"
         );
 
         // Toggle OFF: no Fbl column, no Fable countdown, 7d column unchanged.
@@ -20394,11 +20341,10 @@ mod tests {
 
     /// A view with one account per group, every row carrying a live 7d window
     /// (20% used) and the Fable column off, so the only `cold` a row could
-    /// show is a 5h cell — the CLAUDE row has no 5h window (the old stub read
-    /// `○ cold` there) and the GROK row has a header-fed one (30% used, the
-    /// old stub read `-`). Owner 2026-11-04 removed the 5h column, so neither
-    /// may surface.
-    fn five_hour_group_view() -> DashboardView {
+    /// show is a 5h cell (the old stub read `○ cold` on a CLAUDE row and `-`
+    /// on a GROK row). Owner 2026-11-04 removed the 5h column and 2026-11-10
+    /// the 5h window itself, so neither may surface.
+    fn group_view() -> DashboardView {
         use crate::routing::BackendGroup;
         use crate::scheduler::window::{QuotaWindow, WindowSource};
         use crate::scheduler::{AccountId, AccountSnapshot};
@@ -20409,55 +20355,42 @@ mod tests {
             fetched_at: now,
             source: WindowSource::UsagePoll,
         };
-        let account =
-            |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
-                id: AccountId(name.into()),
-                healthy: true,
-                auth_failure_status: None,
-                credential_kind: kind,
-                group,
-                five_hour: five,
-                seven_day: Some(window(0.20)),
-                scoped_limits: Vec::new(),
-                scoped_cooldowns: Vec::new(),
-                cooldown_until: None,
-                cooldown_source: None,
-                in_flight: 0,
-                token_expires_at_ms: None,
-                last_refresh_ms: None,
-                paused: false,
-                limits: crate::config::AccountLimits::default(),
-            };
+        let account = |name: &str, kind: &'static str, group| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            auth_failure_status: None,
+            credential_kind: kind,
+            group,
+            seven_day: Some(window(0.20)),
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
         let mut view = view_with(Vec::new());
         view.show_fable_weekly = false;
         view.snapshot.accounts = vec![
-            account("codex:me@example.com", "codex", BackendGroup::Codex, None),
-            account(
-                "grok:me@example.com",
-                "grok",
-                BackendGroup::Grok,
-                Some(window(0.30)),
-            ),
-            account("claude:me@example.com", "oauth", BackendGroup::Claude, None),
-            account(
-                "claude:five@example.com",
-                "oauth",
-                BackendGroup::Claude,
-                Some(window(0.37)),
-            ),
+            account("codex:me@example.com", "codex", BackendGroup::Codex),
+            account("grok:me@example.com", "grok", BackendGroup::Grok),
+            account("claude:me@example.com", "oauth", BackendGroup::Claude),
+            account("claude:two@example.com", "oauth", BackendGroup::Claude),
         ];
         view
     }
 
     /// Owner 2026-11-04 ("5h 사용량 삭제해줘. 이제 5시간 사용량 있는 프로바이더가
     /// 없어짐"): the accounts table has no `5h` column at any width — no
-    /// header, and no row shows a 5h value (`○ cold`, the n/a `-`, or a 5h
-    /// percent in either `quota_display` direction). The 7d gauge sits right
+    /// header, and no row shows a 5h `○ cold` stub. The 7d gauge sits right
     /// after `status`.
     #[test]
     fn accounts_table_has_no_five_hour_column() {
         for (width, overlay) in [(200u16, Overlay::Accounts), (100, Overlay::None)] {
-            let view = five_hour_group_view();
+            let view = group_view();
             let rows = render_rows(&view, &chrome_overlay(overlay), width, 30);
             let frame = rows.join("\n");
             let header = rows
@@ -20486,16 +20419,6 @@ mod tests {
                     "{group} row shows no 5h cold stub at {width}: {row:?}\n{frame}"
                 );
             }
-            for row in rows.iter().filter(|r| r.contains("@example.com")) {
-                // 5h: grok 30% used / 70% left, claude 37% / 63%; the 7d
-                // window reads 80% left on every row.
-                for five in ["70%", "30%", "63%", "37%"] {
-                    assert!(
-                        !row.contains(five),
-                        "no 5h value `{five}` at {width}: {row:?}\n{frame}"
-                    );
-                }
-            }
         }
     }
 
@@ -20507,7 +20430,7 @@ mod tests {
     /// the Fbl slice, the column under test (Z 2026-09-18).
     #[test]
     fn fable_gauge_cell_is_n_a_for_non_claude_groups() {
-        let mut view = five_hour_group_view();
+        let mut view = group_view();
         // The helper turns the Fable column off for the no-5h test; this test
         // is about that column, so switch it on for this frame only.
         view.show_fable_weekly = true;
@@ -20765,7 +20688,7 @@ mod tests {
     }
 
     /// An account with NO Fable scope renders the neutral cold state in the Fbl
-    /// slot (never a crash/blank), and does not disturb the 5h/7d columns.
+    /// slot (never a crash/blank), and does not disturb the 7d column.
     #[test]
     fn fable_gauge_cold_state_for_account_without_fable_scope() {
         use crate::routing::BackendGroup;
@@ -20780,14 +20703,8 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            // Both 5h and 7d populated, so the only cold cell in the row is the
+            // 7d populated, so the only cold cell in the row is the
             // absent Fable one — the assertion below is then attributable to it.
-            five_hour: Some(QuotaWindow {
-                utilization: 0.10,
-                resets_at: now + Duration::from_secs(3_600),
-                fetched_at: now,
-                source: WindowSource::UsagePoll,
-            }),
             seven_day: Some(QuotaWindow {
                 utilization: 0.20,
                 resets_at: now + Duration::from_secs(600_000),
@@ -20842,12 +20759,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: Some(QuotaWindow {
-                utilization: 0.42,
-                resets_at: now + Duration::from_secs(3_600),
-                fetched_at: now,
-                source: WindowSource::UsagePoll,
-            }),
             seven_day: None,
             // 76% util, warning severity, is_active=true → the real headroom
             // case that must NOT read red.
@@ -20915,12 +20826,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: Some(QuotaWindow {
-                utilization: 0.42,
-                resets_at: now + Duration::from_secs(3_600),
-                fetched_at: now,
-                source: WindowSource::UsagePoll,
-            }),
             seven_day: None,
             // EXPIRED Fable weekly (resets_at in the past) whose `severity` is
             // still a stale `Critical`: util is 0 after reset but severity has
@@ -21011,7 +20916,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -21201,7 +21105,12 @@ mod tests {
         // A live 7d window, so the detail pane's 7d line carries `resets`
         // (the 5h line that used to carry it is gone, owner 2026-11-04).
         let mut account = fable_account();
-        account.seven_day = account.five_hour;
+        account.seven_day = Some(crate::scheduler::window::QuotaWindow {
+            utilization: 0.42,
+            resets_at: SystemTime::now() + Duration::from_secs(3_600),
+            fetched_at: SystemTime::now(),
+            source: crate::scheduler::window::WindowSource::UsagePoll,
+        });
         view.snapshot.accounts = vec![account];
         view.snapshot.current.insert(
             BackendGroup::Claude,
@@ -21440,9 +21349,6 @@ mod tests {
                     // Instants sit 30 s inside their rendered unit (2h56m,
                     // 2d3h) so the pinned text never depends on how many
                     // milliseconds pass before the frame renders.
-                    five_hour: (group == BackendGroup::Claude)
-                        .then(|| window(0.30, 10_590, 2))
-                        .flatten(),
                     seven_day: window(0.31, 187_170, 5),
                     scoped_limits: Vec::new(),
                     scoped_cooldowns: Vec::new(),
@@ -21667,10 +21573,7 @@ mod tests {
                 account.token_expires_at_ms = Some(ms(now + span));
             }
             account.last_refresh_ms = Some(ms(now - span));
-            for window in [&mut account.five_hour, &mut account.seven_day]
-                .into_iter()
-                .flatten()
-            {
+            if let Some(window) = account.seven_day.as_mut() {
                 window.resets_at = now + span;
                 window.fetched_at = now - span;
             }
@@ -22359,7 +22262,7 @@ mod tests {
     /// The common automatic switches (forward.rs:2898 writes the gate's
     /// name, 21 characters) with the longest ids keep the band at 179
     /// whichever group switched: (i) a 7d switch noted on the claude row,
-    /// (ii) on the codex row, (iii) a 5h switch on either.
+    /// (ii) on the codex row.
     #[test]
     fn band_at_179_user_shaped_event_cases() {
         let chrome = recompose_view().1;
@@ -22368,8 +22271,6 @@ mod tests {
         for (case, group, reason) in [
             ("(i)", "claude", "SevenDayOverThreshold"),
             ("(ii)", "codex", "SevenDayOverThreshold"),
-            ("(iii) claude", "claude", "FiveHourOverThreshold"),
-            ("(iii) codex", "codex", "FiveHourOverThreshold"),
         ] {
             let view = user_shaped(group, 27, 27, reason);
             let bound = band_bound(&view, &chrome);
@@ -22381,7 +22282,7 @@ mod tests {
         assert!(missing.is_empty(), "no band at 179: {}", missing.join(", "));
         // The note row pairs with the token line on the claude side (172)
         // and with the 7d line on the codex side (160).
-        assert_eq!(bounds, [172, 160, 172, 160]);
+        assert_eq!(bounds, [172, 160]);
     }
 
     /// The note's row is an event input: after a codex switch the note
@@ -23204,13 +23105,15 @@ mod tests {
     /// accounts whose 7d window is spent past the 99% ceiling: seven claude
     /// accounts and one codex account, as in the owner-approved picture.
     const FOLD_MEMBERS: [usize; 8] = [2, 6, 7, 8, 10, 12, 14, 15];
-    /// The claude account over its 5h ceiling: `!`-marked, never folded.
-    const FIVE_H_OVER: usize = 4;
+    /// The claude account `!`-marked for a reason other than its week — a
+    /// failed login (403) — so it is never folded. (Until 2026-11-10 it was
+    /// over its 5h ceiling; that window no longer exists.)
+    const AUTH_BROKEN: usize = 4;
 
     /// The recompose fixture with [`FOLD_MEMBERS`] at 100% of their 7d
-    /// window (status `7d 100.0% > 99%` on every one) and [`FIVE_H_OVER`]
-    /// at 95% of its 5h window, plus a fixed config path so the frame never
-    /// depends on the machine's home directory.
+    /// window (status `7d 100.0% > 99%` on every one) and [`AUTH_BROKEN`]
+    /// failing auth, plus a fixed config path so the frame never depends on
+    /// the machine's home directory.
     fn fold_view() -> (DashboardView, Chrome) {
         let (mut view, chrome) = recompose_view();
         for (i, account) in view.snapshot.accounts.iter_mut().enumerate() {
@@ -23220,10 +23123,9 @@ mod tests {
                     window.utilization = 1.0;
                 }
             }
-            if n == FIVE_H_OVER {
-                if let Some(window) = account.five_hour.as_mut() {
-                    window.utilization = 0.95;
-                }
+            if n == AUTH_BROKEN {
+                account.healthy = false;
+                account.auth_failure_status = Some(403);
             }
         }
         view.config_path = Some("/etc/llmux/llmux.json".into());
@@ -23376,7 +23278,14 @@ mod tests {
     /// palette (theme sweep, 2026-11-06): each literal became the `THEME`
     /// field that holds the same named ANSI colour (or a palette const of
     /// the same hue), so the frame is identical, text and styles.
-    const FOLD_OFF_179X43_DIGEST: u64 = 17_866_181_982_027_554_185;
+    /// Re-pinned 2026-11-10 when the 5h window left llmux entirely (owner:
+    /// "llmux에서도 완전히 삭제"): the fixture's `!` account #4 can no longer be
+    /// over a 5h ceiling, so it now fails auth instead. Two cells change:
+    /// its status reads `! 403 auth X` in bold red (was `⠂ 5h 95.0% > 90%`)
+    /// and the health headline counts the extra AUTH condition (`+3`, was
+    /// `+2`); every other row, text and style, unchanged (previous digest
+    /// 17_866_181_982_027_554_185).
+    const FOLD_OFF_179X43_DIGEST: u64 = 8_580_461_030_093_644_723;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -23901,9 +23810,10 @@ mod tests {
     /// Display numbers of the live-shaped fixture's 7d-spent accounts:
     /// seven claude and two codex, as on the owner's dashboard (2026-10-22).
     const LIVE_MEMBERS: [usize; 9] = [2, 3, 6, 7, 11, 12, 14, 15, 16];
-    /// Claude #4 is over its 5h ceiling and #5 is paused — both also at 100%
-    /// of their 7d window, and both stay in the table.
-    const LIVE_FIVE_H_OVER: usize = 4;
+    /// Claude #4 failed auth (403) and #5 is paused — both also at 100% of
+    /// their 7d window, and both stay in the table. (Until 2026-11-10 #4 was
+    /// over its 5h ceiling; that window no longer exists.)
+    const LIVE_AUTH_BROKEN: usize = 4;
     const LIVE_PAUSED: usize = 5;
 
     /// The live-shaped table name of fixture account `n` (synthetic): 8–10
@@ -23947,7 +23857,7 @@ mod tests {
     /// of a 7d window resetting in `4d 2h`, the claude ones with a Fable
     /// window at 82% left (`4d 2h`); req `81.0k`–`88.0k` and tok
     /// `1202.0M`–`1216.0M` (the live value widths); `rst` reading `0`,
-    /// `n/e` and `?`; and the 5h-over and paused accounts also 7d-spent.
+    /// `n/e` and `?`; and the auth-broken and paused accounts also 7d-spent.
     fn live_view() -> (DashboardView, Chrome) {
         use crate::scheduler::window::{LimitSeverity, ScopedQuotaWindow, WindowSource};
         let (mut view, chrome) = recompose_view();
@@ -23967,7 +23877,7 @@ mod tests {
         }
         for (i, account) in view.snapshot.accounts.iter_mut().enumerate() {
             let n = i + 1;
-            if LIVE_MEMBERS.contains(&n) || n == LIVE_FIVE_H_OVER || n == LIVE_PAUSED {
+            if LIVE_MEMBERS.contains(&n) || n == LIVE_AUTH_BROKEN || n == LIVE_PAUSED {
                 account.seven_day = Some(window(1.0));
             }
             if LIVE_MEMBERS.contains(&n) && fold_group(n) == "claude" {
@@ -23978,10 +23888,9 @@ mod tests {
                     is_active: false,
                 }];
             }
-            if n == LIVE_FIVE_H_OVER {
-                if let Some(five) = account.five_hour.as_mut() {
-                    five.utilization = 0.95;
-                }
+            if n == LIVE_AUTH_BROKEN {
+                account.healthy = false;
+                account.auth_failure_status = Some(403);
             }
             account.paused = n == LIVE_PAUSED;
         }
@@ -24210,7 +24119,7 @@ mod tests {
     }
 
     /// The owner's live shape at 179×43: the 12 accounts that are not
-    /// 7d-spent keep their rows and own numbers (the 5h-over and paused
+    /// 7d-spent keep their rows and own numbers (the auth-broken and paused
     /// ones among them), the title carries the fold label with the shared
     /// status, and the 9 spent accounts become a dim-headed block of two
     /// entries per line from the table's left column — every value still
@@ -24247,10 +24156,10 @@ mod tests {
                 "table row {i} is #{n}:\n{frame}"
             );
         }
-        let five = &rows[accounts + 2 + 1];
+        let broken = &rows[accounts + 2 + 1];
         assert!(
-            five.starts_with("!  CLAUDE  4 ") && five.contains("5h 95.0% > 90%"),
-            "the 5h-over account stays in the table:\n{frame}"
+            broken.starts_with("!  CLAUDE  4 ") && broken.contains("403 auth X"),
+            "the auth-broken account stays in the table:\n{frame}"
         );
         assert!(
             rows[accounts + 2 + 2].contains(&format!("5  {}", fold_name(5)))
@@ -24264,7 +24173,6 @@ mod tests {
         assert_eq!(rows[head].matches("group").count(), 2, "{frame}");
         assert_eq!(rows[head].matches(" tok").count(), 2, "{frame}");
         assert!(!rows[head].contains("status"), "status is shared:\n{frame}");
-        assert!(!rows[head].contains("5h"), "no 5h field:\n{frame}");
         let fold_rows = &rows[head + 1..head + 6];
         assert!(fold_rows[0].starts_with("!  CLAUDE  2 "), "{frame}");
         assert!(
@@ -24295,11 +24203,8 @@ mod tests {
             let mut want = vec!["!", group, number.as_str(), name.as_str()];
             if claude {
                 want.extend(["4d", "2h", "0%!", "4d", "2h", "82%"]);
-                // The 5h window (70% left) is not a fold field any more.
-                assert!(!entry.contains("70%"), "no 5h value:\n{frame}");
             } else {
-                // No leading n/a `-` for the removed 5h field; the `-` left
-                // is the Fbl percent.
+                // The `-` is the Fbl percent.
                 want.extend(["4d", "2h", "0%!", "-"]);
             }
             want.extend([rst, "0", req.as_str(), tok.as_str()]);
@@ -24415,27 +24320,23 @@ mod tests {
             .find(|r| r.contains(&fold_name(6)))
             .expect("#6 entry");
         let after = &six[six.find(&fold_name(6)).expect("name")..];
-        // Then the 7d reset — the 5h value (70% left) that used to follow
-        // the status is no fold field any more (owner 2026-11-04).
+        // Then the 7d reset.
         assert!(
             in_order(&tokens(after), &["7d", "99.5%", ">", "99%", "4d", "2h"]),
             "#6's own status right after its account:\n{frame}"
         );
-        assert!(!after.contains("70%"), "no 5h value:\n{frame}");
     }
 
     /// A clock tick never moves the fold (coordinator rule B): one member's
     /// 7d or Fbl reset at its widest form (`23h 59m ◑`, stale) or its
-    /// shortest (`42s`), its Fbl window expired, or its 5h window expired
-    /// or stale (no fold field since owner 2026-11-04 — kept as a negative
-    /// control), leaves the entries per line, every field width and every
-    /// entry's column exactly where they are.
+    /// shortest (`42s`), or its Fbl window expired, leaves the entries per
+    /// line, every field width and every entry's column exactly where they
+    /// are.
     #[test]
     fn fold_geometry_does_not_follow_the_clock() {
         #[derive(Clone, Copy)]
         enum Win {
             Seven,
-            Five,
             Fable,
         }
         let now = SystemTime::now();
@@ -24445,7 +24346,6 @@ mod tests {
                 let account = &mut view.snapshot.accounts[1];
                 let window = match win {
                     Win::Seven => account.seven_day.as_mut(),
-                    Win::Five => account.five_hour.as_mut(),
                     Win::Fable => account.scoped_limits.first_mut().map(|s| &mut s.window),
                 };
                 if let Some(w) = window {
@@ -24467,8 +24367,6 @@ mod tests {
             // Expired: the Fbl window resets back to 100% left while the
             // member stays 7d-spent (`0s ○` / `100%`).
             ("Fbl expired", variant(Some((Win::Fable, -1, 2)))),
-            ("5h expired", variant(Some((Win::Five, -1, 2)))),
-            ("5h stale", variant(Some((Win::Five, 10_590, 601)))),
         ];
         // Entries per line, field widths per entry column, and each folded
         // entry's column on screen — `None` = no fold.
@@ -24719,9 +24617,6 @@ mod tests {
                     auth_failure_status: None,
                     credential_kind: kind,
                     group,
-                    five_hour: (group == BackendGroup::Claude)
-                        .then(|| window(0.30))
-                        .flatten(),
                     seven_day: window(if spent { 1.0 } else { 0.31 }),
                     scoped_limits: Vec::new(),
                     scoped_cooldowns: Vec::new(),
@@ -24836,7 +24731,7 @@ mod tests {
 
     /// [`live_view`] with the fold off and an account in every state the
     /// compact list tells apart: #1 failed auth (401), #8 cooling for 45m,
-    /// #9 with usage an hour old; #5 is paused, #4 over its 5h ceiling, the
+    /// #9 with usage an hour old; #5 is paused, #4 failed auth (403), the
     /// members 7d-spent, #13 and #18 the current accounts, the other five
     /// ok.
     fn compact_view() -> (DashboardView, Chrome) {
@@ -24846,11 +24741,7 @@ mod tests {
         accounts[0].healthy = false;
         accounts[0].auth_failure_status = Some(401);
         accounts[7].cooldown_until = Some(now + Duration::from_secs(45 * 60 + 30));
-        let stale = &mut accounts[8];
-        for window in [&mut stale.five_hour, &mut stale.seven_day]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(window) = accounts[8].seven_day.as_mut() {
             window.fetched_at = now - Duration::from_secs(3_600);
         }
         (view, fold_off(&chrome))
@@ -24859,7 +24750,7 @@ mod tests {
     /// The compact list's glyph for each state, and the word an entry says.
     const COMPACT_STATES: [(usize, &str, &str); 7] = [
         (1, "✗", "error 401"),
-        (4, "◌", "5h spent"),
+        (4, "✗", "error 403"),
         (2, "◌", "7d spent"),
         (8, "◉", "cooling 45m"),
         (13, "⠋", "active"),
@@ -24890,7 +24781,7 @@ mod tests {
         let accounts = row_of(&rows, " accounts · sort name · 21 · ");
         let title = &rows[accounts];
         assert!(
-            title.contains(" accounts · sort name · 21 · ✗ 1 error · "),
+            title.contains(" accounts · sort name · 21 · ✗ 2 error · "),
             "{frame}"
         );
         assert!(title.contains(" · +11 more "), "{frame}");
@@ -24915,7 +24806,7 @@ mod tests {
         let frame = rows.join("\n");
         let accounts = row_of(&rows, " accounts · sort name · 21 (");
         assert!(rows[accounts + 1].starts_with("   group "), "{frame}");
-        assert!(!rows[accounts].contains("✗ 1 error"), "{frame}");
+        assert!(!rows[accounts].contains("✗ 2 error"), "{frame}");
     }
 
     /// `V` on the accounts tab: one row per account with its state's glyph
@@ -24962,7 +24853,7 @@ mod tests {
         let title = &rows[row_of(&rows, " accounts · sort name · 21 (")];
         assert!(
             title.contains(
-                " · ✗ 1 error · ◉ 11 spent+cooling · ⠋ 2 active · ◦ 5 ok · ? 2 paused+stale "
+                " · ✗ 2 error · ◉ 10 spent+cooling · ⠋ 2 active · ◦ 5 ok · ? 2 paused+stale "
             ),
             "{title}"
         );
@@ -24979,7 +24870,7 @@ mod tests {
         let rows = render_rows(&view, &chrome, 179, 30);
         let title = &rows[row_of(&rows, " accounts · sort name · 21 (")];
         assert!(
-            title.contains(" · ◌ 10 spent · ⠋ 2 active · ◦ 8 ok · ǁ 1 paused "),
+            title.contains(" · ✗ 1 error · ◌ 9 spent · ⠋ 2 active · ◦ 8 ok · ǁ 1 paused "),
             "{title}"
         );
     }

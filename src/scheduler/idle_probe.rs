@@ -1,6 +1,6 @@
 //! On-demand idle-account usage probe (issue #21).
 //!
-//! An account with no known 5h/7d window produces no usage data, so the
+//! An account with no known 7d window produces no usage data, so the
 //! scheduler ranks/displays it as a guessed cold account. This module fills
 //! that window ON DEMAND: when such an account is needed for ranking/display,
 //! a single `max_tokens = 1` `POST /v1/messages` (or the codex `/responses`
@@ -45,24 +45,14 @@ use crate::config::{AccountCredential, IdleProbeConfig};
 /// gate ([`IdleProber::probe_if_idle`]) and the proxy's trigger filter
 /// (`AppState::trigger_idle_probes`) so the two can never disagree.
 pub fn windows_need_probe(
-    five_hour: Option<&QuotaWindow>,
     seven_day: Option<&QuotaWindow>,
     now: SystemTime,
     stale_after: Duration,
 ) -> bool {
-    // No heap: this runs per account per forwarded request (trigger filter).
-    let mut any = false;
-    let mut all_stale = true;
-    for w in [five_hour, seven_day].into_iter().flatten() {
-        any = true;
-        if !w.is_stale(now, stale_after) {
-            all_stale = false;
-        }
+    match seven_day {
+        None => true, // windowless — the original probe case
+        Some(w) => !stale_after.is_zero() && w.is_stale(now, stale_after),
     }
-    if !any {
-        return true; // windowless — the original probe case
-    }
-    !stale_after.is_zero() && all_stale
 }
 
 /// Failure of a single probe send. Never carries a credential.
@@ -187,12 +177,7 @@ impl<P: Prober> IdleProber<P> {
             .is_some_and(|a| {
                 !a.paused
                     && !super::select::save_hold_is_final(a, save_until, now)
-                    && windows_need_probe(
-                        a.five_hour.as_ref(),
-                        a.seven_day.as_ref(),
-                        now,
-                        stale_after,
-                    )
+                    && windows_need_probe(a.seven_day.as_ref(), now, stale_after)
             })
     }
 
@@ -217,8 +202,8 @@ impl<P: Prober> IdleProber<P> {
         // "no window" test would re-probe them forever. Spend nothing.
         //
         // OpenRouter is the same shape and for the same reason: its quota
-        // model is per-key credits and rate limits, not the 5h/7d rolling
-        // windows this prober samples, so `ReqwestProber::build` rejects it
+        // model is per-key credits and rate limits, not the 7d rolling
+        // window this prober samples, so `ReqwestProber::build` rejects it
         // deterministically. Without this gate the account stays permanently
         // windowless, burns its cooldown every sweep, and logs one
         // `idle probe failed` warning forever (observed live 2026-08-21:
@@ -226,11 +211,17 @@ impl<P: Prober> IdleProber<P> {
         //
         // Gemini likewise: no quota headers on the stream (its windows come
         // from the usage poll, docs/gemini/spec.md §R6).
+        //
+        // An Anthropic API key likewise: its responses carry only the
+        // per-key token-bucket headers, which fed the retired 5h slot and
+        // are no longer read (2026-11-10). It has no weekly window, so a
+        // probe can never populate one.
         if matches!(
             credential,
             AccountCredential::Grok { .. }
                 | AccountCredential::OpenRouter { .. }
                 | AccountCredential::Gemini { .. }
+                | AccountCredential::Apikey { .. }
         ) {
             return false;
         }
@@ -309,14 +300,14 @@ mod tests {
     /// set so the orchestrator's record path is exercised end to end.
     struct CountingProber {
         calls: AtomicUsize,
-        five_hour_util: f64,
+        weekly_util: f64,
     }
 
     impl CountingProber {
-        fn new(five_hour_util: f64) -> Self {
+        fn new(weekly_util: f64) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
-                five_hour_util,
+                weekly_util,
             }
         }
 
@@ -331,20 +322,12 @@ mod tests {
             _credential: &AccountCredential,
         ) -> impl Future<Output = Result<HeaderMap, ProbeError>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let util = self.five_hour_util;
+            let util = self.weekly_util;
             async move {
                 let mut headers = HeaderMap::new();
                 headers.insert(
-                    "anthropic-ratelimit-unified-5h-utilization",
-                    util.to_string().parse().unwrap(),
-                );
-                headers.insert(
-                    "anthropic-ratelimit-unified-5h-reset",
-                    (NOW_SECS + 3600).to_string().parse().unwrap(),
-                );
-                headers.insert(
                     "anthropic-ratelimit-unified-7d-utilization",
-                    "0.20".parse().unwrap(),
+                    util.to_string().parse().unwrap(),
                 );
                 headers.insert(
                     "anthropic-ratelimit-unified-7d-reset",
@@ -415,14 +398,13 @@ mod tests {
 
         let snapshot = pool.snapshot();
         let acct = &snapshot.accounts[0];
-        let five = acct.five_hour.expect("5h window populated by probe");
-        assert!((five.utilization - 0.42).abs() < 1e-9);
+        let seven = acct.seven_day.expect("7d window populated by probe");
+        assert!((seven.utilization - 0.42).abs() < 1e-9);
         assert_eq!(
-            five.source,
+            seven.source,
             crate::scheduler::window::WindowSource::Headers,
             "populated via the Headers path"
         );
-        assert!(acct.seven_day.is_some(), "7d window populated by probe");
     }
 
     #[tokio::test]
@@ -488,7 +470,7 @@ mod tests {
         );
         assert_eq!(prober.call_count(), 0, "kill-switch sends nothing");
         assert!(
-            pool.snapshot().accounts[0].five_hour.is_none(),
+            pool.snapshot().accounts[0].seven_day.is_none(),
             "no window recorded"
         );
     }
@@ -517,11 +499,10 @@ mod tests {
         pool.record_usage(
             &id("a"),
             &crate::scheduler::usage::UsageSnapshot {
-                five_hour: Some(rl_headers::WindowReading {
+                seven_day: Some(rl_headers::WindowReading {
                     utilization: 0.1,
                     resets_at: at(NOW_SECS + 3600),
                 }),
-                seven_day: None,
                 scoped: Vec::new(),
             },
             now(),
@@ -545,11 +526,10 @@ mod tests {
         pool.record_usage(
             &id("a"),
             &crate::scheduler::usage::UsageSnapshot {
-                five_hour: Some(rl_headers::WindowReading {
+                seven_day: Some(rl_headers::WindowReading {
                     utilization: 0.1,
                     resets_at: at(NOW_SECS + 100_000),
                 }),
-                seven_day: None,
                 scoped: Vec::new(),
             },
             now(),
@@ -578,7 +558,6 @@ mod tests {
         pool.record_usage(
             &id("known"),
             &crate::scheduler::usage::UsageSnapshot {
-                five_hour: None,
                 seven_day: Some(rl_headers::WindowReading {
                     utilization: 0.1,
                     resets_at: at(NOW_SECS + 5 * 86_400),
@@ -606,7 +585,6 @@ mod tests {
         pool.record_usage(
             &id("known"),
             &crate::scheduler::usage::UsageSnapshot {
-                five_hour: None,
                 seven_day: Some(rl_headers::WindowReading {
                     utilization: 0.9,
                     resets_at: at(NOW_SECS + 600),
@@ -639,33 +617,15 @@ mod tests {
             source: crate::scheduler::window::WindowSource::Headers,
         };
         // Windowless: always needs a probe.
-        assert!(windows_need_probe(None, None, now(), stale_after));
-        // One fresh window: no probe.
+        assert!(windows_need_probe(None, now(), stale_after));
+        // A fresh window: no probe.
         let fresh = w(NOW_SECS);
-        assert!(!windows_need_probe(Some(&fresh), None, now(), stale_after));
-        // All windows stale: probe.
+        assert!(!windows_need_probe(Some(&fresh), now(), stale_after));
+        // A stale window: probe.
         let stale = w(NOW_SECS - 1000);
-        assert!(windows_need_probe(
-            Some(&stale),
-            Some(&stale),
-            now(),
-            stale_after
-        ));
-        // Mixed (one fresh, one stale): the fresh one still represents live
-        // data — no probe.
-        assert!(!windows_need_probe(
-            Some(&fresh),
-            Some(&stale),
-            now(),
-            stale_after
-        ));
+        assert!(windows_need_probe(Some(&stale), now(), stale_after));
         // stale_after = 0 disables the staleness re-probe entirely.
-        assert!(!windows_need_probe(
-            Some(&stale),
-            None,
-            now(),
-            Duration::ZERO
-        ));
+        assert!(!windows_need_probe(Some(&stale), now(), Duration::ZERO));
     }
 
     fn credential_account(name: &str, credential: AccountCredential) -> AccountConfig {
@@ -675,8 +635,8 @@ mod tests {
         }
     }
 
-    /// Neither grok, openrouter nor gemini can EVER produce 5h/7d window data
-    /// from a probe, and the prober rejects all three deterministically. Without this gate the account is
+    /// Neither grok, openrouter, gemini nor an Anthropic API key can EVER
+    /// produce 7d window data from a probe. Without this gate the account is
     /// permanently windowless, so `probe_eligible` keeps electing it: the
     /// cooldown is burned every sweep and an `idle probe failed` warning is
     /// logged forever (observed live: default sweep and cooldown are both
@@ -686,8 +646,14 @@ mod tests {
     /// in an edit and nothing caught it — a fix with no failing test can
     /// vanish silently.
     #[tokio::test]
-    async fn grok_openrouter_and_gemini_accounts_are_never_probed() {
+    async fn grok_openrouter_gemini_and_apikey_accounts_are_never_probed() {
         for (name, credential) in [
+            (
+                "apikey",
+                AccountCredential::Apikey {
+                    api_key: "sk-ant-x".into(),
+                },
+            ),
             (
                 "grok",
                 AccountCredential::Grok {

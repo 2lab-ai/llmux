@@ -941,7 +941,6 @@ pub struct GrokSettingsDoc {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SelectParamsDoc {
-    pub five_hour_max: f64,
     pub seven_day_max: f64,
     /// Fable-weekly ceiling (additive: docs from older daemons default 0.98).
     #[serde(default = "crate::config::default_fable_weekly_max")]
@@ -961,7 +960,6 @@ pub struct SelectParamsDoc {
 impl From<&SelectParams> for SelectParamsDoc {
     fn from(params: &SelectParams) -> Self {
         Self {
-            five_hour_max: params.five_hour_max,
             seven_day_max: params.seven_day_max,
             fable_weekly_max: params.fable_weekly_max,
             mode: params.mode,
@@ -974,7 +972,6 @@ impl From<&SelectParams> for SelectParamsDoc {
 impl From<&SelectParamsDoc> for SelectParams {
     fn from(doc: &SelectParamsDoc) -> Self {
         Self {
-            five_hour_max: doc.five_hour_max,
             seven_day_max: doc.seven_day_max,
             fable_weekly_max: doc.fable_weekly_max,
             mode: doc.mode,
@@ -1002,7 +999,6 @@ pub struct AccountDoc {
     /// Optional for documents from older daemons.
     #[serde(default)]
     pub auth_failure_status: Option<u16>,
-    pub five_hour: Option<WindowDoc>,
     pub seven_day: Option<WindowDoc>,
     /// The "Fable" model-scoped weekly window surfaced for convenient reads;
     /// `null` when this account carries no Fable scope. Additive — absent in
@@ -1805,7 +1801,7 @@ pub(crate) fn dashboard_doc(
             let cooling = account.cooldown_until.is_some_and(|until| until > now);
             // The account's EFFECTIVE Fable ceiling: per-account override else
             // global — the doc's `constraining` then matches the selector.
-            let fable_max = select::effective_limits(account, params).2;
+            let fable_max = select::effective_limits(account, params).1;
             let lifetime = totals.get(&account.id);
             let session = hub
                 .account_totals
@@ -1820,7 +1816,6 @@ pub(crate) fn dashboard_doc(
                 blocked,
                 healthy: account.healthy,
                 auth_failure_status: account.auth_failure_status,
-                five_hour: window_doc(&account.five_hour, now),
                 seven_day: window_doc(&account.seven_day, now),
                 fable_weekly: account
                     .fable_weekly()
@@ -2388,7 +2383,6 @@ mod tests {
 
     fn params() -> SelectParams {
         SelectParams {
-            five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
@@ -2559,12 +2553,8 @@ mod tests {
         pool.record_headers(
             &AccountId("a".into()),
             &ParsedRateLimitHeaders {
-                five_hour: Some(WindowReading {
-                    utilization: 0.42,
-                    resets_at: now() + Duration::from_secs(3600),
-                }),
                 seven_day: Some(WindowReading {
-                    utilization: 0.10,
+                    utilization: 0.42,
                     resets_at: now() + Duration::from_secs(86_400),
                 }),
                 ..Default::default()
@@ -2926,12 +2916,12 @@ mod tests {
         );
 
         // Window carries the reconstruction fields.
-        let five = doc.accounts[0].five_hour.as_ref().expect("5h window");
-        assert!((five.utilization - 0.42).abs() < 1e-9);
-        assert_eq!(five.resets_at, NOW_SECS + 3600);
-        assert_eq!(five.resets_in_secs, 3600);
-        assert_eq!(five.fetched_at_ms, NOW_SECS * 1000);
-        assert_eq!(five.source, "headers");
+        let seven = doc.accounts[0].seven_day.as_ref().expect("7d window");
+        assert!((seven.utilization - 0.42).abs() < 1e-9);
+        assert_eq!(seven.resets_at, NOW_SECS + 86_400);
+        assert_eq!(seven.resets_in_secs, 86_400);
+        assert_eq!(seven.fetched_at_ms, NOW_SECS * 1000);
+        assert_eq!(seven.source, "headers");
 
         // Lifetime (proxy) + session (activity) totals both present.
         assert_eq!(doc.accounts[0].totals.requests, 1);
@@ -3598,12 +3588,12 @@ mod tests {
         assert_eq!(parsed.accounts[0].name, "a");
         assert_eq!(
             parsed.accounts[0]
-                .five_hour
+                .seven_day
                 .as_ref()
                 .expect("window")
                 .fetched_at_ms,
             doc.accounts[0]
-                .five_hour
+                .seven_day
                 .as_ref()
                 .expect("window")
                 .fetched_at_ms
@@ -3619,7 +3609,17 @@ mod tests {
         // The JSON keys stay status-compatible ("type", not "kind").
         let value: serde_json::Value = serde_json::from_str(&json).expect("value");
         assert_eq!(value["accounts"][0]["type"], "oauth");
-        assert!(value["accounts"][0]["five_hour"]["resets_in_secs"].is_u64());
+        assert!(value["accounts"][0]["seven_day"]["resets_in_secs"].is_u64());
+        assert!(
+            value["accounts"][0].get("five_hour").is_none(),
+            "no 5h window on the wire: {}",
+            value["accounts"][0]
+        );
+        assert!(
+            value["select_params"].get("five_hour_max").is_none(),
+            "no 5h ceiling on the wire: {}",
+            value["select_params"]
+        );
     }
 
     #[test]

@@ -19,9 +19,6 @@ pub struct TeamclaudeImport {
     pub accounts: Vec<AccountConfig>,
     /// `proxy.port` when present.
     pub proxy_port: Option<u16>,
-    /// `switchThreshold` when present — maps onto `scheduler.five_hour_max`
-    /// (teamclaude's single threshold is its 5h-window switch point).
-    pub switch_threshold: Option<f64>,
     /// Human-readable reasons for entries that could not be converted.
     pub skipped: Vec<String>,
 }
@@ -49,8 +46,9 @@ pub fn import_teamclaude(path: &Path) -> Result<Vec<AccountConfig>, ConfigError>
     Ok(import_teamclaude_config(path)?.accounts)
 }
 
-/// [`import_teamclaude`] plus the settings worth migrating
-/// (`proxy.port`, `switchThreshold`).
+/// [`import_teamclaude`] plus the settings worth migrating (`proxy.port`).
+/// teamclaude's `switchThreshold` was its 5h-window switch point; with no 5h
+/// window left there is nothing to map it onto, so it is not read.
 pub fn import_teamclaude_config(path: &Path) -> Result<TeamclaudeImport, ConfigError> {
     let value = read_json(path)?;
     let Some(obj) = value.as_object() else {
@@ -65,7 +63,6 @@ pub fn import_teamclaude_config(path: &Path) -> Result<TeamclaudeImport, ConfigE
         .and_then(|p| p.get("port"))
         .and_then(Value::as_u64)
         .and_then(|p| u16::try_from(p).ok());
-    let switch_threshold = obj.get("switchThreshold").and_then(Value::as_f64);
 
     let mut accounts = Vec::new();
     let mut skipped = Vec::new();
@@ -80,7 +77,6 @@ pub fn import_teamclaude_config(path: &Path) -> Result<TeamclaudeImport, ConfigE
     Ok(TeamclaudeImport {
         accounts,
         proxy_port,
-        switch_threshold,
         skipped,
     })
 }
@@ -313,7 +309,6 @@ mod tests {
 
         let import = import_teamclaude_config(&path).expect("import");
         assert_eq!(import.proxy_port, Some(4567));
-        assert_eq!(import.switch_threshold, Some(0.98));
         assert_eq!(import.accounts.len(), 3);
         assert_eq!(import.skipped.len(), 1, "tokenless entry reported");
         assert!(
