@@ -181,14 +181,14 @@ pub async fn list(args: AccountsArgs, remote: Option<String>) -> Result<(), CliE
 /// (local or remote) as JSON — used by `llmux accounts --json` and by any
 /// remote `llmux accounts` (a pure client has no local pool to list offline).
 ///
-/// The usage windows the user wants (5h/7d utilization + resets, in-flight,
+/// The usage the user wants (7d utilization + resets, in-flight,
 /// token health) live only in the running server, so this mirrors
 /// `llmux status --json`'s probe + exit-code contract (0 = server running,
 /// 1 = not running) rather than the offline config path. The body is the
 /// `/llmux/status` document — the account-centric slice the dashboard is built
 /// from: top-level `current` / `current_by_group` (the selected subscription,
 /// per backend group) plus a per-account array carrying `group`, `status`,
-/// `order`, `five_hour` / `seven_day` (`utilization` + `resets_at` /
+/// `order`, `seven_day` (`utilization` + `resets_at` /
 /// `resets_in_secs`), `in_flight`, and `token_expires_at_ms` /
 /// `last_refresh_ms`. Pretty-printed (`{:#}`) so it is readable as well as
 /// machine-parseable.

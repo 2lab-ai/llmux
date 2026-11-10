@@ -33,7 +33,7 @@ const LEGACY_GROUP: BackendGroup = BackendGroup::Claude;
 /// almost always a transient, server-side limit (Anthropic "Server is
 /// temporarily limiting requests (not your usage limit)") rather than the
 /// account's own quota — a real quota 429 carries `retry-after`/reset headers,
-/// and the 5h/7d usage windows are the authoritative quota gate anyway. So this
+/// and the 7d usage window is the authoritative quota gate anyway. So this
 /// is SHORT (recover fast, let the client retry) and self-heals early on fresh
 /// data showing capacity. A 60-minute park here would strand a fully-usable
 /// account (≈2% utilized) for an hour on a momentary blip.
@@ -166,7 +166,6 @@ pub struct AccountState {
     pub health: AccountHealth,
     /// HTTP status observed when this credential was marked unhealthy.
     pub auth_failure_status: Option<u16>,
-    pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
     /// Model-scoped weekly limits from the usage poll's `limits[]` (e.g. the
     /// "Fable" weekly gauge) — generic, keyed by scope label; empty until a
@@ -210,7 +209,6 @@ impl AccountState {
             generation: next_generation(),
             health: AccountHealth::Healthy,
             auth_failure_status: None,
-            five_hour: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -279,7 +277,7 @@ impl AccountState {
     }
 
     /// Cooldown self-healing: fresh data (strictly newer than the cooldown)
-    /// showing capacity (< 100% on every present window) clears a `Heuristic`
+    /// showing capacity (a weekly window under 100%) clears a `Heuristic`
     /// cooldown. `RetryAfter` parks are explicit upstream instructions and
     /// are never cleared early.
     fn maybe_self_heal(&mut self, now: SystemTime) {
@@ -290,12 +288,9 @@ impl AccountState {
         if !newer_than_cooldown {
             return;
         }
-        let windows: Vec<&QuotaWindow> = [&self.five_hour, &self.seven_day]
-            .into_iter()
-            .flatten()
-            .collect();
-        let shows_capacity =
-            !windows.is_empty() && windows.iter().all(|w| w.effective_utilization(now) < 1.0);
+        let shows_capacity = self
+            .seven_day
+            .is_some_and(|w| w.effective_utilization(now) < 1.0);
         if shows_capacity {
             self.cooldown_until = None;
             self.cooldown_source = None;
@@ -347,14 +342,12 @@ impl AccountState {
             .is_some_and(|s| s.is_constraining(now, CRITICAL_UTILIZATION))
     }
 
-    /// Whether the account-wide (5h/7d) windows THEMSELVES read critical
+    /// Whether the account-wide (7d) window ITSELF reads critical
     /// (≥ [`CRITICAL_UTILIZATION`], reset-aware) — the only corroboration that
     /// escalates a Fable 429 to an account-wide park.
     fn account_wide_critical(&self, now: SystemTime) -> bool {
-        [self.five_hour, self.seven_day]
-            .into_iter()
-            .flatten()
-            .any(|w| w.effective_utilization(now) >= CRITICAL_UTILIZATION)
+        self.seven_day
+            .is_some_and(|w| w.effective_utilization(now) >= CRITICAL_UTILIZATION)
     }
 }
 
@@ -522,15 +515,7 @@ impl PoolState {
 
     /// Record rate-limit headers from an upstream response. Freshest
     /// `fetched_at` wins per window; header data also self-heals a
-    /// `Heuristic` cooldown when it shows capacity. When no unified windows
-    /// are present, the most-constrained standard (API-key) bucket is
-    /// recorded into the 5h slot so API-key accounts get proactive
-    /// scheduling too (the token bucket's short reset horizon means the
-    /// reading expires quickly and degrades back to cold). grok's
-    /// cli-chat-proxy buckets carry no reset, so a reset-less standard
-    /// reading gets an estimated `STANDARD_RESET_FALLBACK` horizon — but ONLY
-    /// for Grok accounts, since the `x-ratelimit-*` names are provider-generic
-    /// and other groups must keep the strict both-fields-required behavior.
+    /// `Heuristic` cooldown when it shows capacity.
     pub fn record_headers(
         &mut self,
         account: &AccountId,
@@ -541,14 +526,6 @@ impl PoolState {
             return;
         };
         let mut recorded = false;
-        if let Some(reading) = parsed.five_hour {
-            recorded |= AccountState::merge_window(
-                &mut acct.five_hour,
-                reading,
-                now,
-                WindowSource::Headers,
-            );
-        }
         if let Some(reading) = parsed.seven_day {
             recorded |= AccountState::merge_window(
                 &mut acct.seven_day,
@@ -583,30 +560,6 @@ impl PoolState {
                 WindowSource::Headers,
             );
         }
-        if parsed.five_hour.is_none() && parsed.seven_day.is_none() {
-            // The `x-ratelimit-*` fallback names are provider-generic, so a
-            // codex/anthropic response carrying them without a reset would
-            // otherwise get a synthetic-horizon window. Gate the reset-less
-            // fallback to Grok accounts (grok's cli-chat-proxy sends no
-            // reset); every other group keeps the strict both-fields-required
-            // behavior — a reset-less reading is dropped.
-            let is_grok = BackendGroup::from_kind(acct.credential.kind()) == BackendGroup::Grok;
-            let reading = parsed.standard.and_then(|s| {
-                if is_grok {
-                    s.as_window_reading_with_fallback_reset(now + headers::STANDARD_RESET_FALLBACK)
-                } else {
-                    s.as_window_reading()
-                }
-            });
-            if let Some(reading) = reading {
-                recorded |= AccountState::merge_window(
-                    &mut acct.five_hour,
-                    reading,
-                    now,
-                    WindowSource::Headers,
-                );
-            }
-        }
         if recorded {
             acct.maybe_self_heal(now);
         }
@@ -622,14 +575,6 @@ impl PoolState {
             return;
         };
         let mut recorded = false;
-        if let Some(reading) = usage.five_hour {
-            recorded |= AccountState::merge_window(
-                &mut acct.five_hour,
-                reading,
-                now,
-                WindowSource::UsagePoll,
-            );
-        }
         if let Some(reading) = usage.seven_day {
             recorded |= AccountState::merge_window(
                 &mut acct.seven_day,
@@ -662,7 +607,6 @@ impl PoolState {
     /// number of accounts reset.
     pub fn reset_usage(&mut self) -> usize {
         for account in &mut self.accounts {
-            account.five_hour = None;
             account.seven_day = None;
             account.scoped_limits.clear();
             account.scoped_cooldowns.clear();
@@ -708,7 +652,7 @@ impl PoolState {
     ///   healthy (the `.prd/13` §2c anomaly), because a same-account non-Fable
     ///   200 proves the account isn't dead. The account-wide cooldown is left
     ///   untouched, so non-Fable traffic stays eligible. It escalates to an
-    ///   account-wide park ONLY when the 5h/7d windows THEMSELVES read critical.
+    ///   account-wide park ONLY when the 7d window ITSELF reads critical.
     ///
     /// Returns the [`Cooldown429Reason`] chosen, for logging / status. NB: on
     /// [`Cooldown429Reason::FableSuspectSnapshotMismatch`] the design also wants
@@ -749,7 +693,7 @@ impl PoolState {
             reason,
         );
         // Escalate to an account-wide park ONLY on genuine corroboration: the
-        // 5h/7d windows themselves read critical. `acct`'s borrow ends here.
+        // 7d window itself reads critical. `acct`'s borrow ends here.
         let escalate = acct.account_wide_critical(now);
         if escalate {
             self.record_429(account, None, now);
@@ -885,7 +829,6 @@ impl PoolState {
                     auth_failure_status: a.auth_failure_status,
                     credential_kind: a.credential.kind(),
                     group: BackendGroup::from_kind(a.credential.kind()),
-                    five_hour: a.five_hour,
                     seven_day: a.seven_day,
                     scoped_limits: a.scoped_limits.clone(),
                     scoped_cooldowns: a.scoped_cooldowns.clone(),
@@ -994,7 +937,6 @@ pub struct AccountSnapshot {
     /// (codex credential → Codex, oauth/apikey → Claude). The selector's
     /// group filter and per-group stickiness key off this.
     pub group: BackendGroup,
-    pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
     /// Model-scoped weekly limits (`limits[]` weekly_scoped rows from the
     /// usage poll), e.g. the "Fable" weekly gauge. Empty when never seen.
@@ -1208,7 +1150,7 @@ impl AccountPool {
             // Reuse the pure gate so the lease agrees with what the selector
             // chose. Auth failure, operator pause and a RetryAfter cooldown
             // always refuse; a Heuristic cooldown refuses UNLESS the group is
-            // in degraded mode. 5h/7d/staleness gates are evaluation-tick
+            // in degraded mode. 7d/staleness gates are evaluation-tick
             // concerns, not a reason to refuse a request already routed to
             // the sticky current — so ignore those reasons here. A Fable
             // request ALSO refuses on its scope-specific gates (Fable
@@ -1546,7 +1488,7 @@ impl AccountPool {
     /// credential actually CHANGED takes a new generation and has an
     /// `AuthFailed` health restored to `Healthy` — the re-login path.
     ///
-    /// That heal ALSO drops the account's usage evidence (5h/7d windows and
+    /// That heal ALSO drops the account's usage evidence (the 7d window and
     /// scoped limits), so the account re-enters COLD. A re-login answers an
     /// auth failure, which means every window on the entry was read under the
     /// credential this re-login retired — evidence about a dead login. Keeping
@@ -1596,7 +1538,6 @@ impl AccountPool {
                                 // above. Cooldowns, pause, ceilings and
                                 // in-flight leases are NOT usage evidence and
                                 // stay exactly as they were.
-                                kept.five_hour = None;
                                 kept.seven_day = None;
                                 kept.scoped_limits.clear();
                             }
@@ -1740,7 +1681,6 @@ mod tests {
 
     fn params() -> SelectParams {
         SelectParams {
-            five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
@@ -1797,9 +1737,8 @@ mod tests {
         }
     }
 
-    fn usage(five: Option<WindowReading>, seven: Option<WindowReading>) -> UsageSnapshot {
+    fn usage(seven: Option<WindowReading>) -> UsageSnapshot {
         UsageSnapshot {
-            five_hour: five,
             seven_day: seven,
             scoped: Vec::new(),
         }
@@ -1892,17 +1831,17 @@ mod tests {
             !pool.record_usage_if(
                 &id("a"),
                 &before,
-                &usage(Some(reading(0.5, NOW_SECS + 60)), None),
+                &usage(Some(reading(0.5, NOW_SECS + 60))),
                 now()
             ),
             "an observation read before the replacement is discarded"
         );
-        assert!(pool.snapshot().accounts[0].five_hour.is_none());
+        assert!(pool.snapshot().accounts[0].seven_day.is_none());
         assert!(
             pool.record_usage_if(
                 &id("a"),
                 &readded,
-                &usage(Some(reading(0.5, NOW_SECS + 60)), None),
+                &usage(Some(reading(0.5, NOW_SECS + 60))),
                 now()
             ),
             "the CURRENT fingerprint still applies"
@@ -1916,7 +1855,6 @@ mod tests {
         assert!(state.current.is_empty());
         for acct in &state.accounts {
             assert_eq!(acct.health, AccountHealth::Healthy);
-            assert!(acct.five_hour.is_none());
             assert!(acct.seven_day.is_none());
             assert!(acct.cooldown_until.is_none());
             assert_eq!(acct.in_flight, 0);
@@ -1973,13 +1911,9 @@ mod tests {
     fn manual_switch_pins_both_scopes_until_a_real_error() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
         pool.evaluate(None, &params(), now());
-        // Make "b" clearly over the 5h ceiling — automatic selection would
+        // Make "b" clearly over the 7d ceiling — automatic selection would
         // never pick it, and the OLD manual switch would refuse it.
-        pool.record_usage(
-            &id("b"),
-            &usage(Some(reading(0.95, NOW_SECS + 3600)), None),
-            now(),
-        );
+        pool.record_usage(&id("b"), &usage(Some(reading(1.0, NOW_SECS + 3600))), now());
         pool.switch_to(&id("b"), &params(), now())
             .expect("operator override lands on an over-threshold account");
         // Pinned: the evaluation tick must NOT move off b, either scope.
@@ -2037,11 +1971,7 @@ mod tests {
     fn manual_pin_expires_after_its_duration() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
         pool.evaluate(None, &params(), now());
-        pool.record_usage(
-            &id("b"),
-            &usage(Some(reading(0.95, NOW_SECS + 3600)), None),
-            now(),
-        );
+        pool.record_usage(&id("b"), &usage(Some(reading(1.0, NOW_SECS + 3600))), now());
         pool.switch_to(&id("b"), &params(), now()).expect("switch");
         let later = now() + MANUAL_PIN_DURATION + Duration::from_secs(1);
         assert_eq!(
@@ -2059,20 +1989,16 @@ mod tests {
         let mut state = PoolState::from_accounts(&[oauth_account("a"), oauth_account("b")]);
         state.record_usage(
             &id("a"),
-            &usage(
-                Some(reading(0.87, NOW_SECS + 3600)),
-                Some(reading(0.42, NOW_SECS + 86_400)),
-            ),
+            &usage(Some(reading(0.42, NOW_SECS + 86_400))),
             now(),
         );
         state.record_429(&id("b"), None, now());
         state.accounts[1].paused = true;
-        assert!(state.accounts[0].five_hour.is_some(), "seed took");
+        assert!(state.accounts[0].seven_day.is_some(), "seed took");
         assert!(state.accounts[1].cooldown_until.is_some(), "seed took");
 
         assert_eq!(state.reset_usage(), 2, "reports the accounts reset");
         for acct in &state.accounts {
-            assert!(acct.five_hour.is_none(), "{}: 5h window cold", acct.id.0);
             assert!(acct.seven_day.is_none(), "{}: 7d window cold", acct.id.0);
             assert!(
                 acct.scoped_limits.is_empty(),
@@ -2098,16 +2024,14 @@ mod tests {
     fn record_headers_merges_unified_windows() {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
         let parsed = ParsedRateLimitHeaders {
-            five_hour: Some(reading(0.42, NOW_SECS + 3600)),
             seven_day: Some(reading(0.87, NOW_SECS + 86_400)),
             ..Default::default()
         };
         state.record_headers(&id("a"), &parsed, now());
         let acct = &state.accounts[0];
-        assert_eq!(acct.five_hour.unwrap().utilization, 0.42);
-        assert_eq!(acct.five_hour.unwrap().source, WindowSource::Headers);
         assert_eq!(acct.seven_day.unwrap().utilization, 0.87);
-        assert_eq!(acct.five_hour.unwrap().fetched_at, now());
+        assert_eq!(acct.seven_day.unwrap().source, WindowSource::Headers);
+        assert_eq!(acct.seven_day.unwrap().fetched_at, now());
     }
 
     /// Issue #123: the `7d_oi` header reading lands in the Fable scoped slot
@@ -2137,89 +2061,31 @@ mod tests {
     fn stale_observation_does_not_overwrite_fresher_one() {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
         let fresh = ParsedRateLimitHeaders {
-            five_hour: Some(reading(0.50, NOW_SECS + 3600)),
+            seven_day: Some(reading(0.50, NOW_SECS + 3600)),
             ..Default::default()
         };
         state.record_headers(&id("a"), &fresh, at(NOW_SECS + 100));
         // An older (out-of-order) observation must not win.
         let older = ParsedRateLimitHeaders {
-            five_hour: Some(reading(0.10, NOW_SECS + 3600)),
+            seven_day: Some(reading(0.10, NOW_SECS + 3600)),
             ..Default::default()
         };
         state.record_headers(&id("a"), &older, now());
-        assert_eq!(state.accounts[0].five_hour.unwrap().utilization, 0.50);
+        assert_eq!(state.accounts[0].seven_day.unwrap().utilization, 0.50);
     }
 
+    /// The API-key / grok token-bucket headers only ever fed the retired 5h
+    /// slot (2026-11-10): a response carrying only them records nothing on
+    /// any account kind.
     #[test]
-    fn standard_headers_feed_five_hour_slot_when_unified_absent() {
-        let mut state = PoolState::from_accounts(&[apikey_account("k")]);
-        let parsed = ParsedRateLimitHeaders {
-            standard: Some(headers::StandardRateLimit {
-                requests_limit: Some(100),
-                requests_remaining: Some(20),
-                requests_reset: Some(at(NOW_SECS + 60)),
-                tokens_limit: None,
-                tokens_remaining: None,
-                tokens_reset: None,
-            }),
-            ..Default::default()
-        };
-        state.record_headers(&id("k"), &parsed, now());
-        let window = state.accounts[0].five_hour.unwrap();
-        assert!((window.utilization - 0.80).abs() < 1e-9);
-        assert_eq!(window.resets_at, at(NOW_SECS + 60));
-    }
-
-    fn reset_less_grok_standard() -> ParsedRateLimitHeaders {
-        // grok shape: limit/remaining with no reset (900 limit / 720 remaining
-        // → utilization 0.20).
-        ParsedRateLimitHeaders {
-            standard: Some(headers::StandardRateLimit {
-                requests_limit: Some(900),
-                requests_remaining: Some(720),
-                requests_reset: None,
-                tokens_limit: None,
-                tokens_remaining: None,
-                tokens_reset: None,
-            }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn reset_less_standard_headers_use_fallback_horizon_for_grok_only() {
-        // grok account: reset-less reading gets the estimated
-        // STANDARD_RESET_FALLBACK horizon from now.
-        let parsed = reset_less_grok_standard();
-        let mut state = PoolState::from_accounts(&[grok_account("g")]);
-        state.record_headers(&id("g"), &parsed, now());
-        let window = state.accounts[0].five_hour.unwrap();
-        assert!((window.utilization - 0.20).abs() < 1e-9);
-        assert_eq!(window.resets_at, now() + headers::STANDARD_RESET_FALLBACK);
-
-        // codex / oauth accounts: the provider-generic names must NOT inject a
-        // synthetic-horizon window — a reset-less reading is dropped.
-        for account in [codex_account("cx"), oauth_account("o")] {
-            let name = account.name.clone();
-            let mut state = PoolState::from_accounts(&[account]);
-            state.record_headers(&id(&name), &parsed, now());
-            assert!(
-                state.accounts[0].five_hour.is_none(),
-                "{name}: reset-less standard reading must be dropped for non-grok"
-            );
-        }
-    }
-
-    #[test]
-    fn grok_x_ratelimit_capture_parses_and_records_via_record_headers() {
-        // End-to-end: exact 2026-07-14 cli-chat-proxy.grok.com capture (HTTP
-        // 200) through headers::parse then record_headers on a grok account.
+    fn token_bucket_headers_record_nothing() {
         let mut headers_map = http::HeaderMap::new();
         for (name, value) in [
+            ("anthropic-ratelimit-requests-limit", "100"),
+            ("anthropic-ratelimit-requests-remaining", "0"),
+            ("anthropic-ratelimit-requests-reset", "2026-06-12T07:13:19Z"),
             ("x-ratelimit-limit-tokens", "15000000"),
-            ("x-ratelimit-remaining-tokens", "15000000"),
-            ("x-ratelimit-limit-requests", "900"),
-            ("x-ratelimit-remaining-requests", "900"),
+            ("x-ratelimit-remaining-tokens", "0"),
         ] {
             headers_map.insert(
                 name.parse::<http::HeaderName>().unwrap(),
@@ -2227,11 +2093,15 @@ mod tests {
             );
         }
         let parsed = headers::parse(&headers_map);
-        let mut state = PoolState::from_accounts(&[grok_account("g")]);
-        state.record_headers(&id("g"), &parsed, now());
-        let window = state.accounts[0].five_hour.unwrap();
-        assert_eq!(window.utilization, 0.0);
-        assert_eq!(window.resets_at, now() + headers::STANDARD_RESET_FALLBACK);
+        for account in [apikey_account("k"), grok_account("g"), oauth_account("o")] {
+            let name = account.name.clone();
+            let mut state = PoolState::from_accounts(&[account]);
+            state.record_headers(&id(&name), &parsed, now());
+            assert!(
+                state.accounts[0].seven_day.is_none(),
+                "{name}: a token bucket is not a weekly window"
+            );
+        }
     }
 
     #[test]
@@ -2266,10 +2136,7 @@ mod tests {
         // Later poll shows both windows under 100%.
         state.record_usage(
             &id("a"),
-            &usage(
-                Some(reading(0.30, NOW_SECS + 3600)),
-                Some(reading(0.50, NOW_SECS + 86_400)),
-            ),
+            &usage(Some(reading(0.50, NOW_SECS + 86_400))),
             at(NOW_SECS + 300),
         );
         let acct = &state.accounts[0];
@@ -2288,7 +2155,7 @@ mod tests {
         state.record_429(&id("a"), None, now());
         state.record_usage(
             &id("a"),
-            &usage(Some(reading(0.30, NOW_SECS + 3600)), None),
+            &usage(Some(reading(0.30, NOW_SECS + 3600))),
             now(),
         );
         assert!(state.accounts[0].cooldown_until.is_some());
@@ -2300,7 +2167,7 @@ mod tests {
         state.record_429(&id("a"), None, now());
         state.record_usage(
             &id("a"),
-            &usage(Some(reading(1.0, NOW_SECS + 3600)), None),
+            &usage(Some(reading(1.0, NOW_SECS + 3600))),
             at(NOW_SECS + 300),
         );
         assert!(state.accounts[0].cooldown_until.is_some());
@@ -2312,7 +2179,7 @@ mod tests {
         state.record_429(&id("a"), Some(Duration::from_secs(600)), now());
         state.record_usage(
             &id("a"),
-            &usage(Some(reading(0.0, NOW_SECS + 3600)), None),
+            &usage(Some(reading(0.0, NOW_SECS + 3600))),
             at(NOW_SECS + 300),
         );
         assert!(
@@ -2341,12 +2208,11 @@ mod tests {
         acct
     }
 
-    // SCHED-15(a): newer data with every present window under 100% clears a
+    // SCHED-15(a): newer data with the weekly window under 100% clears a
     // Heuristic cooldown.
     #[test]
     fn maybe_self_heal_clears_heuristic_when_all_windows_have_capacity() {
         let mut acct = heuristic_parked(now());
-        acct.five_hour = Some(window(0.30, NOW_SECS + 3600, NOW_SECS + 1));
         acct.seven_day = Some(window(0.99, NOW_SECS + 86_400, NOW_SECS + 1));
         acct.maybe_self_heal(at(NOW_SECS + 1));
         assert!(acct.cooldown_until.is_none());
@@ -2362,7 +2228,7 @@ mod tests {
         acct.cooldown_until = Some(at(NOW_SECS + 600));
         acct.cooldown_source = Some(CooldownSource::RetryAfter);
         acct.cooldown_set_at = Some(now());
-        acct.five_hour = Some(window(0.0, NOW_SECS + 3600, NOW_SECS + 1));
+        acct.seven_day = Some(window(0.0, NOW_SECS + 3600, NOW_SECS + 1));
         acct.maybe_self_heal(at(NOW_SECS + 1));
         assert_eq!(acct.cooldown_until, Some(at(NOW_SECS + 600)));
         assert_eq!(acct.cooldown_source, Some(CooldownSource::RetryAfter));
@@ -2374,7 +2240,7 @@ mod tests {
     #[test]
     fn maybe_self_heal_requires_strictly_newer_than_cooldown_set_at() {
         let mut acct = heuristic_parked(now());
-        acct.five_hour = Some(window(0.10, NOW_SECS + 3600, NOW_SECS));
+        acct.seven_day = Some(window(0.10, NOW_SECS + 3600, NOW_SECS));
         // now == cooldown_set_at -> not strictly newer.
         acct.maybe_self_heal(now());
         assert!(acct.cooldown_until.is_some());
@@ -2397,13 +2263,8 @@ mod tests {
         }
     }
 
-    fn usage_with_fable(
-        five: Option<WindowReading>,
-        seven: Option<WindowReading>,
-        fable: ScopedLimitReading,
-    ) -> UsageSnapshot {
+    fn usage_with_fable(seven: Option<WindowReading>, fable: ScopedLimitReading) -> UsageSnapshot {
         UsageSnapshot {
-            five_hour: five,
             seven_day: seven,
             scoped: vec![fable],
         }
@@ -2420,10 +2281,7 @@ mod tests {
         // All-models weekly well under threshold; no Fable snapshot at all.
         state.record_usage(
             &id("a"),
-            &usage(
-                Some(reading(0.0, NOW_SECS + 3600)),
-                Some(reading(0.40, NOW_SECS + 86_400)),
-            ),
+            &usage(Some(reading(0.40, NOW_SECS + 86_400))),
             now(),
         );
 
@@ -2511,7 +2369,6 @@ mod tests {
         state.record_usage(
             &id("a"),
             &usage_with_fable(
-                Some(reading(0.0, NOW_SECS + 3600)),
                 Some(reading(0.58, NOW_SECS + 86_400)),
                 fable_reading(1.0, true, true),
             ),
@@ -2540,10 +2397,7 @@ mod tests {
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
         state.record_usage(
             &id("a"),
-            &usage(
-                Some(reading(0.0, NOW_SECS + 3600)),
-                Some(reading(0.97, NOW_SECS + 86_400)),
-            ),
+            &usage(Some(reading(0.97, NOW_SECS + 86_400))),
             now(),
         );
         let recorded = state.record_429_classified(&id("a"), None, Some("fable-5"), now());
@@ -2552,7 +2406,7 @@ mod tests {
         assert!(!state.accounts[0].scoped_cooldowns.is_empty());
         assert!(
             state.accounts[0].cooldown_until.is_some(),
-            "critical 5h/7d corroborates → account-wide escalation"
+            "critical 7d corroborates → account-wide escalation"
         );
         assert_eq!(
             state.accounts[0].cooldown_source,
@@ -2983,7 +2837,6 @@ mod tests {
         pool.record_usage(
             &id("a"),
             &usage_with_fable(
-                Some(reading(0.42, NOW_SECS + 3600)),
                 Some(reading(0.80, NOW_SECS + 86_400)),
                 fable_reading(0.30, true, false),
             ),
@@ -2996,10 +2849,6 @@ mod tests {
         let state = pool.read();
         let a = &state.accounts[0];
         assert_eq!(a.health, AccountHealth::Healthy, "the re-login heals");
-        assert!(
-            a.five_hour.is_none(),
-            "5h window was read under the retired credential"
-        );
         assert!(
             a.seven_day.is_none(),
             "7d window was read under the retired credential"
@@ -3019,7 +2868,6 @@ mod tests {
         pool.record_usage(
             &id("a"),
             &usage_with_fable(
-                Some(reading(0.42, NOW_SECS + 3600)),
                 Some(reading(0.80, NOW_SECS + 86_400)),
                 fable_reading(0.30, true, false),
             ),
@@ -3031,11 +2879,10 @@ mod tests {
         let state = pool.read();
         let a = &state.accounts[0];
         assert_eq!(
-            a.five_hour.map(|w| w.utilization),
-            Some(0.42),
+            a.seven_day.map(|w| w.utilization),
+            Some(0.80),
             "a healthy account's windows survive a credential rotation"
         );
-        assert_eq!(a.seven_day.map(|w| w.utilization), Some(0.80));
         assert_eq!(a.scoped_limits.len(), 1, "scoped limits survive too");
     }
 
@@ -3048,7 +2895,6 @@ mod tests {
         pool.record_usage(
             &id("a"),
             &usage_with_fable(
-                Some(reading(0.42, NOW_SECS + 3600)),
                 Some(reading(0.80, NOW_SECS + 86_400)),
                 fable_reading(0.30, true, false),
             ),
@@ -3065,7 +2911,6 @@ mod tests {
             AccountHealth::AuthFailed,
             "same credential bytes are not a re-login"
         );
-        assert_eq!(a.five_hour.map(|w| w.utilization), Some(0.42));
         assert_eq!(a.seven_day.map(|w| w.utilization), Some(0.80));
         assert_eq!(a.scoped_limits.len(), 1);
     }
@@ -3261,7 +3106,7 @@ mod tests {
             !pool.record_usage_if(
                 &id("a"),
                 &before,
-                &usage(Some(reading(0.9, NOW_SECS + 3600)), None),
+                &usage(Some(reading(0.9, NOW_SECS + 3600))),
                 now()
             ),
             "a reading fetched before the re-login is discarded"

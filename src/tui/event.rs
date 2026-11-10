@@ -197,7 +197,7 @@ pub enum ActivityEvent {
         /// `None` on the initial selection.
         from: Option<String>,
         to: String,
-        /// Human-readable cause ("429 park", "5h threshold", …).
+        /// Human-readable cause ("429 park", "7d threshold", …).
         reason: Option<String>,
     },
     /// An OAuth access token was refreshed for `account`.

@@ -1718,7 +1718,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
     };
 
     // On-demand idle probe (issue #21): real traffic to this group is the
-    // trigger to populate any windowless sibling account's 5h/7d data, so the
+    // trigger to populate any windowless sibling account's 7d data, so the
     // scheduler ranks/displays them accurately. Fully gated (kill-switch +
     // per-account cooldown) and spawned — a no-op when disabled, never adds
     // latency to this request.
@@ -2708,7 +2708,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         // necessarily the account's whole quota). Scope-aware
                         // classification (W2): a Fable request parks ONLY the
                         // Fable scope (account keeps serving non-Fable) unless
-                        // the 5h/7d windows corroborate; a non-Fable request
+                        // the 7d window corroborates; a non-Fable request
                         // parks account-wide as before. If EVERY account is
                         // momentarily limited, return a transient 502 so the
                         // client retries promptly — never a long "quota
@@ -3031,10 +3031,10 @@ fn acquire_lease(
 ) -> Result<crate::scheduler::AccountLease, ExhaustInfo> {
     let now = SystemTime::now();
     // Heuristic-degraded selection MUST go through `pick`, not the sticky
-    // fast-path. `lease_for` deliberately ignores the 5h/7d ceilings for the
+    // fast-path. `lease_for` deliberately ignores the 7d ceiling for the
     // sticky current; in degraded mode it also drops the Heuristic cooldown
     // gate, so the sticky current could be re-leased even when it is over its
-    // real quota (5h/7d) — bypassing the ceiling `pick` enforces — and the
+    // real quota (7d) — bypassing the ceiling `pick` enforces — and the
     // soonest-freed ranking would never run. Routing through `evaluate`/`pick`
     // gates quota AND picks the soonest-freed, fully-gated account.
     let degraded = {
@@ -5623,7 +5623,6 @@ mod tests {
             .expect("script lock")
             .pop_front()
             .unwrap_or(Scripted::Ok { body: "{}" });
-        let reset_5h = SystemTime::now() + Duration::from_secs(3600);
         let reset_7d = SystemTime::now() + Duration::from_secs(86_400);
         let epoch = |t: SystemTime| {
             t.duration_since(UNIX_EPOCH)
@@ -5635,9 +5634,7 @@ mod tests {
             Scripted::Ok { body } => http::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
-                .header("anthropic-ratelimit-unified-5h-utilization", "0.42")
-                .header("anthropic-ratelimit-unified-5h-reset", epoch(reset_5h))
-                .header("anthropic-ratelimit-unified-7d-utilization", "0.10")
+                .header("anthropic-ratelimit-unified-7d-utilization", "0.42")
                 .header("anthropic-ratelimit-unified-7d-reset", epoch(reset_7d))
                 .body(axum::body::Body::from(body))
                 .expect("response"),
@@ -5822,8 +5819,8 @@ mod tests {
         // Rate-limit headers were recorded into the pool.
         let snapshot = state.pool.snapshot();
         let account = &snapshot.accounts[0];
-        let five = account.five_hour.expect("5h window recorded");
-        assert!((five.utilization - 0.42).abs() < 1e-9);
+        let seven = account.seven_day.expect("7d window recorded");
+        assert!((seven.utilization - 0.42).abs() < 1e-9);
 
         // Usage extracted from the JSON body into the proxy totals.
         let totals = state.totals.get(&AccountId("a".into()));
@@ -7165,14 +7162,14 @@ mod tests {
     }
 
     #[test]
-    fn degraded_mode_does_not_bypass_5h_ceiling_via_sticky_current() {
+    fn degraded_mode_does_not_bypass_7d_ceiling_via_sticky_current() {
         // Regression: in heuristic-degraded mode `acquire_lease` used to try the
-        // sticky fast-path FIRST. `lease_for` ignores the 5h/7d ceilings for the
+        // sticky fast-path FIRST. `lease_for` ignores the 7d ceiling for the
         // sticky current and, in degraded mode, also drops the Heuristic cooldown
-        // gate — so a current that is BOTH Heuristic-cooled AND over its 5h quota
+        // gate — so a current that is BOTH Heuristic-cooled AND over its quota
         // got re-leased, bypassing the ceiling `pick` enforces and never reaching
         // the soonest-freed ranking. The fix routes degraded selection through
-        // `pick`, which gates 5h/7d and picks the quota-clean soonest-freed peer.
+        // `pick`, which gates 7d and picks the quota-clean soonest-freed peer.
         let upstream = "http://127.0.0.1:9"; // never reached by acquire_lease
         let state = test_state(
             upstream,
@@ -7189,18 +7186,18 @@ mod tests {
             "a is the sticky current"
         );
 
-        // a: over its 5h ceiling (0.95 > 0.90), window live (resets in 1h) and
-        // fresh (record_headers stamps fetched_at = now, so not stale).
-        let over_5h = rl_headers::ParsedRateLimitHeaders {
-            five_hour: Some(rl_headers::WindowReading {
-                utilization: 0.95,
+        // a: over its 7d ceiling (0.995 > 0.99), window live (resets in 1h)
+        // and fresh (record_headers stamps fetched_at = now, so not stale).
+        let over_7d = rl_headers::ParsedRateLimitHeaders {
+            seven_day: Some(rl_headers::WindowReading {
+                utilization: 0.995,
                 resets_at: now + Duration::from_secs(3600),
             }),
             ..Default::default()
         };
         state
             .pool
-            .record_headers(&AccountId("a".into()), &over_5h, now);
+            .record_headers(&AccountId("a".into()), &over_7d, now);
 
         // Both parked by retry-after-LESS 429s (Heuristic cooldowns), so the
         // group is locked out. Only b is heuristic-ONLY-blocked (quota-clean),
@@ -7215,7 +7212,7 @@ mod tests {
         assert_eq!(
             lease.account_id(),
             &AccountId("b".into()),
-            "5h ceiling is NOT bypassed: the over-quota current 'a' is skipped, \
+            "7d ceiling is NOT bypassed: the over-quota current 'a' is skipped, \
              selection goes through pick and serves quota-clean 'b'"
         );
     }

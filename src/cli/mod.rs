@@ -244,7 +244,7 @@ pub struct AccountsArgs {
     #[arg(short, long)]
     pub verbose: bool,
     /// Emit the full live account dashboard as JSON — the currently selected
-    /// subscription per group plus every account's 5h/7d usage windows,
+    /// subscription per group plus every account's 7d usage window,
     /// resets, status, in-flight count and token health — sourced from the
     /// running server. Exits 1 (with a JSON error object) if no server is up.
     #[arg(long)]
