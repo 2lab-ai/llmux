@@ -10,6 +10,10 @@ Then let Claude, GPT and Grok work in the same Claude Code session.
 
 ---
 
+[![llmux film, 48 seconds: every account's usage at a glance, several models in one Claude Code session, what it cost, and the raw request that went to the provider](screenshots/llmux-film-poster.png)](https://github.com/2lab-ai/llmux/releases/download/v0.2.26/llmux-intro-en.mp4)
+
+<p align="center"><sub>▶ <a href="https://github.com/2lab-ai/llmux/releases/download/v0.2.26/llmux-intro-en.mp4">llmux film, 48 s</a>: accounts, models, cost and the raw request, in the TUI and the web dashboard (its UI is in Korean), recorded on 2026-11-10 before the 5-hour window was retired. (<a href="https://github.com/2lab-ai/llmux/releases/download/v0.2.26/llmux-intro-ko.mp4">Korean</a>) ▶ <a href="https://github.com/2lab-ai/soma-work/releases/download/v0.3/soma-work-x-llmux-en.mp4">soma-work × llmux, 51 s</a>: a Slack agent whose every model call goes through llmux. (<a href="https://github.com/2lab-ai/soma-work/releases/download/v0.3/soma-work-x-llmux-ko.mp4">Korean</a>)</sub></p>
+
 ![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with usage bars and reset timers (captured before the 5-hour window was retired on 2026-11-10)](screenshots/llmux-islands-workspace.png)
 
 <sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>

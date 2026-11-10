@@ -2,6 +2,7 @@
 
 Admin-only web view of one llmux daemon: sessions as task cards, per-user (issued key) usage, requests and accounts.
 Contract: [`.prd/26-web-session-dashboard.md`](../.prd/26-web-session-dashboard.md). User guide: [`docs/web-dashboard.md`](../docs/web-dashboard.md).
+See it: ▶ [llmux film, 48 s](https://github.com/2lab-ai/llmux/releases/download/v0.2.26/llmux-intro-en.mp4) (accounts, requests, the raw viewer; [Korean](https://github.com/2lab-ai/llmux/releases/download/v0.2.26/llmux-intro-ko.mp4)).
 
 - `server.mjs` — Node ≥ 20, no dependencies. Reads the daemon admin API with `proxy.api_key` from `~/.config/llmux.json`
   (server side only, never sent to the browser), replays `activity.jsonl`, reads Claude Code transcripts on this host.
