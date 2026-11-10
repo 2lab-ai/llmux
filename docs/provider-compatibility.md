@@ -346,8 +346,8 @@ block with empty text and a `llmux-rs1:<codex|grok>:…` signature, and the next
 replays that block to the same gateway as a `reasoning` item, so a `gpt-*` or `grok-*`
 turn resumes the previous turn's private reasoning. Other prior `thinking` blocks
 (Anthropic-signed, the other gateway's) are still dropped; multi-turn text and tool
-transcripts are unaffected. A request that does not ask for thinking gets no thinking
-block and replays nothing. Beyond that switch, the top-level `thinking` config is
+transcripts are unaffected. A request that does not ask for thinking gets no new
+thinking block; signed blocks already in its history are still replayed. Beyond that switch, the top-level `thinking` config is
 validated and then dropped: `budget_tokens` bounds nothing upstream and
 `{"type":"disabled"}` does not stop these models from reasoning. Reasoning effort on these
 groups comes from llmux's own resolution (`config.codex` / `config.grok`, `/effort`), not
