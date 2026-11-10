@@ -76,6 +76,11 @@ impl CodexTrace {
             v.map(crate::provider::codex::estimate_section_tokens)
                 .unwrap_or(0)
         };
+        // Messages skip thinking-block signatures, as `count_tokens` does.
+        let est_messages = |v: Option<&Value>| {
+            v.map(crate::provider::responses::estimate_messages_tokens)
+                .unwrap_or(0)
+        };
         let array_len = |v: Option<&Value>| {
             v.and_then(Value::as_array)
                 .map(|a| a.len() as u64)
@@ -89,7 +94,7 @@ impl CodexTrace {
             model,
             system_tokens_est: est(system),
             tools_tokens_est: est(tools),
-            messages_tokens_est: est(messages),
+            messages_tokens_est: est_messages(messages),
             tools_count: array_len(tools),
             tools: tools_breakdown(tools),
             messages_count: array_len(messages),
