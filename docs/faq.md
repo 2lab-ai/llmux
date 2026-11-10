@@ -2,7 +2,7 @@
 
 ## I have several Claude subscriptions. How do I see what is left on each?
 
-Run `llmux login` once per account. Islands, the macOS notch app, then shows each account's 5-hour and 7-day windows with their reset timers:
+Run `llmux login` once per account. Islands, the macOS notch app, then shows each account's 7-day window with its reset timer:
 
 ```bash
 brew install --cask 2lab-ai/tap/llmux-islands

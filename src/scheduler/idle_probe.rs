@@ -49,10 +49,8 @@ pub fn windows_need_probe(
     now: SystemTime,
     stale_after: Duration,
 ) -> bool {
-    match seven_day {
-        None => true, // windowless — the original probe case
-        Some(w) => !stale_after.is_zero() && w.is_stale(now, stale_after),
-    }
+    // windowless — the original probe case — or a stale window when staleness is on
+    seven_day.is_none_or(|w| !stale_after.is_zero() && w.is_stale(now, stale_after))
 }
 
 /// Failure of a single probe send. Never carries a credential.

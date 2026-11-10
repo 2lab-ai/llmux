@@ -7,7 +7,7 @@ this lifecycle; see [SDK error mapping](provider-compatibility.md#claude-agent-s
 ## What you experience
 
 - **Selection stays within a provider group.** A Claude model is served by one of your Claude accounts, a `gpt-*` model by one of your Codex accounts. llmux never substitutes a different provider when one is exhausted; crossing providers is your explicit choice (`/model`, or a per-agent `model:` — see [multi-model-agents.md](multi-model-agents.md)).
-- **Quota is finite and perishable.** Each account has a 5-hour and a 7-day window that reset on fixed timestamps; quota left unspent at a reset is gone.
+- **Quota is finite and perishable.** Each account has a 7-day window that resets on a fixed timestamp; quota left unspent at a reset is gone.
 - **`default` spends perishable quota first.** It prefers an eligible account whose soon-to-reset quota would otherwise expire unused, but stays on the current account unless another scores clearly higher (>25%), so prompt caches survive. This is a scoring preference, not a promise to always use the soonest-expiring account.
 - **`round-robin` never switches proactively.** Fewest switches and best cache locality, at the cost of letting other accounts' quota expire.
 - **You can pin or pause an account manually** (`p` in the TUI switcher; context menu in llmux-islands). Paused accounts are never selected.
@@ -31,7 +31,7 @@ An account can be picked only when ALL of these hold — the same pure gate driv
 
 Per-account overrides: `account_limits` in the config (TUI: `L` in the switcher, `"98,98"` = 7d,fbl percents) replace either ceiling for that account.
 
-There is no 5-hour window (2026-11-10): no provider reports one any more, so llmux neither reads nor gates on it. A `five_hour` value in a usage response or a `five_hour_max` key in an older config is ignored.
+There is no 5-hour window (2026-11-10): no provider reports one any more, so llmux neither reads nor gates on it. A `five_hour` value in a usage response or a `five_hour_max` key in an older config is ignored. API-key and Grok accounts, whose per-minute token buckets used to fill that slot, are no longer throttled ahead of a 429: they react to the 429 and its `retry-after` only.
 
 **Fable scope:** Fable-family requests are additionally refused an account whose Fable weekly bucket is constraining (≥ `scheduler.fable_weekly_max`, default **0.98**, reset-aware) or Fable-cooling. Non-Fable traffic ignores Fable state entirely — a Fable-exhausted account still serves everything else. Full Fable lane mechanics: [fable-scheduling.md](fable-scheduling.md).
 
