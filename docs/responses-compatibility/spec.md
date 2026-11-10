@@ -282,8 +282,8 @@ description carries something per session (a Slack MCP tool naming the thread it
 say) gives each session its own route — one cold start per session, never per
 conversation. A per-conversation key starts every new conversation
 cold. The per-process key put every request on one route and changed on every daemon
-restart, so each restart started every conversation cold; the prefix key is derived from
-content and survives restarts.
+restart, so each restart started every conversation cold. The prefix key is derived from
+content, so the same tools give the same key across restarts.
 
 Measured after shipping (owner-mac, 2026-11-10):
 - **New conversations start warm.** A probe sends new conversations one after another
@@ -293,13 +293,19 @@ Measured after shipping (owner-mac, 2026-11-10):
   of the other 3 read 16,384. A second subagent of the same type read 4,352 of 8,974
   tokens from cache on its first request; under the per-conversation key that request was
   always cold.
-- **Sharing one route costs nothing measurable here.** On the per-process key's own
-  traffic (90 minutes, up to 32 requests a minute and 10 in flight on one key), all 42
-  next-turn pairs above 15 requests a minute were cache hits. The 8 misses came from
-  conversations idle for about 40 minutes (5) and from follow-ups sent within 12 seconds
-  (3), at 5 to 12 requests a minute. The public API's guidance to stay under about 15
-  requests a minute per key did not show up on this backend, so do not shard the prefix
-  key by conversation without new evidence: sharding would bring back the cold starts.
+- **Sharing one route cost nothing measurable in the range seen.** On the per-process
+  key's own traffic (one host, 90 minutes, up to 32 requests a minute and 12 in flight on
+  the key in use), all 42 next-turn pairs above 15 requests a minute were cache hits. Of
+  the 8 misses, 5 were turns that resumed after about 40 idle minutes with a daemon
+  restart in between, which changed the per-process key; the two causes cannot be
+  separated here. The other 3 were follow-ups sent within 5 seconds on an unchanged key.
+  All 8 came at 5 to 12 requests a minute.
+- **So do not shard the prefix key by conversation without new evidence.** The public
+  API's guidance to stay under about 15 requests a minute per key did not show up here,
+  up to 32 requests a minute, and sharding would bring back the cold starts. The prefix
+  key's own traffic so far is 5 minutes at up to 11 requests a minute, with 2 misses in
+  15 pairs. That is too little to confirm the result after the deploy, so measure again
+  if a key runs well above 32 requests a minute.
 
 The native Responses frontend
 keeps the client's own `prompt_cache_key` and routes the `session-id` header with it too.
