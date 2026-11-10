@@ -257,8 +257,10 @@ items); the local `count_tokens` estimate skips `signature` values so it is not 
 **`prompt_cache_key` and `session-id` are keyed by the shared prefix (issue #240,
 2026-11-10).** codex sends one key as both — the codex CLI's source notes that "ChatGPT
 derives cache affinity from the Responses session-id header". The key is
-`responses::prefix_cache_key`: a UUID-shaped SHA-256 over the client's `tools` (every
-`cache_control` removed), or over its `system` when it sends no tools. Every request that
+`responses::prefix_cache_key`: a UUID-shaped SHA-256 over the TRANSLATED `tools`, or over
+`instructions` when no tools are sent — what is on the wire, so a client that spells the
+same prefix differently (a string or block `system`, a tool with or without its default
+schema, `cache_control`, the billing-header line) still gets one key. Every request that
 can reuse one cached prefix — each turn of a conversation, a session's subagents, a new
 conversation with the same tool set — shares the route that holds it; different tool sets
 spread across routes.
