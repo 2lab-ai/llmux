@@ -285,7 +285,7 @@ cold. The per-process key put every request on one route and changed on every da
 restart, so each restart started every conversation cold. The prefix key is derived from
 content, so the same tools give the same key across restarts.
 
-Measured after shipping (owner-mac, 2026-11-10):
+Measured around the deploy (owner-mac, 2026-11-10):
 - **New conversations start warm.** A probe sends new conversations one after another
   through the daemon, each with the same real Claude Code system prompt and 84 tools
   (about 16,580 tokens in all). Before the deploy, under the per-conversation key, all 3
