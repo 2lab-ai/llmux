@@ -284,8 +284,11 @@ pub fn build_responses_body(
     if plan.priority_tier {
         upstream["service_tier"] = json!("priority");
     }
-    // `prompt_cache_key` is a codex cache hint: the conversation's own key
-    // (`responses::conversation_key`, spec §R4). Grok gets none — its cache
+    // `prompt_cache_key` is a codex cache hint. This writes the plan's process
+    // id as a placeholder; the codex provider overwrites it with the
+    // shared-prefix key of the translated body (`responses::prefix_cache_key`,
+    // spec §R4), and the native frontend replaces the whole body with the
+    // client's. Grok gets none — its cache
     // already hits 97.4% (2026-11-09) and cli-chat-proxy documents no routing
     // scope for the key, so there is nothing measured to gain.
     if flavor == ResponsesFlavor::Codex {
