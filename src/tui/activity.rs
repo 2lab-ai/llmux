@@ -2937,8 +2937,10 @@ mod tests {
         assert_eq!(normalize_model("sonnet"), "claude-sonnet-5-5");
         assert_eq!(normalize_model("sonnet-5-5"), "claude-sonnet-5-5");
         assert_eq!(normalize_model("sonnet-5"), "claude-sonnet-5");
-        assert_eq!(normalize_model("fable"), "claude-fable-5-1");
-        assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-1");
+        // `fable` floats to Fable 5.2 since 2026-11-10; `fable-5-1` stays.
+        assert_eq!(normalize_model("fable"), "claude-fable-5-2");
+        assert_eq!(normalize_model("fable[1m]"), "claude-fable-5-2");
+        assert_eq!(normalize_model("fable-5-2"), "claude-fable-5-2");
         assert_eq!(normalize_model("fable-5-1"), "claude-fable-5-1");
         assert_eq!(normalize_model("haiku"), "claude-haiku-5-5");
         // A superseded id is NOT an alias: a persisted 4.5 record keeps its

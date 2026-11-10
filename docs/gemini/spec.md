@@ -51,6 +51,9 @@ Out of scope: an Antigravity (`agy`) **frontend** (`llmux run --agy`). The Antig
     `/v1/responses` with its own `User-Agent` and is not affected either.
 - **Unchanged.** Gemini usage stays visible (TUI `gemini N acc` row, `llmux status` quota
   rows). Argon still needs a Google AI Ultra or Enterprise login (404 on Google AI Plus).
+  Update 2026-11-10: the Antigravity models page now lists Argon for paid Google AI Pro
+  (or a trial on eligible premium devices), Ultra and Enterprise, still not for Free or
+  Plus.
 - **Codex receipt (2026-10-15).**
   `llmux run --codex -- exec -m gemini 'Reply with exactly the word: pong'` → `pong`;
   activity `/v1/responses group=gemini model=gemini-3.8-flash-high status=200`.
@@ -75,7 +78,7 @@ predate this decision and are kept as the design record.
 | Thought signature rule | turn 2 with the real signature → 200; with `"skip_thought_signature_validator"` → 200; with none → **400** `Function call is missing a thought_signature in functionCall parts…` | live 3-variant probe 2026-10-15 |
 | Tool schema | `functionDeclarations[].parametersJsonSchema` accepted a JSON Schema with `additionalProperties:false` | live probe 2026-10-15 |
 | Model catalog + quota | `POST {base}/v1internal:fetchAvailableModels {"project"}` → `models{id:{displayName,maxTokens,maxOutputTokens,quotaInfo{remainingFraction,resetTime?},…}}`, `defaultAgentModelId` | live 2026-10-15: `gemini-3.8-flash-{high,medium,low}` ctx 1,048,576 / out 65,536, `quotaInfo {remainingFraction:1, resetTime:2026-10-22T01:50:24Z}`; `defaultAgentModelId = gemini-3.8-flash-high` |
-| Argon availability | Ultra / Enterprise only; this account lists `gemini-4-argon-disabled` ("Unavailable", `quotaInfo:null`); `gemini-4-argon` → **404 NOT_FOUND** | [Antigravity models page](https://antigravity.google/docs/models/) (fetched 2026-10-15); live probe 2026-10-15 |
+| Argon availability | Ultra / Enterprise only (2026-10-15); this account lists `gemini-4-argon-disabled` ("Unavailable", `quotaInfo:null`); `gemini-4-argon` → **404 NOT_FOUND**. **2026-11-10:** paid Google AI Pro (or a trial on eligible premium devices), Ultra and Enterprise — not Free or Plus. Third-party reports of `gemini-4-argon-{high,medium,low}` ids and a User-Agent gate are unverified ([#244](https://github.com/2lab-ai/llmux/issues/244)) | [Antigravity models page](https://antigravity.google/docs/models/) (fetched 2026-10-15 and 2026-11-10); live probe 2026-10-15 |
 | Context / output | `gemini-3.8-flash`: 1,048,576 in / 65,536 out; `gemini-4-argon`: 1,048,576 unified, 65,536 out by default | [3.8 Flash page](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) (updated 2026-09-02); [Argon page](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon) (updated 2026-10-14) |
 | Pricing (API list, for cost display only) | 3.8 Flash $0.75 in / $3.75 out / $0.075 cached (through 2026-12-31, then doubles); Argon $2 / $10 / $0.10 (through 2026-11-30, then doubles) | [pricing page](https://ai.google.dev/gemini-api/docs/pricing) (updated 2026-10-14) |
 | 429 shapes | `error.status = RESOURCE_EXHAUSTED`; `error.details[]` carries `google.rpc.RetryInfo.retryDelay` and `google.rpc.ErrorInfo.reason` (`QUOTA_EXHAUSTED` = window spent, `RATE_LIMIT_EXCEEDED` = burst) | `antigravity_executor_credits.go:226-282` |

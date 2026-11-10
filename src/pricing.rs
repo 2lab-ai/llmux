@@ -17,7 +17,10 @@
 //! https://platform.claude.com/docs/en/about-claude/pricing. Gemini 3.8 Flash
 //! and Gemini 4 Argon from https://ai.google.dev/gemini-api/docs/pricing
 //! (updated 2026-10-14). gpt-5.6-terra and grok-4.5 corrected 2026-10-23
-//! against their model pages (see the rows).
+//! against their model pages (see the rows). Fable 5.2 from
+//! https://platform.claude.com/docs/en/about-claude/pricing and
+//! gpt-6.1-terra from https://developers.openai.com/api/docs/models/gpt-6.1-terra
+//! (and the pricing page), both read 2026-11-10.
 
 use std::collections::HashMap;
 
@@ -84,13 +87,20 @@ const HAIKU_5_5: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
 const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// Fable 5.1 cache reads are $0.25 (official pricing, read 2026-10-08).
 const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
+/// Fable 5.2 (released 2026-11-09; official pricing, read 2026-11-10): $8 in /
+/// $40 out / $0.20 cache read / $10 cache write (5m). 1h writes ($16) are not
+/// modeled; there is no long-context tier. CHEAPER than Fable 5 / 5.1, so it
+/// must NOT fall to the `claude-fable-` prefix fallback.
+const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 0.0}. Codex has no cache-creation charge. Also the
 /// `group == "codex"` unknown-model fallback.
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 /// gpt-5.6-sol (flagship, 2026-07-09 launch). developers.openai.com pricing,
 /// read 2026-10-06: $4 in / $0.40 cached / $5 cache write / $20 out
-/// ("promotional pricing … at least through November 21, 2026"). Corrected
+/// ("promotional pricing … at least through November 21, 2026"; the page
+/// read 2026-11-10 says "until November 30, 2026", post-promo price not
+/// published). Corrected
 /// from the launch-era $5/$30 row; OpenAI now lists a cache-write rate, so
 /// the "codex has no cache-creation charge" convention no longer holds for
 /// the rows re-read on 2026-10-06.
@@ -113,6 +123,14 @@ const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// default). OpenAI pricing page, read 2026-10-06 (standard, ≤272k input):
 /// $2 in / $0.10 cached / $2.50 cache write / $10 out.
 const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5);
+/// gpt-6.1-terra (released 2026-10-26; generation 6.1's mid tier).
+/// developers.openai.com model page and pricing page, read 2026-11-10
+/// (standard, ≤272k input): $1 in / $0.05 cached / $1.25 cache write
+/// (30-minute retention) / $5 out — half of 6.1-sol, so it must NOT fall to
+/// the `gpt-6.1-` prefix branch. Not modeled: above 272K input tokens the
+/// whole request bills at 2x input and cache rates and 1.5x output, and the
+/// 12-hour cache-write rate ($2.50).
+const GPT_6_1_TERRA: ModelPrice = ModelPrice::new(1.0, 5.0, 0.05, 1.25);
 /// gpt-6-sol (released 2026-09-22). developers.openai.com model page, read
 /// 2026-10-06: $2 in / $0.20 cached / $2.50 cache write / $10 out (absent
 /// from the pricing page's flagship table; the model page carries the rates).
@@ -160,8 +178,10 @@ const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
 const GEMINI_3_8_FLASH: ModelPrice = ModelPrice::new(0.75, 3.75, 0.075, 0.0);
 /// Gemini 4 Argon (same page, updated 2026-10-14): $2 in / $10 out / $0.10
 /// cached input, no cache-write rate — introductory rates valid through
-/// 2026-11-30 (they double after). API-list-price-equivalent estimate, like
-/// the Flash row.
+/// 2026-11-30. From 2026-12-01 they double to $4 in / $20 out / $0.20 cached
+/// (aistudio.google.com/docs/pricing, re-read 2026-11-10); that change is not
+/// modeled, so from that date this row shows half the list price.
+/// API-list-price-equivalent estimate, like the Flash row.
 const GEMINI_4_ARGON: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
@@ -180,6 +200,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-haiku-5-5" => Some(HAIKU_5_5),
         // Records from before the 2026-10-23 float (accounting never floats).
         "claude-haiku-4-5" => Some(HAIKU_TIER),
+        "claude-fable-5-2" => Some(FABLE_5_2),
         "claude-fable-5-1" => Some(FABLE_5_1),
         "claude-fable-5" => Some(FABLE_TIER),
         "gpt-5.5" => Some(GPT_5_5),
@@ -190,6 +211,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-6-sol" => Some(GPT_6_SOL),
         "gpt-6-luna" => Some(GPT_6_LUNA),
         "gpt-6.1" | "gpt-6.1-sol" => Some(GPT_6_1_SOL),
+        "gpt-6.1-terra" => Some(GPT_6_1_TERRA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
         "grok-4.6" => Some(GROK_4_6),
@@ -244,6 +266,11 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(HAIKU_5_5)
     } else if model_norm_lower.starts_with("claude-haiku-") {
         Some(HAIKU_TIER)
+    } else if model_norm_lower.starts_with("claude-fable-5-2-") {
+        // Fable 5.2 is CHEAPER than the Fable tier, so a dated snapshot must
+        // be caught before `claude-fable-` overcharges it. The trailing `-` is
+        // the version boundary: `claude-fable-5-20-*` must miss this branch.
+        Some(FABLE_5_2)
     } else if model_norm_lower.starts_with("claude-fable-5-1-") {
         Some(FABLE_5_1)
     } else if model_norm_lower.starts_with("claude-fable-") {
@@ -262,9 +289,14 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
         // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.1-terra-") {
+        // Terra is half sol's price, so a dated / suffixed terra id must be
+        // caught before the `gpt-6.1-` branch below overcharges it.
+        Some(GPT_6_1_TERRA)
     } else if model_norm_lower.starts_with("gpt-6.1-") {
-        // Generation 6.1 has one tier (sol); `gpt-6.10-*` must miss this
-        // branch, hence the required `-`.
+        // Sol is generation 6.1's flagship, so it is the `gpt-6.1-` default
+        // (terra has its own exact and prefix rows above). `gpt-6.10-*` must
+        // miss this branch, hence the required `-`.
         Some(GPT_6_1_SOL)
     } else if model_norm_lower.starts_with("gpt-6-astra-") {
         Some(GPT_6_ASTRA)
@@ -472,7 +504,12 @@ mod tests {
             ("claude-sonnet-5", 0.20),
             ("claude-sonnet-5-20260701", 0.20),
             ("claude-sonnet-5-50-20261007", 0.20),
-            ("fable", 0.25),
+            // `fable` floats to Fable 5.2 since 2026-11-10 ($0.20 cache
+            // read); the version alias and the 5.1 ids keep 5.1's $0.25.
+            ("fable", 0.20),
+            ("fable-5-2", 0.20),
+            ("fable-5-1", 0.25),
+            ("claude-fable-5-1", 0.25),
             ("claude-fable-5-1-20260901", 0.25),
             ("claude-fable-5", 1.0),
             ("claude-fable-5-10-20261007", 1.0),
@@ -1038,6 +1075,90 @@ mod tests {
         assert_eq!(builtin_price("gpt-6.10-sol"), None);
         // The bare `gpt-6-` prefix still means astra.
         assert_eq!(builtin_price("gpt-6-terra-x"), Some(GPT_6_ASTRA));
+    }
+
+    #[test]
+    fn fable_5_2_takes_its_own_rates_not_the_fable_tier() {
+        // Fable 5.2 (pricing page, read 2026-11-10): $8 in / $40 out / $0.20
+        // cache read / $10 cache write (5m). The `fable` alias, the version
+        // alias, the `[1m]` catalog id and a dated snapshot all price here.
+        let fable_5_2 = ModelPrice::new(8.0, 40.0, 0.20, 10.0);
+        for model in [
+            "claude-fable-5-2",
+            "claude-fable-5-2[1m]",
+            "CLAUDE-FABLE-5-2",
+            "fable",
+            "fable[1m]",
+            "fable-5-2",
+            "claude-fable-5-2-20261109",
+        ] {
+            assert_eq!(
+                price_for("claude", model, &empty()),
+                Some(fable_5_2),
+                "{model}"
+            );
+        }
+        for (tokens, expected) in [
+            (tc(1_000_000, 0, None, None), 8.0),
+            (tc(0, 1_000_000, None, None), 40.0),
+            (tc(0, 0, Some(1_000_000), None), 0.20),
+            (tc(0, 0, None, Some(1_000_000)), 10.0),
+        ] {
+            approx(
+                cost_usd("claude", "claude-fable-5-2", &tokens, &empty()),
+                expected,
+            );
+        }
+        // Version boundary: `claude-fable-5-20-*` and `claude-fable-5-2x` are
+        // different models and must NOT take 5.2 rates — they fall to the
+        // Fable tier, like any unknown Fable id.
+        assert_eq!(
+            builtin_price("claude-fable-5-20-20261109"),
+            Some(FABLE_TIER)
+        );
+        assert_eq!(builtin_price("claude-fable-5-20"), Some(FABLE_TIER));
+        assert_eq!(builtin_price("claude-fable-5-2x"), Some(FABLE_TIER));
+        // Fable 5.1 keeps its own row, exact and dated.
+        assert_eq!(builtin_price("claude-fable-5-1"), Some(FABLE_5_1));
+        assert_eq!(builtin_price("claude-fable-5-1-20260901"), Some(FABLE_5_1));
+    }
+
+    #[test]
+    fn gpt_6_1_terra_takes_its_own_rates_not_sol() {
+        // gpt-6.1-terra (model page + pricing page, read 2026-11-10; standard,
+        // ≤272k input): $1 in / $0.05 cached / $1.25 cache write (30m) / $5
+        // out. Exact, `[1m]` and dated ids price here, not at 6.1-sol.
+        for model in [
+            "gpt-6.1-terra",
+            "gpt-6.1-terra[1m]",
+            "GPT-6.1-TERRA",
+            "gpt-6.1-terra-20261026",
+        ] {
+            assert_eq!(
+                price_for("codex", model, &empty()),
+                Some(GPT_6_1_TERRA),
+                "{model}"
+            );
+        }
+        for (tokens, expected) in [
+            (tc(1_000_000, 0, None, None), 1.0),
+            (tc(0, 1_000_000, None, None), 5.0),
+            (tc(0, 0, Some(1_000_000), None), 0.05),
+            (tc(0, 0, None, Some(1_000_000)), 1.25),
+        ] {
+            approx(
+                cost_usd("codex", "gpt-6.1-terra", &tokens, &empty()),
+                expected,
+            );
+        }
+        // Sol keeps the `gpt-6.1-` default: a terra look-alike without the
+        // `-` boundary is not terra, and `gpt-6.10-terra` is not 6.1 at all.
+        assert_eq!(builtin_price("gpt-6.1-terrax"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.1-sol"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.1"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.10-terra"), None);
+        // The 5.6 terra row is unchanged.
+        assert_eq!(builtin_price("gpt-5.6-terra"), Some(GPT_5_6_TERRA));
     }
 
     #[test]
