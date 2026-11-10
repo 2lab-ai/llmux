@@ -96,11 +96,11 @@ impl CodexShape {
 /// shape (model/fast/effort), and a per-process fallback id.
 ///
 /// Every translated request sends ONE key as both `session-id` and
-/// `prompt_cache_key`: the conversation's own key
-/// ([`responses::conversation_key`]), stable across its turns and distinct
-/// from every other conversation — the codex CLI's policy, whose source notes
-/// that ChatGPT derives cache affinity from the `session-id` header. The
-/// per-process id is used only for a body with no message to key on.
+/// `prompt_cache_key` — the codex CLI's source notes that ChatGPT derives cache
+/// affinity from the `session-id` header. The key is the request's shared
+/// prefix ([`responses::prefix_cache_key`]: its tools, else its system), so
+/// requests that can reuse one cached prefix share a route. The per-process id
+/// remains the native Responses frontend's fallback.
 ///
 /// The shape is behind an `RwLock` so the dashboard can toggle fast/model/
 /// effort on a running daemon (req8.1) without a restart: requests take a
@@ -201,8 +201,7 @@ impl CodexProvider {
         let body: Value = serde_json::from_slice(anthropic_body).map_err(|err| {
             ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
         })?;
-        let cache_key =
-            responses::conversation_key(&body).unwrap_or_else(|| self.session_id.clone());
+        let cache_key = responses::prefix_cache_key(&body);
         let (upstream_body, client_stream) = translate_request_with(&body, &cache_key, shape)?;
 
         let mut headers = HeaderMap::new();
@@ -1433,18 +1432,18 @@ mod tests {
         assert_eq!(sent["model"], CODEX_MODEL);
         assert_eq!(sent["prompt_cache_key"], session, "cache key = session id");
         assert_eq!(
-            Some(session),
-            responses::conversation_key(&body).as_deref(),
-            "both carry the conversation's own key"
+            session,
+            responses::prefix_cache_key(&body),
+            "both carry the prefix key"
         );
     }
 
-    /// #240: one key per CONVERSATION, not per daemon. Every turn of a
-    /// conversation sends the same `session-id` / `prompt_cache_key`; a second
-    /// conversation in the same Claude Code session (a subagent: same session
-    /// id, different first message) gets its own.
+    /// #240: one key per shared PREFIX. Every turn of a conversation, and every
+    /// other conversation with the same tool set (a subagent, a new session),
+    /// sends the same `session-id` / `prompt_cache_key`, so they can reuse one
+    /// cached prefix; another tool set gets another key.
     #[test]
-    fn build_request_keys_the_cache_per_conversation() {
+    fn build_request_keys_the_cache_by_the_shared_prefix() {
         let provider = CodexProvider::new("https://chatgpt.example/backend-api/codex");
         let keys = |body: &Value| {
             let (req, _) = provider
@@ -1458,27 +1457,26 @@ mod tests {
             assert_eq!(sent["prompt_cache_key"], header.as_str());
             header
         };
-        let user_id = r#"{"device_id":"d","account_uuid":"","session_id":"sess-a"}"#;
-        let turn1 = json!({"metadata": {"user_id": user_id}, "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "task one",
-                                           "cache_control": {"type": "ephemeral"}}]},
+        let tools = json!([{"name": "read", "input_schema": {"type": "object"}}]);
+        let turn1 = json!({"tools": tools, "system": "main", "messages": [
+            {"role": "user", "content": "task one"},
         ]});
-        let turn2 = json!({"metadata": {"user_id": user_id}, "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "task one"}]},
+        let turn2 = json!({"tools": tools, "system": "main", "messages": [
+            {"role": "user", "content": "task one"},
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "next"},
         ]});
-        let subagent = json!({"metadata": {"user_id": user_id}, "messages": [
+        let subagent = json!({"tools": tools, "system": "a subagent", "messages": [
             {"role": "user", "content": "task two"},
         ]});
-        let other_session = json!({"metadata": {"user_id":
-            r#"{"device_id":"d","account_uuid":"","session_id":"sess-b"}"#}, "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "task one"}]},
+        let other_tools = json!({"tools": [{"name": "write", "input_schema": {"type": "object"}}],
+                                 "system": "main", "messages": [
+            {"role": "user", "content": "task one"},
         ]});
         let key = keys(&turn1);
         assert_eq!(keys(&turn2), key, "a later turn keeps the key");
-        assert_ne!(keys(&subagent), key, "a sibling conversation gets its own");
-        assert_ne!(keys(&other_session), key, "another session gets its own");
+        assert_eq!(keys(&subagent), key, "same tools: one shared route");
+        assert_ne!(keys(&other_tools), key, "another tool set gets its own");
         assert_ne!(key, provider.session_id, "never the per-process id");
     }
 

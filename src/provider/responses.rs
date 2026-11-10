@@ -69,9 +69,9 @@ pub struct RequestPlan<'a> {
     pub priority_tier: bool,
     /// `include: ["reasoning.encrypted_content"]` (OpenAI-specific; grok off).
     pub include_encrypted_reasoning: bool,
-    /// Sent as `prompt_cache_key` (codex only): the per-conversation key from
-    /// [`conversation_key`], so one conversation keeps one cache route across
-    /// its turns. A cache hint, not conversation state.
+    /// Sent as `prompt_cache_key` (codex only): the prefix key from
+    /// [`prefix_cache_key`], shared by every request that can share a cached
+    /// prefix. A cache hint, not conversation state.
     pub session_id: &'a str,
 }
 
@@ -297,52 +297,57 @@ pub fn requests_thinking(body: &Value) -> bool {
     )
 }
 
-/// Per-conversation cache key: a UUID-shaped SHA-256 over Claude Code's
-/// session id (`metadata.user_id` → `session_id`, or the raw `user_id` when it
-/// is not that JSON) and the conversation's FIRST message, with every
-/// `cache_control` marker removed (Claude Code moves them turn to turn).
+/// The cache routing key for a request: a UUID-shaped SHA-256 over the start of
+/// the prompt it will share with other requests — the client's `tools` (every
+/// `cache_control` marker removed), or its `system` when it sends no tools.
 ///
-/// Both inputs stay fixed while a conversation grows, so every turn of one
-/// conversation gets the same key, and two conversations — a session's main
-/// thread and each of its subagents, which share the session id but not the
-/// first message — get different ones. That is the codex CLI's own policy
-/// (one key per thread, sent as both `prompt_cache_key` and `session-id`).
-/// Measured on owner-mac raw-io, 2026-11-10: 133 of 133 requests that
-/// continued an earlier one kept its key. `None` when there is no message.
-pub fn conversation_key(body: &Value) -> Option<String> {
+/// The backend caches the rendered prefix tools → instructions → input, and
+/// `prompt_cache_key` / `session-id` pick the route that holds it. Keying by
+/// the prefix gives every request that CAN share a cached prefix the same
+/// route — a session's main thread, its subagents, a new conversation with the
+/// same tool set — while one conversation keeps its key on every turn (its
+/// tools do not change) and different tool sets spread across routes.
+///
+/// Measured on the live codex gateway, 2026-11-10 (spec §R4): a new
+/// conversation under its OWN key read 0 of a 17K-token shared prefix from
+/// cache (3/3); under the shared key it read 16,896 (3/3). Same tools with
+/// different instructions: 16,640 of 16,845 cached under a shared key, 0
+/// under its own — the tools part is shared before the instructions differ.
+/// A per-conversation key (#275) therefore threw that prefix away.
+pub fn prefix_cache_key(body: &Value) -> String {
     use sha2::{Digest as _, Sha256};
-    let first = body.get("messages")?.as_array()?.first()?;
-    let session = body
-        .pointer("/metadata/user_id")
-        .and_then(Value::as_str)
-        .map(|user_id| {
-            serde_json::from_str::<Value>(user_id)
-                .ok()
-                .and_then(|id| id.get("session_id")?.as_str().map(str::to_string))
-                .unwrap_or_else(|| user_id.to_string())
-        })
-        .unwrap_or_default();
+    let tools = body
+        .get("tools")
+        .filter(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
     let mut hasher = Sha256::new();
-    hasher.update(b"llmux-conversation-key-v1\0");
-    hasher.update(session.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(without_cache_control(first).to_string().as_bytes());
+    hasher.update(b"llmux-prefix-key-v1\0");
+    match tools {
+        Some(tools) => {
+            hasher.update(b"tools\0");
+            hasher.update(without_cache_control(tools).to_string().as_bytes());
+        }
+        None => {
+            hasher.update(b"system\0");
+            let system = body.get("system").unwrap_or(&Value::Null);
+            hasher.update(without_cache_control(system).to_string().as_bytes());
+        }
+    }
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    // RFC 9562 version 8 (custom) + variant bits: a well-formed UUID, which is
-    // what the codex CLI sends in both places.
+    // RFC 9562 version 8 (custom) + variant bits: a well-formed UUID, the
+    // shape the codex CLI sends in both places.
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Some(format!(
+    format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
         &hex[16..20],
         &hex[20..32]
-    ))
+    )
 }
 
 /// `value` with every `cache_control` key removed, at any depth.
@@ -1547,51 +1552,46 @@ mod tests {
         );
     }
 
-    /// #240's key: UUID-shaped, stable while the conversation grows and while
-    /// `cache_control` markers move, distinct per session and per first
-    /// message, absent without a message.
+    /// The prefix key: UUID-shaped; the same for every request that shares the
+    /// tool set (any conversation, session, instructions or turn, wherever
+    /// `cache_control` sits); different for another tool set; keyed by
+    /// `system` when no tools are sent.
     #[test]
-    fn conversation_key_is_stable_per_conversation() {
-        let uid = |session: &str| {
-            json!(format!(
-                r#"{{"device_id":"d","account_uuid":"","session_id":"{session}"}}"#
-            ))
+    fn prefix_cache_key_follows_the_shared_prefix() {
+        let tool = |name: &str| json!({"name": name, "input_schema": {"type": "object"}});
+        let body = |tools: Value, system: &str, first: &str| {
+            json!({"tools": tools, "system": system,
+                   "metadata": {"user_id": first},
+                   "messages": [{"role": "user", "content": first}]})
         };
-        let first = json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
-        let mut marked = first.clone();
-        marked["content"][0]["cache_control"] = json!({"type": "ephemeral"});
-        let key = |user_id: Value, messages: Value| {
-            conversation_key(&json!({"metadata": {"user_id": user_id}, "messages": messages}))
-        };
-        let a = key(uid("s1"), json!([first])).expect("key");
-        assert_eq!(a.len(), 36);
-        assert_eq!(a.matches('-').count(), 4);
-        assert_eq!(&a[14..15], "8", "RFC 9562 version 8");
-        assert_eq!(
-            key(
-                uid("s1"),
-                json!([marked, {"role": "assistant", "content": "x"}])
+        let key = prefix_cache_key(&body(json!([tool("a"), tool("b")]), "main", "one"));
+        assert_eq!(key.len(), 36);
+        assert_eq!(key.matches('-').count(), 4);
+        assert_eq!(&key[14..15], "8", "RFC 9562 version 8");
+        let mut marked = json!([tool("a"), tool("b")]);
+        marked[1]["cache_control"] = json!({"type": "ephemeral"});
+        for same in [
+            body(
+                json!([tool("a"), tool("b")]),
+                "subagent persona",
+                "another task",
             ),
-            Some(a.clone()),
-            "later turn, moved cache_control"
-        );
+            body(marked, "main", "one"),
+        ] {
+            assert_eq!(prefix_cache_key(&same), key, "{same}");
+        }
         assert_ne!(
-            key(uid("s2"), json!([first])),
-            Some(a.clone()),
-            "other session"
+            prefix_cache_key(&body(json!([tool("a")]), "main", "one")),
+            key,
+            "another tool set"
         );
-        assert_ne!(
-            key(uid("s1"), json!([{"role": "user", "content": "other"}])),
-            Some(a.clone()),
-            "other first message"
+        let no_tools = |system: &str| prefix_cache_key(&json!({"system": system, "messages": []}));
+        assert_eq!(
+            no_tools("s1"),
+            prefix_cache_key(&body(json!([]), "s1", "x"))
         );
-        assert_ne!(key(json!("raw-user-id"), json!([first])), Some(a.clone()));
-        assert!(
-            conversation_key(&json!({"messages": [first]})).is_some(),
-            "no metadata"
-        );
-        assert_eq!(conversation_key(&json!({"messages": []})), None);
-        assert_eq!(conversation_key(&json!({})), None);
+        assert_ne!(no_tools("s1"), no_tools("s2"));
+        assert_ne!(no_tools("s1"), key);
     }
 
     #[test]

@@ -254,17 +254,32 @@ the same as the codex CLI, which replays every reasoning item, and as Claude its
 `keep: "all"`. The ciphertext is ~8K characters per turn (median 7,928 over 91 codex
 items); the local `count_tokens` estimate skips `signature` values so it is not inflated.
 
-**`prompt_cache_key` and `session-id` are per conversation (issue #240, 2026-11-10).** codex
-sends one key as both: `responses::conversation_key`, a UUID-shaped SHA-256 over Claude
-Code's session id (`metadata.user_id` → `session_id`) and the conversation's first message
-with every `cache_control` removed. Every turn of one conversation keeps the key; the main
-thread and each subagent get their own. That is the codex CLI's policy — its source notes
-that "ChatGPT derives cache affinity from the Responses session-id header" — where llmux
-used to send one id per daemon process for every conversation. On owner-mac raw-io
-(2026-11-10, 183 codex/grok requests), 133 of 133 requests that continued an earlier one
-kept its key. The native Responses frontend keeps the client's own `prompt_cache_key` and
-now routes the `session-id` header with it too. Grok still sends no `prompt_cache_key`:
-its cache hit rate is already 97.4% (2026-11-09), so there is no measured need.
+**`prompt_cache_key` and `session-id` are keyed by the shared prefix (issue #240,
+2026-11-10).** codex sends one key as both — the codex CLI's source notes that "ChatGPT
+derives cache affinity from the Responses session-id header". The key is
+`responses::prefix_cache_key`: a UUID-shaped SHA-256 over the client's `tools` (every
+`cache_control` removed), or over its `system` when it sends no tools. Every request that
+can reuse one cached prefix — each turn of a conversation, a session's subagents, a new
+conversation with the same tool set — shares the route that holds it; different tool sets
+spread across routes.
+
+Why the prefix and not the conversation. Before, llmux sent one id per daemon process. A
+first fix (#275) sent one key per conversation, the codex CLI's per-thread policy; after it
+shipped, the next-turn cache ratio on owner-mac fell from 0.901 to 0.821 on codex
+(27 minutes against the 90 before), with every low-cache pair keeping its full prefix. A
+controlled A/B on the live codex gateway (2026-11-10) found the cause:
+
+| New request | under its own key | under the shared key |
+| --- | --- | --- |
+| same 17K-token instructions prefix, no tools | 0 / 17,127 cached (3/3) | 16,896 / 17,127 (3/3) |
+| same 60 tools (~16.6K tokens), different instructions | 0 / 16,845 (2/2) | 16,640 / 16,845 (2/2) |
+
+So the backend reuses a cached prefix only on the route the key picks, and tools precede
+the instructions in that prefix. A per-conversation key starts every new conversation
+cold; the per-process key put every request on one route. The native Responses frontend
+keeps the client's own `prompt_cache_key` and routes the `session-id` header with it too.
+Grok still sends no `prompt_cache_key`: its cache hit rate is already 97.4%
+(2026-11-09), so there is no measured need.
 
 ### R5 — the report
 
