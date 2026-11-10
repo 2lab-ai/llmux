@@ -178,14 +178,13 @@ final class DashboardAnalyticsTests: XCTestCase {
     // MARK: - Health warning (U11/U13): auth_failed OR quota > 90%
 
     func testQuotaRule() {
-        XCTAssertTrue(DashboardHealth.isOverQuota(fiveHour: 0.91, sevenDay: nil, fableUtilization: nil, fableConstraining: nil))
-        XCTAssertTrue(DashboardHealth.isOverQuota(fiveHour: nil, sevenDay: 0.95, fableUtilization: nil, fableConstraining: nil))
+        XCTAssertTrue(DashboardHealth.isOverQuota(sevenDay: 0.95, fableUtilization: nil, fableConstraining: nil))
         // Exactly 90% is NOT "> 90%".
-        XCTAssertFalse(DashboardHealth.isOverQuota(fiveHour: 0.9, sevenDay: 0.9, fableUtilization: nil, fableConstraining: nil))
+        XCTAssertFalse(DashboardHealth.isOverQuota(sevenDay: 0.9, fableUtilization: nil, fableConstraining: nil))
         // Scoped Fable weekly counts only while the daemon marks it constraining.
-        XCTAssertTrue(DashboardHealth.isOverQuota(fiveHour: nil, sevenDay: nil, fableUtilization: 0.95, fableConstraining: true))
-        XCTAssertFalse(DashboardHealth.isOverQuota(fiveHour: nil, sevenDay: nil, fableUtilization: 0.95, fableConstraining: false))
-        XCTAssertFalse(DashboardHealth.isOverQuota(fiveHour: nil, sevenDay: nil, fableUtilization: 0.95, fableConstraining: nil))
+        XCTAssertTrue(DashboardHealth.isOverQuota(sevenDay: nil, fableUtilization: 0.95, fableConstraining: true))
+        XCTAssertFalse(DashboardHealth.isOverQuota(sevenDay: nil, fableUtilization: 0.95, fableConstraining: false))
+        XCTAssertFalse(DashboardHealth.isOverQuota(sevenDay: nil, fableUtilization: 0.95, fableConstraining: nil))
     }
 
     func testHealthSummaryFromDashboardFixture() throws {
@@ -206,7 +205,7 @@ final class DashboardAnalyticsTests: XCTestCase {
         let json = """
         [{"name": "claude:a@example.com", "type": "oauth", "status": "auth_failed"},
          {"name": "claude:b@example.com", "type": "oauth", "status": "active",
-          "five_hour": {"utilization": 0.2}, "seven_day": {"utilization": 0.3}}]
+          "seven_day": {"utilization": 0.3}}]
         """
         let records = try JSONDecoder().decode([LlmuxAccountRecord].self, from: Data(json.utf8))
         let summary = DashboardHealth.summary(records: records)
@@ -217,43 +216,39 @@ final class DashboardAnalyticsTests: XCTestCase {
         XCTAssertEqual(DashboardHealth.bannerText(summary), "1 account auth failed")
     }
 
-    // MARK: - Displayed quota windows: no 5h (owner 2026-11-04)
+    // MARK: - Displayed quota windows (no 5h window since 2026-11-10)
 
     private struct Usage: CompactUsageInput {
-        var fiveHourPercent: Double?
         var sevenDayPercent: Double?
         var fableWeeklyPercent: Double?
         var fableWeeklyConstraining: Bool?
     }
 
-    func testCompactGaugesNeverDrawFiveHour() {
-        // A reported 5h window (95% used) draws no gauge; 7d and Fab do.
+    func testCompactGaugesDrawSevenDayAndFable() {
         let usage = Usage(
-            fiveHourPercent: 95, sevenDayPercent: 31,
+            sevenDayPercent: 31,
             fableWeeklyPercent: 82, fableWeeklyConstraining: false
         )
         let gauges = CompactUsageGauges.gauges(usage, showFable: true)
         XCTAssertEqual(gauges.map(\.id), ["7d", "Fab"])
         XCTAssertEqual(gauges.first?.usedFraction ?? 0, 0.31, accuracy: 1e-9)
         XCTAssertEqual(CompactUsageGauges.gauges(usage, showFable: false).map(\.id), ["7d"])
-        // Only a 5h window reported: no gauge at all.
-        XCTAssertTrue(CompactUsageGauges.gauges(Usage(fiveHourPercent: 40), showFable: true).isEmpty)
-        // The status dot keeps its old rule: an undrawn 5h window at ≥ 90%
-        // still warns (the scheduler still gates on it), a calm one does not.
-        XCTAssertTrue(CompactUsageGauges.warning(usage, showFable: true))
-        XCTAssertFalse(CompactUsageGauges.warning(Usage(fiveHourPercent: 40, sevenDayPercent: 31), showFable: true))
+        // Nothing reported: no gauge at all.
+        XCTAssertTrue(CompactUsageGauges.gauges(Usage(), showFable: true).isEmpty)
+        // The status dot warns only on a drawn gauge at its warning level.
+        XCTAssertFalse(CompactUsageGauges.warning(usage, showFable: true))
         XCTAssertTrue(CompactUsageGauges.warning(Usage(sevenDayPercent: 92), showFable: true))
     }
 
     func testQuotaSummaryNeverShowsFiveHour() throws {
         let dash = try JSONDecoder().decode(LlmuxDashboard.self, from: Data(DashboardFixtures.full.utf8))
         let user1 = try XCTUnwrap(dash.accounts.first { $0.name == "claude:user1@example.com" })
-        XCTAssertNotNil(user1.fiveHour, "the fixture reports a 5h window")
         XCTAssertEqual(user1.quotaSummary, "7d 61% · Fab 91%")
         for account in dash.accounts {
             XCTAssertFalse(account.quotaSummary?.contains("5h") ?? false, account.name)
         }
-        // An account reporting only a 5h window has no summary (cold).
+        // An older daemon's account reporting only a 5h window has no
+        // summary (cold): the field is not decoded any more.
         let json = #"{"name": "claude:x@example.com", "type": "oauth", "five_hour": {"utilization": 0.2}}"#
         let only5h = try JSONDecoder().decode(LlmuxDashboardAccount.self, from: Data(json.utf8))
         XCTAssertNil(only5h.quotaSummary)

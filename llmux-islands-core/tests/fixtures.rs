@@ -33,10 +33,11 @@ fn current_fixture_derives_accounts_gauges_and_activity_without_reordering() {
     assert_eq!(state.usage.accounts[0].display_name, "a***@example.com");
     assert_eq!(state.usage.accounts[0].provider, Provider::Claude);
     assert!(state.usage.accounts[0].current);
-    assert_eq!(state.usage.accounts[0].gauges.len(), 3);
+    assert_eq!(state.usage.accounts[0].gauges.len(), 2);
+    assert_eq!(state.usage.accounts[0].gauges[0].kind, GaugeKind::SevenDay);
     assert_eq!(
         state.usage.accounts[0].gauges[0].resets_at,
-        Some(2_000_000_000_000),
+        Some(2_000_003_600_000),
         "semantic UI timestamps use epoch milliseconds"
     );
     assert_eq!(state.window.provider_in_flight.get("claude"), Some(&2));

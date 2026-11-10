@@ -138,7 +138,7 @@ enum StatsSection: String, CaseIterable {
 
 /// The U11/U13 health-warning rule — ONE source for the banner and the
 /// closed-island warning color: any account `status == "auth_failed"` OR any
-/// quota > 90%. "Quota" = the account-wide 5h/7d windows; the scoped Fable
+/// quota > 90%. "Quota" = the account-wide 7d window; the scoped Fable
 /// weekly window counts only while the daemon marks it `constraining` (it is
 /// scoped to Fable models, and `constraining` is the reset-aware bool the
 /// tiles already key red off — a stale 91% that constrains nothing must not
@@ -155,10 +155,9 @@ enum DashboardHealth {
     }
 
     static func isOverQuota(
-        fiveHour: Double?, sevenDay: Double?,
+        sevenDay: Double?,
         fableUtilization: Double?, fableConstraining: Bool?
     ) -> Bool {
-        if let fiveHour, fiveHour > quotaThreshold { return true }
         if let sevenDay, sevenDay > quotaThreshold { return true }
         if let fableUtilization, fableUtilization > quotaThreshold, fableConstraining == true {
             return true
@@ -173,7 +172,6 @@ enum DashboardHealth {
             if account.status == "auth_failed" {
                 result.authFailed += 1
             } else if isOverQuota(
-                fiveHour: account.fiveHour?.utilization,
                 sevenDay: account.sevenDay?.utilization,
                 fableUtilization: account.fableWeekly?.utilization,
                 fableConstraining: account.fableWeekly?.constraining
@@ -193,7 +191,6 @@ enum DashboardHealth {
             if record.status == "auth_failed" {
                 result.authFailed += 1
             } else if isOverQuota(
-                fiveHour: record.fiveHour?.utilization,
                 sevenDay: record.sevenDay?.utilization,
                 fableUtilization: record.fableWeekly?.utilization,
                 fableConstraining: record.fableWeekly?.constraining
@@ -217,12 +214,11 @@ enum DashboardHealth {
     }
 }
 
-// MARK: - Displayed quota windows (owner 2026-11-04: no 5h on any surface)
+// MARK: - Displayed quota windows (no 5h window since 2026-11-10)
 
 /// The per-account usage the compact account row reads (`CLIUsageInfo`
 /// conforms in the app target). Percents are 0...100.
 protocol CompactUsageInput {
-    var fiveHourPercent: Double? { get }
     var sevenDayPercent: Double? { get }
     var fableWeeklyPercent: Double? { get }
     var fableWeeklyConstraining: Bool? { get }
@@ -230,9 +226,8 @@ protocol CompactUsageInput {
 
 /// What the compact account row (`UsageAccountCompactRow`) draws: a thin
 /// gauge per reported window, `7d` then `Fab` (only when the toggle is on).
-/// There is no `5h` gauge even when the daemon still reports a 5h window
-/// (owner 2026-11-04: "5h 사용량 삭제해줘"). That window keeps only its say in
-/// the status dot, because the scheduler still gates on the 5h ceiling.
+/// No provider has a 5h window any more (owner 2026-11-04 and 2026-11-10),
+/// so there is no `5h` gauge and the daemon reports none.
 enum CompactUsageGauges {
     struct Gauge: Equatable, Identifiable {
         let id: String
@@ -252,13 +247,9 @@ enum CompactUsageGauges {
         return result
     }
 
-    /// The status dot's warning: a drawn gauge at its warning level, or an
-    /// undrawn 5h window at ≥ 90% — the same amber the row showed when it
-    /// still drew the 5h gauge.
+    /// The status dot's warning: a drawn gauge at its warning level.
     static func warning<Info: CompactUsageInput>(_ info: Info, showFable: Bool) -> Bool {
-        if gauges(info, showFable: showFable).contains(where: \.warning) { return true }
-        guard let five = info.fiveHourPercent else { return false }
-        return fraction(five) >= DashboardHealth.quotaThreshold
+        gauges(info, showFable: showFable).contains(where: \.warning)
     }
 
     private static func gauge(_ id: String, usedPercent: Double, warningOverride: Bool? = nil) -> Gauge {
@@ -277,8 +268,7 @@ enum CompactUsageGauges {
 
 extension LlmuxDashboardAccount {
     /// The account health row's quota text: `7d 31% · Fab 82%`, used
-    /// percentages of the reported windows. No `5h` part even when the
-    /// daemon still reports a 5h window (owner 2026-11-04). nil (cold
+    /// percentages of the reported windows. nil (cold
     /// account, no displayed window reported) omits the element entirely
     /// (#68).
     var quotaSummary: String? {

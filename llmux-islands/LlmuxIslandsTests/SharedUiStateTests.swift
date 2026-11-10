@@ -121,7 +121,7 @@ final class SharedUiStateTests: XCTestCase {
           "blocked_reason": null,
           "in_flight": 1,
           "gauges": [{
-            "kind": "five_hour",
+            "kind": "seven_day",
             "available": true,
             "used_fraction": 0.25,
             "remaining_fraction": 0.75,

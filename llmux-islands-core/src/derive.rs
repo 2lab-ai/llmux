@@ -172,11 +172,6 @@ fn account_tile(
 ) -> AccountTile {
     let gauges = vec![
         window_gauge(
-            GaugeKind::FiveHour,
-            account.five_hour.as_ref(),
-            document.select_params.five_hour_max,
-        ),
-        window_gauge(
             GaugeKind::SevenDay,
             account.seven_day.as_ref(),
             document.select_params.seven_day_max,

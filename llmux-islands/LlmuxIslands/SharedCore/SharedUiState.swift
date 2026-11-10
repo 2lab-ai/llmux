@@ -199,7 +199,6 @@ struct SharedTokenExpiry: Decodable, Equatable {
 
 struct SharedGauge: Decodable, Equatable {
     enum Kind: String, Decodable, Equatable {
-        case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case fableWeekly = "fable_weekly"
     }

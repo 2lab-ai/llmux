@@ -124,7 +124,6 @@ enum LegacyStatusDashboardAdapter {
             "upstream": "",
             "config_path": NSNull(),
             "select_params": [
-                "five_hour_max": 0.90,
                 "seven_day_max": 0.99,
                 "fable_weekly_max": 0.98,
                 "mode": "default",
@@ -200,11 +199,6 @@ enum LegacyStatusDashboardAdapter {
         result["order"] = unsigned(raw["order"]) ?? UInt64(order)
         result["blocked"] = nullableString(raw["blocked"]) ?? NSNull()
         result["healthy"] = bool(raw["healthy"]) ?? (status != "auth_failed")
-        result["five_hour"] = window(
-            raw["five_hour"],
-            previous: previous?["five_hour"],
-            receivedAtMs: receivedAtMs
-        )
         result["seven_day"] = window(
             raw["seven_day"],
             previous: previous?["seven_day"],

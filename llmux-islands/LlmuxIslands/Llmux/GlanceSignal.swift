@@ -22,8 +22,7 @@ enum GlanceSignal: Equatable {
     /// approaching limit changes the plan (soon).
     case limit(count: Int)
     /// The worst account's 7d window at ≤10% remaining (but not exhausted):
-    /// window is "7d" (no 5h candidate since owner 2026-11-04), remainingPct
-    /// the ACTUAL remaining percent.
+    /// window is "7d", remainingPct the ACTUAL remaining percent.
     case lowQuota(window: String, remainingPct: Int, account: String)
     /// An account the daemon EXPLICITLY reports as degraded, debounced over
     /// [`GlanceResolver.degradedDebounce`] consecutive polls. unknown/cold are
@@ -103,9 +102,7 @@ enum GlanceResolver {
 
         // 2/3. Windows: exhausted (LIMIT) and approaching (lowQuota).
         // Candidates over EVERY eligible account × 7d — never an average,
-        // never a representative account. A 5h window the daemon may still
-        // report is not a candidate (owner 2026-11-04: no 5h on any Islands
-        // surface; the scheduler still gates on it). Eligible = an OPERATIONAL
+        // never a representative account. Eligible = an OPERATIONAL
         // status ("active"/"ok") and not operator-paused: unknown/cold/
         // cooldown/degraded states are NEVER promoted into a quota chip
         // (consensus MUST-FIX 4 — their quota reading is not an action).
