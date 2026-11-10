@@ -281,7 +281,27 @@ the instructions in that prefix. Sharing needs byte-identical tools: a tool whos
 description carries something per session (a Slack MCP tool naming the thread it serves,
 say) gives each session its own route — one cold start per session, never per
 conversation. A per-conversation key starts every new conversation
-cold; the per-process key put every request on one route. The native Responses frontend
+cold. The per-process key put every request on one route and changed on every daemon
+restart, so each restart started every conversation cold; the prefix key is derived from
+content and survives restarts.
+
+Measured after shipping (owner-mac, 2026-11-10):
+- **New conversations start warm.** A probe sends new conversations one after another
+  through the daemon, each with the same real Claude Code system prompt and 84 tools
+  (about 16,580 tokens in all). Before the deploy, under the per-conversation key, all 3
+  read 0 tokens from cache. After it, under the prefix key, the first of 4 read 0 and each
+  of the other 3 read 16,384. A second subagent of the same type read 4,352 of 8,974
+  tokens from cache on its first request; under the per-conversation key that request was
+  always cold.
+- **Sharing one route costs nothing measurable here.** On the per-process key's own
+  traffic (90 minutes, up to 32 requests a minute and 10 in flight on one key), all 42
+  next-turn pairs above 15 requests a minute were cache hits. The 8 misses came from
+  conversations idle for about 40 minutes (5) and from follow-ups sent within 12 seconds
+  (3), at 5 to 12 requests a minute. The public API's guidance to stay under about 15
+  requests a minute per key did not show up on this backend, so do not shard the prefix
+  key by conversation without new evidence: sharding would bring back the cold starts.
+
+The native Responses frontend
 keeps the client's own `prompt_cache_key` and routes the `session-id` header with it too.
 Grok still sends no `prompt_cache_key`: its cache hit rate is already 97.4%
 (2026-11-09), so there is no measured need.
