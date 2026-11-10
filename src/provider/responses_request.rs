@@ -85,12 +85,47 @@ pub enum ResponsesFlavor {
 impl ResponsesFlavor {
     /// Lowercase name, as the compatibility spec and the refusal messages
     /// spell it (`Debug` would shout `Codex` at a user reading a 400).
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Grok => "grok",
         }
     }
+}
+
+/// Prefix of the `signature` llmux puts on a `thinking` block that carries a
+/// Responses backend's own reasoning (spec §R4). The full form is
+/// `llmux-rs1:<flavor>:<encrypted_content>`: the backend's opaque reasoning
+/// ciphertext, labelled with the backend that minted it.
+///
+/// It is NOT an Anthropic signature. The native Messages paths strip any
+/// thinking block carrying it ([`super::anthropic::strip_foreign_thinking`])
+/// so a `/model` switch back to Claude never sends it to api.anthropic.com.
+pub(crate) const REASONING_SIGNATURE_PREFIX: &str = "llmux-rs1:";
+
+/// The `thinking.signature` that carries `encrypted_content` from `flavor`.
+pub(crate) fn reasoning_signature(flavor: ResponsesFlavor, encrypted_content: &str) -> String {
+    format!(
+        "{REASONING_SIGNATURE_PREFIX}{}:{encrypted_content}",
+        flavor.label()
+    )
+}
+
+/// Is `signature` one llmux minted with [`reasoning_signature`] (for any
+/// flavor)?
+pub(crate) fn is_reasoning_signature(signature: &str) -> bool {
+    signature.starts_with(REASONING_SIGNATURE_PREFIX)
+}
+
+/// The `encrypted_content` inside `signature` when it was minted for
+/// `flavor`; `None` for any other signature, including another flavor's
+/// (one backend cannot read the other's ciphertext).
+fn replayable_reasoning(signature: &str, flavor: ResponsesFlavor) -> Option<&str> {
+    signature
+        .strip_prefix(REASONING_SIGNATURE_PREFIX)?
+        .strip_prefix(flavor.label())?
+        .strip_prefix(':')
+        .filter(|encrypted| !encrypted.is_empty())
 }
 
 /// Media types `flavor`'s gateway takes as-is, in the order a refusal message
@@ -604,13 +639,15 @@ fn convert_message(
                             "output": output,
                         }));
                     }
-                    // Prior-turn reasoning: an Anthropic `signature` is not
-                    // either backend's reasoning ciphertext, and llmux
-                    // implements NO replay/provenance bridge in v1 (neither
-                    // backend's own `encrypted_content` is stored or replayed
-                    // here). Passing a foreign signature through would assert a
-                    // provenance llmux cannot back, so the block is omitted and
-                    // reported; the rest of the transcript keeps its order.
+                    // Prior-turn reasoning (spec §R4). A `thinking` block
+                    // whose signature llmux minted from THIS backend's own
+                    // `encrypted_content` goes back as a `reasoning` item at
+                    // its own position — the item that came before the call
+                    // it reasoned about, exactly as the backend produced it.
+                    // Anything else (an Anthropic signature, the other
+                    // backend's ciphertext, an unsigned summary) is not this
+                    // backend's reasoning: omitted and reported, the rest of
+                    // the transcript keeping its order.
                     "thinking" | "redacted_thinking" => {
                         if role != "assistant" {
                             return Err(invalid(
@@ -618,11 +655,26 @@ fn convert_message(
                                 &format!("`{block_type}` is only valid on an `assistant` message"),
                             ));
                         }
-                        report.omit(if block_type == "thinking" {
-                            "thinking"
-                        } else {
-                            "redacted_thinking"
-                        });
+                        let replay = (block_type == "thinking")
+                            .then(|| block.get("signature").and_then(Value::as_str))
+                            .flatten()
+                            .and_then(|signature| replayable_reasoning(signature, flavor));
+                        match replay {
+                            Some(encrypted_content) => {
+                                flush_text(&mut parts, &mut text, text_type);
+                                flush_message(input, &mut parts, out_role);
+                                input.push(json!({
+                                    "type": "reasoning",
+                                    "summary": [],
+                                    "encrypted_content": encrypted_content,
+                                }));
+                            }
+                            None => report.omit(if block_type == "thinking" {
+                                "thinking"
+                            } else {
+                                "redacted_thinking"
+                            }),
+                        }
                     }
                     other => {
                         return Err(invalid(
@@ -2617,6 +2669,61 @@ mod tests {
         assert_eq!(build(&string, Codex)["instructions"], "be terse");
         assert_eq!(without_billing_header(header), "");
         assert_eq!(without_billing_header("plain"), "plain");
+    }
+
+    /// #239: only THIS backend's own reasoning is replayed. The other
+    /// backend's ciphertext, an Anthropic signature and an unsigned summary
+    /// are omitted and reported, never sent as a `reasoning` item.
+    #[test]
+    fn only_this_backends_own_reasoning_is_replayed() {
+        let turn = |signature: Value| {
+            let mut thinking = json!({"type": "thinking", "thinking": "summary"});
+            if !signature.is_null() {
+                thinking["signature"] = signature;
+            }
+            json!({"messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [thinking, {"type": "text", "text": "a"}]},
+            ]})
+        };
+        let own = |flavor: ResponsesFlavor| reasoning_signature(flavor, "enc-123");
+        for flavor in [Codex, Grok] {
+            let replayed = build(&turn(json!(own(flavor))), flavor);
+            assert_eq!(
+                replayed["input"][1],
+                json!({"type": "reasoning", "summary": [], "encrypted_content": "enc-123"}),
+                "{flavor:?}"
+            );
+            assert_eq!(replayed["input"][2]["role"], "assistant", "{flavor:?}");
+            let report = validate_request(&turn(json!(own(flavor))), flavor, false).expect("ok");
+            assert!(!report.omitted_fields.contains(&"thinking"), "{flavor:?}");
+            let other = if flavor == Codex { Grok } else { Codex };
+            for foreign in [
+                json!(own(other)),
+                json!("EqQBCkgIBhABGAIiQL-anthropic-signature"),
+                json!(""),
+                Value::Null,
+                json!("llmux-rs1:codex:"),
+            ] {
+                let body = turn(foreign.clone());
+                let input = build(&body, flavor)["input"].clone();
+                assert!(
+                    !input
+                        .as_array()
+                        .expect("input")
+                        .iter()
+                        .any(|item| item["type"] == "reasoning"),
+                    "{flavor:?} {foreign}: {input}"
+                );
+                let report = validate_request(&body, flavor, false).expect("ok");
+                assert!(
+                    report.omitted_fields.contains(&"thinking"),
+                    "{flavor:?} {foreign}"
+                );
+            }
+        }
+        assert!(is_reasoning_signature(&own(Codex)));
+        assert!(!is_reasoning_signature("EqQBCkgIBhABGAIiQL"));
     }
 
     #[test]

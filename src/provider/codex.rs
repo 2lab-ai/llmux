@@ -93,9 +93,14 @@ impl CodexShape {
 }
 
 /// The codex provider: holds the upstream base URL, the (live-mutable) request
-/// shape (model/fast/effort), and a per-process session id (sent as
-/// `session-id` and `prompt_cache_key`, stable so the backend's prompt cache
-/// keys stay warm across requests).
+/// shape (model/fast/effort), and a per-process fallback id.
+///
+/// Every translated request sends ONE key as both `session-id` and
+/// `prompt_cache_key`: the conversation's own key
+/// ([`responses::conversation_key`]), stable across its turns and distinct
+/// from every other conversation — the codex CLI's policy, whose source notes
+/// that ChatGPT derives cache affinity from the `session-id` header. The
+/// per-process id is used only for a body with no message to key on.
 ///
 /// The shape is behind an `RwLock` so the dashboard can toggle fast/model/
 /// effort on a running daemon (req8.1) without a restart: requests take a
@@ -196,8 +201,9 @@ impl CodexProvider {
         let body: Value = serde_json::from_slice(anthropic_body).map_err(|err| {
             ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
         })?;
-        let (upstream_body, client_stream) =
-            translate_request_with(&body, &self.session_id, shape)?;
+        let cache_key =
+            responses::conversation_key(&body).unwrap_or_else(|| self.session_id.clone());
+        let (upstream_body, client_stream) = translate_request_with(&body, &cache_key, shape)?;
 
         let mut headers = HeaderMap::new();
         let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))
@@ -215,7 +221,7 @@ impl CodexProvider {
         headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
         headers.insert(
             "session-id",
-            HeaderValue::from_str(&self.session_id)
+            HeaderValue::from_str(&cache_key)
                 .map_err(|err| ProviderError::Convert(err.to_string()))?,
         );
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -243,6 +249,19 @@ impl CodexProvider {
         let (model, effort, fast) = self.request_meta(&metadata);
         let seed = serde_json::json!({"model":model,"messages":[{"role":"user","content":""}],"stream":true});
         let (mut request, _) = self.build_request(seed.to_string().as_bytes(), credential)?;
+        // The seed's derived key names nothing: a native client keys its own
+        // conversation, so its `prompt_cache_key` routes the header too
+        // (the per-process id when it sent none, as before).
+        let cache_key = input
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .unwrap_or(&self.session_id);
+        request.headers.insert(
+            "session-id",
+            HeaderValue::from_str(cache_key)
+                .map_err(|err| ProviderError::Convert(err.to_string()))?,
+        );
         let mut body = input.clone();
         body["model"] = Value::String(model);
         body["stream"] = Value::Bool(true);
@@ -1413,6 +1432,155 @@ mod tests {
         let sent: Value = serde_json::from_slice(&req.body).expect("json");
         assert_eq!(sent["model"], CODEX_MODEL);
         assert_eq!(sent["prompt_cache_key"], session, "cache key = session id");
+        assert_eq!(
+            Some(session),
+            responses::conversation_key(&body).as_deref(),
+            "both carry the conversation's own key"
+        );
+    }
+
+    /// #240: one key per CONVERSATION, not per daemon. Every turn of a
+    /// conversation sends the same `session-id` / `prompt_cache_key`; a second
+    /// conversation in the same Claude Code session (a subagent: same session
+    /// id, different first message) gets its own.
+    #[test]
+    fn build_request_keys_the_cache_per_conversation() {
+        let provider = CodexProvider::new("https://chatgpt.example/backend-api/codex");
+        let keys = |body: &Value| {
+            let (req, _) = provider
+                .build_request(body.to_string().as_bytes(), &codex_credential())
+                .expect("build");
+            let header = req.headers["session-id"]
+                .to_str()
+                .expect("ascii")
+                .to_string();
+            let sent: Value = serde_json::from_slice(&req.body).expect("json");
+            assert_eq!(sent["prompt_cache_key"], header.as_str());
+            header
+        };
+        let user_id = r#"{"device_id":"d","account_uuid":"","session_id":"sess-a"}"#;
+        let turn1 = json!({"metadata": {"user_id": user_id}, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "task one",
+                                           "cache_control": {"type": "ephemeral"}}]},
+        ]});
+        let turn2 = json!({"metadata": {"user_id": user_id}, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "task one"}]},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next"},
+        ]});
+        let subagent = json!({"metadata": {"user_id": user_id}, "messages": [
+            {"role": "user", "content": "task two"},
+        ]});
+        let other_session = json!({"metadata": {"user_id":
+            r#"{"device_id":"d","account_uuid":"","session_id":"sess-b"}"#}, "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "task one"}]},
+        ]});
+        let key = keys(&turn1);
+        assert_eq!(keys(&turn2), key, "a later turn keeps the key");
+        assert_ne!(keys(&subagent), key, "a sibling conversation gets its own");
+        assert_ne!(keys(&other_session), key, "another session gets its own");
+        assert_ne!(key, provider.session_id, "never the per-process id");
+    }
+
+    /// #239: a reasoning item that carries `encrypted_content` comes back to a
+    /// client that asked for thinking as ONE signed `thinking` block at the
+    /// item's position (before the call it reasoned about) on the stream and
+    /// in the aggregate alike.
+    #[test]
+    fn reasoning_comes_back_as_a_signed_thinking_block_before_its_call() {
+        let events = [
+            json!({"type": "response.created", "response": {"id": "r1", "model": "gpt-x"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": [],
+                            "encrypted_content": "gAAAAA-opaque"}}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "summary": [],
+                            "encrypted_content": "gAAAAA-opaque"}}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1",
+                            "name": "now", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 1,
+                   "item_id": "fc_1", "delta": "{}"}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1",
+                            "name": "now", "arguments": "{}"}}),
+            json!({"type": "response.completed", "response": {"id": "r1", "status": "completed",
+                   "usage": {"input_tokens": 10, "output_tokens": 5}}}),
+        ];
+        let converter = CodexSseConverter::with_model("gpt-x".to_string())
+            .with_reasoning_replay(Some(ResponsesFlavor::Codex));
+        let (converter, out) = run_converter_with(converter, &events);
+        let signature = "llmux-rs1:codex:gAAAAA-opaque";
+        let starts: Vec<&Value> = out
+            .iter()
+            .filter(|(t, _)| t == "content_block_start")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(starts.len(), 2, "{out:?}");
+        assert_eq!(starts[0]["index"], 0);
+        assert_eq!(starts[0]["content_block"]["type"], "thinking");
+        assert_eq!(starts[1]["index"], 1);
+        assert_eq!(starts[1]["content_block"]["type"], "tool_use");
+        let signatures: Vec<&Value> = out
+            .iter()
+            .filter(|(_, v)| v["delta"]["type"] == "signature_delta")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(signatures.len(), 1, "once: {out:?}");
+        assert_eq!(signatures[0]["index"], 0);
+        assert_eq!(signatures[0]["delta"]["signature"], signature);
+        let aggregate = converter.into_message_json().expect("aggregate");
+        assert_eq!(
+            aggregate["content"][0],
+            json!({"type": "thinking", "thinking": "", "signature": signature})
+        );
+        assert_eq!(aggregate["content"][1]["type"], "tool_use");
+        assert_eq!(aggregate["stop_reason"], "tool_use");
+
+        // A client that did not ask for thinking sees no thinking block.
+        let (plain, out) = run_converter(&events);
+        assert!(
+            !out.iter()
+                .any(|(_, v)| v["content_block"]["type"] == "thinking"),
+            "{out:?}"
+        );
+        assert_eq!(
+            plain.into_message_json().expect("aggregate")["content"][0]["type"],
+            "tool_use"
+        );
+    }
+
+    /// #239 round trip: what the converter hands the client, sent back on the
+    /// next turn, reaches the backend as the same `reasoning` item, in front
+    /// of the call it belongs to.
+    #[test]
+    fn a_returned_thinking_block_replays_as_the_reasoning_item() {
+        let next_turn = json!({"messages": [
+            {"role": "user", "content": "what time is it?"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "",
+                 "signature": "llmux-rs1:codex:gAAAAA-opaque"},
+                {"type": "tool_use", "id": "call_1", "name": "now", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "12:34"},
+            ]},
+        ]});
+        let (upstream, _) = translate_request(&next_turn, "s").expect("translate");
+        let input = upstream["input"].as_array().expect("input");
+        assert_eq!(
+            input[1],
+            json!({"type": "reasoning", "summary": [], "encrypted_content": "gAAAAA-opaque"})
+        );
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(upstream["include"][0], "reasoning.encrypted_content");
+        let report = responses::validate_request(&next_turn, ResponsesFlavor::Codex, false)
+            .expect("validate");
+        assert!(
+            !report.omitted_fields.contains(&"thinking"),
+            "replayed, not omitted: {report:?}"
+        );
     }
 
     #[test]
@@ -1452,7 +1620,14 @@ mod tests {
     /// Feed a scripted sequence and split the emitted bytes back into
     /// `(event_type, data_json)` pairs for assertion.
     fn run_converter(events: &[Value]) -> (CodexSseConverter, Vec<(String, Value)>) {
-        let mut converter = CodexSseConverter::new();
+        run_converter_with(CodexSseConverter::new(), events)
+    }
+
+    /// [`run_converter`] with a caller-configured converter.
+    fn run_converter_with(
+        mut converter: CodexSseConverter,
+        events: &[Value],
+    ) -> (CodexSseConverter, Vec<(String, Value)>) {
         let mut emitted = Vec::new();
         for e in events {
             emitted.extend_from_slice(&converter.on_event(&event(e.clone())));
