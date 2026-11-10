@@ -252,16 +252,16 @@ impl CodexProvider {
         // The seed's derived key names nothing: a native client keys its own
         // conversation, so its `prompt_cache_key` routes the header too
         // (the per-process id when it sent none, as before).
-        let cache_key = input
+        // A key that cannot be a header value keeps the per-process id, as
+        // before: never a failed request over a routing hint.
+        let session = input
             .get("prompt_cache_key")
             .and_then(Value::as_str)
             .filter(|key| !key.is_empty())
-            .unwrap_or(&self.session_id);
-        request.headers.insert(
-            "session-id",
-            HeaderValue::from_str(cache_key)
-                .map_err(|err| ProviderError::Convert(err.to_string()))?,
-        );
+            .and_then(|key| HeaderValue::from_str(key).ok())
+            .map_or_else(|| HeaderValue::from_str(&self.session_id), Ok)
+            .map_err(|err| ProviderError::Convert(err.to_string()))?;
+        request.headers.insert("session-id", session);
         let mut body = input.clone();
         body["model"] = Value::String(model);
         body["stream"] = Value::Bool(true);
@@ -1548,6 +1548,61 @@ mod tests {
             plain.into_message_json().expect("aggregate")["content"][0]["type"],
             "tool_use"
         );
+    }
+
+    /// #239 review: the reasoning block keeps its place even when a later item
+    /// is announced before the reasoning item finishes — queued at the
+    /// announcement, which carries the ciphertext. Also the legacy shape with
+    /// no item identity at all: queued at `done`, before the text that follows.
+    #[test]
+    fn reasoning_keeps_its_place_when_items_overlap_or_carry_no_identity() {
+        let overlapping = [
+            json!({"type": "response.created", "response": {"id": "r1"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "encrypted_content": "enc-1"}}),
+            json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1",
+                            "name": "now", "arguments": ""}}),
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"id": "fc_1", "type": "function_call", "call_id": "call_1",
+                            "name": "now", "arguments": "{}"}}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "rs_1", "type": "reasoning", "encrypted_content": "enc-1"}}),
+            json!({"type": "response.completed", "response": {"id": "r1", "status": "completed"}}),
+        ];
+        let legacy = [
+            json!({"type": "response.created", "response": {"id": "r2"}}),
+            json!({"type": "response.output_item.done",
+                   "item": {"type": "reasoning", "encrypted_content": "enc-2"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.completed", "response": {"id": "r2", "status": "completed"}}),
+        ];
+        for (events, signature, second) in [
+            (&overlapping[..], "llmux-rs1:codex:enc-1", "tool_use"),
+            (&legacy[..], "llmux-rs1:codex:enc-2", "text"),
+        ] {
+            let converter = CodexSseConverter::with_model("gpt-x".to_string())
+                .with_reasoning_replay(Some(ResponsesFlavor::Codex));
+            let (converter, out) = run_converter_with(converter, events);
+            let starts: Vec<(&Value, &Value)> = out
+                .iter()
+                .filter(|(t, _)| t == "content_block_start")
+                .map(|(_, v)| (&v["index"], &v["content_block"]["type"]))
+                .collect();
+            assert_eq!(
+                starts,
+                vec![(&json!(0), &json!("thinking")), (&json!(1), &json!(second))],
+                "{out:?}"
+            );
+            let signatures = out
+                .iter()
+                .filter(|(_, v)| v["delta"]["type"] == "signature_delta")
+                .count();
+            assert_eq!(signatures, 1, "{out:?}");
+            let aggregate = converter.into_message_json().expect("aggregate");
+            assert_eq!(aggregate["content"][0]["signature"], signature);
+            assert_eq!(aggregate["content"][1]["type"], second);
+        }
     }
 
     /// #239 round trip: what the converter hands the client, sent back on the

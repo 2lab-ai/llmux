@@ -78,19 +78,25 @@ pub struct RequestPlan<'a> {
 /// Total UTF-8 characters of every string anywhere under `value` (recurses
 /// arrays and object values). The atom of the chars/4 token estimate.
 ///
-/// A `signature` value is skipped: it is opaque ciphertext the model never
-/// reads as text. An llmux reasoning signature is ~8K characters for a few
-/// dozen reasoning tokens (spec §R4), so counting it would inflate the
-/// estimate by thousands of tokens per assistant turn.
+/// A `thinking` block's `signature` is skipped: opaque ciphertext the model
+/// never reads as text. An llmux reasoning signature is ~8K characters for a
+/// few dozen reasoning tokens (spec §R4), so counting it would inflate the
+/// estimate by thousands of tokens per assistant turn. Any other field named
+/// `signature` (a tool argument, say) is ordinary input and still counts.
 fn section_chars(value: &Value) -> u64 {
     match value {
         Value::String(s) => s.chars().count() as u64,
         Value::Array(items) => items.iter().map(section_chars).sum(),
-        Value::Object(map) => map
-            .iter()
-            .filter(|(key, _)| key.as_str() != "signature")
-            .map(|(_, value)| section_chars(value))
-            .sum(),
+        Value::Object(map) => {
+            let thinking = matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            );
+            map.iter()
+                .filter(|(key, _)| !(thinking && key.as_str() == "signature"))
+                .map(|(_, value)| section_chars(value))
+                .sum()
+        }
         _ => 0,
     }
 }
@@ -488,6 +494,37 @@ impl ResponsesSseConverter {
     pub fn with_reasoning_replay(mut self, flavor: Option<ResponsesFlavor>) -> Self {
         self.reasoning_flavor = flavor;
         self
+    }
+
+    /// Queue the signed `thinking` block for reasoning `item` (spec §R4) when
+    /// replay is on, the item carries `encrypted_content`, and its block is not
+    /// queued yet. Queued complete — the ciphertext is the whole payload — so it
+    /// keeps the item's place among the blocks whatever arrives after it.
+    fn queue_reasoning(&mut self, out: &mut Vec<u8>, item_key: Option<&str>, item: Option<&Value>) {
+        let Some(flavor) = self.reasoning_flavor else {
+            return;
+        };
+        let Some(encrypted) = item
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .and_then(|item| item.get("encrypted_content"))
+            .and_then(Value::as_str)
+            .filter(|encrypted| !encrypted.is_empty())
+        else {
+            return;
+        };
+        let key = item_key.map(|item| format!("{item}#signature"));
+        if key
+            .as_deref()
+            .is_some_and(|key| self.position_of(key, BlockKind::Thinking).is_some())
+        {
+            return;
+        }
+        self.ensure_started(out);
+        let pos = self.push_block(key, item_key.map(str::to_string), BlockKind::Thinking);
+        self.blocks[pos].signature =
+            super::responses_request::reasoning_signature(flavor, encrypted);
+        self.blocks[pos].done = true;
+        self.flush_pending(out);
     }
 
     /// The model NAME to stamp into client-facing responses: the override when
@@ -1202,7 +1239,15 @@ impl SseTransform for ResponsesSseConverter {
                         self.blocks[pos].tool_name = name;
                         self.claim_wire(&mut out, pos);
                     }
-                    _ => {} // reasoning items etc. open lazily via their deltas
+                    // The codex gateway sends the finished ciphertext with the
+                    // announcement (239 of 239 items, 2026-11-10), so the
+                    // reasoning block is queued HERE, before any later item.
+                    // Only an identified item: the `done` below is the single
+                    // queueing point for a legacy capture with no ids.
+                    Some("reasoning") if item_key.is_some() => {
+                        self.queue_reasoning(&mut out, item_key.as_deref(), item);
+                    }
+                    _ => {} // other reasoning items open lazily via their deltas
                 }
             }
             "response.output_text.delta" => {
@@ -1282,30 +1327,8 @@ impl SseTransform for ResponsesSseConverter {
             "response.output_item.done" => {
                 let item_key = Self::item_key(&value);
                 // The backend's own reasoning, for a client that asked for
-                // thinking: one signed block per reasoning item, finished at
-                // birth, queued in item order like any other block.
-                if let Some(flavor) = self.reasoning_flavor {
-                    let encrypted = value
-                        .get("item")
-                        .filter(|item| {
-                            item.get("type").and_then(Value::as_str) == Some("reasoning")
-                        })
-                        .and_then(|item| item.get("encrypted_content"))
-                        .and_then(Value::as_str)
-                        .filter(|encrypted| !encrypted.is_empty());
-                    if let Some(encrypted) = encrypted {
-                        self.ensure_started(&mut out);
-                        let key = item_key.as_deref().map(|item| format!("{item}#signature"));
-                        let pos = self.push_block(key, item_key.clone(), BlockKind::Thinking);
-                        self.blocks[pos].signature =
-                            super::responses_request::reasoning_signature(flavor, encrypted);
-                        self.blocks[pos].done = true;
-                        if item_key.is_none() {
-                            self.flush_pending(&mut out);
-                            return out;
-                        }
-                    }
-                }
+                // thinking: queued here unless its announcement already did.
+                self.queue_reasoning(&mut out, item_key.as_deref(), value.get("item"));
                 // Resolve the FINISHED item, not "whatever is open": with
                 // interleaved items a `done` routinely arrives for an item that
                 // is not the live one, and closing the live block there would
@@ -1466,6 +1489,16 @@ mod tests {
         signed["messages"][0]["content"][0]["signature"] =
             json!(format!("llmux-rs1:codex:{}", "g".repeat(8000)));
         assert_eq!(estimate_input_tokens(&signed), estimate_input_tokens(&bare));
+        // A tool argument that happens to be named `signature` is input.
+        let tool = |input: Value| {
+            json!({"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "sign", "input": input},
+            ]}]})
+        };
+        assert!(
+            estimate_input_tokens(&tool(json!({"signature": "x".repeat(4000)})))
+                > estimate_input_tokens(&tool(json!({})))
+        );
     }
 
     /// #240's key: UUID-shaped, stable while the conversation grows and while
