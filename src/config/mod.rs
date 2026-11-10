@@ -919,7 +919,6 @@ mod tests {
         // config written before issue #29) loads the 120s default.
         assert_eq!(config.proxy.forward_idle_timeout_secs, 120);
         assert_eq!(config.upstream, schema::DEFAULT_UPSTREAM);
-        assert!((config.scheduler.five_hour_max - 0.90).abs() < f64::EPSILON);
         assert!((config.scheduler.seven_day_max - 0.99).abs() < f64::EPSILON);
         assert_eq!(config.scheduler.usage_poll_secs, 300);
         assert_eq!(config.scheduler.usage_max_age_secs, 600);
@@ -978,7 +977,7 @@ mod tests {
         config.proxy.port = 4000;
         config.proxy.api_key = Some("lm-test".into());
         config.upstream = "https://example.test".into();
-        config.scheduler.five_hour_max = 0.5;
+        config.scheduler.seven_day_max = 0.5;
         config.email_anonymous = true;
         config.accounts.push(oauth_account("a@x.com", "uuid-a"));
         config.accounts.push(apikey_account("api-1"));
@@ -1359,7 +1358,7 @@ mod tests {
     #[test]
     fn idle_probe_defaults_are_always_on() {
         // Issue #45: the probe is ALWAYS-ON out of the box — a cold account
-        // (no 5h/7d window) gets a 1-token probe without any operator opt-in.
+        // (no 7d window) gets a 1-token probe without any operator opt-in.
         // Both the Rust default and a config file missing the block entirely
         // must load enabled with an hourly sweep.
         let defaults = IdleProbeConfig::default();

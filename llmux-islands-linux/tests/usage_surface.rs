@@ -114,7 +114,7 @@ fn account_tiles_render_only_the_semantic_privacy_safe_inventory() {
 }
 
 #[test]
-fn gauges_are_dynamic_and_cover_five_hour_seven_day_and_fable() {
+fn gauges_are_dynamic_and_cover_seven_day_and_fable() {
     let qml = read("qml/Usage.qml");
 
     for marker in [
@@ -126,13 +126,16 @@ fn gauges_are_dynamic_and_cover_five_hour_seven_day_and_fable() {
         "gauge.resets_at",
         "gauge.reset_text",
         "gauge.constraining",
-        "five_hour",
         "seven_day",
         "fable_weekly",
         "settings.show_fable_weekly",
     ] {
         assert!(qml.contains(marker), "missing gauge marker {marker}");
     }
+    assert!(
+        !qml.contains("five_hour"),
+        "no provider has a 5h window any more (2026-11-10): no five_hour gauge kind"
+    );
 
     assert!(
         qml.contains("Repeater") && qml.contains("visibleGauges"),

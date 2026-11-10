@@ -291,10 +291,6 @@ fn seed_exhausted(pool: &AccountPool, name: &str) {
     pool.record_usage(
         &AccountId(name.to_string()),
         &UsageSnapshot {
-            five_hour: Some(WindowReading {
-                utilization: 0.25,
-                resets_at: SystemTime::now() + Duration::from_secs(60),
-            }),
             seven_day: Some(WindowReading {
                 utilization: 1.0,
                 resets_at: SystemTime::now() + Duration::from_secs(3_600),
@@ -311,7 +307,7 @@ fn seed_exhausted(pool: &AccountPool, name: &str) {
 
 /// The explicit refresh reads the billing endpoint with the grok-CLI identity
 /// set, the WEEKLY period lands on `seven_day` (65 → 0.65) replacing a stale
-/// 100% cache, and the header-fed 5h burst gauge is left alone.
+/// 100% cache.
 #[tokio::test]
 async fn refresh_usage_records_the_weekly_billing_window_for_grok() {
     let mock = BillingMock::spawn().await;
@@ -353,10 +349,9 @@ async fn refresh_usage_records_the_weekly_billing_window_for_grok() {
         (seven - 0.65).abs() < 1e-9,
         "weekly allowance 65% → 0.65, got {seven}: {account}"
     );
-    assert_eq!(
-        account["five_hour"]["utilization"].as_f64(),
-        Some(0.25),
-        "the billing read never touches the header-fed 5h gauge: {account}"
+    assert!(
+        account.get("five_hour").is_none(),
+        "there is no 5h window on the wire: {account}"
     );
 }
 
@@ -498,7 +493,7 @@ async fn the_usage_poller_primes_grok_accounts_from_billing() {
         "the poller's weekly reading (7%) is on the gauge, got {seven}: {account}"
     );
     assert!(
-        account["five_hour"]["utilization"].is_null(),
-        "billing carries no burst window — the 5h gauge stays cold: {account}"
+        account.get("five_hour").is_none(),
+        "there is no 5h window on the wire: {account}"
     );
 }

@@ -13,7 +13,7 @@ final class LegacyStatusDashboardAdapterTests: XCTestCase {
             "group": "codex",
             "status": "active",
             "five_hour": {"utilization": 0.25, "resets_in_secs": 300},
-            "seven_day": null,
+            "seven_day": {"utilization": 0.40, "resets_in_secs": 300},
             "in_flight": 2
           }]
         }
@@ -31,15 +31,19 @@ final class LegacyStatusDashboardAdapterTests: XCTestCase {
             try JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
         let account = try XCTUnwrap((dashboard["accounts"] as? [[String: Any]])?.first)
-        let fiveHour = try XCTUnwrap(account["five_hour"] as? [String: Any])
+        let sevenDay = try XCTUnwrap(account["seven_day"] as? [String: Any])
 
         XCTAssertEqual(dashboard["current_by_group"] as? [String: String], ["codex": "codex:user@example.com"])
         XCTAssertEqual(dashboard["email_anonymous"] as? Bool, true)
         XCTAssertEqual(dashboard["show_fable_weekly"] as? Bool, false)
         XCTAssertEqual(account["name"] as? String, "codex:user@example.com")
         XCTAssertEqual(account["healthy"] as? Bool, true)
-        XCTAssertEqual(fiveHour["resets_at"] as? Int, 1_300)
-        XCTAssertEqual(fiveHour["fetched_at_ms"] as? Int, 1_000_000)
+        XCTAssertEqual(sevenDay["resets_at"] as? Int, 1_300)
+        XCTAssertEqual(sevenDay["fetched_at_ms"] as? Int, 1_000_000)
+        // A legacy daemon's `five_hour` is not carried into the dashboard
+        // shape: no provider has a 5h window any more (2026-11-10).
+        XCTAssertNil(account["five_hour"])
+        XCTAssertNil((dashboard["select_params"] as? [String: Any])?["five_hour_max"])
         XCTAssertNotNil(account["session"] as? [String: Any])
         XCTAssertNotNil(dashboard["scheduler"] as? [String: Any])
         XCTAssertNotNil(dashboard["activity"] as? [String: Any])

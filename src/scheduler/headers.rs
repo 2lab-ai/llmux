@@ -1,19 +1,14 @@
 //! Rate-limit header parsing: undocumented unified headers
-//! (`anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}`, reset = epoch
-//! seconds), documented API-key headers
-//! (`anthropic-ratelimit-{requests,tokens}-*`, reset = RFC3339), and codex
-//! quota headers (`x-codex-{primary,secondary}-{used-percent,window-minutes,
-//! reset-at}`, used-percent = 0–100, reset-at = epoch seconds; live capture
-//! 2026-06-12: primary window-minutes 300 = the 5h window, secondary 10080 =
-//! the 7d window). Three parsers — the formats differ.
+//! (`anthropic-ratelimit-unified-{7d,7d_oi}-{utilization,reset}`, reset =
+//! epoch seconds) and codex quota headers (`x-codex-{primary,secondary}-
+//! {used-percent,window-minutes,reset-at}`, used-percent = 0–100, reset-at =
+//! epoch seconds). Two parsers — the formats differ.
 //!
-//! The standard (token-bucket) parser also reads grok's kind-first
-//! `x-ratelimit-{limit,remaining}-{requests,tokens}` names as a fallback (live
-//! capture 2026-07-14 from `POST cli-chat-proxy.grok.com/v1/responses`, HTTP
-//! 200: limit/remaining-requests 900/900, limit/remaining-tokens
-//! 15000000/15000000). These carry NO reset header of any kind and are
-//! RPM/TPM-shaped burst limits; anthropic names win per-field when both
-//! appear.
+//! Only WEEKLY windows are read. No provider reports a 5-hour window any more
+//! (owner, 2026-11-04 and 2026-11-10), so llmux keeps no 5h slot: a stray
+//! `unified-5h-*` header, a short codex window (`window-minutes` ≤ a day) and
+//! the API-key/grok token-bucket headers (`anthropic-ratelimit-{requests,
+//! tokens}-*`, `x-ratelimit-*`, which only ever fed that slot) are ignored.
 //!
 //! Tolerance contract: malformed or missing values are skipped, never an
 //! error — headers are an optional evidence source and the 429 path is the
@@ -22,12 +17,6 @@
 use std::time::{Duration, SystemTime};
 
 use http::HeaderMap;
-
-/// grok's cli-chat-proxy sends limit/remaining with no reset header of any
-/// kind; the buckets are RPM/TPM-shaped burst limits, so a reset-less reading
-/// is given an estimated 60s horizon (same estimated-cooldown spirit as
-/// `GROK_FREE_USAGE_COOLDOWN` in `proxy/forward.rs`).
-pub const STANDARD_RESET_FALLBACK: Duration = Duration::from_secs(60);
 
 /// `anthropic-ratelimit-unified-status` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,82 +34,9 @@ pub struct WindowReading {
     pub resets_at: SystemTime,
 }
 
-/// Documented API-key rate-limit headers (token bucket).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StandardRateLimit {
-    pub requests_limit: Option<u64>,
-    pub requests_remaining: Option<u64>,
-    pub requests_reset: Option<SystemTime>,
-    pub tokens_limit: Option<u64>,
-    pub tokens_remaining: Option<u64>,
-    pub tokens_reset: Option<SystemTime>,
-}
-
-impl StandardRateLimit {
-    /// Derived utilization `1 - remaining/limit` for the requests bucket.
-    pub fn requests_utilization(&self) -> Option<f64> {
-        derived_utilization(self.requests_limit, self.requests_remaining)
-    }
-
-    /// Derived utilization `1 - remaining/limit` for the tokens bucket.
-    pub fn tokens_utilization(&self) -> Option<f64> {
-        derived_utilization(self.tokens_limit, self.tokens_remaining)
-    }
-
-    /// The most-constrained bucket as a window reading, so API-key accounts
-    /// get proactive scheduling too. Requires both a derivable utilization
-    /// and a reset timestamp for the chosen bucket — a reset-less bucket is
-    /// skipped.
-    pub fn as_window_reading(&self) -> Option<WindowReading> {
-        self.window_reading(None)
-    }
-
-    /// Like [`Self::as_window_reading`], but a bucket with a derivable
-    /// utilization and NO reset (grok's cli-chat-proxy shape) uses
-    /// `fallback_resets_at` instead of being skipped.
-    pub fn as_window_reading_with_fallback_reset(
-        &self,
-        fallback_resets_at: SystemTime,
-    ) -> Option<WindowReading> {
-        self.window_reading(Some(fallback_resets_at))
-    }
-
-    /// Shared most-constrained-bucket logic. With `fallback` absent a
-    /// reset-less bucket is skipped; with `fallback` present it supplies the
-    /// missing reset.
-    fn window_reading(&self, fallback: Option<SystemTime>) -> Option<WindowReading> {
-        let bucket = |utilization: Option<f64>, reset: Option<SystemTime>| {
-            let utilization = utilization?;
-            let resets_at = reset.or(fallback)?;
-            Some(WindowReading {
-                utilization,
-                resets_at,
-            })
-        };
-        let requests = bucket(self.requests_utilization(), self.requests_reset);
-        let tokens = bucket(self.tokens_utilization(), self.tokens_reset);
-        match (requests, tokens) {
-            (Some(r), Some(t)) => Some(if t.utilization >= r.utilization { t } else { r }),
-            (Some(r), None) => Some(r),
-            (None, Some(t)) => Some(t),
-            (None, None) => None,
-        }
-    }
-}
-
-fn derived_utilization(limit: Option<u64>, remaining: Option<u64>) -> Option<f64> {
-    let limit = limit?;
-    let remaining = remaining?;
-    if limit == 0 {
-        return None;
-    }
-    Some((1.0 - remaining as f64 / limit as f64).clamp(0.0, 1.0))
-}
-
 /// Everything quota-relevant extracted from one upstream response.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ParsedRateLimitHeaders {
-    pub five_hour: Option<WindowReading>,
     pub seven_day: Option<WindowReading>,
     /// The model-scoped weekly bucket from the
     /// `anthropic-ratelimit-unified-7d_oi-*` headers (issue #123; live
@@ -130,76 +46,69 @@ pub struct ParsedRateLimitHeaders {
     /// a COLD gauge heals on the first request through the account.
     pub fable_weekly: Option<WindowReading>,
     pub unified_status: Option<UnifiedStatus>,
-    pub standard: Option<StandardRateLimit>,
 }
 
 impl ParsedRateLimitHeaders {
     /// True when nothing quota-relevant was present (e.g. error responses
     /// from intermediaries) — callers skip recording in that case.
     pub fn is_empty(&self) -> bool {
-        self.five_hour.is_none()
-            && self.seven_day.is_none()
-            && self.fable_weekly.is_none()
-            && self.unified_status.is_none()
-            && self.standard.is_none()
+        self.seven_day.is_none() && self.fable_weekly.is_none() && self.unified_status.is_none()
     }
 }
 
 /// Parse all known rate-limit headers from an upstream response. Unknown or
-/// malformed values are skipped, never an error. Anthropic unified windows
-/// and codex `x-codex-*` windows fill the same 5h/7d slots (they never
-/// coexist on one response — different upstreams); unified wins if both
-/// are somehow present.
+/// malformed values are skipped, never an error. The Anthropic unified weekly
+/// window and the codex weekly window fill the same 7d slot (they never
+/// coexist on one response — different upstreams); unified wins if both are
+/// somehow present.
 pub fn parse(headers: &HeaderMap) -> ParsedRateLimitHeaders {
-    let (codex_five, codex_seven) = codex_windows(headers);
     ParsedRateLimitHeaders {
-        five_hour: unified_window(headers, "5h").or(codex_five),
-        seven_day: unified_window(headers, "7d").or(codex_seven),
+        seven_day: unified_window(headers, "7d").or_else(|| codex_weekly(headers)),
         fable_weekly: unified_window(headers, "7d_oi"),
         unified_status: header_str(headers, "anthropic-ratelimit-unified-status")
             .and_then(parse_unified_status),
-        standard: parse_standard(headers),
     }
 }
 
-/// `window-minutes` at or under this maps a codex window into the 5h slot;
-/// anything longer (the observed weekly value is 10080) maps into the 7d
-/// slot. The observed session value is 300 (= 5h exactly); a day of slack
-/// absorbs plan-dependent variations without misfiling the weekly window.
-const CODEX_FIVE_HOUR_SLOT_MAX_MINUTES: u64 = 1440;
+/// A codex window whose `window-minutes` is at or under this is a short
+/// (session) window and is ignored; anything longer (the observed weekly
+/// value is 10080) is the weekly window.
+const CODEX_SHORT_WINDOW_MAX_MINUTES: u64 = 1440;
 
-/// Codex quota windows from `x-codex-{primary,secondary}-*` headers, mapped
-/// into the (5h, 7d) scheduler slots by `window-minutes` (live capture:
-/// primary 300 → 5h, secondary 10080 → 7d). When `window-minutes` is absent
-/// the observed roles are assumed: primary → 5h, secondary → 7d. Exact
-/// header names only — `x-codex-bengalfox-*` model-specific variants are
-/// deliberately not read.
-fn codex_windows(headers: &HeaderMap) -> (Option<WindowReading>, Option<WindowReading>) {
-    let mut five_hour = None;
-    let mut seven_day = None;
-    for (which, five_hour_by_default) in [("primary", true), ("secondary", false)] {
-        let Some((reading, window_minutes)) = codex_window(headers, which) else {
-            continue;
-        };
-        let is_five_hour = match window_minutes {
-            Some(minutes) => minutes <= CODEX_FIVE_HOUR_SLOT_MAX_MINUTES,
-            None => five_hour_by_default,
-        };
-        let slot = if is_five_hour {
-            &mut five_hour
-        } else {
-            &mut seven_day
-        };
-        if slot.is_none() {
-            *slot = Some(reading);
-        }
-    }
-    (five_hour, seven_day)
+/// The codex weekly window from `x-codex-{primary,secondary}-*` headers,
+/// chosen by `window-minutes` (the 2026-09-11 capture has the weekly window
+/// in `primary`, so position says nothing). When no window states its
+/// minutes, the observed weekly role is assumed: `secondary` (the 2026-06-12
+/// shape) else a LONE `primary` (the 2026-09-11 shape) — lone meaning no
+/// secondary header at all: a secondary that is there but unreadable leaves
+/// the slot empty rather than handing it to the session window. Exact header
+/// names only — `x-codex-bengalfox-*` model-specific variants are deliberately
+/// not read.
+fn codex_weekly(headers: &HeaderMap) -> Option<WindowReading> {
+    let windows = [
+        codex_window(headers, "primary"),
+        codex_window(headers, "secondary"),
+    ];
+    let by_minutes = windows.iter().flatten().find_map(|(reading, minutes)| {
+        minutes
+            .filter(|m| *m > CODEX_SHORT_WINDOW_MAX_MINUTES)
+            .map(|_| *reading)
+    });
+    let unlabeled = |w: &Option<(WindowReading, Option<u64>)>| {
+        w.filter(|(_, minutes)| minutes.is_none())
+            .map(|(reading, _)| reading)
+    };
+    let secondary_absent = ["used-percent", "reset-at", "window-minutes"]
+        .iter()
+        .all(|field| !headers.contains_key(format!("x-codex-secondary-{field}").as_str()));
+    by_minutes
+        .or_else(|| unlabeled(&windows[1]))
+        .or_else(|| unlabeled(&windows[0]).filter(|_| secondary_absent))
 }
 
 /// One codex window needs BOTH a parseable `used-percent` and a parseable
 /// `reset-at` (same contract as unified windows); `window-minutes` is
-/// optional and only steers slot mapping.
+/// optional and only steers which window is the weekly one.
 fn codex_window(headers: &HeaderMap, which: &str) -> Option<(WindowReading, Option<u64>)> {
     let used_percent = header_f64(headers, &format!("x-codex-{which}-used-percent"))?;
     if !used_percent.is_finite() {
@@ -247,34 +156,6 @@ fn parse_unified_status(value: &str) -> Option<UnifiedStatus> {
     }
 }
 
-/// Documented anthropic API-key headers (bucket-first names, RFC3339 reset)
-/// with a per-field fallback to grok's kind-first `x-ratelimit-*` names
-/// (limit/remaining only, no reset observed 2026-07-14). Anthropic names win
-/// per-field when both are present.
-fn parse_standard(headers: &HeaderMap) -> Option<StandardRateLimit> {
-    let standard = StandardRateLimit {
-        requests_limit: header_u64(headers, "anthropic-ratelimit-requests-limit")
-            .or_else(|| header_u64(headers, "x-ratelimit-limit-requests")),
-        requests_remaining: header_u64(headers, "anthropic-ratelimit-requests-remaining")
-            .or_else(|| header_u64(headers, "x-ratelimit-remaining-requests")),
-        requests_reset: header_str(headers, "anthropic-ratelimit-requests-reset")
-            .and_then(parse_rfc3339),
-        tokens_limit: header_u64(headers, "anthropic-ratelimit-tokens-limit")
-            .or_else(|| header_u64(headers, "x-ratelimit-limit-tokens")),
-        tokens_remaining: header_u64(headers, "anthropic-ratelimit-tokens-remaining")
-            .or_else(|| header_u64(headers, "x-ratelimit-remaining-tokens")),
-        tokens_reset: header_str(headers, "anthropic-ratelimit-tokens-reset")
-            .and_then(parse_rfc3339),
-    };
-    let any = standard.requests_limit.is_some()
-        || standard.requests_remaining.is_some()
-        || standard.requests_reset.is_some()
-        || standard.tokens_limit.is_some()
-        || standard.tokens_remaining.is_some()
-        || standard.tokens_reset.is_some();
-    any.then_some(standard)
-}
-
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok().map(str::trim)
 }
@@ -299,7 +180,7 @@ pub(crate) fn parse_epoch_seconds(value: &str) -> Option<SystemTime> {
 }
 
 /// Minimal RFC3339 → `SystemTime` parser (UTC math, `Z` or `±HH:MM` offsets,
-/// optional fractional seconds). The standard `-reset` headers are RFC3339;
+/// optional fractional seconds). The usage endpoints' `resets_at` strings are RFC3339;
 /// pulling in chrono/time for one format is not worth the tree weight.
 /// Returns `None` on anything malformed or pre-epoch.
 pub(crate) fn parse_rfc3339(s: &str) -> Option<SystemTime> {
@@ -411,7 +292,7 @@ mod tests {
     #[test]
     fn parses_full_unified_headers() {
         // Real shape per anthropics/claude-code#34074: utilization fraction,
-        // reset epoch seconds, status enum.
+        // reset epoch seconds, status enum. A stray 5h pair is ignored.
         let parsed = parse(&map(&[
             ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
             ("anthropic-ratelimit-unified-5h-reset", "1765500000"),
@@ -420,13 +301,6 @@ mod tests {
             ("anthropic-ratelimit-unified-status", "allowed_warning"),
         ]));
         assert_eq!(
-            parsed.five_hour,
-            Some(WindowReading {
-                utilization: 0.42,
-                resets_at: at(1_765_500_000),
-            })
-        );
-        assert_eq!(
             parsed.seven_day,
             Some(WindowReading {
                 utilization: 0.87,
@@ -434,19 +308,29 @@ mod tests {
             })
         );
         assert_eq!(parsed.unified_status, Some(UnifiedStatus::AllowedWarning));
-        assert!(parsed.standard.is_none());
         assert!(!parsed.is_empty());
+    }
+
+    #[test]
+    fn five_hour_headers_alone_are_empty() {
+        let parsed = parse(&map(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+            ("anthropic-ratelimit-unified-5h-reset", "1765500000"),
+        ]));
+        assert!(parsed.is_empty(), "{parsed:?}");
     }
 
     #[test]
     fn unified_window_requires_both_fields() {
         let parsed = parse(&map(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
-            // no 5h reset
             ("anthropic-ratelimit-unified-7d-reset", "1765900000"),
             // no 7d utilization
         ]));
-        assert!(parsed.five_hour.is_none());
+        assert!(parsed.seven_day.is_none());
+        let parsed = parse(&map(&[
+            ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+            // no 7d reset
+        ]));
         assert!(parsed.seven_day.is_none());
     }
 
@@ -480,12 +364,11 @@ mod tests {
     #[test]
     fn malformed_values_are_skipped_not_errors() {
         let parsed = parse(&map(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "not-a-float"),
-            ("anthropic-ratelimit-unified-5h-reset", "1765500000"),
-            ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
-            ("anthropic-ratelimit-unified-7d-reset", "yesterday"),
+            ("anthropic-ratelimit-unified-7d-utilization", "not-a-float"),
+            ("anthropic-ratelimit-unified-7d-reset", "1765900000"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "0.5"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", "yesterday"),
             ("anthropic-ratelimit-unified-status", "banana"),
-            ("anthropic-ratelimit-requests-limit", "fifty"),
         ]));
         assert!(parsed.is_empty());
     }
@@ -493,13 +376,13 @@ mod tests {
     #[test]
     fn utilization_is_clamped_to_unit_range() {
         let parsed = parse(&map(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "1.7"),
-            ("anthropic-ratelimit-unified-5h-reset", "1765500000"),
-            ("anthropic-ratelimit-unified-7d-utilization", "-0.2"),
+            ("anthropic-ratelimit-unified-7d-utilization", "1.7"),
             ("anthropic-ratelimit-unified-7d-reset", "1765900000"),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "-0.2"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", "1765900000"),
         ]));
-        assert_eq!(parsed.five_hour.unwrap().utilization, 1.0);
-        assert_eq!(parsed.seven_day.unwrap().utilization, 0.0);
+        assert_eq!(parsed.seven_day.unwrap().utilization, 1.0);
+        assert_eq!(parsed.fable_weekly.unwrap().utilization, 0.0);
     }
 
     #[test]
@@ -523,149 +406,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_standard_api_key_headers() {
-        // Real shape per docs.anthropic.com rate-limit docs (RFC3339 reset).
+    fn token_bucket_headers_are_not_read() {
+        // The API-key and grok token buckets only ever fed the retired 5h
+        // slot: a response carrying only them records nothing.
         let parsed = parse(&map(&[
             ("anthropic-ratelimit-requests-limit", "50"),
-            ("anthropic-ratelimit-requests-remaining", "49"),
+            ("anthropic-ratelimit-requests-remaining", "0"),
             ("anthropic-ratelimit-requests-reset", "2026-06-12T07:13:19Z"),
             ("anthropic-ratelimit-tokens-limit", "40000"),
-            ("anthropic-ratelimit-tokens-remaining", "10000"),
+            ("anthropic-ratelimit-tokens-remaining", "0"),
             ("anthropic-ratelimit-tokens-reset", "2026-06-12T07:13:19Z"),
-        ]));
-        let standard = parsed.standard.unwrap();
-        assert_eq!(standard.requests_limit, Some(50));
-        assert_eq!(standard.requests_remaining, Some(49));
-        assert_eq!(standard.tokens_limit, Some(40_000));
-        assert!((standard.requests_utilization().unwrap() - 0.02).abs() < 1e-9);
-        assert!((standard.tokens_utilization().unwrap() - 0.75).abs() < 1e-9);
-        // Most-constrained bucket (tokens at 75%) drives the window reading.
-        let reading = standard.as_window_reading().unwrap();
-        assert!((reading.utilization - 0.75).abs() < 1e-9);
-        assert_eq!(reading.resets_at, standard.tokens_reset.unwrap());
-    }
-
-    #[test]
-    fn standard_zero_limit_yields_no_utilization() {
-        let standard = StandardRateLimit {
-            requests_limit: Some(0),
-            requests_remaining: Some(0),
-            requests_reset: Some(at(100)),
-            tokens_limit: None,
-            tokens_remaining: None,
-            tokens_reset: None,
-        };
-        assert!(standard.requests_utilization().is_none());
-        assert!(standard.as_window_reading().is_none());
-    }
-
-    #[test]
-    fn standard_single_bucket_is_enough() {
-        let parsed = parse(&map(&[
-            ("anthropic-ratelimit-tokens-limit", "1000"),
-            ("anthropic-ratelimit-tokens-remaining", "250"),
-            ("anthropic-ratelimit-tokens-reset", "2026-06-12T00:00:00Z"),
-        ]));
-        let reading = parsed.standard.unwrap().as_window_reading().unwrap();
-        assert!((reading.utilization - 0.75).abs() < 1e-9);
-    }
-
-    #[test]
-    fn parses_grok_x_ratelimit_headers_from_live_capture() {
-        // Exact map from the 2026-07-14 cli-chat-proxy.grok.com capture (HTTP
-        // 200). Kind-first names, no reset of any kind — RPM/TPM burst limits.
-        let parsed = parse(&map(&[
             ("x-ratelimit-limit-tokens", "15000000"),
-            ("x-ratelimit-remaining-tokens", "15000000"),
+            ("x-ratelimit-remaining-tokens", "0"),
             ("x-ratelimit-limit-requests", "900"),
-            ("x-ratelimit-remaining-requests", "900"),
+            ("x-ratelimit-remaining-requests", "0"),
         ]));
-        let standard = parsed.standard.unwrap();
-        assert_eq!(standard.requests_limit, Some(900));
-        assert_eq!(standard.requests_remaining, Some(900));
-        assert_eq!(standard.requests_reset, None);
-        assert_eq!(standard.tokens_limit, Some(15_000_000));
-        assert_eq!(standard.tokens_remaining, Some(15_000_000));
-        assert_eq!(standard.tokens_reset, None);
-        assert_eq!(standard.requests_utilization(), Some(0.0));
-        assert_eq!(standard.tokens_utilization(), Some(0.0));
-        assert!(!parsed.is_empty());
-        assert!(parsed.five_hour.is_none());
-        assert!(parsed.seven_day.is_none());
-    }
-
-    #[test]
-    fn anthropic_names_win_over_grok_names_per_field() {
-        // All four limit/remaining fields collide → anthropic wins each one.
-        let parsed = parse(&map(&[
-            ("anthropic-ratelimit-requests-limit", "50"),
-            ("x-ratelimit-limit-requests", "900"),
-            ("anthropic-ratelimit-requests-remaining", "49"),
-            ("x-ratelimit-remaining-requests", "900"),
-            ("anthropic-ratelimit-tokens-limit", "40000"),
-            ("x-ratelimit-limit-tokens", "15000000"),
-            ("anthropic-ratelimit-tokens-remaining", "10000"),
-            ("x-ratelimit-remaining-tokens", "15000000"),
-        ]));
-        let standard = parsed.standard.unwrap();
-        assert_eq!(standard.requests_limit, Some(50));
-        assert_eq!(standard.requests_remaining, Some(49));
-        assert_eq!(standard.tokens_limit, Some(40_000));
-        assert_eq!(standard.tokens_remaining, Some(10_000));
-    }
-
-    #[test]
-    fn malformed_anthropic_value_falls_back_to_grok_name() {
-        // A malformed anthropic value parses to None, so the or_else fallback
-        // takes the generic value — the documented contract.
-        let parsed = parse(&map(&[
-            ("anthropic-ratelimit-requests-limit", "fifty"),
-            ("x-ratelimit-limit-requests", "900"),
-        ]));
-        let standard = parsed.standard.unwrap();
-        assert_eq!(standard.requests_limit, Some(900));
-    }
-
-    #[test]
-    fn fallback_reset_fills_reset_less_bucket_only() {
-        let fallback = at(1_000);
-        // Reset-less most-constrained bucket (tokens at 0.75) adopts fallback.
-        let grok = StandardRateLimit {
-            requests_limit: Some(900),
-            requests_remaining: Some(900),
-            requests_reset: None,
-            tokens_limit: Some(1000),
-            tokens_remaining: Some(250),
-            tokens_reset: None,
-        };
-        let reading = grok
-            .as_window_reading_with_fallback_reset(fallback)
-            .unwrap();
-        assert!((reading.utilization - 0.75).abs() < 1e-9);
-        assert_eq!(reading.resets_at, fallback);
-        // No-fallback path skips reset-less buckets → None.
-        assert!(grok.as_window_reading().is_none());
-
-        // A bucket WITH its own reset keeps it, ignoring the fallback.
-        let with_reset = StandardRateLimit {
-            requests_limit: None,
-            requests_remaining: None,
-            requests_reset: None,
-            tokens_limit: Some(1000),
-            tokens_remaining: Some(250),
-            tokens_reset: Some(at(500)),
-        };
-        let reading = with_reset
-            .as_window_reading_with_fallback_reset(fallback)
-            .unwrap();
-        assert_eq!(reading.resets_at, at(500));
+        assert!(parsed.is_empty(), "{parsed:?}");
     }
 
     // ---- codex x-codex-* quota headers ----
 
     #[test]
     fn parses_codex_quota_headers_from_live_capture() {
-        // Exact values from the 2026-06-12 chatgpt.com smoke capture.
+        // Exact values from the 2026-06-12 chatgpt.com smoke capture. The
+        // 300-minute primary window is a short window and is ignored.
         let parsed = parse(&map(&[
             ("x-codex-primary-used-percent", "0"),
             ("x-codex-secondary-used-percent", "2"),
@@ -679,14 +443,6 @@ mod tests {
             ("x-codex-active-limit", "premium"),
         ]));
         assert_eq!(
-            parsed.five_hour,
-            Some(WindowReading {
-                utilization: 0.0,
-                resets_at: at(1_781_284_314),
-            }),
-            "primary (300 min) is the 5h window"
-        );
-        assert_eq!(
             parsed.seven_day,
             Some(WindowReading {
                 utilization: 0.02,
@@ -695,14 +451,12 @@ mod tests {
             "secondary (10080 min) is the 7d window"
         );
         assert!(parsed.unified_status.is_none());
-        assert!(parsed.standard.is_none());
         assert!(!parsed.is_empty());
     }
 
     #[test]
-    fn codex_slot_mapping_follows_window_minutes_not_position() {
-        // Roles swapped: primary carries the weekly window. Mapping must
-        // follow window-minutes, not the primary/secondary label.
+    fn codex_weekly_follows_window_minutes_not_position() {
+        // The 2026-09-11 shape: primary carries the weekly window.
         let parsed = parse(&map(&[
             ("x-codex-primary-used-percent", "40"),
             ("x-codex-primary-window-minutes", "10080"),
@@ -711,22 +465,58 @@ mod tests {
             ("x-codex-secondary-window-minutes", "300"),
             ("x-codex-secondary-reset-at", "1781284314"),
         ]));
-        assert_eq!(parsed.five_hour.unwrap().utilization, 0.10);
-        assert_eq!(parsed.five_hour.unwrap().resets_at, at(1_781_284_314));
         assert_eq!(parsed.seven_day.unwrap().utilization, 0.40);
         assert_eq!(parsed.seven_day.unwrap().resets_at, at(1_781_749_417));
     }
 
     #[test]
+    fn codex_short_window_alone_is_empty() {
+        let parsed = parse(&map(&[
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-at", "1781284314"),
+        ]));
+        assert!(parsed.is_empty(), "{parsed:?}");
+    }
+
+    #[test]
     fn codex_window_minutes_absent_falls_back_to_observed_roles() {
+        // Both present, no minutes: secondary is the weekly role.
         let parsed = parse(&map(&[
             ("x-codex-primary-used-percent", "37"),
             ("x-codex-primary-reset-at", "1781284314"),
             ("x-codex-secondary-used-percent", "2"),
             ("x-codex-secondary-reset-at", "1781749417"),
         ]));
-        assert_eq!(parsed.five_hour.unwrap().utilization, 0.37);
         assert_eq!(parsed.seven_day.unwrap().utilization, 0.02);
+        // A lone primary with no minutes is the 2026-09-11 weekly shape.
+        let parsed = parse(&map(&[
+            ("x-codex-primary-used-percent", "43"),
+            ("x-codex-primary-reset-at", "1789442251"),
+        ]));
+        assert_eq!(parsed.seven_day.unwrap().utilization, 0.43);
+    }
+
+    #[test]
+    fn codex_lone_primary_fallback_needs_the_secondary_absent_not_broken() {
+        // review-of-legends P2 (PR #273): a secondary that is there but unreadable (weekly by its
+        // minutes, reset missing) must not hand the weekly slot to an unlabeled primary — that is
+        // the session window, and a 100% session reading would mark the account weekly-exhausted.
+        let parsed = parse(&map(&[
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-reset-at", "1781284314"),
+            ("x-codex-secondary-used-percent", "2"),
+            ("x-codex-secondary-window-minutes", "10080"),
+        ]));
+        assert!(parsed.is_empty(), "{parsed:?}");
+        // Same with a garbage secondary reset.
+        let parsed = parse(&map(&[
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-reset-at", "1781284314"),
+            ("x-codex-secondary-used-percent", "2"),
+            ("x-codex-secondary-reset-at", "soon"),
+        ]));
+        assert!(parsed.is_empty(), "{parsed:?}");
     }
 
     #[test]
@@ -751,12 +541,14 @@ mod tests {
     #[test]
     fn codex_used_percent_is_clamped_to_unit_range() {
         let parsed = parse(&map(&[
-            ("x-codex-primary-used-percent", "250"),
-            ("x-codex-primary-reset-at", "1781284314"),
+            ("x-codex-secondary-used-percent", "250"),
+            ("x-codex-secondary-reset-at", "1781749417"),
+        ]));
+        assert_eq!(parsed.seven_day.unwrap().utilization, 1.0);
+        let parsed = parse(&map(&[
             ("x-codex-secondary-used-percent", "-5"),
             ("x-codex-secondary-reset-at", "1781749417"),
         ]));
-        assert_eq!(parsed.five_hour.unwrap().utilization, 1.0);
         assert_eq!(parsed.seven_day.unwrap().utilization, 0.0);
     }
 
@@ -776,12 +568,12 @@ mod tests {
     #[test]
     fn unified_windows_win_over_codex_windows() {
         let parsed = parse(&map(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
-            ("anthropic-ratelimit-unified-5h-reset", "1765500000"),
-            ("x-codex-primary-used-percent", "90"),
-            ("x-codex-primary-reset-at", "1781284314"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.42"),
+            ("anthropic-ratelimit-unified-7d-reset", "1765900000"),
+            ("x-codex-secondary-used-percent", "90"),
+            ("x-codex-secondary-reset-at", "1781284314"),
         ]));
-        assert_eq!(parsed.five_hour.unwrap().utilization, 0.42);
+        assert_eq!(parsed.seven_day.unwrap().utilization, 0.42);
     }
 
     #[test]

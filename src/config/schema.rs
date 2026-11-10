@@ -323,12 +323,11 @@ pub struct EventBanner {
 }
 
 /// Per-account utilization-ceiling overrides (config `account_limits`); every
-/// field optional — `None` falls back to the global scheduler value.
+/// field optional — `None` falls back to the global scheduler value. A legacy
+/// `five_hour_max` key (the retired 5h ceiling) in an older config is
+/// ignored on load and dropped on the next write.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct AccountLimits {
-    /// Override of `scheduler.five_hour_max` (0..=1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub five_hour_max: Option<f64>,
     /// Override of `scheduler.seven_day_max` (0..=1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seven_day_max: Option<f64>,
@@ -340,9 +339,7 @@ pub struct AccountLimits {
 impl AccountLimits {
     /// True when no field overrides anything — the map entry can be dropped.
     pub fn is_empty(&self) -> bool {
-        self.five_hour_max.is_none()
-            && self.seven_day_max.is_none()
-            && self.fable_weekly_max.is_none()
+        self.seven_day_max.is_none() && self.fable_weekly_max.is_none()
     }
 }
 
@@ -930,7 +927,7 @@ impl Default for ProxyConfig {
 }
 
 /// Idle-account usage probe (issue #21, extended by #45). An account with no
-/// known 5h/7d window produces no usage data for the scheduler's
+/// known 7d window produces no usage data for the scheduler's
 /// ranking/display. When this is enabled, such an account can be populated by a
 /// single `max_tokens = 1` request through its own credential (`POST
 /// /v1/messages` for oauth/apikey, `POST /responses` for codex): the response's
@@ -978,7 +975,7 @@ pub struct IdleProbeConfig {
     /// `per_account_cooldown_secs` regardless of how often the sweep ticks).
     #[serde(default = "default_idle_probe_sweep_secs")]
     pub sweep_secs: u64,
-    /// Age (seconds) past which an account's freshest 5h/7d observation counts
+    /// Age (seconds) past which an account's freshest 7d observation counts
     /// as STALE and the account becomes probe-eligible again (Z 2026-07-15:
     /// cold subscriptions must keep refreshing, not freeze at their last
     /// reading). Before this knob an account was probed only while it had NO
@@ -1002,12 +999,11 @@ impl Default for IdleProbeConfig {
     }
 }
 
-/// Scheduler thresholds and polling cadence (FR3).
+/// Scheduler thresholds and polling cadence (FR3). A legacy `five_hour_max`
+/// key (the retired 5h ceiling — no provider reports a 5h window any more) in
+/// an older config is ignored on load and dropped on the next write.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    /// Max 5h-window utilization before an account becomes ineligible. Default 0.90.
-    #[serde(default = "default_five_hour_max")]
-    pub five_hour_max: f64,
     /// Max 7d-window utilization before an account becomes ineligible. Default 0.99.
     #[serde(default = "default_seven_day_max")]
     pub seven_day_max: f64,
@@ -1075,7 +1071,6 @@ impl SchedulerMode {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            five_hour_max: default_five_hour_max(),
             seven_day_max: default_seven_day_max(),
             usage_poll_secs: default_usage_poll_secs(),
             usage_max_age_secs: default_usage_max_age_secs(),
@@ -1538,10 +1533,6 @@ fn default_upstream() -> String {
 
 pub fn default_fable_weekly_max() -> f64 {
     0.98
-}
-
-fn default_five_hour_max() -> f64 {
-    0.90
 }
 
 fn default_seven_day_max() -> f64 {

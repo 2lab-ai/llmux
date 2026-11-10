@@ -146,7 +146,6 @@ struct LlmuxDashboardAccount: Decodable {
     let status: String?         // "active" | "ok" | "cooldown" | "auth_failed"
     let blocked: String?
     let healthy: Bool?
-    let fiveHour: LlmuxDashboardWindow?
     let sevenDay: LlmuxDashboardWindow?
     /// Fable weekly window — reuses the status DTO (identical wire object) so
     /// the tile mapping stays byte-for-byte the same on both paths.
@@ -161,7 +160,6 @@ struct LlmuxDashboardAccount: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case name, type, status, blocked, healthy, paused
-        case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case fableWeekly = "fable_weekly"
         case cooldownUntil = "cooldown_until"
@@ -172,7 +170,7 @@ struct LlmuxDashboardAccount: Decodable {
     }
 }
 
-/// A 5h/7d quota window (dashboard form — carries freshness fields the status
+/// A 7d quota window (dashboard form — carries freshness fields the status
 /// window omits).
 struct LlmuxDashboardWindow: Decodable {
     let utilization: Double      // 0...1
@@ -466,7 +464,6 @@ extension LlmuxDashboardAccount {
             type: type,
             group: nil,
             status: status,
-            fiveHour: fiveHour.map { LlmuxWindow(utilization: $0.utilization, resetsInSecs: $0.resetsInSecs) },
             sevenDay: sevenDay.map { LlmuxWindow(utilization: $0.utilization, resetsInSecs: $0.resetsInSecs) },
             fableWeekly: fableWeekly,
             inFlight: inFlight,

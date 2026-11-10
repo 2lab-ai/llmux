@@ -79,6 +79,6 @@ Claude through Codex still stops at the SDK transport boundary described below.
 The kinds of questions this answers in seconds, because the evidence is already on
 screen: why is this request 428 KB; did `context_management` edits actually apply
 upstream; what did the provider really return before the adapter converted it;
-which account is about to hit its 5-hour window, and why did the scheduler switch.
+which account is about to hit its weekly window, and why did the scheduler switch.
 Debugging an agent stack without seeing the wire is guesswork — this makes the wire
 a first-class surface.

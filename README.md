@@ -10,11 +10,11 @@ Then let Claude, GPT and Grok work in the same Claude Code session.
 
 ---
 
-![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with 5h/7d usage bars and reset timers](screenshots/llmux-islands-workspace.png)
+![llmux Islands: "Your AI workspace · 4 accounts", a Start coding row, and four account tiles with usage bars and reset timers (captured before the 5-hour window was retired on 2026-11-10)](screenshots/llmux-islands-workspace.png)
 
 <sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>
 
-llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 5-hour and 7-day windows is left, and when each window resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex session can also reach Gemini accounts (Claude Code cannot select gemini models).
+llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 7-day window is left, and when it resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex session can also reach Gemini accounts (Claude Code cannot select gemini models).
 
 ## Start with Islands
 
@@ -120,7 +120,7 @@ This is project configuration (two agent files and a prompt), not a bundled llmu
 
 ## What makes it work
 
-- **Account choice before reset.** Within one provider group, an account must pass eligibility gates first (auth, pause, 429 cooldown, 5h ≤ 0.90, 7d ≤ 0.99, fresh usage). The `default` mode then scores servable headroom × urgency (urgency rises up to 4× as the 7-day reset nears) and switches only when another account scores more than 25% higher, so it prefers quota that would otherwise expire unused. `round-robin` never switches proactively. [Schedulers](docs/schedulers.md).
+- **Account choice before reset.** Within one provider group, an account must pass eligibility gates first (auth, pause, 429 cooldown, 7d ≤ 0.99, fresh usage). The `default` mode then scores servable headroom × urgency (urgency rises up to 4× as the 7-day reset nears) and switches only when another account scores more than 25% higher, so it prefers quota that would otherwise expire unused. `round-robin` never switches proactively. [Schedulers](docs/schedulers.md).
 - **Keep your harness, change the model.** Claude Code keeps its own tools, permissions and project conventions. `/model fable`, `/model gpt-6-astra[1m]` or `/model grok-4.7` selects the backend. [Why llmux exists](docs/why-llmux.md).
 - **Codex CLI too.** `llmux run --codex` launches Codex against the same account pool and routing. Claude models on that path need Node.js 18+ and npm on the daemon host. llmux does not synchronize settings, hooks or skills between Claude Code and Codex. [Codex frontend](docs/codex-frontend/README.md).
 - **One daemon for several computers (optional).** Manage accounts on one computer and connect other computers over a trusted overlay such as Tailscale or WireGuard. Issued per-computer keys attribute usage to each computer. The CLI uses plain HTTP; the Islands app requires HTTPS for non-loopback endpoints. [Remote daemon](docs/remote.md).

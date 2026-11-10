@@ -196,7 +196,7 @@
       ],
       "properties": {
         "kind": {
-          "enum": ["five_hour", "seven_day", "fable_weekly"]
+          "enum": ["seven_day", "fable_weekly"]
         },
         "available": { "type": "boolean" },
         "used_fraction": { "type": "number", "minimum": 0, "maximum": 1 },

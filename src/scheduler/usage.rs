@@ -29,7 +29,6 @@ use crate::proxy::gemini_project::{self, GeminiProject};
 /// the response has no `limits[]` (older shape) or no scoped rows.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UsageSnapshot {
-    pub five_hour: Option<WindowReading>,
     pub seven_day: Option<WindowReading>,
     pub scoped: Vec<ScopedLimitReading>,
 }
@@ -90,7 +89,10 @@ impl From<GeminiUsageError> for UsageError {
     }
 }
 
-/// Parse the usage endpoint body. Tolerant by design: a missing window is
+/// Parse the usage endpoint body. Only the weekly `seven_day` window and the
+/// scoped `limits[]` rows are read — a `five_hour` field, if the endpoint
+/// still sends one, is ignored (no provider has a 5h window any more, owner
+/// 2026-11-10). Tolerant by design: a missing window is
 /// `None`, `resets_at` accepts epoch seconds or an RFC3339 string, and only
 /// undecodable JSON is an error.
 ///
@@ -114,7 +116,6 @@ impl From<GeminiUsageError> for UsageError {
 pub fn parse_usage_body(body: &[u8]) -> Result<UsageSnapshot, UsageError> {
     let value: Value = serde_json::from_slice(body)?;
     Ok(UsageSnapshot {
-        five_hour: raw_window(value.get("five_hour")).map(|(u, at)| percent_reading(u, at)),
         seven_day: raw_window(value.get("seven_day")).map(|(u, at)| percent_reading(u, at)),
         scoped: scoped_limits(&value),
     })
@@ -124,10 +125,11 @@ pub fn parse_usage_body(body: &[u8]) -> Result<UsageSnapshot, UsageError> {
 /// `.prd/13-usage-raw-sources.md` §Carrier 1, captured 2026-07-03).
 ///
 /// Only `kind == "weekly_scoped"` rows become scoped readings, keyed by
-/// `scope.model.display_name`. The `session`/`weekly_all` rows duplicate the
-/// legacy top-level `five_hour`/`seven_day` fields (which stay the canonical
-/// parse for those windows, and the fallback when `limits[]` is absent), so
-/// they are deliberately skipped here. `percent` is a 0..=100 int and is
+/// `scope.model.display_name`. The `weekly_all` row duplicates the legacy
+/// top-level `seven_day` field (which stays the canonical parse for that
+/// window, and the fallback when `limits[]` is absent) and the `session` row
+/// is the retired 5h window, so both are deliberately skipped here.
+/// `percent` is a 0..=100 int and is
 /// normalized to a 0..1 fraction like every other reading from this endpoint.
 /// Tolerant by design: a missing/invalid row is dropped, never an error.
 fn scoped_limits(value: &Value) -> Vec<ScopedLimitReading> {
@@ -837,7 +839,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
         }
         // One usage SOURCE per credential kind. A grok snapshot carries only
         // the weekly window, and `PoolState::record_usage` merges `Some`
-        // windows only, so the header-fed 5h burst gauge stays intact.
+        // windows only.
         // `bench_on_forbidden` rides along because the 403 verdict belongs to
         // the SOURCE, not to the account (see the doc comment above).
         let (outcome, bench_on_forbidden) = match &credential {
@@ -1145,11 +1147,10 @@ mod tests {
 
     fn snapshot_with(util: f64) -> UsageSnapshot {
         UsageSnapshot {
-            five_hour: Some(WindowReading {
+            seven_day: Some(WindowReading {
                 utilization: util,
                 resets_at: at(NOW_SECS + 3600),
             }),
-            seven_day: None,
             scoped: Vec::new(),
         }
     }
@@ -1160,36 +1161,34 @@ mod tests {
     fn parses_percentage_utilization_and_rfc3339_reset() {
         // Endpoint sends percentages (0..=100); parser divides by 100.
         let body = br#"{
-            "five_hour": {"utilization": 42.0, "resets_at": "2026-06-12T00:00:00Z"},
-            "seven_day": {"utilization": 90.0, "resets_at": "2026-06-14T00:00:00Z"}
+            "seven_day": {"utilization": 90.0, "resets_at": "2026-06-12T00:00:00Z"}
         }"#;
         let snapshot = parse_usage_body(body).unwrap();
-        assert!((snapshot.five_hour.unwrap().utilization - 0.42).abs() < 1e-9);
+        assert!((snapshot.seven_day.unwrap().utilization - 0.90).abs() < 1e-9);
         assert_eq!(
-            snapshot.five_hour.unwrap().resets_at,
+            snapshot.seven_day.unwrap().resets_at,
             at(1_781_222_400) // 2026-06-12T00:00:00Z
         );
-        assert!((snapshot.seven_day.unwrap().utilization - 0.90).abs() < 1e-9);
     }
 
     #[test]
     fn percentage_utilization_is_normalized() {
-        let body = br#"{"five_hour": {"utilization": 42, "resets_at": 1781222400}}"#;
+        let body = br#"{"seven_day": {"utilization": 42, "resets_at": 1781222400}}"#;
         let snapshot = parse_usage_body(body).unwrap();
-        assert!((snapshot.five_hour.unwrap().utilization - 0.42).abs() < 1e-9);
+        assert!((snapshot.seven_day.unwrap().utilization - 0.42).abs() < 1e-9);
     }
 
     #[test]
     fn sub_one_percent_seven_day_is_not_misread_as_full() {
         // Ground truth from the live endpoint (2026-06-13): percentages, with a
-        // 7d of 1.0 meaning 1% — NOT the fraction 1.0 (100%). The 5h value
-        // (16.0) sets the response scale, so the 7d normalizes to 0.01.
+        // 7d of 1.0 meaning 1% — NOT the fraction 1.0 (100%). The capture's
+        // five_hour row (16.0, now retired) is still sent and must not change
+        // the 7d's scale.
         let body = br#"{
             "five_hour": {"utilization": 16.0, "resets_at": 1781350800},
             "seven_day": {"utilization": 1.0, "resets_at": 1781946000}
         }"#;
         let snapshot = parse_usage_body(body).unwrap();
-        assert!((snapshot.five_hour.unwrap().utilization - 0.16).abs() < 1e-9);
         assert!(
             (snapshot.seven_day.unwrap().utilization - 0.01).abs() < 1e-9,
             "7d at 1.0% must read as 0.01, not 1.0 (the old per-window bug)"
@@ -1204,33 +1203,30 @@ mod tests {
         // whose values were all ≤ 1.0 as fractions and recorded 1.0 == 100%,
         // gating them as exhausted.
 
-        // ai2@: five_hour=1.0, seven_day=1.0  (== 1% / 1%, NOT 100% / 100%)
+        // ai2@: seven_day=1.0  (== 1%, NOT 100%)
         let ai2 = br#"{
             "five_hour": {"utilization": 1.0, "resets_at": 1781222400},
             "seven_day": {"utilization": 1.0, "resets_at": 1781222400}
         }"#;
         let s = parse_usage_body(ai2).unwrap();
-        assert!((s.five_hour.unwrap().utilization - 0.01).abs() < 1e-9);
         assert!((s.seven_day.unwrap().utilization - 0.01).abs() < 1e-9);
 
-        // ai@: five_hour=1.0, seven_day=0.0  (== 1% / 0%). A single sub-1.0
-        // window must still be a percentage, not a fraction.
+        // ai@: seven_day=0.0  (== 0%). A single sub-1.0 window must still be
+        // a percentage, not a fraction.
         let ai = br#"{
-            "five_hour": {"utilization": 1.0, "resets_at": 1781222400},
             "seven_day": {"utilization": 0.0, "resets_at": 1781222400}
         }"#;
         let s = parse_usage_body(ai).unwrap();
-        assert!((s.five_hour.unwrap().utilization - 0.01).abs() < 1e-9);
         assert_eq!(s.seven_day.unwrap().utilization, 0.0);
     }
 
     #[test]
     fn over_one_hundred_percent_clamps_to_full() {
-        let body = br#"{"five_hour": {"utilization": 137.0, "resets_at": 1781222400}}"#;
+        let body = br#"{"seven_day": {"utilization": 137.0, "resets_at": 1781222400}}"#;
         assert_eq!(
             parse_usage_body(body)
                 .unwrap()
-                .five_hour
+                .seven_day
                 .unwrap()
                 .utilization,
             1.0
@@ -1242,7 +1238,6 @@ mod tests {
         let body = br#"{"seven_day": {"utilization": 0.5, "resets_at": 1781222400}}"#;
         let snapshot = parse_usage_body(body).unwrap();
         assert_eq!(snapshot.seven_day.unwrap().resets_at, at(1_781_222_400));
-        assert!(snapshot.five_hour.is_none());
     }
 
     #[test]
@@ -1253,8 +1248,16 @@ mod tests {
 
     #[test]
     fn malformed_window_fields_are_dropped() {
-        let body = br#"{"five_hour": {"utilization": "high", "resets_at": true}}"#;
-        assert!(parse_usage_body(body).unwrap().five_hour.is_none());
+        let body = br#"{"seven_day": {"utilization": "high", "resets_at": true}}"#;
+        assert!(parse_usage_body(body).unwrap().seven_day.is_none());
+    }
+
+    #[test]
+    fn a_five_hour_window_in_the_body_is_ignored() {
+        // No provider has a 5h window any more (owner 2026-11-10): a body
+        // that still carries one yields nothing for it.
+        let body = br#"{"five_hour": {"utilization": 100.0, "resets_at": 1781222400}}"#;
+        assert_eq!(parse_usage_body(body).unwrap(), UsageSnapshot::default());
     }
 
     #[test]
@@ -1270,15 +1273,12 @@ mod tests {
     #[test]
     fn dev1_fixture_yields_legacy_windows_and_a_fable_scoped_reading() {
         // The verbatim live capture (.prd/13-usage-raw-sources.md §Carrier 1):
-        // legacy five_hour/seven_day parse exactly as before, AND the
-        // limits[] weekly_scoped row becomes a "Fable" scoped reading at
-        // 100% / critical / active. session + weekly_all rows are skipped
-        // (they duplicate the legacy fields).
+        // legacy seven_day parses exactly as before (the retired five_hour
+        // row is ignored), AND the limits[] weekly_scoped row becomes a
+        // "Fable" scoped reading at 100% / critical / active. session +
+        // weekly_all rows are skipped.
         let snapshot = parse_usage_body(DEV1_USAGE_FIXTURE.as_bytes()).unwrap();
 
-        let five = snapshot.five_hour.unwrap();
-        assert_eq!(five.utilization, 0.0);
-        assert_eq!(epoch_of(five.resets_at), 1_783_063_799); // 2026-07-03T07:29:59Z
         let seven = snapshot.seven_day.unwrap();
         assert!((seven.utilization - 0.58).abs() < 1e-9);
         assert_eq!(epoch_of(seven.resets_at), 1_783_115_999); // 2026-07-03T21:59:59Z
@@ -1301,11 +1301,9 @@ mod tests {
         // A response WITHOUT limits[] (older shape) must behave exactly as
         // before: legacy windows parse, scoped list is empty.
         let body = br#"{
-            "five_hour": {"utilization": 42.0, "resets_at": 1781222400},
             "seven_day": {"utilization": 90.0, "resets_at": 1781308800}
         }"#;
         let snapshot = parse_usage_body(body).unwrap();
-        assert!((snapshot.five_hour.unwrap().utilization - 0.42).abs() < 1e-9);
         assert!((snapshot.seven_day.unwrap().utilization - 0.90).abs() < 1e-9);
         assert!(snapshot.scoped.is_empty(), "no limits[] → no scoped rows");
     }
@@ -1410,7 +1408,7 @@ mod tests {
         );
         assert_eq!(poller.schedule[&id("a")].consecutive_failures, 0);
         assert_eq!(
-            pool.snapshot().accounts[0].five_hour.unwrap().utilization,
+            pool.snapshot().accounts[0].seven_day.unwrap().utilization,
             0.42
         );
     }
@@ -1463,7 +1461,7 @@ mod tests {
         poller.tick(now() + MIN_POLL_GAP).await;
         assert_eq!(fetcher.call_count(), 2);
         assert_eq!(poller.schedule[&id("a")].consecutive_failures, 1);
-        assert!(pool.snapshot().accounts[0].five_hour.is_none());
+        assert!(pool.snapshot().accounts[0].seven_day.is_none());
         assert!(
             pool.snapshot().accounts[0].healthy,
             "429 does not revoke auth"
@@ -1515,7 +1513,7 @@ mod tests {
             "bearer = account token"
         );
         let snapshot = pool.snapshot();
-        assert_eq!(snapshot.accounts[0].five_hour.unwrap().utilization, 0.42);
+        assert_eq!(snapshot.accounts[0].seven_day.unwrap().utilization, 0.42);
     }
 
     #[tokio::test]
@@ -1707,7 +1705,7 @@ mod tests {
             }
             assert_eq!(pool.fingerprint(&id("a")).unwrap().generation, generation);
             assert!(pool.snapshot().accounts[0].healthy);
-            assert!(pool.snapshot().accounts[0].five_hour.is_none());
+            assert!(pool.snapshot().accounts[0].seven_day.is_none());
             let rows = hub.account_history.snapshot();
             let event = &rows["a"][0];
             assert_eq!(event.outcome, "discarded", "{event:?}");
@@ -1862,7 +1860,7 @@ mod tests {
         poller.poll_account(&id("a"), now()).await.expect("poll ok");
 
         assert!(
-            pool.snapshot().accounts[0].five_hour.is_none(),
+            pool.snapshot().accounts[0].seven_day.is_none(),
             "a reading from the retired credential never lands"
         );
     }
@@ -1872,7 +1870,6 @@ mod tests {
     /// A weekly billing reading from the grok billing endpoint.
     fn grok_weekly(util: f64) -> UsageSnapshot {
         UsageSnapshot {
-            five_hour: None,
             seven_day: Some(WindowReading {
                 utilization: util,
                 resets_at: at(NOW_SECS + 604_800),
@@ -1884,13 +1881,10 @@ mod tests {
     /// Grok accounts USED to be skipped by the poller (only the `Oauth` arm
     /// existed), so their 7d gauge stayed empty forever. They are now polled
     /// through the billing endpoint — with the grok upstream, the account's own
-    /// token and its `subject` — and the reading lands on `seven_day` WITHOUT
-    /// disturbing the header-fed 5h burst gauge.
+    /// token and its `subject` — and the reading lands on `seven_day`.
     #[tokio::test]
     async fn grok_accounts_are_polled_via_billing() {
         let pool = AccountPool::new(&[grok_account("g")]);
-        // The 5h slot as the response headers left it (grok's burst gauge).
-        pool.record_usage(&id("g"), &snapshot_with(0.42), now());
         let fetcher = MockFetcher::new(vec![Ok(grok_weekly(0.65))]);
         let mut poller = UsagePoller::with_fetcher(
             pool.clone(),
@@ -1921,11 +1915,6 @@ mod tests {
         assert!(
             (account.seven_day.expect("7d gauge").utilization - 0.65).abs() < 1e-9,
             "the weekly allowance fills the 7d gauge"
-        );
-        assert_eq!(
-            account.five_hour.expect("5h gauge").utilization,
-            0.42,
-            "a snapshot without a 5h window leaves the header-fed burst gauge intact"
         );
     }
 
@@ -2102,7 +2091,6 @@ mod tests {
         );
         let account = pool.snapshot().accounts[0].clone();
         assert!(account.seven_day.is_none(), "unknown is never zero");
-        assert!(account.five_hour.is_none(), "unknown is never zero");
         assert!(account.healthy);
     }
 

@@ -24,8 +24,9 @@ use crate::scheduler::usage::UsageSnapshot;
 /// timeouts). Deliberately short — these are interactive operator actions.
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Windows at or above this duration are the WEEKLY gauge, below it the
-/// session (5h) gauge. Live shapes are 18000 and 604800; the split is by
+/// Windows at or above this duration are the WEEKLY gauge; a shorter
+/// (session) window is ignored — no provider has a 5h window any more
+/// (owner, 2026-11-10). Live shapes were 18000 and 604800; the split is by
 /// DURATION because `primary_window` carries either one (live capture
 /// 2026-09-11 had a weekly primary and a null secondary).
 const WEEKLY_MIN_SECS: u64 = 86_400;
@@ -267,12 +268,9 @@ pub fn parse_usage(body: &[u8], now: SystemTime) -> Result<CodexUsage, CodexUsag
         // primary/secondary position: the live weekly reading arrived as the
         // primary window with a null secondary.
         let (weekly, reading) = window(row, now).ok_or(CodexUsageError::Malformed)?;
-        let slot = if weekly {
-            &mut usage.seven_day
-        } else {
-            &mut usage.five_hour
-        };
-        *slot = Some(reading);
+        if weekly {
+            usage.seven_day = Some(reading);
+        }
     }
     let credits = value.get("rate_limit_reset_credits");
     Ok(CodexUsage {
@@ -525,10 +523,6 @@ mod tests {
         let seven = parsed.usage.seven_day.expect("weekly window");
         assert!((seven.utilization - 0.43).abs() < 1e-9);
         assert_eq!(seven.resets_at, at(1_789_442_251));
-        assert!(
-            parsed.usage.five_hour.is_none(),
-            "a weekly window is never filed as the 5h window"
-        );
         assert_eq!(parsed.available_resets, Some(3));
         assert_eq!(
             parsed.applicable_resets,
@@ -537,13 +531,14 @@ mod tests {
         );
     }
 
+    /// No provider has a 5h window any more (owner 2026-11-10): a short
+    /// (session) window is read but filed nowhere.
     #[test]
-    fn five_hour_duration_lands_on_the_session_window() {
+    fn a_short_session_window_is_ignored() {
         let body = br#"{"rate_limit":{"primary_window":
             {"used_percent":12,"limit_window_seconds":18000,"reset_at":1789442251}}}"#;
         let parsed = parse_usage(body, at(0)).unwrap();
-        assert!((parsed.usage.five_hour.unwrap().utilization - 0.12).abs() < 1e-9);
-        assert!(parsed.usage.seven_day.is_none());
+        assert_eq!(parsed.usage, UsageSnapshot::default());
     }
 
     #[test]
@@ -614,9 +609,9 @@ mod tests {
     #[test]
     fn reset_after_seconds_is_the_fallback_when_no_absolute_reset() {
         let body = br#"{"rate_limit":{"primary_window":
-            {"used_percent":50,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#;
+            {"used_percent":50,"limit_window_seconds":604800,"reset_after_seconds":600}}}"#;
         let parsed = parse_usage(body, at(1_000)).unwrap();
-        assert_eq!(parsed.usage.five_hour.unwrap().resets_at, at(1_600));
+        assert_eq!(parsed.usage.seven_day.unwrap().resets_at, at(1_600));
     }
 
     #[test]

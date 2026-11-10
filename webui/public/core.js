@@ -165,20 +165,20 @@
     const rows = groups.map(g => {
       const list = doc.accounts.filter(a => X.group(a.name) === g);
       if (!list.length) return '';
-      return `<tbody><tr class="x-grp"><td colspan="9">${g} <span class="x-dim">${list.length}</span></td></tr>${list.map(a => {
+      return `<tbody><tr class="x-grp"><td colspan="8">${g} <span class="x-dim">${list.length}</span></td></tr>${list.map(a => {
         const [k, label, tone] = X.accountState(a, p);
-        const l5 = left(a.five_hour), l7 = left(a.seven_day);
+        const l7 = left(a.seven_day);
         const bar = (v) => v == null ? '<span class="x-dim">—</span>' : `<span class="x-bar"><i style="width:${v * 100}%" class="${v < .15 ? 'lo' : v < .4 ? 'mid' : ''}"></i></span> ${Math.round(v * 100)}%`;
         const cur = Object.values(doc.current_by_group || {}).includes(a.name);
         return `<tr data-acct="${X.esc(a.name)}"><td>${cur ? '<b class="x-cur">●</b>' : ''}</td><td><b>${X.esc(X.short(a.name))}</b> <span class="x-dim">${X.esc(a.plan ? a.plan.label || a.plan.plan_type || '' : a.type)}</span></td>
-          <td><span class="x-pill ${tone}">${X.esc(label)}</span></td><td>${bar(l5)}</td><td>${bar(l7)}</td>
+          <td><span class="x-pill ${tone}">${X.esc(label)}</span></td><td>${bar(l7)}</td>
           <td class="x-num">${X.n(a.session.requests)}</td><td class="x-num">${X.n(a.session.errors)}</td><td class="x-num">${a.in_flight || ''}</td>
           <td class="x-acts"><button data-act="Switch to ${X.esc(X.short(a.name))}">Use now</button><button data-act="${a.paused ? 'Resume' : 'Pause'} ${X.esc(X.short(a.name))}">${a.paused ? 'Resume' : 'Pause'}</button><button data-act="Set limits">Limits</button><button data-act="Re-login ${X.esc(X.short(a.name))}">Re-login</button><button class="danger" data-act="Remove ${X.esc(X.short(a.name))}">Remove</button></td></tr>`;
       }).join('')}</tbody>`;
     }).join('');
-    return `<div class="x-toolbar"><b>${doc.accounts.length} accounts</b><span class="x-dim">scheduler ${X.esc(p.mode)} · 5h ≤ ${p.five_hour_max} · 7d ≤ ${p.seven_day_max}</span><span class="x-sp"></span>
+    return `<div class="x-toolbar"><b>${doc.accounts.length} accounts</b><span class="x-dim">scheduler ${X.esc(p.mode)} · 7d ≤ ${p.seven_day_max}</span><span class="x-sp"></span>
       <button class="x-primary" data-act="Add account (browser login: Claude / Codex / Grok / OpenRouter / Gemini)">+ Add account</button><button data-act="Import accounts">Import</button><button data-act="Refresh usage">Refresh usage</button></div>
-      <table class="x-table"><thead><tr><th></th><th>account</th><th>state</th><th>5h left</th><th>7d left</th><th class="x-num">requests</th><th class="x-num">errors</th><th class="x-num">now</th><th></th></tr></thead>${rows}</table>`;
+      <table class="x-table"><thead><tr><th></th><th>account</th><th>state</th><th>7d left</th><th class="x-num">requests</th><th class="x-num">errors</th><th class="x-num">now</th><th></th></tr></thead>${rows}</table>`;
   };
 
   /* ---------- Activities view (every request, all sessions) ---------- */

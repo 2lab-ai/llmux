@@ -45,8 +45,8 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertEqual(first.status, "active")
         XCTAssertEqual(first.inFlight, 1)
         XCTAssertEqual(first.tokenExpiresAtMs, 1_783_170_183_305)
-        XCTAssertEqual(try XCTUnwrap(first.fiveHour).utilization, 0.06, accuracy: 1e-9)
-        XCTAssertEqual(try XCTUnwrap(first.fiveHour).source, "headers")
+        XCTAssertEqual(try XCTUnwrap(first.sevenDay).utilization, 0.61, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(first.sevenDay).source, "headers")
 
         // Fable weekly rides the same wire object as /llmux/status.
         let fable = try XCTUnwrap(first.fableWeekly)
@@ -282,8 +282,7 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         XCTAssertEqual(record.type, account.type)
         XCTAssertNil(record.group)  // dashboard doc carries no group key
         XCTAssertEqual(record.status, account.status)
-        XCTAssertEqual(record.fiveHour?.utilization, account.fiveHour?.utilization)
-        XCTAssertEqual(record.fiveHour?.resetsInSecs, account.fiveHour?.resetsInSecs)
+        XCTAssertEqual(record.sevenDay?.resetsInSecs, account.sevenDay?.resetsInSecs)
         XCTAssertEqual(record.sevenDay?.utilization, account.sevenDay?.utilization)
         XCTAssertEqual(record.fableWeekly?.utilization, account.fableWeekly?.utilization)
         XCTAssertEqual(record.fableWeekly?.severity, account.fableWeekly?.severity)

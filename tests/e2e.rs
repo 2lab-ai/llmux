@@ -288,7 +288,6 @@ async fn sse_stream_passes_through_byte_identical_under_fragmentation() {
         body: SSE_BODY.to_string(),
         chunk_size: 7, // deliberately misaligned with event boundaries
         chunk_delay: Duration::from_millis(2),
-        five_hour: Some((0.10, 3_600)),
         seven_day: Some((0.10, 86_400)),
         content_type: true,
         extra_headers: Vec::new(),
@@ -383,27 +382,25 @@ async fn idle_upstream_stall_aborts_stream_and_releases_lease() {
 // 3. Threshold crossing: next request switches, in-flight stays pinned
 // ---------------------------------------------------------------------------
 
-/// Acceptance #3: account A pushed past 98% 5h utilization → the NEXT
+/// Acceptance #3: account A pushed past its 7d ceiling → the NEXT
 /// request lands on account B, while the request that crossed the threshold
 /// (still streaming) completes on A.
 #[tokio::test]
 async fn threshold_crossing_switches_next_request_but_not_in_flight() {
     let mock = MockUpstream::spawn().await;
-    // Request 1 (on A): slow SSE whose headers report A at 99% of the 5h
-    // window — over the 0.90 ceiling, so the scheduler must move off A.
+    // Request 1 (on A): slow SSE whose headers report A at 99.5% of the 7d
+    // window — over the 0.99 ceiling, so the scheduler must move off A.
     mock.push(ScriptedResponse::Sse {
         body: SSE_BODY.to_string(),
         chunk_size: 16,
         chunk_delay: Duration::from_millis(30),
-        five_hour: Some((0.99, 3_600)),
-        seven_day: Some((0.50, 86_400)),
+        seven_day: Some((0.995, 86_400)),
         content_type: true,
         extra_headers: Vec::new(),
     });
     // Request 2 (must be on B).
     mock.push(ScriptedResponse::ok_with(
         r#"{"id":"msg_b"}"#,
-        (0.10, 3_600),
         (0.10, 86_400),
     ));
     let proxy = Proxy::spawn(
@@ -491,8 +488,8 @@ async fn threshold_crossing_switches_next_request_but_not_in_flight() {
 async fn scheduler_picks_account_with_sooner_seven_day_reset() {
     let mock = MockUpstream::spawn().await;
     // a's 7d window resets in 48h; b's in 12h → b must be picked first.
-    mock.set_usage("at-a", (0.50, 3_600), (0.50, 48 * 3_600));
-    mock.set_usage("at-b", (0.50, 3_600), (0.50, 12 * 3_600));
+    mock.set_usage("at-a", (0.50, 48 * 3_600));
+    mock.set_usage("at-b", (0.50, 12 * 3_600));
     mock.push(ScriptedResponse::ok(r#"{"id":"msg_4"}"#));
     let proxy = Proxy::spawn(
         &mock.base_url(),
@@ -1618,7 +1615,8 @@ async fn status_account(proxy: &Proxy, name: &str) -> serde_json::Value {
 /// streaming 200 with NO content-type header — the proxy must still treat
 /// the 2xx as SSE (stream:true is always sent upstream) and convert it,
 /// never wrap it into a 502. The x-codex-* quota headers on the same
-/// response must populate the account's 5h/7d windows in /llmux/status.
+/// response must populate the account's 7d window in /llmux/status (the
+/// 300-minute primary window is a short window and is ignored).
 #[tokio::test]
 async fn codex_200_without_content_type_streams_and_populates_quota_windows() {
     let mock = MockUpstream::spawn().await;
@@ -1683,13 +1681,9 @@ async fn codex_200_without_content_type_streams_and_populates_quota_windows() {
     // The x-codex-* headers were recorded as the account's windows.
     let account = status_account(&proxy, "cx").await;
     assert_eq!(account["type"], "codex");
-    let five = &account["five_hour"];
-    assert!(five.is_object(), "5h window populated: {account}");
-    assert!((five["utilization"].as_f64().expect("5h util") - 0.0).abs() < 1e-9);
-    let five_resets_in = five["resets_in_secs"].as_u64().expect("5h reset");
     assert!(
-        (260..=275).contains(&five_resets_in),
-        "5h resets_in ~275s, got {five_resets_in}"
+        account.get("five_hour").is_none(),
+        "no 5h window on the wire: {account}"
     );
     let seven = &account["seven_day"];
     assert!((seven["utilization"].as_f64().expect("7d util") - 0.02).abs() < 1e-9);
@@ -1739,7 +1733,6 @@ async fn codex_quota_headers_drive_eligibility_gate_and_blocking_reason() {
     let _ = response.bytes().await.expect("drain stream");
 
     let account = status_account(&proxy, "cx").await;
-    assert!((account["five_hour"]["utilization"].as_f64().expect("5h") - 0.37).abs() < 1e-9);
     assert!((account["seven_day"]["utilization"].as_f64().expect("7d") - 0.995).abs() < 1e-9);
     let blocked = account["blocked"].as_str().expect("blocked reason");
     assert!(
@@ -1755,7 +1748,6 @@ async fn codex_json_200_body_terminates_with_clean_error_event() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::Ok {
         body: r#"{"detail":"not an event stream"}"#.to_string(),
-        five_hour: None,
         seven_day: None,
     });
     let proxy =
@@ -1802,7 +1794,6 @@ async fn raw_io_endpoint_serves_the_captured_exchange() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::ok_with(
         r#"{"id":"msg_raw","type":"message","usage":{"input_tokens":3,"output_tokens":2}}"#,
-        (0.20, 3_600),
         (0.20, 12 * 3_600),
     ));
     let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
@@ -2120,11 +2111,10 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     let mock = MockUpstream::spawn().await;
     // b's 7d window resets sooner → b ranks first; a follows. Selection
     // order in the document must mirror that (current first, then by rank).
-    mock.set_usage("at-a", (0.50, 3_600), (0.50, 48 * 3_600));
-    mock.set_usage("at-b", (0.50, 3_600), (0.50, 12 * 3_600));
+    mock.set_usage("at-a", (0.50, 48 * 3_600));
+    mock.set_usage("at-b", (0.50, 12 * 3_600));
     mock.push(ScriptedResponse::ok_with(
         r#"{"id":"msg_d","type":"message","usage":{"input_tokens":11,"output_tokens":4}}"#,
-        (0.20, 3_600),
         (0.20, 12 * 3_600),
     ));
     let proxy = Proxy::spawn(
@@ -2179,7 +2169,12 @@ async fn dashboard_endpoint_serves_the_attach_document() {
         "config_path present: {doc}"
     );
     assert_eq!(doc["current"], "b");
-    assert!(doc["select_params"]["five_hour_max"].is_number());
+    assert!(doc["select_params"]["seven_day_max"].is_number());
+    assert!(
+        doc["select_params"].get("five_hour_max").is_none(),
+        "no 5h ceiling on the wire: {}",
+        doc["select_params"]
+    );
     assert!(doc["evaluate_tick_secs"].is_u64());
 
     // Accounts in selection order (current → rank), status-compatible keys.
@@ -2192,7 +2187,11 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     assert_eq!(accounts[0]["order"], 1);
     assert_eq!(accounts[0]["status"], "active");
     assert_eq!(accounts[0]["type"], "oauth");
-    assert!(accounts[0]["five_hour"]["resets_in_secs"].is_u64());
+    assert!(accounts[0]["seven_day"]["resets_in_secs"].is_u64());
+    assert!(
+        accounts.iter().all(|a| a.get("five_hour").is_none()),
+        "no 5h window on the wire: {doc}"
+    );
     assert!(accounts[0]["session"]["requests"].is_u64());
 
     // Scheduler / poller / totals panes.
@@ -2228,7 +2227,7 @@ async fn dashboard_endpoint_serves_the_attach_document() {
     let parsed_names: Vec<&str> = parsed.accounts.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(parsed_names, vec!["b", "a"]);
     assert!(
-        parsed.accounts[0].five_hour.is_some(),
+        parsed.accounts[0].seven_day.is_some(),
         "window reconstruction fields present after round-trip"
     );
 }
@@ -2246,8 +2245,8 @@ async fn dashboard_endpoint_serves_the_attach_document() {
 async fn switch_endpoint_switches_current_account() {
     let mock = MockUpstream::spawn().await;
     // Both eligible; a ranks first (sooner 7d reset) so initial current = a.
-    mock.set_usage("at-a", (0.30, 3_600), (0.30, 12 * 3_600));
-    mock.set_usage("at-b", (0.30, 3_600), (0.30, 48 * 3_600));
+    mock.set_usage("at-a", (0.30, 12 * 3_600));
+    mock.set_usage("at-b", (0.30, 48 * 3_600));
     let proxy = Proxy::spawn(
         &mock.base_url(),
         vec![oauth_account("a", "at-a"), oauth_account("b", "at-b")],
@@ -2627,7 +2626,6 @@ async fn oversized_request_body_returns_413_without_disturbing_in_flight() {
         body: SSE_BODY.to_string(),
         chunk_size: 16,
         chunk_delay: Duration::from_millis(30),
-        five_hour: Some((0.10, 3_600)),
         seven_day: Some((0.10, 86_400)),
         content_type: true,
         extra_headers: Vec::new(),
@@ -2743,9 +2741,9 @@ fn idle_probe_config(mock: &MockUpstream, cooldown_secs: u64) -> Config {
     config
 }
 
-/// Poll the pool until `account` has a 5h window (the spawned probe is async),
+/// Poll the pool until `account` has a 7d window (the spawned probe is async),
 /// up to ~2s. Returns the window's utilization, or `None` if it never arrives.
-async fn await_five_hour(proxy: &Proxy, account: &str) -> Option<f64> {
+async fn await_seven_day(proxy: &Proxy, account: &str) -> Option<f64> {
     for _ in 0..200 {
         if let Some(util) = proxy
             .pool
@@ -2753,7 +2751,7 @@ async fn await_five_hour(proxy: &Proxy, account: &str) -> Option<f64> {
             .accounts
             .iter()
             .find(|a| a.id.0 == account)
-            .and_then(|a| a.five_hour)
+            .and_then(|a| a.seven_day)
             .map(|w| w.utilization)
         {
             return Some(util);
@@ -2781,12 +2779,12 @@ fn probe_count(mock: &MockUpstream, bearer: &str) -> usize {
 
 /// Acceptance (#21): an idle (no-window) account is populated on demand by a
 /// single gated `max_tokens = 1` probe whose `anthropic-ratelimit-*` headers
-/// feed the 5h/7d windows; a per-account cooldown prevents a second probe.
+/// feed the 7d window; a per-account cooldown prevents a second probe.
 #[tokio::test]
 async fn idle_probe_populates_windows_once_and_respects_cooldown() {
     let mock = MockUpstream::spawn().await;
     // Probe responses (and the served request) all return unified headers by
-    // default — b's 5h reads 0.10 from `ScriptedResponse::ok`.
+    // default — b's 7d reads 0.10 from `ScriptedResponse::ok`.
     let proxy = Proxy::spawn_probing(idle_probe_config(&mock, 3600)).await;
 
     // Sanity: b starts windowless (poller's /api/oauth/usage 404s).
@@ -2797,7 +2795,7 @@ async fn idle_probe_populates_windows_once_and_respects_cooldown() {
             .accounts
             .iter()
             .find(|a| a.id.0 == "b")
-            .and_then(|a| a.five_hour)
+            .and_then(|a| a.seven_day)
             .is_none(),
         "b is idle (no window) before any traffic"
     );
@@ -2808,11 +2806,11 @@ async fn idle_probe_populates_windows_once_and_respects_cooldown() {
     let response = post_messages(&client, &proxy, "{}").await;
     assert_eq!(response.status(), 200);
 
-    // b's 5h window is populated by the probe's response headers
+    // b's 7d window is populated by the probe's response headers
     // (WindowSource::Headers via record_headers).
-    let util = await_five_hour(&proxy, "b")
+    let util = await_seven_day(&proxy, "b")
         .await
-        .expect("b's 5h window populated by the idle probe");
+        .expect("b's 7d window populated by the idle probe");
     assert!(
         (util - 0.10).abs() < 1e-9,
         "window came from the probe headers"
@@ -2861,7 +2859,7 @@ async fn idle_probe_kill_switch_disables_probing() {
             .accounts
             .iter()
             .find(|a| a.id.0 == "b")
-            .and_then(|a| a.five_hour)
+            .and_then(|a| a.seven_day)
             .is_none(),
         "b stays windowless with probing disabled"
     );
@@ -2883,8 +2881,9 @@ fn codex_sweep_config(mock: &MockUpstream, sweep_secs: u64) -> Config {
     config
 }
 
-/// `x-codex-*` quota headers for a healthy codex account (primary 5h, secondary
-/// 7d), shaped like the live capture so the probe response feeds both windows.
+/// `x-codex-*` quota headers for a healthy codex account, shaped like the
+/// 2026-06-12 live capture: a short 300-minute primary window (ignored) and
+/// the weekly secondary window the probe response feeds.
 fn codex_quota_headers() -> Vec<(String, String)> {
     let primary_reset = epoch_secs_in(275).to_string();
     let secondary_reset = epoch_secs_in(465_379).to_string();
@@ -2914,7 +2913,7 @@ fn codex_probe_count(mock: &MockUpstream, bearer: &str) -> usize {
 }
 
 /// Acceptance (#45): a cold Codex account with ZERO client traffic gains its
-/// 5h/7d windows within one sweep interval once the probe is enabled and a
+/// 7d window within one sweep interval once the probe is enabled and a
 /// positive `sweep_secs` is configured. No `post_messages` is ever sent — the
 /// background timer alone drives the `/responses` probe whose `x-codex-*`
 /// headers populate the windows.
@@ -2946,24 +2945,24 @@ async fn timer_sweep_warms_cold_codex_account_without_traffic() {
             .accounts
             .iter()
             .find(|a| a.id.0 == "cx")
-            .and_then(|a| a.five_hour)
+            .and_then(|a| a.seven_day)
             .is_none(),
         "cx is cold (no window) before any sweep"
     );
 
     // The background sweep fires the codex `/responses` probe; its x-codex-*
-    // headers populate the 5h window via record_headers — with NO client
+    // headers populate the 7d window via record_headers — with NO client
     // request ever sent.
-    let util = await_five_hour(&proxy, "cx")
+    let util = await_seven_day(&proxy, "cx")
         .await
-        .expect("the timer sweep populated cx's 5h window with zero traffic");
+        .expect("the timer sweep populated cx's 7d window with zero traffic");
     assert!(
-        (util - 0.05).abs() < 1e-9,
+        (util - 0.20).abs() < 1e-9,
         "window came from the sweep probe's x-codex-* headers"
     );
 
-    // The 7d window is populated too, and the probe really was the codex
-    // `/responses` path bearing the account's own credential.
+    // The probe really was the codex `/responses` path bearing the
+    // account's own credential.
     let account = status_account(&proxy, "cx").await;
     assert!(
         account["seven_day"].is_object(),
@@ -2982,7 +2981,7 @@ async fn timer_sweep_warms_cold_codex_account_without_traffic() {
 #[tokio::test]
 async fn timer_sweep_warms_cold_oauth_account_without_traffic() {
     let mock = MockUpstream::spawn().await;
-    // Probe responses carry unified ratelimit headers (5h util 0.10 from ok()).
+    // Probe responses carry unified ratelimit headers (7d util 0.10 from ok()).
     for _ in 0..8 {
         mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
     }
@@ -3004,15 +3003,15 @@ async fn timer_sweep_warms_cold_oauth_account_without_traffic() {
             .accounts
             .iter()
             .find(|x| x.id.0 == "a")
-            .and_then(|x| x.five_hour)
+            .and_then(|x| x.seven_day)
             .is_none(),
         "a is cold before any sweep"
     );
 
     // The all-groups sweep probes the cold oauth account with zero client traffic.
-    let util = await_five_hour(&proxy, "a")
+    let util = await_seven_day(&proxy, "a")
         .await
-        .expect("the timer sweep populated the cold oauth account's 5h window");
+        .expect("the timer sweep populated the cold oauth account's 7d window");
     assert!(
         (util - 0.10).abs() < 1e-9,
         "window came from the sweep probe headers"
@@ -3060,7 +3059,7 @@ async fn timer_sweep_kill_switch_disables_sweep() {
             .accounts
             .iter()
             .find(|a| a.id.0 == "cx")
-            .and_then(|a| a.five_hour)
+            .and_then(|a| a.seven_day)
             .is_none(),
         "cx stays cold with probing disabled"
     );
@@ -3100,7 +3099,7 @@ async fn timer_sweep_disabled_when_sweep_secs_zero() {
             .accounts
             .iter()
             .find(|a| a.id.0 == "cx")
-            .and_then(|a| a.five_hour)
+            .and_then(|a| a.seven_day)
             .is_none(),
         "cx stays cold when the sweep is off"
     );

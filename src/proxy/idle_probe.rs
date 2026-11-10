@@ -3,14 +3,14 @@
 //! reusing the SAME credential-injection / request-build hooks the forward
 //! path uses — sends it with the shared `reqwest::Client`, and hands the
 //! response headers back to the scheduler's [`IdleProber`] orchestrator, which
-//! parses the `anthropic-ratelimit-*` set into the 5h/7d windows
+//! parses the `anthropic-ratelimit-*` set into the 7d window
 //! (`WindowSource::Headers`).
 //!
 //! Codex path (issue #21 §Codex): a Codex account's `count_tokens` is answered
 //! locally with no upstream call, so it emits no ratelimit headers — a real
 //! `/responses` ping is therefore used for Codex too (built via
 //! [`crate::provider::codex::CodexProvider::build_request`]). That is the only
-//! path that actually moves/returns Codex's 5h/7d windows. Its body is built
+//! path that actually moves/returns Codex's 7d window. Its body is built
 //! separately from the Anthropic one because Codex accepts no output cap (see
 //! [`codex_probe_body`]).
 
@@ -114,11 +114,11 @@ impl ReqwestProber {
                 "grok accounts expose no quota headers; idle probe skipped".into(),
             )),
             // OpenRouter's quota model is per-key credit/rate limits, not the
-            // 5h/7d rolling windows the prober exists to sample, and the free
+            // 7d rolling window the prober exists to sample, and the free
             // models cost nothing — a probe would burn a request to learn
             // nothing the scheduler ranks on. Gated out alongside grok.
             AccountCredential::OpenRouter { .. } => Err(ProbeError::Build(
-                "openrouter accounts expose no 5h/7d quota windows; idle probe skipped".into(),
+                "openrouter accounts expose no 7d quota window; idle probe skipped".into(),
             )),
             // Gemini streams carry no quota headers either; its windows come
             // from the `fetchAvailableModels` usage poll instead
@@ -169,7 +169,7 @@ impl Prober for ReqwestProber {
                 .await?;
             // The rate-limit headers ride on EVERY response (200, 429, even
             // some errors), so we read them regardless of status — a 429 still
-            // tells us the account's current 5h/7d utilization.
+            // tells us the account's current 7d utilization.
             Ok(response.headers().clone())
         }
     }

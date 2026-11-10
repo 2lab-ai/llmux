@@ -226,7 +226,6 @@ pub struct SettingsLive {
     pub routing_enabled: AtomicBool,
     /// Raw-io capture gate (config `raw_io.enabled`) — read per request.
     pub raw_io_enabled: AtomicBool,
-    pub five_hour_max: AtomicU64,
     pub seven_day_max: AtomicU64,
     pub fable_weekly_max: AtomicU64,
     pub usage_max_age_secs: AtomicU64,
@@ -246,7 +245,6 @@ impl SettingsLive {
             ),
             routing_enabled: AtomicBool::new(config.routing.enabled),
             raw_io_enabled: AtomicBool::new(config.raw_io.enabled),
-            five_hour_max: AtomicU64::new(config.scheduler.five_hour_max.to_bits()),
             seven_day_max: AtomicU64::new(config.scheduler.seven_day_max.to_bits()),
             fable_weekly_max: AtomicU64::new(config.scheduler.fable_weekly_max.to_bits()),
             usage_max_age_secs: AtomicU64::new(config.scheduler.usage_max_age_secs),
@@ -294,7 +292,7 @@ pub struct AppState {
     pub openrouter: Arc<crate::provider::openrouter::OpenRouterProvider>,
     /// On-demand idle-account usage probe (issue #21). Fires at most one
     /// gated `max_tokens = 1` ping for a windowless account so the scheduler's
-    /// ranking/display has real 5h/7d data. Enabled by default (#45;
+    /// ranking/display has real 7d data. Enabled by default (#45;
     /// `config.proxy.idle_probe.enabled`), with the background timer sweep in
     /// [`serve`] driving it; cooldown-gated per account so triggers never burst.
     pub idle_prober: Arc<IdleProber<ReqwestProber>>,
@@ -570,7 +568,6 @@ impl AppState {
             crate::config::SchedulerMode::Default
         };
         let live = &self.settings_live;
-        params.five_hour_max = f64::from_bits(live.five_hour_max.load(Ordering::Relaxed));
         params.seven_day_max = f64::from_bits(live.seven_day_max.load(Ordering::Relaxed));
         params.fable_weekly_max = f64::from_bits(live.fable_weekly_max.load(Ordering::Relaxed));
         params.usage_max_age = Duration::from_secs(live.usage_max_age_secs.load(Ordering::Relaxed));
@@ -654,7 +651,6 @@ impl AppState {
         for account in snapshot.accounts.iter().filter(|a| {
             group.is_none_or(|g| a.group == g)
                 && crate::scheduler::idle_probe::windows_need_probe(
-                    a.five_hour.as_ref(),
                     a.seven_day.as_ref(),
                     now,
                     stale_after,
@@ -1340,8 +1336,8 @@ pub async fn serve(
 
     // Background: keep ALL cold accounts warm (issue #45, generalized). A cold
     // account with NO client traffic is never probed by the request path. The
-    // oauth-only usage poller covers cold *oauth* accounts, but cold Codex AND
-    // cold api-key accounts have no other window source, so their 5h/7d windows
+    // oauth-only usage poller covers cold *oauth* accounts, but cold Codex
+    // accounts have no other window source, so their 7d window would
     // stay empty forever (and show no usage in `status`/dashboard/llmux-islands).
     // When the idle probe is enabled AND a positive sweep cadence is configured,
     // fire the probe trigger for EVERY backend group on a timer (`None` = all
@@ -2494,8 +2490,8 @@ fn epoch_secs(at: SystemTime) -> u64 {
 
 /// One model-scoped window (`limits[]` `weekly_scoped`, e.g. "Fable") as a
 /// `/llmux/status` JSON object. Utilization uses `effective_utilization` — the
-/// same expiry-collapsing convention this endpoint applies to `five_hour` /
-/// `seven_day` (an already-reset window reads 0). `scope_label` is included
+/// same expiry-collapsing convention this endpoint applies to `seven_day`
+/// (an already-reset window reads 0). `scope_label` is included
 /// only for the generic `scoped_limits` list; `fable_weekly` surfaces the same
 /// fields without it (`with_label = false`).
 fn scoped_window_json(
@@ -2612,7 +2608,6 @@ pub fn status_json(
                     "order": order + 1,
                     "blocked": blocked,
                     "auth_failure_status": account.auth_failure_status,
-                    "five_hour": window(&account.five_hour),
                     "seven_day": window(&account.seven_day),
                     // Model-scoped weekly windows (additive; null / empty when
                     // none seen). `fable_weekly` is the "Fable" entry surfaced
@@ -3101,8 +3096,8 @@ pub struct SettingsRequest {
     pub quota_display: Option<String>,
     pub routing_enabled: Option<bool>,
     pub raw_io_enabled: Option<bool>,
-    /// Scheduler ceilings, fractions in `[0.0, 1.0]`.
-    pub five_hour_max: Option<f64>,
+    /// Scheduler ceilings, fractions in `[0.0, 1.0]`. A `five_hour_max` from
+    /// an older client (the retired 5h ceiling) is ignored.
     pub seven_day_max: Option<f64>,
     pub fable_weekly_max: Option<f64>,
     /// Scheduler usage evidence max age, seconds in `[5, 3600]`.
@@ -3160,7 +3155,6 @@ pub fn apply_settings(
         Some(other) => return Err(format!("quota_display: unknown value {other:?}")),
     };
     for (name, v) in [
-        ("five_hour_max", req.five_hour_max),
         ("seven_day_max", req.seven_day_max),
         ("fable_weekly_max", req.fable_weekly_max),
     ] {
@@ -3247,7 +3241,6 @@ pub fn apply_settings(
             quota_display: req.quota_display.clone(),
             routing_enabled: req.routing_enabled,
             raw_io_enabled: req.raw_io_enabled,
-            five_hour_max: req.five_hour_max,
             seven_day_max: req.seven_day_max,
             fable_weekly_max: req.fable_weekly_max,
             usage_max_age_secs: req.usage_max_age_secs,
@@ -3281,9 +3274,6 @@ pub fn apply_settings(
             }
             if let Some(v) = r.raw_io_enabled {
                 c.raw_io.enabled = v;
-            }
-            if let Some(v) = r.five_hour_max {
-                c.scheduler.five_hour_max = v;
             }
             if let Some(v) = r.seven_day_max {
                 c.scheduler.seven_day_max = v;
@@ -3355,10 +3345,6 @@ pub fn apply_settings(
     if let Some(v) = req.raw_io_enabled {
         live.raw_io_enabled.store(v, Ordering::Relaxed);
         applied.push("raw_io_enabled");
-    }
-    if let Some(v) = req.five_hour_max {
-        live.five_hour_max.store(v.to_bits(), Ordering::Relaxed);
-        applied.push("five_hour_max");
     }
     if let Some(v) = req.seven_day_max {
         live.seven_day_max.store(v.to_bits(), Ordering::Relaxed);
@@ -3914,9 +3900,9 @@ async fn pause_account_endpoint(
 #[derive(serde::Deserialize)]
 struct AccountLimitsRequest {
     account: String,
-    /// Fractions 0..=1; absent field = no override for that window. All three
-    /// absent = clear the account's overrides entirely.
-    five_hour_max: Option<f64>,
+    /// Fractions 0..=1; absent field = no override for that window. Both
+    /// absent = clear the account's overrides entirely. A `five_hour_max` from
+    /// an older client (the retired 5h ceiling) is ignored.
     seven_day_max: Option<f64>,
     fable_weekly_max: Option<f64>,
 }
@@ -3932,7 +3918,6 @@ async fn account_limits_endpoint(
         return relay_error(StatusCode::BAD_REQUEST, "account is required");
     }
     for (label, v) in [
-        ("five_hour_max", body.five_hour_max),
         ("seven_day_max", body.seven_day_max),
         ("fable_weekly_max", body.fable_weekly_max),
     ] {
@@ -3946,7 +3931,6 @@ async fn account_limits_endpoint(
         }
     }
     let limits = crate::config::AccountLimits {
-        five_hour_max: body.five_hour_max,
         seven_day_max: body.seven_day_max,
         fable_weekly_max: body.fable_weekly_max,
     };
@@ -4612,7 +4596,6 @@ mod tests {
 
     fn params() -> SelectParams {
         SelectParams {
-            five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
@@ -4645,12 +4628,8 @@ mod tests {
         pool.record_headers(
             &AccountId("a".into()),
             &ParsedRateLimitHeaders {
-                five_hour: Some(WindowReading {
-                    utilization: 0.42,
-                    resets_at: now + Duration::from_secs(3600),
-                }),
                 seven_day: Some(WindowReading {
-                    utilization: 0.10,
+                    utilization: 0.42,
                     resets_at: now + Duration::from_secs(86_400),
                 }),
                 ..Default::default()
@@ -4690,10 +4669,13 @@ mod tests {
         assert_eq!(a["status"], "active");
         assert_eq!(a["order"], 1);
         assert_eq!(a["blocked"], serde_json::Value::Null);
-        assert!((a["five_hour"]["utilization"].as_f64().expect("util") - 0.42).abs() < 1e-9);
-        assert_eq!(a["five_hour"]["resets_at"], 1_000_000 + 3600);
-        assert_eq!(a["five_hour"]["resets_in_secs"], 3600);
+        assert!((a["seven_day"]["utilization"].as_f64().expect("util") - 0.42).abs() < 1e-9);
+        assert_eq!(a["seven_day"]["resets_at"], 1_000_000 + 86_400);
         assert_eq!(a["seven_day"]["resets_in_secs"], 86_400);
+        assert!(
+            a.get("five_hour").is_none(),
+            "no 5h window on the wire: {a}"
+        );
         assert_eq!(a["totals"]["requests"], 3);
         assert_eq!(a["totals"]["input_tokens"], 100);
         assert_eq!(a["totals"]["output_tokens"], 50);
@@ -4707,7 +4689,7 @@ mod tests {
         assert_eq!(k["blocked"], "cooldown 2m00s");
         assert_eq!(k["cooldown_until"], 1_000_000 + 120);
         assert_eq!(
-            k["five_hour"],
+            k["seven_day"],
             serde_json::Value::Null,
             "cold window is null"
         );
@@ -4720,7 +4702,7 @@ mod tests {
         // reaches the `/llmux/status` JSON: parse the verbatim live DEV1 usage
         // body, record it, and assert `fable_weekly` + `scoped_limits` are
         // present with the fixture's 100% / critical / active Fable reading —
-        // while `five_hour`/`seven_day` stay exactly as before. A second account
+        // while `seven_day` stays exactly as before. A second account
         // with no scoped rows proves the null/empty shape.
         //
         // `now` sits BEFORE the fixture's Fable reset (2026-07-03T21:59:59Z =
@@ -4779,8 +4761,9 @@ mod tests {
         assert_eq!(scoped[0]["severity"], "critical");
         assert_eq!(scoped[0]["is_active"], true);
 
-        // Legacy windows stay EXACTLY as today: five_hour 0%, seven_day 58%.
-        assert_eq!(dev1["five_hour"]["utilization"], 0.0);
+        // The legacy weekly window stays EXACTLY as today (58%); the
+        // fixture's retired five_hour row surfaces nowhere.
+        assert!(dev1.get("five_hour").is_none(), "{dev1}");
         assert!(
             (dev1["seven_day"]["utilization"].as_f64().expect("util") - 0.58).abs() < 1e-9,
             "seven_day legacy parse unchanged"
@@ -5141,7 +5124,6 @@ mod tests {
         let state = endpoint_state(&path, vec![oauth_account("a"), oauth_account("b")]);
         let now = SystemTime::now();
         let weekly = |days: u64| crate::scheduler::usage::UsageSnapshot {
-            five_hour: None,
             seven_day: Some(crate::scheduler::headers::WindowReading {
                 utilization: 0.10,
                 resets_at: now + Duration::from_secs(days * 86_400),
@@ -6235,7 +6217,7 @@ mod tests {
         // Invalid values are rejected BEFORE any write (atomic apply).
         for bad in [
             SettingsRequest {
-                five_hour_max: Some(1.5),
+                seven_day_max: Some(1.5),
                 ..Default::default()
             },
             SettingsRequest {
@@ -6264,8 +6246,8 @@ mod tests {
         }
         let on_disk = crate::config::load_path(&path).expect("reload");
         assert_eq!(
-            on_disk.scheduler.five_hour_max,
-            crate::config::SchedulerConfig::default().five_hour_max,
+            on_disk.scheduler.seven_day_max,
+            crate::config::SchedulerConfig::default().seven_day_max,
             "rejected request wrote nothing (default intact)"
         );
 
@@ -6273,21 +6255,21 @@ mod tests {
         let req = SettingsRequest {
             tui_effects: Some(false),
             routing_enabled: Some(true),
-            five_hour_max: Some(0.5),
+            seven_day_max: Some(0.5),
             raw_io_max_body_bytes: Some(1_048_576),
             ..Default::default()
         };
         let (applied, restart) = apply_settings(&state, &req).expect("valid");
         assert_eq!(
             applied,
-            vec!["tui_effects", "routing_enabled", "five_hour_max"]
+            vec!["tui_effects", "routing_enabled", "seven_day_max"]
         );
         assert_eq!(restart, vec!["raw_io_max_body_bytes"]);
         // Live holders flipped (no restart)...
         assert!(!state.settings_live.tui_effects.load(Ordering::Relaxed));
         assert!(state.settings_live.routing_enabled.load(Ordering::Relaxed));
         assert_eq!(
-            state.select_params().five_hour_max,
+            state.select_params().seven_day_max,
             0.5,
             "scheduler reads the live ceiling immediately"
         );
@@ -6295,7 +6277,7 @@ mod tests {
         let on_disk = crate::config::load_path(&path).expect("reload");
         assert!(!on_disk.tui_effects);
         assert!(on_disk.routing.enabled);
-        assert_eq!(on_disk.scheduler.five_hour_max, 0.5);
+        assert_eq!(on_disk.scheduler.seven_day_max, 0.5);
         assert_eq!(on_disk.raw_io.max_body_bytes, 1_048_576);
         assert_eq!(on_disk.accounts.len(), 1, "accounts survive the merge");
     }
@@ -6373,7 +6355,7 @@ mod tests {
 
         let snap = &state.pool.snapshot().accounts[0];
         assert!(snap.cooldown_until.is_none(), "cooldown cleared");
-        assert!(snap.five_hour.is_none() && snap.seven_day.is_none(), "cold");
+        assert!(snap.seven_day.is_none(), "cold");
     }
 
     #[tokio::test]

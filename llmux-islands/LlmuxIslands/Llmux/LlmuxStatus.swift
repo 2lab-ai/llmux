@@ -23,7 +23,6 @@ struct LlmuxAccountRecord: Decodable {
     let type: String            // "oauth" | "apikey" | "codex" | "grok" | "gemini"
     let group: String?          // "claude" | "codex" | "grok" | "gemini"
     let status: String?         // "active" | "ok" | "cooldown" | "auth_failed"
-    let fiveHour: LlmuxWindow?
     let sevenDay: LlmuxWindow?
     /// The Fable weekly (7d) usage window. Optional on purpose: an OLD daemon
     /// omits `fable_weekly` entirely, and the daemon reports `null` for an
@@ -39,7 +38,6 @@ struct LlmuxAccountRecord: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case name, type, group, status, paused
-        case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case fableWeekly = "fable_weekly"
         case inFlight = "in_flight"
