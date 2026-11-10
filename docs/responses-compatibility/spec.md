@@ -277,7 +277,10 @@ controlled A/B on the live codex gateway (2026-11-10) found the cause:
 | same 60 tools (~16.6K tokens), different instructions | 0 / 16,845 (2/2) | 16,640 / 16,845 (2/2) |
 
 So the backend reuses a cached prefix only on the route the key picks, and tools precede
-the instructions in that prefix. A per-conversation key starts every new conversation
+the instructions in that prefix. Sharing needs byte-identical tools: a tool whose
+description carries something per session (a Slack MCP tool naming the thread it serves,
+say) gives each session its own route — one cold start per session, never per
+conversation. A per-conversation key starts every new conversation
 cold; the per-process key put every request on one route. The native Responses frontend
 keeps the client's own `prompt_cache_key` and routes the `session-id` header with it too.
 Grok still sends no `prompt_cache_key`: its cache hit rate is already 97.4%
