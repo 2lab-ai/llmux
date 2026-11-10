@@ -23,7 +23,6 @@ extension SharedUiState {
                 status: account.status,
                 blocked: account.blockedReason,
                 healthy: account.healthy,
-                fiveHour: account.gauge(.fiveHour)?.dashboardWindow(nowMs: nowMs),
                 sevenDay: account.gauge(.sevenDay)?.dashboardWindow(nowMs: nowMs),
                 fableWeekly: account.gauge(.fableWeekly)?.scopedWindow(nowMs: nowMs),
                 cooldownUntil: health?.cooldownUntilMs.map { $0 / 1_000 },
@@ -70,7 +69,6 @@ extension SharedUiState {
 
 extension SharedAccountTile {
     var usageTile: UsageAccountTile {
-        let five = gauge(.fiveHour)
         let seven = gauge(.sevenDay)
         let fable = gauge(.fableWeekly)
         let email = displayName.contains("@") ? displayName : nil
@@ -92,9 +90,7 @@ extension SharedAccountTile {
                 name: displayName,
                 available: healthy,
                 error: !healthy,
-                fiveHourPercent: five.map { $0.usedFraction * 100 },
                 sevenDayPercent: seven.map { $0.usedFraction * 100 },
-                fiveHourReset: five?.resetDate,
                 sevenDayReset: seven?.resetDate,
                 model: nil,
                 plan: nil,

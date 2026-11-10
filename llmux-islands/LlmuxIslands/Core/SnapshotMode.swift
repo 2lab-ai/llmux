@@ -525,14 +525,12 @@ enum SnapshotMode {
     private static func fixtureTiles() -> [UsageAccountTile] {
         let now = Date()
 
-        func info(name: String, fiveHour: Double, sevenDay: Double) -> CLIUsageInfo {
+        func info(name: String, sevenDay: Double) -> CLIUsageInfo {
             CLIUsageInfo(
                 name: name,
                 available: true,
                 error: false,
-                fiveHourPercent: fiveHour,
                 sevenDayPercent: sevenDay,
-                fiveHourReset: now.addingTimeInterval(2 * 3600 + 17 * 60),
                 sevenDayReset: now.addingTimeInterval(3 * 24 * 3600 + 5 * 3600),
                 model: nil,
                 plan: nil,
@@ -540,7 +538,7 @@ enum SnapshotMode {
             )
         }
 
-        func tile(index: Int, provider: UsageProvider, tier: String?, fiveHour: Double, sevenDay: Double) -> UsageAccountTile {
+        func tile(index: Int, provider: UsageProvider, tier: String?, sevenDay: Double) -> UsageAccountTile {
             let email = DemoMode.fakeEmail(index: index)
             return UsageAccountTile(
                 id: email,
@@ -554,18 +552,18 @@ enum SnapshotMode {
                     expiresAt: now.addingTimeInterval(5 * 3600),
                     lifetimeSeconds: 8 * 3600
                 ),
-                info: info(name: email, fiveHour: fiveHour, sevenDay: sevenDay),
+                info: info(name: email, sevenDay: sevenDay),
                 errorMessage: nil,
                 issue: nil
             )
         }
 
         return [
-            tile(index: 0, provider: .claude, tier: "max20", fiveHour: 34, sevenDay: 61),
-            tile(index: 1, provider: .claude, tier: "max5", fiveHour: 78, sevenDay: 42),
-            tile(index: 2, provider: .codex, tier: nil, fiveHour: 12, sevenDay: 27),
+            tile(index: 0, provider: .claude, tier: "max20", sevenDay: 61),
+            tile(index: 1, provider: .claude, tier: "max5", sevenDay: 42),
+            tile(index: 2, provider: .codex, tier: nil, sevenDay: 27),
             // 7d ≥ 90% — exercises the compact rows' warning color (#68).
-            tile(index: 3, provider: .claude, tier: "pro", fiveHour: 55, sevenDay: 96),
+            tile(index: 3, provider: .claude, tier: "pro", sevenDay: 96),
         ]
     }
 }

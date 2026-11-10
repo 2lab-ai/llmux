@@ -64,8 +64,7 @@ impl GeminiUsageError {
 ///
 /// `usage` carries ONLY what the document proves: the default agent model's
 /// quota lands on `seven_day`; every other usable model with a complete quota
-/// becomes a scoped reading. `five_hour` is never set (the backend reports no
-/// burst window).
+/// becomes a scoped reading.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GeminiQuota {
     pub usage: UsageSnapshot,
@@ -260,7 +259,6 @@ mod tests {
         let seven = quota.usage.seven_day.expect("default model window");
         assert_eq!(seven.utilization, 0.0, "remainingFraction 1 → 0% used");
         assert_eq!(epoch_of(seven.resets_at), RESET_EPOCH);
-        assert!(quota.usage.five_hour.is_none(), "no burst window upstream");
 
         let labels: Vec<&str> = quota
             .usage

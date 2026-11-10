@@ -18,13 +18,11 @@ enum UsageProvider: Hashable {
 }
 
 enum UsageWindow: CaseIterable {
-    case twentyFourHour
     case sevenDay
     case fableWeekly
 
     var label: String {
         switch self {
-        case .twentyFourHour: "24h"
         case .sevenDay: "7d"
         // Fable weekly is a 7-day window scoped to the Fable model — stack the
         // duration over the scope so the row reads "7d / Fab" (two lines).
@@ -509,9 +507,8 @@ private struct UsageProviderColumn: View {
     private var providerWindows: [UsageWindow] {
         switch provider {
         case .claude, .codex, .grok, .gemini:
-            // Only the 7d row: Islands intentionally no longer displays the 5h
-            // window (owner 2026-11-04), even when the daemon reports one.
-            // Grok reports no quota windows (docs/grok/spec.md §R3) — the row
+            // Only the 7d row: no provider has a 5h window any more (owner
+            // 2026-11-04 and 2026-11-10). Grok reports no quota windows (docs/grok/spec.md §R3) — the row
             // renders its placeholder until a parked reset appears.
             var windows: [UsageWindow] = [.sevenDay]
             // The Fable weekly row is opt-out (default on) and only appears when
@@ -526,7 +523,6 @@ private struct UsageProviderColumn: View {
     private func percentUsed(for window: UsageWindow) -> Double? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
-        case .twentyFourHour: return info.fiveHourPercent
         case .sevenDay: return info.sevenDayPercent
         case .fableWeekly: return info.fableWeeklyPercent
         }
@@ -535,7 +531,6 @@ private struct UsageProviderColumn: View {
     private func resetAt(for window: UsageWindow) -> Date? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
-        case .twentyFourHour: return info.fiveHourReset
         case .sevenDay: return info.sevenDayReset
         case .fableWeekly: return info.fableWeeklyReset
         }
@@ -797,8 +792,6 @@ private struct UsageWindowRow: View {
 
     private var windowDurationSeconds: TimeInterval? {
         switch window {
-        case .twentyFourHour:
-            return 24 * 60 * 60
         case .sevenDay, .fableWeekly:
             return 7 * 24 * 60 * 60
         }
@@ -840,7 +833,7 @@ struct UsageAccountCompactList: View {
 
 /// One account: status dot + provider mark + masked name, then a thin
 /// CONTINUOUS capsule bar per REPORTED window (7d / Fable-only-when-the-
-/// daemon-reports-it; never 5h — `CompactUsageGauges`) with a small used-%
+/// daemon-reports-it — `CompactUsageGauges`) with a small used-%
 /// label. Cold/absent windows are omitted entirely — no dashes, no empty
 /// gauges. One color semantic: neutral fill for normal utilization, warning
 /// red only at ≥ 90% (Fable additionally requires the daemon's reset-aware

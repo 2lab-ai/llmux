@@ -159,7 +159,10 @@ core with thin per-provider adapters.
   - **5h burst slot — headers, unchanged.** 200 responses carry
     `x-ratelimit-{limit,remaining}-{requests,tokens}` (RPM/TPM-shaped, no reset). These
     feed the 5h slot via the standard-bucket path with an estimated 60s reset horizon
-    (`headers::STANDARD_RESET_FALLBACK`), grok accounts only.
+    (`headers::STANDARD_RESET_FALLBACK`), grok accounts only. **Amended
+    2026-11-10:** the 5h slot is gone from llmux (owner: "llmux에서도 완전히
+    삭제") — these token-bucket headers are no longer read, and a grok account's
+    only window is the 7d one below.
   - **7d slot — the billing endpoint.** `GET {grok upstream}/billing?format=credits`
     (identity headers + evidence in the facts table above) is grok's ACTIVE usage source:
     `src/auth/grok_usage.rs` — `billing_url` (refuses any upstream whose path is not

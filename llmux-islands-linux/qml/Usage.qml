@@ -178,10 +178,6 @@ Kirigami.ScrollablePage {
             if (objectOrEmpty(gauges[index]).constraining === true)
                 return [gauges[index]]
         }
-        for (var fiveHourIndex = 0; fiveHourIndex < gauges.length; fiveHourIndex += 1) {
-            if (objectOrEmpty(gauges[fiveHourIndex]).kind === "five_hour")
-                return [gauges[fiveHourIndex]]
-        }
         return [gauges[0]]
     }
 
@@ -196,7 +192,6 @@ Kirigami.ScrollablePage {
     function gaugeLabel(gauge) {
         gauge = objectOrEmpty(gauge)
         switch (gauge.kind) {
-        case "five_hour": return qsTr("5 hour")
         case "seven_day": return qsTr("7 day")
         case "fable_weekly": return qsTr("Fable weekly")
         default: return qsTr("Quota")

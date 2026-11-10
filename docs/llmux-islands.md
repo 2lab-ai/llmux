@@ -4,7 +4,7 @@
 
 The app does not read `~/.config/llmux.json` or provider credentials. It asks the installed llmux CLI for an endpoint-bound local control key through a private pipe, keeps it only in the HTTP executor, and reads usage from the daemon. Remote connections use their explicitly configured control key.
 
-![llmux Islands workspace with four accounts, 5-hour and 7-day usage bars, reset timers, and the Start coding row](../screenshots/llmux-islands-workspace.png)
+![llmux Islands workspace with four accounts, usage bars, reset timers, and the Start coding row (captured before the 5-hour window was retired on 2026-11-10)](../screenshots/llmux-islands-workspace.png)
 
 *Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.*
 
@@ -13,7 +13,7 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
 ## What it shows
 
 - Per-account Claude / Codex / Grok / Gemini / API-key usage from the llmux daemon.
-- 5-hour and 7-day quota windows with reset timing.
+- The 7-day quota window with reset timing (no provider reports a 5-hour window since 2026-11).
 - Token/auth health and degraded accounts.
 - A **Start coding** row (preview channel) that opens Claude Code or Codex in a chosen project folder through llmux.
 - A closed floating island label:
@@ -35,7 +35,7 @@ Swift shell needs tolerant provider decoding plus an icon before Islands can
 carry the fourth backend group.
 
 **Gemini accounts** (2026-10-15, preview channel) use the same account tiles.
-Google reports one 7-day quota window for them; there is no 5-hour window. The
+Google reports one 7-day quota window for them, like every provider now. The
 account provider list includes **Sign in to Google (Gemini)**, which runs the
 daemon-owned Google login like the other sign-ins. Google states that using
 Antigravity through third-party tools or proxies violates its terms and has
@@ -119,7 +119,7 @@ connecting, ready with no accounts, connection failure, and connected accounts.
 3. Choose **Open in Terminal**. A new Terminal session runs `llmux run` or
    `llmux run --codex` in that folder. **Copy command** is an alternative.
 
-After the first account appears, the tiles show each account's 5-hour and 7-day usage with reset timers — this is the view most people install Islands for.
+After the first account appears, the tiles show each account's 7-day usage with reset timers — this is the view most people install Islands for.
 
 The app reports Terminal dispatch, not a completed model request. Missing tools
 have a copyable installation command. A Terminal permission refusal leaves the

@@ -279,3 +279,11 @@ Against mock upstreams and live dogfood:
 - Session-stickiness rationale: snipeship/ccflare `docs/load-balancing.md`.
 - Provider translation references: ollama `anthropic/anthropic.go`, ChatMock, CLIProxyAPI.
 - Daemon/attach conventions + brew pipeline: 2lab.ai herdr / herdr-mx + 2lab-ai/homebrew-tap.
+
+## Amendment 2026-11-10 — one quota window
+
+FR3's 5h session window is gone (owner: "5시간 사용량 … llmux에서도 완전히
+삭제해줘"; no provider reports one any more). Each account has one quota window,
+the 7d weekly window; eligibility drops the `five_hour_max` gate, `servable_now`
+is the 7d headroom, and codex `x-codex-*` headers feed only the weekly window.
+See `.prd/18` (amendment 2026-11-10) for every removed surface.

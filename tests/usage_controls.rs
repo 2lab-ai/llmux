@@ -922,7 +922,6 @@ fn seed_exhausted(pool: &AccountPool, name: &str) {
     pool.record_usage(
         &AccountId(name.to_string()),
         &UsageSnapshot {
-            five_hour: None,
             seven_day: Some(WindowReading {
                 utilization: 1.0,
                 resets_at: SystemTime::now() + Duration::from_secs(3_600),
@@ -1005,8 +1004,8 @@ async fn refresh_replaces_exhausted_window_with_live_weekly_primary() {
         "weekly primary (604800s) lands on seven_day at 0.43, got {seven}"
     );
     assert!(
-        cx["five_hour"].is_null(),
-        "a weekly window must not be filed as five_hour: {cx}"
+        cx.get("five_hour").is_none(),
+        "there is no 5h window on the wire: {cx}"
     );
     assert_eq!(
         cx["usage_control"]["available_resets"], 3,
@@ -1110,7 +1109,7 @@ async fn malformed_usage_body_does_not_fabricate_zeros() {
         "the previous observation survives, nothing is zeroed: {cx}"
     );
     assert!(
-        cx["five_hour"].is_null(),
+        cx.get("five_hour").is_none(),
         "and no window is fabricated: {cx}"
     );
     assert!(
@@ -1175,7 +1174,7 @@ async fn structurally_invalid_usage_body_is_a_failure_not_an_empty_success() {
     );
     let cx = dashboard_account(&proxy, "cx").await;
     assert!(
-        cx["five_hour"].is_null() && cx["seven_day"].is_null(),
+        cx.get("five_hour").is_none() && cx["seven_day"].is_null(),
         "…and nothing is fabricated for them: {cx}"
     );
     assert!(

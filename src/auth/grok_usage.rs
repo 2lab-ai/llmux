@@ -86,9 +86,7 @@ impl GrokUsageError {
 ///
 /// `usage` carries ONLY what the document proves: the weekly period lands on
 /// `seven_day`, a monthly (or otherwise-named) period becomes a scoped
-/// reading, and an unreadable/absent period leaves both empty. `five_hour` is
-/// never set here — grok's burst gauge comes from the response
-/// `x-ratelimit-*` headers and must stay untouched.
+/// reading, and an unreadable/absent period leaves both empty.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GrokBilling {
     pub usage: UsageSnapshot,
@@ -339,10 +337,6 @@ mod tests {
         assert!((seven.utilization - 0.65).abs() < 1e-9);
         // 2026-09-22T02:19:18Z
         assert_eq!(epoch_of(seven.resets_at), 1_790_043_558);
-        assert!(
-            parsed.usage.five_hour.is_none(),
-            "the billing period never feeds the 5h burst gauge (headers own it)"
-        );
         assert!(parsed.usage.scoped.is_empty(), "weekly is not a scoped row");
         assert_eq!(
             parsed.period_type.as_deref(),

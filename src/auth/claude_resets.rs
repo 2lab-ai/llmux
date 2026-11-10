@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn live_eligible_body_maps_to_one_available_credit_with_expiry() {
         let read = parse_usage_with_resets(&live_body(ELIGIBLE)).expect("parses");
-        assert!(read.usage.five_hour.is_some(), "windows still parse");
+        assert!(read.usage.seven_day.is_some(), "windows still parse");
         let status = read.resets.expect("cedar_ember present");
         assert_eq!(status.eligible, Some(true));
         assert_eq!(status.available_count(), Some(1));

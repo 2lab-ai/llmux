@@ -29,7 +29,6 @@ pub enum ScriptedResponse {
     /// 200 JSON with these unified window readings.
     Ok {
         body: String,
-        five_hour: Option<WindowSpec>,
         seven_day: Option<WindowSpec>,
     },
     /// 200 SSE, streamed in `chunk_size`-byte fragments with `chunk_delay`
@@ -42,7 +41,6 @@ pub enum ScriptedResponse {
         body: String,
         chunk_size: usize,
         chunk_delay: Duration,
-        five_hour: Option<WindowSpec>,
         seven_day: Option<WindowSpec>,
         content_type: bool,
         extra_headers: Vec<(String, String)>,
@@ -66,16 +64,14 @@ impl ScriptedResponse {
     pub fn ok(body: &str) -> Self {
         Self::Ok {
             body: body.to_string(),
-            five_hour: Some((0.10, 3_600)),
             seven_day: Some((0.10, 86_400)),
         }
     }
 
-    /// 200 with explicit unified window readings.
-    pub fn ok_with(body: &str, five_hour: WindowSpec, seven_day: WindowSpec) -> Self {
+    /// 200 with an explicit unified weekly window reading.
+    pub fn ok_with(body: &str, seven_day: WindowSpec) -> Self {
         Self::Ok {
             body: body.to_string(),
-            five_hour: Some(five_hour),
             seven_day: Some(seven_day),
         }
     }
@@ -87,7 +83,6 @@ impl ScriptedResponse {
             body: body.to_string(),
             chunk_size,
             chunk_delay: Duration::from_millis(2),
-            five_hour: None,
             seven_day: None,
             content_type: true,
             extra_headers: Vec::new(),
@@ -101,7 +96,6 @@ impl ScriptedResponse {
             body: body.to_string(),
             chunk_size,
             chunk_delay: Duration::from_millis(2),
-            five_hour: None,
             seven_day: None,
             content_type: false,
             extra_headers: extra_headers
@@ -196,15 +190,13 @@ impl MockUpstream {
     }
 
     /// Script `/api/oauth/usage` for the account whose bearer is
-    /// `access_token`. Windows are `(utilization, resets_in_secs)` where
+    /// `access_token`. The window is `(utilization, resets_in_secs)` where
     /// `utilization` is a 0..=1 FRACTION for test ergonomics; it is emitted on
     /// the wire as a PERCENTAGE (×100) to match the live endpoint, which the
     /// parser divides back by 100.
-    pub fn set_usage(&self, access_token: &str, five_hour: WindowSpec, seven_day: WindowSpec) {
+    pub fn set_usage(&self, access_token: &str, seven_day: WindowSpec) {
         let body = format!(
-            r#"{{"five_hour":{{"utilization":{},"resets_at":{}}},"seven_day":{{"utilization":{},"resets_at":{}}}}}"#,
-            five_hour.0 * 100.0,
-            epoch_in(five_hour.1),
+            r#"{{"seven_day":{{"utilization":{},"resets_at":{}}}}}"#,
             seven_day.0 * 100.0,
             epoch_in(seven_day.1),
         );
@@ -260,21 +252,9 @@ fn epoch_in(secs: u64) -> u64 {
 
 fn unified_headers(
     builder: http::response::Builder,
-    five_hour: Option<WindowSpec>,
     seven_day: Option<WindowSpec>,
 ) -> http::response::Builder {
     let mut builder = builder;
-    if let Some((utilization, resets_in)) = five_hour {
-        builder = builder
-            .header(
-                "anthropic-ratelimit-unified-5h-utilization",
-                utilization.to_string(),
-            )
-            .header(
-                "anthropic-ratelimit-unified-5h-reset",
-                epoch_in(resets_in).to_string(),
-            );
-    }
     if let Some((utilization, resets_in)) = seven_day {
         builder = builder
             .header(
@@ -325,15 +305,11 @@ async fn catch_all(
         .unwrap_or_else(|| ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
 
     match next {
-        ScriptedResponse::Ok {
-            body,
-            five_hour,
-            seven_day,
-        } => {
+        ScriptedResponse::Ok { body, seven_day } => {
             let builder = http::Response::builder()
                 .status(200)
                 .header("content-type", "application/json");
-            unified_headers(builder, five_hour, seven_day)
+            unified_headers(builder, seven_day)
                 .body(axum::body::Body::from(body))
                 .expect("ok response")
         }
@@ -341,7 +317,6 @@ async fn catch_all(
             body,
             chunk_size,
             chunk_delay,
-            five_hour,
             seven_day,
             content_type,
             extra_headers,
@@ -366,7 +341,7 @@ async fn catch_all(
             for (name, value) in &extra_headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
-            unified_headers(builder, five_hour, seven_day)
+            unified_headers(builder, seven_day)
                 .body(axum::body::Body::from_stream(stream))
                 .expect("sse response")
         }

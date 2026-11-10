@@ -99,3 +99,10 @@ and preserve the long-runway reservoir** — which is what `score` now ranks.
 - **Wasted-quota simulation** — a constructed staggered-reset scenario where the
   OLD policy lets a soon-resetting account's budget evaporate (load-balancing)
   and drops demand later, while the NEW policy harvests it and serves all demand.
+
+## Amendment 2026-11-10 — no 5h window
+
+No provider reports a 5h window any more (owner, 2026-11-04 and 2026-11-10), so
+llmux dropped it: `r5` is gone and `servable_now = r7` (the Fable lane:
+`min(r7, rf)`). The ranking drops the "lower 5h utilization" tiebreak; the
+order is score → soonest 7d reset → id. The OLD/NEW tables above are history.

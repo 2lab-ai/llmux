@@ -176,9 +176,6 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
         .filter_map(|account| {
             let gate = select::eligibility(account, params, now, headers_only);
             let window = match gate {
-                Some(IneligibleReason::FiveHourOverThreshold) => {
-                    ("5h", account.five_hour.as_ref().map(|w| w.utilization))
-                }
                 Some(IneligibleReason::SevenDayOverThreshold) => {
                     ("7d", account.seven_day.as_ref().map(|w| w.utilization))
                 }
@@ -228,16 +225,12 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
 /// key anywhere here (MUST-FIX 4 — row jitter would destroy position memory).
 fn tier(account: &AccountSnapshot, gate: Option<IneligibleReason>) -> u8 {
     match gate {
-        Some(
-            IneligibleReason::FiveHourOverThreshold
-            | IneligibleReason::SevenDayOverThreshold
-            | IneligibleReason::FableWeeklyExhausted,
-        ) => 0,
+        Some(IneligibleReason::SevenDayOverThreshold | IneligibleReason::FableWeeklyExhausted) => 0,
         Some(IneligibleReason::AuthUnhealthy) => 1,
         // Cooling down still has KNOWN usage — it sorts with the usage tier.
         Some(IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown) => 2,
-        None if account.five_hour.is_some() => 2,
-        // Eligible but no 5h sample yet: "ready" — below the known rows.
+        None if account.seven_day.is_some() => 2,
+        // Eligible but no weekly sample yet: "ready" — below the known rows.
         None => 3,
         // Save mode holds like a pause: an operator decision, not a fault.
         Some(IneligibleReason::Paused | IneligibleReason::Saved) => 4,
@@ -518,7 +511,6 @@ mod tests {
             auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
-            five_hour: Some(window(0.10)),
             seven_day: Some(window(0.10)),
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -543,7 +535,6 @@ mod tests {
 
     fn params() -> SelectParams {
         SelectParams {
-            five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
@@ -673,7 +664,7 @@ mod tests {
         // order (stable), and in-flight/usage never move a row.
         let mut busy = grouped("Alpha", BackendGroup::Claude);
         busy.in_flight = 7;
-        busy.five_hour = Some(window(0.80));
+        busy.seven_day = Some(window(0.80));
         let snapshot = pool(vec![
             grouped("zeta", BackendGroup::Claude),
             grouped("Beta", BackendGroup::Claude),
@@ -727,10 +718,10 @@ mod tests {
         // is `pick`'s decision, not "current first"): at 5% it beats the cold
         // ready account by less than SWITCH_MARGIN, so pick stays on it.
         let mut current = grouped("z-current", BackendGroup::Claude);
-        current.five_hour = Some(window(0.05));
+        current.seven_day = Some(window(0.05));
         let ready = grouped("a-ready", BackendGroup::Claude);
         let mut exhausted = grouped("m-exhausted", BackendGroup::Claude);
-        exhausted.five_hour = Some(window(0.97));
+        exhausted.seven_day = Some(window(0.995));
         let mut snapshot = pool(vec![
             ready,
             exhausted,
@@ -767,15 +758,14 @@ mod tests {
         // gate). It is NOT urgent (tiers 0–1 only), unlike an exhausted or
         // auth-broken account — the marker survived the order change.
         let mut cold = account("cold");
-        cold.five_hour = Some(QuotaWindow {
+        cold.seven_day = Some(QuotaWindow {
             utilization: 0.10,
             resets_at: now() + Duration::from_secs(3600),
             fetched_at: now() - Duration::from_secs(700), // > usage_max_age 600
             source: WindowSource::UsagePoll,
         });
-        cold.seven_day = None;
         let mut exhausted = account("exhausted");
-        exhausted.five_hour = Some(window(0.97));
+        exhausted.seven_day = Some(window(0.995));
         let mut broken = account("broken");
         broken.healthy = false;
         let mut paused = account("paused");
@@ -798,7 +788,7 @@ mod tests {
         // `None` health = no telemetry (old daemon): storm detection is
         // unavailable, and account/poller conditions still work.
         let mut exhausted = account("exhausted");
-        exhausted.five_hour = Some(window(0.97));
+        exhausted.seven_day = Some(window(0.995));
         let verdict = health_verdict(&view_without_health(pool(vec![exhausted])), now());
         assert_eq!(verdict.level(), VerdictLevel::Warn);
         assert!(verdict
@@ -906,7 +896,7 @@ mod tests {
     #[test]
     fn exhausted_account_is_a_warning_not_a_failure() {
         let mut exhausted = account("exhausted");
-        exhausted.five_hour = Some(window(0.97));
+        exhausted.seven_day = Some(window(0.995));
         let verdict = health_verdict(
             &view_with(pool(vec![exhausted]), HealthCounts::default()),
             now(),
