@@ -25,7 +25,6 @@ enum DashboardFixtures {
   "upstream": "https://api.anthropic.com",
   "config_path": "/Users/user/.config/llmux.json",
   "select_params": {
-    "five_hour_max": 0.9,
     "seven_day_max": 0.99,
     "usage_max_age_secs": 600
   },
@@ -39,13 +38,6 @@ enum DashboardFixtures {
       "order": 2,
       "blocked": null,
       "healthy": true,
-      "five_hour": {
-        "utilization": 0.06,
-        "resets_at": 1783159200,
-        "resets_in_secs": 13088,
-        "fetched_at_ms": 1783146111454,
-        "source": "headers"
-      },
       "seven_day": {
         "utilization": 0.61,
         "resets_at": 1783155600,
@@ -97,13 +89,6 @@ enum DashboardFixtures {
       "order": 1,
       "blocked": null,
       "healthy": true,
-      "five_hour": {
-        "utilization": 0.13,
-        "resets_at": 1783148125,
-        "resets_in_secs": 2013,
-        "fetched_at_ms": 1783145180138,
-        "source": "headers"
-      },
       "seven_day": {
         "utilization": 0.1,
         "resets_at": 1783389705,
@@ -138,13 +123,6 @@ enum DashboardFixtures {
       "order": 12,
       "blocked": "7d 100.0% > 99%",
       "healthy": true,
-      "five_hour": {
-        "utilization": 0.0,
-        "resets_at": 1783163180,
-        "resets_in_secs": 17068,
-        "fetched_at_ms": 1783145180942,
-        "source": "headers"
-      },
       "seven_day": {
         "utilization": 1.0,
         "resets_at": 1783388609,

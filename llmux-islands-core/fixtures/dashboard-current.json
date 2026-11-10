@@ -11,7 +11,6 @@
   "upstream": "https://api.anthropic.com",
   "config_path": "/home/test/.config/llmux.json",
   "select_params": {
-    "five_hour_max": 0.9,
     "seven_day_max": 0.99,
     "fable_weekly_max": 0.98,
     "usage_max_age_secs": 600
@@ -26,13 +25,6 @@
       "order": 1,
       "blocked": null,
       "healthy": true,
-      "five_hour": {
-        "utilization": 0.25,
-        "resets_at": 2000000000,
-        "resets_in_secs": 3600,
-        "fetched_at_ms": 1700000000000,
-        "source": "poll"
-      },
       "seven_day": {
         "utilization": 0.8,
         "resets_at": 2000003600,
@@ -66,7 +58,6 @@
       "order": 2,
       "blocked": "paused",
       "healthy": true,
-      "five_hour": null,
       "seven_day": null,
       "cooldown_until": null,
       "cooldown_source": null,

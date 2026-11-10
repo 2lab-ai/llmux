@@ -669,7 +669,6 @@ struct UsageAccountHealthRow: View {
     private var isAuthFailed: Bool { account.status == "auth_failed" }
     private var isOverQuota: Bool {
         DashboardHealth.isOverQuota(
-            fiveHour: account.fiveHour?.utilization,
             sevenDay: account.sevenDay?.utilization,
             fableUtilization: account.fableWeekly?.utilization,
             fableConstraining: account.fableWeekly?.constraining
@@ -703,7 +702,6 @@ struct UsageAccountHealthRow: View {
             }
             Spacer()
             // Cold account (no windows reported) omits the summary — no `—`.
-            // No 5h part (`LlmuxDashboardAccount.quotaSummary`).
             if let quotaSummary = account.quotaSummary {
                 MetricText(quotaSummary)
             }

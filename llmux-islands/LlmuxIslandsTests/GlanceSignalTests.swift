@@ -7,9 +7,7 @@ final class GlanceSignalTests: XCTestCase {
     private func record(
         _ name: String,
         status: String = "ok",
-        fiveHour: Double? = nil,
         sevenDay: Double? = nil,
-        fiveResets: Int? = nil,
         sevenResets: Int? = nil
     ) -> LlmuxAccountRecord {
         LlmuxAccountRecord(
@@ -17,7 +15,6 @@ final class GlanceSignalTests: XCTestCase {
             type: "oauth",
             group: "claude",
             status: status,
-            fiveHour: fiveHour.map { LlmuxWindow(utilization: $0, resetsInSecs: fiveResets) },
             sevenDay: sevenDay.map { LlmuxWindow(utilization: $0, resetsInSecs: sevenResets) },
             fableWeekly: nil,
             inFlight: 0,
@@ -37,7 +34,7 @@ final class GlanceSignalTests: XCTestCase {
     // MARK: priority
 
     func testHealthyIsCompletelyQuiet() {
-        let output = resolve([record("a", fiveHour: 0.42, sevenDay: 0.10)])
+        let output = resolve([record("a", sevenDay: 0.10)])
         XCTAssertEqual(output.signal, .none)
         XCTAssertNil(output.signal.chipText, "healthy label must be pixel-identical")
         XCTAssertTrue(output.attention.isEmpty)
@@ -119,26 +116,25 @@ final class GlanceSignalTests: XCTestCase {
         )
     }
 
-    // MARK: 5h — owner 2026-11-04: never a chip or an attention row
+    // MARK: 5h — no provider has a 5h window any more (2026-11-10)
 
-    func testFiveHourWindowNeverReachesTheChipOrThePanel() {
-        // The daemon may still report a 5h window; exhausted or nearly so, it
-        // is no candidate — the 7d window is the only quota signal.
-        let output = resolve([
-            record("gone5h", fiveHour: 1.0, sevenDay: 0.10, fiveResets: 600),
-            record("hot5h", fiveHour: 0.97, sevenDay: 0.20),
-        ])
-        XCTAssertEqual(output.signal, .none)
-        XCTAssertNil(output.signal.chipText)
-        XCTAssertTrue(output.attention.isEmpty)
-        // Next to a real 7d problem, the 5h window still adds nothing.
-        let mixed = resolve([
-            record("five", fiveHour: 0.99),
-            record("seven", fiveHour: 0.10, sevenDay: 0.95),
-        ])
-        XCTAssertEqual(mixed.signal, .lowQuota(window: "7d", remainingPct: 5, account: "seven"))
-        XCTAssertEqual(mixed.attention.map(\.account), ["seven"])
-        XCTAssertFalse(mixed.attention.contains { $0.reason.contains("5h") })
+    func testAnOlderDaemonsFiveHourWindowNeverReachesTheChipOrThePanel() throws {
+        // An older daemon may still send `five_hour`; the record no longer
+        // decodes it, so it is no candidate — the 7d window is the only quota
+        // signal.
+        let json = #"""
+        [{"name": "gone5h", "type": "oauth", "status": "ok",
+          "five_hour": {"utilization": 1.0, "resets_in_secs": 600},
+          "seven_day": {"utilization": 0.10}},
+         {"name": "seven", "type": "oauth", "status": "ok",
+          "five_hour": {"utilization": 0.10},
+          "seven_day": {"utilization": 0.95}}]
+        """#
+        let records = try JSONDecoder().decode([LlmuxAccountRecord].self, from: Data(json.utf8))
+        let output = resolve(records)
+        XCTAssertEqual(output.signal, .lowQuota(window: "7d", remainingPct: 5, account: "seven"))
+        XCTAssertEqual(output.attention.map(\.account), ["seven"])
+        XCTAssertFalse(output.attention.contains { $0.reason.contains("5h") })
     }
 
     // MARK: degraded — explicit + debounced, unknown/cold never promoted
@@ -178,7 +174,7 @@ final class GlanceSignalTests: XCTestCase {
         var paused = record("paused", sevenDay: 0.95)
         paused = LlmuxAccountRecord(
             name: paused.name, type: paused.type, group: paused.group,
-            status: paused.status, fiveHour: paused.fiveHour, sevenDay: paused.sevenDay,
+            status: paused.status, sevenDay: paused.sevenDay,
             fableWeekly: nil, inFlight: 0, tokenExpiresAtMs: nil, paused: true
         )
         XCTAssertEqual(resolve([paused]).signal, .none)
