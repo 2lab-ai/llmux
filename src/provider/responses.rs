@@ -312,6 +312,8 @@ pub fn requests_thinking(body: &Value) -> bool {
 /// conversation with the same tool set — and spreads different tool sets
 /// across routes. The key changes only when that prefix itself changes (new
 /// tools mid-conversation), when there is no cached prefix to keep anyway.
+/// Sharing needs byte-identical tools: a per-session tool description gives
+/// each session its own route (one cold start per session).
 ///
 /// Measured on the live codex gateway, 2026-11-10 (spec §R4): a new
 /// conversation under its OWN key read 0 of a 17K-token shared prefix from
