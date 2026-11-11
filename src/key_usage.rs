@@ -364,7 +364,9 @@ impl UsageRow {
 
     /// [`Self::with_tokens`] from a request's (or sub-usage's) counters,
     /// the extended-TTL write subset and the web searches included; a
-    /// counter the upstream did not report is stored as 0.
+    /// counter the upstream did not report is stored as 0. The extended
+    /// subset is clamped to the write total, as every parser clamps it (a
+    /// hand-edited `activity.jsonl` line could claim more).
     pub fn with_counts(self, t: &TokenCounts) -> Self {
         let mut row = self.with_tokens(
             t.input,
@@ -372,7 +374,10 @@ impl UsageRow {
             t.cache_read.unwrap_or(0),
             t.cache_creation.unwrap_or(0),
         );
-        row.cache_creation_extended = t.cache_creation_extended.unwrap_or(0);
+        row.cache_creation_extended = t
+            .cache_creation_extended
+            .unwrap_or(0)
+            .min(row.cache_creation);
         row.web_search_requests = t.web_search_requests.unwrap_or(0);
         row
     }
@@ -2002,6 +2007,35 @@ mod tests {
                 .expect("query"),
             report
         );
+    }
+
+    /// A hand-edited `activity.jsonl` line can claim more extended-TTL writes
+    /// than writes; the stored subset is clamped to the total, as every
+    /// parser clamps it, so the store never prices a write that was not made.
+    #[test]
+    fn an_imported_extended_count_is_clamped_to_the_write_total() {
+        let mut line: serde_json::Value =
+            serde_json::from_str(line(1_000, 1, "t").trim()).expect("line");
+        line["tokens"] = serde_json::json!({
+            "input": 1, "output": 1, "cache_creation": 5, "cache_creation_extended": 9
+        });
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        append(&jsonl, &format!("{line}\n"));
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000))
+            .expect("query");
+        let m1 = cell(&report, "m1");
+        assert_eq!((m1.cache_creation, m1.cache_creation_extended), (5, 5));
+        // No write total at all: nothing to be a subset of.
+        let row = UsageRow::new(1, 2, None, None, None, 200).with_counts(&TokenCounts {
+            cache_creation_extended: Some(9),
+            ..Default::default()
+        });
+        assert_eq!(row.cache_creation_extended, 0);
     }
 
     /// A v2 store (#278 PR 1: `requests`, no split columns) is migrated to v3
