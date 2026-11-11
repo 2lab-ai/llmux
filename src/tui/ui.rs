@@ -24,10 +24,10 @@ use crate::dashboard::ModelUsageDoc;
 use crate::logging::LogLine;
 use crate::routing::BackendGroup;
 use crate::scheduler::select::IneligibleReason;
+use crate::scheduler::usage::is_polled_kind;
 use crate::scheduler::window::{
     classify_window_display, QuotaWindow, ScopedQuotaWindow, WindowDisplayState,
 };
-use crate::scheduler::usage::is_polled_kind;
 use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};

@@ -1,13 +1,14 @@
 //! `llmux usage [--json]` — a focused per-account weekly-quota summary:
-//! name, logged-in status, remaining 7d usage, and when it resets.
+//! name, logged-in status, 7d usage and pace, the Fable weekly window, and
+//! when the week resets.
 //!
 //! `llmux accounts --json` already exposes the full live dashboard document
-//! (5h + 7d + scoped windows, in-flight, token health, selection order —
-//! the whole `/llmux/status` schema); this command reads that SAME endpoint
-//! (no new server-side state) but reshapes it into a small, stable, scripting-
+//! (7d + scoped windows, in-flight, token health, selection order — the
+//! whole `/llmux/status` schema); this command reads that SAME endpoint (no
+//! new server-side state) but reshapes it into a small, stable, scripting-
 //! friendly slice for the one question "how much of my week is left, per
 //! account" — without a caller having to know the full dashboard schema or
-//! pick the right window out of `five_hour`/`seven_day`/`scoped_limits`.
+//! pick the right window out of `seven_day`/`fable_weekly`/`scoped_limits`.
 
 use super::daemon::{self, ServerProbe};
 use super::{resolve_endpoint, CliError, UsageArgs};
@@ -40,6 +41,11 @@ struct AccountUsage {
     /// `/billing?format=credits`, oauth's from `/api/oauth/usage` — both
     /// land here through the same `UsagePoller` (see `scheduler/usage.rs`).
     seven_day: Option<SevenDayUsage>,
+    /// The model-scoped "Fable" weekly window (same shape as `seven_day`),
+    /// or `null` when the account has none. The scheduler stops an account
+    /// on this window too, so a Claude account can be out of Fable quota
+    /// while `seven_day` still has room. Additive field.
+    fable_weekly: Option<SevenDayUsage>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -147,17 +153,20 @@ fn summarize(status: &serde_json::Value) -> Vec<AccountUsage> {
                 .unwrap_or("?")
                 .to_string();
             let logged_in = status_label != "auth_failed";
-            let seven_day = account
-                .get("seven_day")
-                .filter(|w| !w.is_null())
-                .and_then(seven_day_usage);
+            let window = |key: &str| {
+                account
+                    .get(key)
+                    .filter(|w| !w.is_null())
+                    .and_then(seven_day_usage)
+            };
             Some(AccountUsage {
                 name,
                 group,
                 kind,
                 logged_in,
                 status: status_label,
-                seven_day,
+                seven_day: window("seven_day"),
+                fable_weekly: window("fable_weekly"),
             })
         })
         .collect()
@@ -191,29 +200,36 @@ fn round2(v: f64) -> f64 {
 }
 
 /// Human-readable table: name, 7d used, window elapsed, burn-rate
-/// multiplier, reset ETA — kept narrow enough for an 80-column terminal.
-/// (`--json` still carries type, logged-in and remaining percent.)
-/// `n/a` for accounts with no weekly-quota source or no reading yet.
+/// multiplier, Fable weekly used, reset ETA — kept narrow enough for an
+/// 80-column terminal. (`--json` still carries type, logged-in and remaining
+/// percent.) `n/a` for accounts with no weekly-quota source or no reading
+/// yet.
 fn print_table(accounts: &[AccountUsage]) {
+    print!("{}", format_table(accounts));
+}
+
+fn format_table(accounts: &[AccountUsage]) -> String {
+    use std::fmt::Write as _;
     if accounts.is_empty() {
-        println!("No accounts.");
-        return;
+        return "No accounts.\n".into();
     }
     let name_width = accounts
         .iter()
-        .map(|a| a.name.len())
+        .map(|a| a.name.chars().count())
         .max()
         .unwrap_or(4)
         .max(4);
-    println!(
-        "{:<name_width$}  {:>7}  {:>7}  {:>6}  RESETS",
-        "NAME",
-        "7D USED",
-        "ELAPSED",
-        "RATE",
-        name_width = name_width
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<name_width$}  {:>7}  {:>7}  {:>6}  {:>6}  RESETS",
+        "NAME", "7D USED", "ELAPSED", "RATE", "FABLE",
     );
     for account in accounts {
+        let fable = account
+            .fable_weekly
+            .as_ref()
+            .map_or_else(|| "n/a".into(), |w| format!("{:.1}%", w.used_percent));
         let (used, elapsed, rate, resets) = match &account.seven_day {
             Some(w) => (
                 format!("{:.1}%", w.used_percent),
@@ -228,15 +244,13 @@ fn print_table(accounts: &[AccountUsage]) {
             ),
             None => ("n/a".into(), "n/a".into(), "n/a".into(), "n/a".into()),
         };
-        println!(
-            "{:<name_width$}  {:>7}  {:>7}  {:>6}  {resets}",
-            account.name,
-            used,
-            elapsed,
-            rate,
-            name_width = name_width
+        let _ = writeln!(
+            out,
+            "{:<name_width$}  {:>7}  {:>7}  {:>6}  {:>6}  {resets}",
+            account.name, used, elapsed, rate, fable,
         );
     }
+    out
 }
 
 #[cfg(test)]
@@ -349,6 +363,33 @@ mod tests {
             "malformed row dropped, well-formed row kept"
         );
         assert_eq!(accounts[0].name, "ok@x.com");
+    }
+
+    /// A Claude account can be stopped by its "Fable" weekly window while
+    /// its 7-day window still has room (the scheduler gates on both), so the
+    /// summary carries that window too — in the JSON and in the table.
+    #[test]
+    fn fable_weekly_window_is_reported_next_to_seven_day() {
+        let doc = status_doc(serde_json::json!([
+            {"name": "a@x.com", "type": "oauth", "group": "claude", "status": "ok",
+             "seven_day": {"utilization": 0.30, "resets_at": 0, "resets_in_secs": 302_400},
+             "fable_weekly": {"utilization": 0.95, "resets_at": 0, "resets_in_secs": 86_400,
+                              "severity": "critical", "is_active": true}},
+            {"name": "c@x.com", "type": "codex", "group": "codex", "status": "ok",
+             "seven_day": null, "fable_weekly": null}
+        ]));
+        let accounts = summarize(&doc);
+        assert_eq!(
+            accounts[0].fable_weekly.as_ref().unwrap().used_percent,
+            95.0
+        );
+        assert!(accounts[1].fable_weekly.is_none());
+        let table = format_table(&accounts);
+        let header = table.lines().next().unwrap();
+        assert!(header.contains("FABLE"), "{table}");
+        let row = table.lines().nth(1).unwrap();
+        assert!(row.contains("30.0%") && row.contains("95.0%"), "{table}");
+        assert!(table.lines().nth(2).unwrap().contains("n/a"), "{table}");
     }
 
     #[test]
