@@ -78,7 +78,9 @@ in the TUI or with `llmux keys`; the web page is read-only.
 - Window usage on 사용자 comes from the daemon and is exact.
 - Session cost uses the daemon's own number for recent requests. Older history rows carry no cost, so
   they are priced from their tokens with per-token rates solved from the daemon's priced hourly
-  aggregates. That makes the session cost an estimate (`≈`).
+  aggregates. That makes the session cost an estimate (`≈`). Both include a request's
+  sub-inferences (an advisor call, a compaction, a billed fallback attempt — each at its own model's
+  rates), and so do the session's token totals (2026-11-11, #278).
 - Context fill is the newest main request's input plus cache plus output, set against the model window.
   A session past 170k tokens counts as a 1M-window session.
 

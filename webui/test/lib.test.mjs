@@ -1,7 +1,7 @@
 // node --test webui/test/
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { solveRates, priceRow } from '../lib/pricing.mjs';
+import { solveRates, priceRow, rowTokens } from '../lib/pricing.mjs';
 import { cleanPrompt, buildOverview } from '../lib/overview.mjs';
 import { promptOf, AUX_RE, SessionIndex, requestPage, cursorOf } from '../lib/sessions.mjs';
 import { parseRawMeta, userPrompts } from '../lib/rawmeta.mjs';
@@ -16,6 +16,17 @@ test('solveRates recovers the linear per-token rates the daemon priced with', ()
   for (const k of ['in', 'out', 'cr', 'cc']) assert.ok(Math.abs(r[k] - rate[k]) / rate[k] < 1e-6, k);
   assert.equal(+priceRow({ model: 'm', tokens: { input: 1e6, output: 0, cache_read: 0, cache_creation: 0 }, cost_usd: null }, new Map([['m', r]]), new Map()).toFixed(4), 5);
   assert.equal(priceRow({ model: 'm', cost_usd: 1.5 }, new Map(), new Map()), 1.5, 'daemon cost wins');
+});
+
+test('a history row is priced with its sub-usages at their own rates (#278)', () => {
+  const rates = new Map([['exec', { in: 1e-6, out: 2e-6, cr: 0, cc: 0 }], ['adv', { in: 10e-6, out: 20e-6, cr: 0, cc: 0 }]]);
+  const row = { model: 'exec', cost_usd: null, tokens: { input: 1000, output: 100 },
+    sub_usage: [{ model: 'adv', tokens: { input: 500, output: 50 } }, { tokens: { input: 200, output: 0 } }, { model: 'unknown', tokens: { input: 9, output: 9 } }] };
+  // exec 1000·1 + 100·2 + adv 500·10 + 50·20 + (no model → exec) 200·1; an unpriced sub model adds 0.
+  assert.equal(+priceRow(row, rates, new Map([['unknown', 99]])).toFixed(6), +((1000 + 200 + 5000 + 1000 + 200) * 1e-6).toFixed(6));
+  assert.equal(priceRow({ ...row, cost_usd: 0.5 }, rates, new Map()), 0.5, 'the daemon cost already includes sub-usage');
+  assert.deepEqual(rowTokens(row), { input: 1709, output: 159, cache_read: 0, cache_creation: 0 });
+  assert.deepEqual(rowTokens({ tokens: { input: 1, output: 2 } }), { input: 1, output: 2, cache_read: 0, cache_creation: 0 });
 });
 
 test('solveRates refuses a fit that is not linear', () => {

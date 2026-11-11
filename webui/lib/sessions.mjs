@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readTranscript, messagesToEntries, transcriptMeta, listSubagents, recoverMessages, parseResponse } from './transcript.mjs';
-import { solveRates, avgPerRequest, priceRow } from './pricing.mjs';
+import { solveRates, avgPerRequest, priceRow, rowTokens } from './pricing.mjs';
 import { parseRawMeta } from './rawmeta.mjs';
 import { cleanPrompt, promptOf } from './overview.mjs';
 export { promptOf };
@@ -177,7 +177,7 @@ export class SessionIndex {
     if (!this.hourly.has(tenant)) this.hourly.set(tenant, new Map());
     const m = this.hourly.get(tenant);
     let b = m.get(h);
-    if (!b) { b = { n: 0, err: 0, models: new Map(), accounts: new Map() }; m.set(h, b); if (m.size > KEEP_HOURS + 4) for (const k of [...m.keys()].sort((a, c) => a - c).slice(0, m.size - KEEP_HOURS)) m.delete(k); }
+    if (!b) { b = { n: 0, err: 0, models: new Map(), accounts: new Map(), sub: new Map() }; m.set(h, b); if (m.size > KEEP_HOURS + 4) for (const k of [...m.keys()].sort((a, c) => a - c).slice(0, m.size - KEEP_HOURS)) m.delete(k); }
     b.n++; if (r.status >= 400 || r.aborted) b.err++;
     if (r.account) b.accounts.set(r.account, (b.accounts.get(r.account) || 0) + 1);
     const t = r.tokens || {};
@@ -185,6 +185,14 @@ export class SessionIndex {
     mt.n++; mt.input += t.input || 0; mt.output += t.output || 0; mt.cache_read += t.cache_read || 0; mt.cache_creation += t.cache_creation || 0;
     if (r.cost_usd != null) { mt.cost += r.cost_usd; mt.priced++; }
     b.models.set(r.model, mt);
+    // A history row has no daemon cost: its sub-usages (#278) are priced per model in bucketCost.
+    // A daemon row's cost_usd already includes them.
+    if (r.cost_usd == null) for (const s of r.sub_usage || []) {
+      const k = s.model || r.model, st = s.tokens || {};
+      const e = b.sub.get(k) || { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+      e.input += st.input || 0; e.output += st.output || 0; e.cache_read += st.cache_read || 0; e.cache_creation += st.cache_creation || 0;
+      b.sub.set(k, e);
+    }
   }
 
   bucketCost(b) {
@@ -196,6 +204,10 @@ export class SessionIndex {
       const est = r ? t.input * r.in + t.output * r.out + t.cache_read * r.cr + t.cache_creation * r.cc : (this.avg.get(model) || 0) * t.n;
       // mixed buckets: daemon-priced part is exact; scale the estimate to the unpriced share
       c += t.priced ? t.cost + est * (unpriced / t.n) : est;
+    }
+    for (const [model, t] of b.sub || []) {
+      const r = this.rates.get(model);
+      if (r) c += t.input * r.in + t.output * r.out + t.cache_read * r.cr + t.cache_creation * r.cc;
     }
     return c;
   }
@@ -219,7 +231,7 @@ export class SessionIndex {
       if (!line.startsWith('{')) continue;
       let o; try { o = JSON.parse(line); } catch { continue; }
       if (!o.ts_ms) continue;
-      this.addRow({ kind: 'request', id: o.id, at_ms: o.ts_ms, method: o.method, path: o.path, endpoint: o.endpoint, account: o.account, status: o.status, duration_ms: o.duration_ms, tokens: o.tokens, group: o.group, model: o.model, effort: o.effort, fast: o.fast, ttfb_ms: o.ttfb_ms, ttft_ms: o.ttft_ms, gen_ms: o.gen_ms, aborted: o.aborted, msg_kind: o.kind, tenant: o.tenant, user_id: o.user_id, excerpt: o.excerpt, cost_usd: null, _hist: true });
+      this.addRow({ kind: 'request', id: o.id, at_ms: o.ts_ms, method: o.method, path: o.path, endpoint: o.endpoint, account: o.account, status: o.status, duration_ms: o.duration_ms, tokens: o.tokens, group: o.group, model: o.model, effort: o.effort, fast: o.fast, ttfb_ms: o.ttfb_ms, ttft_ms: o.ttft_ms, gen_ms: o.gen_ms, aborted: o.aborted, msg_kind: o.kind, tenant: o.tenant, user_id: o.user_id, excerpt: o.excerpt, sub_usage: o.sub_usage, cost_usd: null, _hist: true });
       this.backfill.rows++;
     }
     this.backfill.state = 'done';
@@ -328,8 +340,9 @@ export class SessionIndex {
       requests: rows.length, mainRequests: main.length, subagentRequests: s.kinds.get('subagent') || 0,
       sideRequests: ['title', 'recap', 'suggest', 'count', 'compact', 'audit'].reduce((a, k) => a + (s.kinds.get(k) || 0), 0),
       errors: rows.filter(r => r.status >= 400 || r.aborted).length,
-      tokens_in: sum(r => r.tokens && (r.tokens.input || 0) + (r.tokens.cache_read || 0) + (r.tokens.cache_creation || 0)),
-      tokens_out: sum(r => r.tokens && r.tokens.output),
+      // Session totals count each request's sub-usages too (#278), as its cost does.
+      tokens_in: sum(r => { const t = rowTokens(r); return t.input + t.cache_read + t.cache_creation; }),
+      tokens_out: sum(r => rowTokens(r).output),
       costEst, cost1h, req10m,
       ccCost: t && t.cost,
       context: ctx,

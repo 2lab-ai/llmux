@@ -427,6 +427,30 @@ pub fn cost_usd(
     )
 }
 
+/// API-equivalent USD cost of ONE finished request: its top-level `tokens`
+/// at `(group, model)` rates plus each sub-usage (#278: advisor, compaction,
+/// billed fallback attempt) at its own model's rates (`None` → `model`). The
+/// figure every per-request view shows, so per-request costs add up to the
+/// per-model aggregates that book the same sub-usages under their models.
+pub fn request_cost_usd(
+    group: &str,
+    model: &str,
+    tokens: &TokenCounts,
+    sub_usage: &[crate::tui::SubUsage],
+    overrides: &HashMap<String, ModelPrice>,
+) -> f64 {
+    sub_usage
+        .iter()
+        .fold(cost_usd(group, model, tokens, overrides), |sum, sub| {
+            sum + cost_usd(
+                group,
+                sub.model.as_deref().unwrap_or(model),
+                &sub.tokens,
+                overrides,
+            )
+        })
+}
+
 /// Same as [`cost_usd`] but from the accumulated row fields the dashboard
 /// already holds (`tokens_in`/`tokens_out` plus the `Option` cache counters on
 /// [`crate::tui::activity::ModelUsage`]). `None` cache fields contribute `0`.

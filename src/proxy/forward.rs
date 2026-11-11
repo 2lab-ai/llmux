@@ -3841,7 +3841,7 @@ async fn relay(
                     false,
                     timing.saw_error_event,
                 );
-                totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                totals.record_usage(&account, &usage);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
                 // `raw_captured` carries the bounded prefix + the total streamed
@@ -3931,9 +3931,7 @@ async fn relay(
             }
         };
         let usage = usage_from_json_body(&bytes);
-        state
-            .totals
-            .record(&account, 1, usage.input_tokens, usage.output_tokens);
+        state.totals.record_usage(&account, &usage);
         ctx.log(format!(
             "=== RESPONSE BODY ({} bytes) ===\n{}",
             bytes.len(),
@@ -4416,7 +4414,7 @@ async fn relay_translate(
                     converter.error_message().is_some(),
                     timing.saw_error_event,
                 );
-                totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                totals.record_usage(&account, &usage);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
                 // `raw_captured` carries the bounded prefix + the total emitted
@@ -4584,9 +4582,7 @@ async fn relay_translate(
     }
     let _ = converter.on_end();
     let usage = converter.usage();
-    state
-        .totals
-        .record(&account, 1, usage.input_tokens, usage.output_tokens);
+    state.totals.record_usage(&account, &usage);
     // Capture converter-level trace detail BEFORE into_message_json consumes it.
     let trace_raw_usage = converter.raw_usage().cloned();
     let trace_events_seen = converter.events_seen();

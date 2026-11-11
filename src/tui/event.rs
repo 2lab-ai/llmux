@@ -63,6 +63,27 @@ pub struct SubUsage {
     pub tokens: TokenCounts,
 }
 
+impl SubUsage {
+    /// Every token of these sub-usages ([`TokenCounts::total`] summed) — what
+    /// a per-request TOTAL token figure adds to the request's own total.
+    pub fn total(sub_usage: &[SubUsage]) -> u64 {
+        sub_usage
+            .iter()
+            .fold(0, |sum, sub| sum.saturating_add(sub.tokens.total()))
+    }
+
+    /// `(input, output)` of these sub-usages — for the per-account
+    /// in/out token counters.
+    pub fn input_output(sub_usage: &[SubUsage]) -> (u64, u64) {
+        sub_usage.iter().fold((0, 0), |(i, o), sub| {
+            (
+                i.saturating_add(sub.tokens.input),
+                o.saturating_add(sub.tokens.output),
+            )
+        })
+    }
+}
+
 /// One observable proxy/scheduler happening, rendered into the activity log.
 ///
 /// `id` correlates the started → routed → finished lifecycle of a single

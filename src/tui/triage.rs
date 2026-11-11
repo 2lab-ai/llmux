@@ -947,6 +947,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         }
     }
