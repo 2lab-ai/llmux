@@ -11391,6 +11391,7 @@ mod tests {
             efforts: Vec::new(),
             endpoints: Vec::new(),
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         }];
         v
     }

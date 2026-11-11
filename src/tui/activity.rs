@@ -455,6 +455,10 @@ struct ModelStats {
     tokens_out: u64,
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
+    /// The part of the token counters above booked from sub-usages (#278) —
+    /// tokens no request of this row spent — so its cost can be told apart
+    /// from the rows' own requests.
+    sub_tokens: TokenCounts,
     last_used: Option<SystemTime>,
     /// Which account(s) served this model (req19).
     accounts: HashMap<String, Totals>,
@@ -476,6 +480,7 @@ impl ModelStats {
         self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
         self.cache_read = crate::proxy::sse::add_opt(self.cache_read, other.cache_read);
         self.cache_creation = crate::proxy::sse::add_opt(self.cache_creation, other.cache_creation);
+        self.sub_tokens = add_tokens(self.sub_tokens, other.sub_tokens);
         self.last_used = match (self.last_used, other.last_used) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -494,6 +499,17 @@ impl ModelStats {
     }
 }
 
+/// Saturating sum of two token counts (optional cache counters present iff
+/// either side reported one).
+fn add_tokens(a: TokenCounts, b: TokenCounts) -> TokenCounts {
+    TokenCounts {
+        input: a.input.saturating_add(b.input),
+        output: a.output.saturating_add(b.output),
+        cache_read: crate::proxy::sse::add_opt(a.cache_read, b.cache_read),
+        cache_creation: crate::proxy::sse::add_opt(a.cache_creation, b.cache_creation),
+    }
+}
+
 /// A finished aggregated model row (snapshot of [`ModelStats`]). Timestamps are
 /// kept as `SystemTime`; the document builder converts to epoch ms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +523,8 @@ pub(crate) struct ModelUsage {
     pub tokens_out: u64,
     pub cache_read: Option<u64>,
     pub cache_creation: Option<u64>,
+    /// The sub-usage part of the token counters above (#278).
+    pub sub_tokens: TokenCounts,
     pub last_used: SystemTime,
     pub accounts: Vec<ModelAccount>,
     pub efforts: Vec<ModelCount>,
@@ -1795,6 +1813,9 @@ impl ActivityLog {
             entry.cache_read = crate::proxy::sse::add_opt(entry.cache_read, t.cache_read);
             entry.cache_creation =
                 crate::proxy::sse::add_opt(entry.cache_creation, t.cache_creation);
+            if request.is_none() {
+                entry.sub_tokens = add_tokens(entry.sub_tokens, t);
+            }
         }
         entry.last_used = Some(now);
         if let Some(name) = account {
@@ -2015,6 +2036,7 @@ impl ActivityLog {
                     tokens_out: stats.tokens_out,
                     cache_read: stats.cache_read,
                     cache_creation: stats.cache_creation,
+                    sub_tokens: stats.sub_tokens,
                     last_used: stats.last_used.unwrap_or(SystemTime::UNIX_EPOCH),
                     accounts,
                     efforts: sorted_counts(&stats.efforts),

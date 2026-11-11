@@ -1218,6 +1218,18 @@ pub struct ModelUsageDoc {
     /// may recompute from the row's tokens as a fallback).
     #[serde(default)]
     pub cost_usd: f64,
+    /// The part of `cost_usd` booked from SUB-USAGES (#278: advisor /
+    /// compaction / billed fallback attempt that requests of any model ran
+    /// on this one) — tokens with no request of this row, so a per-request
+    /// average is `(cost_usd - sub_cost_usd) / requests`. Additive: omitted
+    /// when 0, absent (→ 0) in docs from older daemons.
+    #[serde(default, skip_serializing_if = "is_zero_usd")]
+    pub sub_cost_usd: f64,
+}
+
+/// `skip_serializing_if` helper: an exactly-zero USD amount.
+fn is_zero_usd(usd: &f64) -> bool {
+    *usd == 0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1720,6 +1732,12 @@ fn model_usage_docs(
                 requests: c.requests,
             })
             .collect(),
+        sub_cost_usd: crate::pricing::cost_usd(
+            &m.group,
+            &m.model,
+            &m.sub_tokens,
+            pricing_overrides,
+        ),
     };
     let mut docs: Vec<ModelUsageDoc> = hub.model_usage.iter().map(row).collect();
 
@@ -1758,6 +1776,7 @@ fn model_usage_docs(
             // No completed request yet → no accumulated tokens to price.
             // The per-request cost lands on the row once the request finishes.
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         });
     }
     // Global total = Σ per-row costs, by construction (in-flight-only rows
@@ -3435,12 +3454,30 @@ mod tests {
         }
         let (cost, sub_usage) = advisor_row.expect("the advisor request row");
         assert!((cost - want).abs() < 1e-9, "row cost {cost} != {want}");
-        assert_eq!(sub_usage, vec![advisor]);
+        assert_eq!(sub_usage, vec![advisor.clone()]);
         let rows: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
         assert!(
             (per_request - rows).abs() < 1e-9,
             "sum of per-request costs {per_request} != model rows {rows}"
         );
+        // The advisor's model row says how much of its cost is sub-usage (no
+        // request of that row), so a per-request average can leave it out.
+        let row = |model: &str| {
+            doc.model_usage
+                .iter()
+                .find(|m| m.model == model)
+                .unwrap_or_else(|| panic!("no {model} row"))
+        };
+        let advisor_cost =
+            crate::pricing::cost_usd("claude", "claude-fable-5-1", &advisor.tokens, &none);
+        let fable = row("claude-fable-5-1");
+        assert_eq!(fable.requests, 0);
+        assert!(
+            (fable.sub_cost_usd - advisor_cost).abs() < 1e-12,
+            "{} != {advisor_cost}",
+            fable.sub_cost_usd
+        );
+        assert_eq!(row("claude-opus-5-5").sub_cost_usd, 0.0);
         assert!((doc.totals.cost_usd - rows).abs() < 1e-9);
     }
 
