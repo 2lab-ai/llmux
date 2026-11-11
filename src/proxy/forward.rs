@@ -3144,7 +3144,7 @@ pub(crate) enum RefreshOutcome {
     /// `detail` is the upstream reason rendered by [`refresh_death_detail`]:
     /// without it the operator-visible message said only "refresh token dead",
     /// which hid the one distinction that matters — expired (just re-login)
-    /// vs. rotated-out-from-under-us by a second daemon (iq-64, 2026-09-10..21).
+    /// vs. rotated-out-from-under-us by a second daemon (shared host, 2026-09-10..21).
     Permanent { detail: String, status: StatusCode },
     /// Transient refresh failure — old token may still work.
     Failed { status: Option<StatusCode> },
@@ -3186,7 +3186,7 @@ const REVOKED_HINT: &str =
 ///
 /// WHY this exists: the message used to be "refresh token dead; re-login
 /// required" and nothing else, which hid the only distinction that changes what
-/// the operator should DO. On iq-64 (2026-09-10..21) a retired daemon kept
+/// the operator should DO. On a shared host (2026-09-10..21) a retired daemon kept
 /// draining for 25 days and its background refresh loop kept rotating the same
 /// OAuth refresh-token family as its successor; the loser saw `invalid_grant
 /// "Refresh token not found or invalid"` and benched a perfectly good account.
@@ -4710,7 +4710,7 @@ mod tests {
     /// The refresh-death message must carry the upstream reason, and must call
     /// out the one reason that is NOT "your login expired": a token the
     /// provider no longer knows (or has revoked) is what a second process
-    /// rotating the same refresh-token family produces — the iq-64 zombie
+    /// rotating the same refresh-token family produces — the shared-host zombie
     /// daemon (2026-09-10..21), where re-logging in would have fixed nothing.
     #[test]
     fn refresh_death_detail_quotes_upstream_reason_and_flags_rotation() {

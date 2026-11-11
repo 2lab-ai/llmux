@@ -1,0 +1,47 @@
+name: Sanitize Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One scan per ref: a newer push cancels the scan of the commit it supersedes. Named apart from
+# CI's group, because groups are repository-wide and a shared name would let one workflow cancel
+# another's run.
+concurrency:
+  group: sanitize-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. The scan reads the full history and reports; it writes nothing.
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    # Same gate as 2lab-ai/soma-work (`.github/workflows/sanitize-gate.yml` there), running the
+    # same script. The repository is public and `pull_request` fires for forks, while the scan
+    # step is handed the pattern secrets and runs `scripts/sanitize-scan.sh` — a file the pull
+    # request can rewrite. Without this guard a fork PR could replace that script with one that
+    # prints the secrets. Job-level, so a fork PR's head commit is never fetched and no secret is
+    # ever materialised in a step environment; forks simply do not get this gate.
+    #
+    # Kept flat (no continuation line indented further than the first): a more-indented line in a
+    # folded scalar is preserved verbatim, which would put a literal newline inside the expression.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Full-history forbidden-pattern scan
+        env:
+          SANITIZE_PATTERNS_SHARED: ${{ secrets.SANITIZE_PATTERNS_SHARED }}
+          SANITIZE_PATTERNS: ${{ secrets.SANITIZE_PATTERNS }}
+        run: bash scripts/sanitize-scan.sh

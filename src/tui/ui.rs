@@ -417,7 +417,7 @@ fn masked_name(name: &str, mask: bool) -> String {
 /// `email_anonymous` aliasing), then strip the `{group}:` prefix — the table's
 /// `group` column already says CLAUDE/CODEX, so repeating it per name is pure
 /// width — then abbreviate the email domain via config `domain_abbrev`
-/// (`ai3@insightquest.io` → `ai3@iq.io`). Render layer ONLY, exactly like
+/// (`ai3@example.com` → `ai3@ex`). Render layer ONLY, exactly like
 /// [`masked_name`]: the snapshot keeps real ids so switch/remove still
 /// address the pool correctly. The detail pane keeps the FULL raw id (it is
 /// the fidelity surface, issue #70).
@@ -13866,19 +13866,20 @@ mod tests {
 
     #[test]
     fn row_account_name_strips_group_prefix_and_abbreviates_domain() {
-        let abbrev = crate::config::default_domain_abbrev();
+        let abbrev =
+            std::collections::BTreeMap::from([("example.com".to_string(), "ex".to_string())]);
         assert_eq!(
-            row_account_name("claude:ai3@insightquest.io", false, &abbrev),
-            "ai3@iq.io"
+            row_account_name("claude:ai3@example.com", false, &abbrev),
+            "ai3@ex"
         );
         assert_eq!(
-            row_account_name("codex:ai@insightquest.io", false, &abbrev),
-            "ai@iq.io"
+            row_account_name("codex:ai@example.com", false, &abbrev),
+            "ai@ex"
         );
         // Unmapped domain: prefix still stripped, domain untouched.
         assert_eq!(
-            row_account_name("claude:x@example.com", false, &abbrev),
-            "x@example.com"
+            row_account_name("claude:x@example.org", false, &abbrev),
+            "x@example.org"
         );
         // No prefix / no email shape: passes through.
         assert_eq!(row_account_name("plainname", false, &abbrev), "plainname");
@@ -17165,7 +17166,7 @@ mod tests {
             user_id: Some("u1".into()),
             tenant: Some("k-t1".into()),
             excerpt: Some("hello world".into()),
-            client_name: Some("Z (U09F1M5MML1)".into()),
+            client_name: Some("Z (U0TESTUSER1)".into()),
             started_at: std::time::SystemTime::now(),
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -17315,7 +17316,7 @@ mod tests {
     /// unreadable).
     #[test]
     fn in_flight_row_columns_align_with_a_completed_row() {
-        let view = aligned_pair_view("Z (U09F1M5MML1)", Duration::ZERO);
+        let view = aligned_pair_view("Z (U0TESTUSER1)", Duration::ZERO);
         let (running, completed) = badge_rows(&view);
         let (a, b) = (row_columns(&running), row_columns(&completed));
         assert_eq!(
@@ -17469,7 +17470,7 @@ mod tests {
             "4-char short name after the kind column: {row}"
         );
         // "Z (U09…)" → "Z", padded to the fixed 4-cell column.
-        let row = render(&named("Z (U09F1M5MML1)"));
+        let row = render(&named("Z (U0TESTUSER1)"));
         assert!(row.contains("user     Z    "), "padded short name: {row}");
         // No tenant → blank cell, and nothing invents a name.
         let blank = completed_request(1_000, Some("claude"), Some("claude-opus-4-8"), 10, 5, 200);
@@ -17579,7 +17580,7 @@ mod tests {
         };
         // The 4 user examples, at the rendered-cell level.
         for (name, cell) in [
-            ("Z (U09F1M5MML1)", "Z    "),
+            ("Z (U0TESTUSER1)", "Z    "),
             ("luka (U0AAAAAAAAA)", "luka "),
             ("angelo (U0BBBBBBBBB)", "ange "),
             ("local", "loca "),
@@ -17683,7 +17684,7 @@ mod tests {
         {
             *kind = Some("count".into());
             *tenant = Some("k-1".into());
-            *client_name = Some("Z (U09F1M5MML1)".into());
+            *client_name = Some("Z (U0TESTUSER1)".into());
         }
         let run = [probe.clone(), probe.clone()];
         let labels = BTreeMap::new();
@@ -19622,6 +19623,10 @@ mod tests {
             },
         );
         config.scheduler.save_until = Some(1_800_000_000);
+        // The built-in abbreviation map is empty, so fill it here.
+        config
+            .domain_abbrev
+            .insert("example.com".into(), "ex".into());
         config.paused_accounts.insert("a@x.com".into());
         config.account_limits.insert(
             "a@x.com".into(),

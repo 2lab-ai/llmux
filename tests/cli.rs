@@ -1164,7 +1164,7 @@ async fn run_injects_base_url_and_propagates_exit_code() {
 }
 
 // ---------------------------------------------------------------------------
-// Shutdown drain deadline — the REAL binary, end to end (iq-64 zombie daemon,
+// Shutdown drain deadline — the REAL binary, end to end (shared-host zombie daemon,
 // 2026-09-10..21): a client that never closes its connection must not keep a
 // retired daemon alive past the drain deadline. Runs `llmux server --no-tui`
 // with `LLMUX_SHUTDOWN_DRAIN_DEADLINE_SECS=1`, holds a half-sent request open,

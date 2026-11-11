@@ -106,7 +106,7 @@ the database only when it needs to be queried.
 Keep the SQLite files and archives until the server copy has been checked.
 Nothing in this procedure deletes them.
 
-## Trial run (fable-m5max, 2026-10-31, PostgreSQL 17.11)
+## Trial run (owner-mac, 2026-10-31, PostgreSQL 17.11)
 
 I ran the procedure above from an empty data directory:
 

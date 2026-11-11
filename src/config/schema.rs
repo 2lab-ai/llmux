@@ -132,12 +132,12 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
     /// TUI display: shorten well-known email domains in the accounts table
-    /// (`ai3@insightquest.io` → `ai3@iq.io`). Render-only — API documents and
+    /// (`ai3@example.com` → `ai3@ex`). Render-only — API documents and
     /// interactive targets (switch/remove) keep real ids, same layering as
     /// `email_anonymous`. Additive
     /// (`#[serde(default = "default_domain_abbrev")]`): a config without this
-    /// field loads the built-in `{"insightquest.io": "iq.io"}` map; set `{}`
-    /// explicitly to disable abbreviation.
+    /// field loads the built-in map, which is empty: no domain is abbreviated
+    /// until the operator lists one (`{"example.com": "ex"}`).
     #[serde(default = "default_domain_abbrev")]
     pub domain_abbrev: BTreeMap<String, String>,
     /// Which quantity the TUI quota gauges FILL with: `"remaining"` (default
@@ -356,8 +356,10 @@ pub enum QuotaDisplay {
 }
 
 /// Built-in domain abbreviations for the accounts table (`domain_abbrev`).
+/// Empty: the binary ships no deployment's domain; each operator lists their
+/// own in the config file.
 pub fn default_domain_abbrev() -> BTreeMap<String, String> {
-    BTreeMap::from([("insightquest.io".to_string(), "iq.io".to_string())])
+    BTreeMap::new()
 }
 
 /// Remote-daemon target for the CLI client commands. All fields optional:

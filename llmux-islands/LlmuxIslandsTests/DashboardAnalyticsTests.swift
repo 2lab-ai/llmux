@@ -70,7 +70,7 @@ final class DashboardAnalyticsTests: XCTestCase {
 
     func testClientNameLabelFirstTokenFirstFourChars() {
         // The user-spec examples, verbatim (mirrors Rust `client_short_name`).
-        XCTAssertEqual(ClientNameLabel.short("Z (U09F1M5MML1)"), "Z")
+        XCTAssertEqual(ClientNameLabel.short("Z (U0TESTUSER1)"), "Z")
         XCTAssertEqual(ClientNameLabel.short("luka (U0AAAAAAAAA)"), "luka")
         XCTAssertEqual(ClientNameLabel.short("angelo (U0BBBBBBBBB)"), "ange")
         XCTAssertEqual(ClientNameLabel.short("local"), "loca")
@@ -98,7 +98,7 @@ final class DashboardAnalyticsTests: XCTestCase {
         // The PRODUCTION composition — dropping the name from the label
         // makes this fail, not just the shortening helper.
         let named = try completedRow(
-            #"{"kind":"request","at_ms":1,"model":"claude-opus-4-8","client_name":"Z (U09F1M5MML1)"}"#
+            #"{"kind":"request","at_ms":1,"model":"claude-opus-4-8","client_name":"Z (U0TESTUSER1)"}"#
         )
         XCTAssertEqual(ClientNameLabel.completedLabel(named), "Z claude-opus-4-8")
         let bare = try completedRow(#"{"kind":"request","at_ms":1,"model":"claude-opus-4-8"}"#)
@@ -116,7 +116,7 @@ final class DashboardAnalyticsTests: XCTestCase {
         // no label/trailing expression of its own) — dropping the short name
         // from the composed row fails HERE, at the production surface.
         let entry = try completedRow(
-            #"{"kind":"request","at_ms":0,"model":"claude-opus-4-8","client_name":"Z (U09F1M5MML1)","status":200,"duration_ms":1000,"tokens":{"input":10,"output":5}}"#
+            #"{"kind":"request","at_ms":0,"model":"claude-opus-4-8","client_name":"Z (U0TESTUSER1)","status":200,"duration_ms":1000,"tokens":{"input":10,"output":5}}"#
         )
         let now = Date(timeIntervalSince1970: 300)
         let model = ActivityRowModel.completed(entry, now: now)

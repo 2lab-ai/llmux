@@ -40,4 +40,4 @@ SSOT: `.prd/tui-accounts-sort-detail/ssot.md` · loop: `.prd/tui-accounts-sort-d
 ## Release
 
 Preview only (owner: "프리릴리즈까지 배포"): merge to main → preview.yml →
-tap `llmux-preview` → `brew upgrade` + daemon restart on fable-m5max.
+tap `llmux-preview` → `brew upgrade` + daemon restart on owner-mac.

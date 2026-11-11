@@ -224,7 +224,7 @@ fn activity_receipts_carry_tenant_and_client_name() {
         .find(|row| matches!(row, llmux::dashboard::CompletedDoc::Request { .. }))
     {
         *tenant = Some("k-t1".into());
-        *client_name = Some("Z (U09F1M5MML1)".into());
+        *client_name = Some("Z (U0TESTUSER1)".into());
     }
 
     let state = derive_ui_state(&doc, &options(), 1_700_000_003_000);
@@ -235,7 +235,7 @@ fn activity_receipts_carry_tenant_and_client_name() {
         .find(|receipt| receipt.status == Some(200))
         .expect("request receipt");
     assert_eq!(request.tenant.as_deref(), Some("k-t1"));
-    assert_eq!(request.client_name.as_deref(), Some("Z (U09F1M5MML1)"));
+    assert_eq!(request.client_name.as_deref(), Some("Z (U0TESTUSER1)"));
     // Rows without attribution (in-flight here) stay None — never coerced.
     let in_flight = &state.statistics.activity_receipts[0];
     assert_eq!(in_flight.receipt_id, "in_flight:99");
