@@ -40,7 +40,7 @@ final class SharedUiStateTests: XCTestCase {
         XCTAssertEqual(state.statistics.activityReceipts.first?.receiptId, "request:1:POST:/v1/messages:200")
         XCTAssertEqual(state.statistics.activityReceipts.first?.path, "/v1/messages")
         XCTAssertEqual(state.statistics.activityReceipts.first?.tenant, "k-t1")
-        XCTAssertEqual(state.statistics.activityReceipts.first?.clientName, "Z (U09F1M5MML1)")
+        XCTAssertEqual(state.statistics.activityReceipts.first?.clientName, "Z (U0TESTUSER1)")
         XCTAssertEqual(state.verificationReceipts.first?.operation, "pause_account")
         XCTAssertEqual(state.verificationReceipts.first?.outcome, "succeeded")
         XCTAssertTrue(state.settings.emailAnonymous)
@@ -166,7 +166,7 @@ final class SharedUiStateTests: XCTestCase {
           "message": null,
           "error": false,
           "tenant": "k-t1",
-          "client_name": "Z (U09F1M5MML1)"
+          "client_name": "Z (U0TESTUSER1)"
         }],
         "data_quality": {
           "model_usage": "canonical",

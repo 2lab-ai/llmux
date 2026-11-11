@@ -82,5 +82,13 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
   then `llmux restart`. A later `brew upgrade` overwrites a hot-deployed dev binary.
 - **Push fallback** if the remote's `ghs_` token is stale:
   `git push "https://x-access-token:$(gh auth token)@github.com/2lab-ai/llmux" <ref>`.
+- **Sanitize Gate** (`.github/workflows/sanitize-gate.yml`) scans every published commit —
+  files, messages, author lines, branch and tag names — for private host names and other
+  companies' names and domains. The patterns live only in the `SANITIZE_PATTERNS_SHARED`
+  secret, which 2lab-ai/soma-work holds with the same value; `scripts/sanitize-scan.sh` is a
+  byte-identical copy of soma-work's. Write "a shared host" or "the owner's Mac" instead of a
+  machine name, and commit with a configured `user.email` (git's default `user@hostname` puts
+  the host name in the author line). Commits published before the gate are listed in
+  `scripts/sanitize-known-leaks.txt`.
 - The `/api/oauth/usage` endpoint returns **percentages (0–100)**, not fractions — each
   evidence source has a fixed scale (see `src/scheduler/usage.rs`).

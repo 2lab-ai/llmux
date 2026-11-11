@@ -668,7 +668,7 @@ pub struct DashboardDoc {
     #[serde(default = "default_true")]
     pub show_fable_weekly: bool,
     /// Domain abbreviations for the accounts table's name column (config
-    /// `domain_abbrev`): `ai3@insightquest.io` renders `ai3@iq.io`. Carried
+    /// `domain_abbrev`): `ai3@example.com` renders `ai3@ex`. Carried
     /// here so BOTH TUI backends abbreviate identically (local builds the doc
     /// in-process; attach receives it here); account names in the document
     /// itself stay real, same convention as `email_anonymous`. Additive:
@@ -2787,7 +2787,7 @@ mod tests {
         let mut meta = meta();
         meta.client_keys.push(KeyRowDoc {
             id: "k-t1".into(),
-            name: "Z (U09F1M5MML1)".into(),
+            name: "Z (U0TESTUSER1)".into(),
             email: None,
             kind: "default".into(),
             key_prefix: "lmk-aaaa".into(),
@@ -2822,7 +2822,7 @@ mod tests {
         );
         assert_eq!(
             row(2),
-            (Some("k-t1".into()), Some("Z (U09F1M5MML1)".into()),),
+            (Some("k-t1".into()), Some("Z (U0TESTUSER1)".into()),),
             "key name joined from key metadata"
         );
         // Additive wire shape: the pre-tenant row omits both keys entirely.
@@ -2855,7 +2855,7 @@ mod tests {
         let mut meta = meta();
         meta.client_keys.push(KeyRowDoc {
             id: "k-t1".into(),
-            name: "Z (U09F1M5MML1)".into(),
+            name: "Z (U0TESTUSER1)".into(),
             email: None,
             kind: "default".into(),
             key_prefix: "lmk-aaaa".into(),
@@ -2875,7 +2875,7 @@ mod tests {
 
         let keyed = &doc.activity.in_flight[0];
         assert_eq!(keyed.tenant.as_deref(), Some("k-t1"));
-        assert_eq!(keyed.client_name.as_deref(), Some("Z (U09F1M5MML1)"));
+        assert_eq!(keyed.client_name.as_deref(), Some("Z (U0TESTUSER1)"));
         assert_eq!(keyed.user_id.as_deref(), Some("u1"));
         assert_eq!(keyed.excerpt.as_deref(), Some("hello world"));
 

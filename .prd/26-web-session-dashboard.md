@@ -7,10 +7,10 @@ Round plan and open gaps: [web-session-dashboard/loop.md](web-session-dashboard/
 
 ## Problem
 
-The web dashboard (`webui/`, served at `https://llmux.internals.2lab.ai/` on fable-m5max and
-`https://llmux.internals.insightquest.io/` on iq-64) was built against one person's machine. On the
-shared iq-64 daemon (16 issued keys, about 10 people) it does not answer the questions it exists for.
-Measured [LIVE iq-64, 2026-11-09 12:50 KST, `GET /api/sessions` + browser capture]:
+The web dashboard (`webui/`, served at `https://llmux.internals.2lab.ai/` on owner-mac and
+on a shared team host) was built against one person's machine. On the
+shared team-host daemon (16 issued keys, about 10 people) it does not answer the questions it exists for.
+Measured [LIVE team host, 2026-11-09 12:50 KST, `GET /api/sessions` + browser capture]:
 
 1. **Half the board is noise.** 155 of 300 cards are soma-work one-shot side calls (safety reviewer,
    "Summarize this AI assistant response", `<session-title-pending>`), each 2 requests, each shown as
@@ -31,9 +31,9 @@ Viewer: an admin of the host's soma-work (`ADMIN_USERS`), signed in through the 
 
 | Reader | When | Checks, in order |
 |---|---|---|
-| R1 team lead on iq-64 | several times a day, glance first | Q1, Q2, Q4 |
+| R1 team lead on the team host | several times a day, glance first | Q1, Q2, Q4 |
 | R2 admin debugging one session ("my agent is stuck / weird / expensive") | on report | Q3, Q5 |
-| R3 Z on fable-m5max watching ~20 own consoles and bots | continuously | Q1 (which one needs me), Q3 |
+| R3 Z on owner-mac watching ~20 own consoles and bots | continuously | Q1 (which one needs me), Q3 |
 
 - **Q1 Who is doing what right now?** Per user: running and waiting sessions with title, repo and
   branch, PR links, elapsed time and the step in progress.
@@ -48,7 +48,7 @@ Viewer: an admin of the host's soma-work (`ADMIN_USERS`), signed in through the 
 Glance rule: the first screen answers Q1 and flags Q4 within 3 seconds without scrolling; every number
 links to the sessions or requests behind it.
 
-## Data available (research, [LIVE iq-64 2026-11-09])
+## Data available (research, [LIVE team host 2026-11-09])
 
 | Source | Fields used | Notes |
 |---|---|---|
@@ -57,7 +57,7 @@ links to the sessions or requests behind it.
 | `/llmux/keys/usage?window=` | `tenants[]{tenant,name,email,requests,ok,errors,tokens_in,tokens_out,cost_usd,first_ms,last_ms,models[]}` | Exact per-user usage per window — the Q2 numbers. |
 | `~/.config/llmux.json` `client_keys[]` | `id name email kind suspended created_at_ms` | Users that exist but were idle in the window. Never read or show `key_prefix`/`key_digest`. |
 | `/llmux/raw-io?id=&at_ms=` | request headers (`user-agent` → Claude Code version and cli/sdk, `x-stainless-os/arch`), body (`system`, `messages`, `tools` incl. MCP servers, `thinking`, `output_config.effort`, `context_management`), response SSE (`stop_reason`, usage incl. `thinking_tokens`) | ~1 MB per main request. The first user message carries CLAUDE.md paths and the working directory; the real user turns rebuild the conversation of a remote session. Fetched only when a session is opened. |
-| Claude Code transcript (`<config>/projects/<cwd>/<sid>.jsonl`) | `ai-title`, cwd, branch, version, messages with `requestId`, subagent files | Present only for sessions run on the host (soma-work on iq-64, local consoles on fable-m5max). |
+| Claude Code transcript (`<config>/projects/<cwd>/<sid>.jsonl`) | `ai-title`, cwd, branch, version, messages with `requestId`, subagent files | Present only for sessions run on the host (soma-work on the team host, local consoles on owner-mac). |
 
 ## Goals
 
@@ -85,9 +85,9 @@ links to the sessions or requests behind it.
 
 ## Acceptance (run → observe)
 
-A1. iq-64 board, default filters → no card whose only requests are a known side-call template; the
+A1. Team-host board, default filters → no card whose only requests are a known side-call template; the
     header shows "부속 호출 N건 숨김"; toggling it shows them.
-A2. iq-64 board → every card shows a user name; filter chips list each user with their running count;
+A2. Team-host board → every card shows a user name; filter chips list each user with their running count;
     choosing one leaves only that user's cards.
 A3. A remote personal Claude Code session (e.g. `fd268b59`) → card title is its first real user
     prompt, origin "개인 PC", detail shows working directory, Claude Code version, OS, MCP servers,
@@ -98,7 +98,7 @@ A5. Detail of a soma-work session → 개요 lists instructions with tool count,
     changed and PR links; 작업 로그 renders with `ui-work-log` + `ui-tool-call-card`; 요청 opens a raw
     exchange.
 A6. Q4: a session above the burst threshold carries a visible flag on its card and in the attention strip.
-A7. fable-m5max keeps working with one user (no regressions in SSO, sessions, accounts, activities).
+A7. owner-mac keeps working with one user (no regressions in SSO, sessions, accounts, activities).
 A8. Both public URLs: admin login only, as in request 4; screenshots of each acceptance attached to
     the round receipt.
 

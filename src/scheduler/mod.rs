@@ -1496,7 +1496,7 @@ impl AccountPool {
     /// treats an old window as `UsageStale` → never selected → never receives
     /// the response headers that would refill it, while the usage poller is
     /// the only other refill path and can be
-    /// 429-rate-limited out. Observed on iq-64 2026-09-18..21: two re-logged
+    /// 429-rate-limited out. Observed on a shared host 2026-09-18..21: two re-logged
     /// accounts sat at "usage stale 2d14h" for two days with healthy tokens.
     /// A cold account (no live windows) is explicitly eligible, so dropping
     /// the readings re-opens selection and the first response refills them.
@@ -1533,7 +1533,7 @@ impl AccountPool {
                                 // evidence about a dead login. Re-enter COLD
                                 // (cold is eligible, stale is not) or the
                                 // healed account can never be selected and so
-                                // can never refill from headers — the iq-64
+                                // can never refill from headers — the shared-host
                                 // "usage stale 2d14h" deadlock documented
                                 // above. Cooldowns, pause, ceilings and
                                 // in-flight leases are NOT usage evidence and
@@ -2824,7 +2824,7 @@ mod tests {
         assert!(a.paused, "the operator pause outlives a re-login");
     }
 
-    /// iq-64 2026-09-18..21: `claude:ai2` / `claude:ai10` were re-logged out of
+    /// Shared host 2026-09-18..21: `claude:ai2` / `claude:ai10` were re-logged out of
     /// `AuthFailed` and then sat at "usage stale 2d14h" for two days — the
     /// windows fetched under the RETIRED credential survived the re-login, and
     /// a stale account is never selected, so no response header ever refilled

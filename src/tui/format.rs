@@ -212,7 +212,7 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// its first 4 GRAPHEME CLUSTERS — the same unit Swift's `String.prefix`
 /// counts in `ClientNameLabel.short`, so a family emoji or decomposed
 /// Hangul shortens identically on every client (scalar-based `chars()`
-/// would tear a ZWJ cluster and diverge). "Z (U09F1M5MML1)" → "Z",
+/// would tear a ZWJ cluster and diverge). "Z (U0TESTUSER1)" → "Z",
 /// "luka (U0…)" → "luka", "angelo (U0…)" → "ange", "local" → "loca".
 /// Empty input stays empty.
 pub(crate) fn client_short_name(name: &str) -> String {
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn client_short_name_first_token_first_four_chars() {
-        assert_eq!(client_short_name("Z (U09F1M5MML1)"), "Z");
+        assert_eq!(client_short_name("Z (U0TESTUSER1)"), "Z");
         assert_eq!(client_short_name("luka (U0AAAAAAAAA)"), "luka");
         assert_eq!(client_short_name("angelo (U0BBBBBBBBB)"), "ange");
         assert_eq!(client_short_name("local"), "loca");

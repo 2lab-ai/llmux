@@ -127,11 +127,11 @@ final class LlmuxDashboardDecodeTests: XCTestCase {
         {"kind": "request", "at_ms": 1783146111455, "method": "POST",
          "path": "/v1/messages", "account": "claude:user1@example.com",
          "status": 200, "duration_ms": 1463,
-         "tenant": "k-abc123", "client_name": "Z (U09F1M5MML1)"}
+         "tenant": "k-abc123", "client_name": "Z (U0TESTUSER1)"}
         """
         let row = try JSONDecoder().decode(LlmuxDashboardCompleted.self, from: Data(json.utf8))
         XCTAssertEqual(row.tenant, "k-abc123")
-        XCTAssertEqual(row.clientName, "Z (U09F1M5MML1)")
+        XCTAssertEqual(row.clientName, "Z (U0TESTUSER1)")
         XCTAssertEqual(ClientNameLabel.short(try XCTUnwrap(row.clientName)), "Z")
     }
 

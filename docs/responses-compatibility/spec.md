@@ -267,7 +267,7 @@ spread across routes.
 
 Why the prefix and not the conversation. Before, llmux sent one id per daemon process. A
 first fix (#275) sent one key per conversation, the codex CLI's per-thread policy; after it
-shipped, the next-turn cache ratio on fable-m5max fell from 0.901 to 0.821 on codex
+shipped, the next-turn cache ratio on owner-mac fell from 0.901 to 0.821 on codex
 (27 minutes against the 90 before), with every low-cache pair keeping its full prefix. A
 controlled A/B on the live codex gateway (2026-11-10) found the cause:
 
@@ -285,7 +285,7 @@ cold. The per-process key put every request on one route and changed on every da
 restart, so each restart started every conversation cold. The prefix key is derived from
 content, so the same tools give the same key across restarts.
 
-Measured around the deploy (fable-m5max, 2026-11-10):
+Measured around the deploy (owner-mac, 2026-11-10):
 - **New conversations start warm.** A probe sends new conversations one after another
   through the daemon, each with the same real Claude Code system prompt and 84 tools
   (about 16,580 tokens in all). Before the deploy, under the per-conversation key, all 3
@@ -381,7 +381,7 @@ Two channels, never mixed:
 Why. Claude Code (Agent SDK 2.1.28x, beta `mid-conversation-system-2026-04-07`) sends
 operator text as system messages where it applies: environment and skill listings, agent
 types, nested `CLAUDE.md`, background-task notifications, TodoWrite reminders. Until
-2026-11-09 llmux folded all of them into `instructions`. Measured on fable-m5max's
+2026-11-09 llmux folded all of them into `instructions`. Measured on owner-mac's
 raw-io store, 2026-11-09 15:00–17:00:
 
 | | codex (383 requests, 44 conversations) | grok (182 requests, 11 conversations) |

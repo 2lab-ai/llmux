@@ -291,9 +291,9 @@ impl AccountSort {
 ///   `dev1@…` < `devteam@…` and `codex:2@…` < `codex:backup@…`.
 ///
 /// ```text
-/// ai[    ]@iq.io
-/// ai[   1]@iq.io
-/// ai[  10]@iq.io
+/// ai[    ]@example.com
+/// ai[   1]@example.com
+/// ai[  10]@example.com
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NatChunk {
@@ -313,8 +313,8 @@ pub(crate) enum NatChunk {
 ///
 /// Per-character (rather than per-word) chunks are what makes the comparison
 /// land on the divergence itself, where [`NatChunk`]'s three kinds decide:
-/// separator < number < letter. Hence `ai@iq.io` < `ai1@iq.io` (empty slot
-/// first) and `dev1@iq.io` < `devteam@iq.io` / `codex:2@x` < `codex:backup@x`
+/// separator < number < letter. Hence `ai@x` < `ai1@x` (empty slot
+/// first) and `dev1@x` < `devteam@x` / `codex:2@x` < `codex:backup@x`
 /// (a number is not a letter, and does not sort as one).
 ///
 /// Digit runs that spell the same number (`ai01` vs `ai1`) tie here; callers
@@ -685,26 +685,26 @@ mod tests {
         // 정렬이 병신이잖아" — the plain lexicographic key read ai10, ai1, ai;
         // the number slot has to compare as a NUMBER.
         let snapshot = pool(vec![
-            grouped("ai10@insightquest.io", BackendGroup::Claude),
-            grouped("ai2@insightquest.io", BackendGroup::Claude),
-            grouped("ai@insightquest.io", BackendGroup::Claude),
-            grouped("ai1@insightquest.io", BackendGroup::Claude),
-            grouped("devteam@insightquest.io", BackendGroup::Claude),
-            grouped("dev1@insightquest.io", BackendGroup::Claude),
+            grouped("ai10@example.com", BackendGroup::Claude),
+            grouped("ai2@example.com", BackendGroup::Claude),
+            grouped("ai@example.com", BackendGroup::Claude),
+            grouped("ai1@example.com", BackendGroup::Claude),
+            grouped("devteam@example.com", BackendGroup::Claude),
+            grouped("dev1@example.com", BackendGroup::Claude),
             grouped("icedac@gmail.com", BackendGroup::Claude),
-            grouped("notify@insightquest.io", BackendGroup::Claude),
+            grouped("notify@example.com", BackendGroup::Claude),
         ]);
         assert_eq!(
             ordered_ids(&snapshot, AccountSort::Name),
             vec![
-                "ai@insightquest.io",
-                "ai1@insightquest.io",
-                "ai2@insightquest.io",
-                "ai10@insightquest.io",
-                "dev1@insightquest.io",
-                "devteam@insightquest.io",
+                "ai@example.com",
+                "ai1@example.com",
+                "ai2@example.com",
+                "ai10@example.com",
+                "dev1@example.com",
+                "devteam@example.com",
                 "icedac@gmail.com",
-                "notify@insightquest.io",
+                "notify@example.com",
             ],
             "digit runs compare numerically; empty slot first, number before letter"
         );

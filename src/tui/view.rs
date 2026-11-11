@@ -103,7 +103,7 @@ pub(crate) struct DashboardView {
     /// below) — this flag only gates the render.
     pub show_fable_weekly: bool,
     /// Accounts-table domain abbreviations (config `domain_abbrev`, carried on
-    /// the document): render `ai3@insightquest.io` as `ai3@iq.io`. Render-only
+    /// the document): render `ai3@example.com` as `ai3@ex`. Render-only
     /// — the snapshot keeps real ids, same layering as `email_anonymous`.
     pub domain_abbrev: std::collections::BTreeMap<String, String>,
     /// Boot default for the quota-gauge fill direction (config
@@ -902,7 +902,7 @@ mod tests {
         infl["user_id"] = serde_json::json!("u1");
         infl["tenant"] = serde_json::json!("k-t1");
         infl["excerpt"] = serde_json::json!("hello world");
-        infl["client_name"] = serde_json::json!("Z (U09F1M5MML1)");
+        infl["client_name"] = serde_json::json!("Z (U0TESTUSER1)");
 
         let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(view.in_flight[0].excerpt.as_deref(), Some("hello world"));
         assert_eq!(
             view.in_flight[0].client_name.as_deref(),
-            Some("Z (U09F1M5MML1)")
+            Some("Z (U0TESTUSER1)")
         );
 
         // A doc WITHOUT the fields still parses (back-compat → None).
@@ -1082,7 +1082,7 @@ mod tests {
     fn completed_tenant_and_client_name_survive_doc_to_view() {
         let mut json = doc_json();
         json["activity"]["completed"][0]["tenant"] = serde_json::json!("k-1");
-        json["activity"]["completed"][0]["client_name"] = serde_json::json!("Z (U09F1M5MML1)");
+        json["activity"]["completed"][0]["client_name"] = serde_json::json!("Z (U0TESTUSER1)");
         let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         match &view.completed[0].body {
@@ -1092,7 +1092,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tenant.as_deref(), Some("k-1"));
-                assert_eq!(client_name.as_deref(), Some("Z (U09F1M5MML1)"));
+                assert_eq!(client_name.as_deref(), Some("Z (U0TESTUSER1)"));
             }
             other => panic!("expected request, got {other:?}"),
         }
@@ -1247,15 +1247,18 @@ mod tests {
     #[test]
     fn display_settings_survive_doc_to_view_and_default() {
         // A doc from an older daemon (neither field) → the built-in abbrev map
-        // and `used` fill, mirroring the show_fable_weekly additive convention.
+        // (empty) and `remaining` fill, mirroring the show_fable_weekly
+        // additive convention.
         let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         assert_eq!(
-            view.domain_abbrev
-                .get("insightquest.io")
-                .map(String::as_str),
-            Some("iq.io"),
+            view.domain_abbrev,
+            crate::config::default_domain_abbrev(),
             "absent wire field defaults to the built-in map"
+        );
+        assert!(
+            view.domain_abbrev.is_empty(),
+            "the built-in map names no deployment's domain"
         );
         assert_eq!(
             view.quota_display,
@@ -1273,7 +1276,11 @@ mod tests {
             view.domain_abbrev.get("example.com").map(String::as_str),
             Some("ex")
         );
-        assert!(!view.domain_abbrev.contains_key("insightquest.io"));
+        assert_eq!(
+            view.domain_abbrev.len(),
+            1,
+            "the wire map replaces the default"
+        );
         assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
     }
 
