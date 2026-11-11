@@ -154,9 +154,13 @@ if [ -f "$list" ]; then
       echo "sanitize-scan: $list: entries are full 40-hex commit ids — not a clean result" >&2
       exit 2
     fi
+    # An entry for a commit the clone does not have is refused, not skipped: a
+    # skipped entry could wait in main's list until the commit appears on some
+    # branch, and the next push would exempt it with no red run in between. When
+    # the branch carrying a listed commit is deleted, remove the entry too.
     if [ "$(git cat-file -t "$sha" 2>/dev/null)" != commit ]; then
-      echo "sanitize-scan: known leak $sha is not a commit in this clone — nothing exempted for it" >&2
-      continue
+      echo "sanitize-scan: known leak $sha is not a commit in this clone — remove the entry; not a clean result" >&2
+      exit 2
     fi
     if { [ -z "$base" ] || ! git merge-base --is-ancestor "$sha" "$base" 2>/dev/null; } &&
       { [ -z "$pushed" ] || [[ $'\n'"$prior"$'\n' != *$'\n'"$sha"$'\n'* ]] || ! on_other_published_ref "$sha" "$pushed"; }; then

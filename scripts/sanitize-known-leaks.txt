@@ -3,6 +3,8 @@
 # What such a commit added is tolerated wherever it persists; any other hit still fails, including
 # another commit adding the same text again. One full 40-hex commit id per line, then the reason.
 # Ids only — never the matching text. Same format as 2lab-ai/soma-work's list.
+# Every entry must name a commit the clone has: when the branch that carries a listed commit is
+# deleted, remove its entry too, or the scan fails.
 012311cd6543791a664b3ca52d09ecb405ceaa7d  baseline 2026-11-11 (published before the gate)
 013018276fc86dd5795764253c2d7b67a947eb7b  baseline 2026-11-11 (published before the gate)
 053cbf896f816844d3ea109ab9b39a43d24dd6b6  baseline 2026-11-11 (published before the gate)
