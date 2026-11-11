@@ -379,14 +379,7 @@ impl DashboardView {
                         // ATTACH-mode detail row renders cache_read /
                         // cache_creation instead of a permanent `—`. `None`
                         // stays `None` (older docs / upstream didn't report).
-                        tokens: tokens.map(|t| TokenCounts {
-                            input: t.input,
-                            output: t.output,
-                            cache_read: t.cache_read,
-                            cache_creation: t.cache_creation,
-                            cache_creation_extended: None,
-                            web_search_requests: None,
-                        }),
+                        tokens: tokens.as_ref().map(TokenCounts::from),
                         group: group.clone(),
                         model: model.clone(),
                         effort: effort.clone(),

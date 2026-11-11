@@ -1,11 +1,15 @@
 // Per-model token rates recovered from the daemon's own priced aggregates.
 // `usage_stats` rows (hour/day × model) carry tokens and the daemon-computed `cost_usd`, which is linear:
-//   cost = in·a + out·b + cache_read·c + cache_creation·d
-// Solving those rows by least squares gives the rates the daemon used (overrides included), so
-// history rows that carry tokens but no cost can be priced without copying src/pricing.rs.
+//   cost = in·a + out·b + cache_read·c + cache_creation·d + cache_creation_extended·e + web_search_requests·f
+// (#278: the extended-TTL writes — Anthropic 1h, OpenAI 12h — are a subset of cache_creation, so `e` is
+// their surcharge over the short-TTL rate `d`; `f` is the per-search fee.) Solving those rows by least
+// squares gives the rates the daemon used (overrides included), so history rows that carry tokens but
+// no cost can be priced without copying src/pricing.rs.
 
-const COLS = ['tokens_in', 'tokens_out', 'cache_read', 'cache_creation'];
-const SCALE = 1e-6; // work in millions of tokens so the normal equations stay well conditioned
+const COLS = ['tokens_in', 'tokens_out', 'cache_read', 'cache_creation', 'cache_creation_extended', 'web_search_requests'];
+const KEY = { tokens_in: 'in', tokens_out: 'out', cache_read: 'cr', cache_creation: 'cc', cache_creation_extended: 'ce', web_search_requests: 'ws' };
+// Work in millions of tokens (thousands of searches) so the normal equations stay well conditioned.
+const SCALE = { tokens_in: 1e-6, tokens_out: 1e-6, cache_read: 1e-6, cache_creation: 1e-6, cache_creation_extended: 1e-6, web_search_requests: 1e-3 };
 
 function solve(A, b) {
   const n = b.length;
@@ -24,7 +28,8 @@ function solve(A, b) {
   return M.map((row, i) => row[n] / row[i]);
 }
 
-/** @returns {Map<string, {in:number,out:number,cr:number,cc:number}>} USD per token, per model */
+/** @returns {Map<string, {in:number,out:number,cr:number,cc:number,ce:number,ws:number}>} USD per token
+ *  (`ce`: extended-TTL surcharge per written token; `ws`: USD per web search), per model */
 export function solveRates(usageStats) {
   const byModel = new Map();
   for (const u of usageStats || []) {
@@ -40,7 +45,7 @@ export function solveRates(usageStats) {
     const A = Array.from({ length: n }, () => new Array(n).fill(0));
     const b = new Array(n).fill(0);
     for (const r of rows) {
-      const x = live.map(c => (r[c] || 0) * SCALE);
+      const x = live.map(c => (r[c] || 0) * SCALE[c]);
       for (let i = 0; i < n; i++) { b[i] += x[i] * r.cost_usd; for (let j = 0; j < n; j++) A[i][j] += x[i] * x[j]; }
     }
     const sol = solve(A, b);
@@ -48,12 +53,12 @@ export function solveRates(usageStats) {
     // Accept only an exact-looking fit: the daemon's cost is linear, so the residual must be tiny.
     let err = 0, tot = 0;
     for (const r of rows) {
-      const est = live.reduce((a, c, i) => a + (r[c] || 0) * SCALE * sol[i], 0);
+      const est = live.reduce((a, c, i) => a + (r[c] || 0) * SCALE[c] * sol[i], 0);
       err += Math.abs(est - r.cost_usd); tot += r.cost_usd;
     }
     if (tot <= 0 || err / tot > 0.02) continue;
-    const rate = { in: 0, out: 0, cr: 0, cc: 0 };
-    live.forEach((c, i) => { rate[{ tokens_in: 'in', tokens_out: 'out', cache_read: 'cr', cache_creation: 'cc' }[c]] = Math.max(0, sol[i]) * SCALE; });
+    const rate = { in: 0, out: 0, cr: 0, cc: 0, ce: 0, ws: 0 };
+    live.forEach((c, i) => { rate[KEY[c]] = Math.max(0, sol[i]) * SCALE[c]; });
     out.set(model, rate);
   }
   return out;
@@ -71,10 +76,16 @@ export function avgPerRequest(modelUsage) {
   return m;
 }
 
+/** Counters (activity `tokens` shape) priced at solved rates `r`. */
+export function priceCounts(t, r) {
+  return (t.input || 0) * r.in + (t.output || 0) * r.out + (t.cache_read || 0) * r.cr + (t.cache_creation || 0) * r.cc
+    + Math.min(t.cache_creation_extended || 0, t.cache_creation || 0) * (r.ce || 0) + (t.web_search_requests || 0) * (r.ws || 0);
+}
+
 export function priceTokens(model, t, rates, avg) {
   if (!t) return 0;
   const r = rates && rates.get(model);
-  if (r) return (t.input || 0) * r.in + (t.output || 0) * r.out + (t.cache_read || 0) * r.cr + (t.cache_creation || 0) * r.cc;
+  if (r) return priceCounts(t, r);
   return (avg && avg.get(model)) || 0;
 }
 

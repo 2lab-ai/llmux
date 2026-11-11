@@ -18,6 +18,17 @@ test('solveRates recovers the linear per-token rates the daemon priced with', ()
   assert.equal(priceRow({ model: 'm', cost_usd: 1.5 }, new Map(), new Map()), 1.5, 'daemon cost wins');
 });
 
+test('extended-TTL writes and web searches are solved and priced like the daemon does (#278)', () => {
+  // Daemon: cost = in·a + out·b + cr·c + (cc − ext)·d + ext·e + searches·f.
+  const d = 5e-6, e = 8e-6, f = 0.01;
+  const rows = [[1000, 2000, 3e6, 1e5, 6e4, 0], [10, 50000, 9e6, 2e4, 0, 3], [400, 800, 1e5, 9e5, 9e5, 1], [7, 12000, 4e6, 3e3, 1e3, 0], [99, 1, 2e7, 1e4, 5e3, 7], [5, 5, 5, 8e5, 2e5, 2]]
+    .map(([a, b, c, w, x, s]) => ({ gran: 'hour', model: 'm', tokens_in: a, tokens_out: b, cache_read: c, cache_creation: w, cache_creation_extended: x, web_search_requests: s,
+      cost_usd: a * 4e-6 + b * 20e-6 + c * 0.2e-6 + (w - x) * d + x * e + s * f }));
+  const r = solveRates(rows).get('m');
+  assert.ok(r, 'solved');
+  const row = { model: 'm', cost_usd: null, tokens: { input: 0, output: 0, cache_read: 0, cache_creation: 1e6, cache_creation_extended: 6e5, web_search_requests: 2 } };
+  assert.equal(+priceRow(row, new Map([['m', r]]), new Map()).toFixed(6), +(4e5 * d + 6e5 * e + 2 * f).toFixed(6));
+});
 test('a history row is priced with its sub-usages at their own rates (#278)', () => {
   const rates = new Map([['exec', { in: 1e-6, out: 2e-6, cr: 0, cc: 0 }], ['adv', { in: 10e-6, out: 20e-6, cr: 0, cc: 0 }]]);
   const row = { model: 'exec', cost_usd: null, tokens: { input: 1000, output: 100 },

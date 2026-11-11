@@ -10223,10 +10223,21 @@ fn completed_detail_lines(
             // The request's own columns; `total` adds its sub-usages (#278),
             // each listed below with its own model, tokens and cost.
             let (total, _) = request_totals(t, sub_usage, group.as_deref(), model.as_deref());
+            // The extended-TTL write subset (Anthropic 1h / OpenAI 12h) and
+            // the web searches (#278) show only when the upstream reported
+            // them.
+            let extended = t
+                .cache_creation_extended
+                .map(|n| format!(" (extended {})", format::human_count(n)))
+                .unwrap_or_default();
+            let searches = t
+                .web_search_requests
+                .map(|n| format!(" · web_search {n}"))
+                .unwrap_or_default();
             lines.push(indent(
                 "tokens",
                 format!(
-                    "in {} · out {} · cache_read {} · cache_creation {} · total {}",
+                    "in {} · out {} · cache_read {} · cache_creation {}{extended}{searches} · total {}",
                     format::human_count(t.input),
                     format::human_count(t.output),
                     opt_count(t.cache_read),
@@ -10236,18 +10247,36 @@ fn completed_detail_lines(
             ));
             // Per-component + total API-equivalent cost (item #4). Empty
             // overrides = built-in default rate table. Each component is priced
-            // in isolation via `cost_from_parts`, and each sub-usage (#278) at
-            // its own model's rates, so the parts add up to the total.
+            // in isolation (cache writes with their TTL split), and each
+            // sub-usage (#278) at its own model's rates, so the parts add up
+            // to the total.
             let empty = std::collections::HashMap::new();
             let (g, m) = (
                 group.as_deref().unwrap_or(""),
                 model.as_deref().unwrap_or(""),
             );
-            let cost_in = crate::pricing::cost_from_parts(g, m, t.input, 0, None, None, &empty);
-            let cost_out = crate::pricing::cost_from_parts(g, m, 0, t.output, None, None, &empty);
-            let cost_cr = crate::pricing::cost_from_parts(g, m, 0, 0, t.cache_read, None, &empty);
-            let cost_cc =
-                crate::pricing::cost_from_parts(g, m, 0, 0, None, t.cache_creation, &empty);
+            let part = |tokens: TokenCounts| crate::pricing::cost_usd(g, m, &tokens, &empty);
+            let cost_in = part(TokenCounts {
+                input: t.input,
+                ..Default::default()
+            });
+            let cost_out = part(TokenCounts {
+                output: t.output,
+                ..Default::default()
+            });
+            let cost_cr = part(TokenCounts {
+                cache_read: t.cache_read,
+                ..Default::default()
+            });
+            let cost_cc = part(TokenCounts {
+                cache_creation: t.cache_creation,
+                cache_creation_extended: t.cache_creation_extended,
+                ..Default::default()
+            });
+            let cost_ws = part(TokenCounts {
+                web_search_requests: t.web_search_requests,
+                ..Default::default()
+            });
             let mut cost_sub = 0.0;
             for sub in sub_usage {
                 let sub_model = sub.model.as_deref().unwrap_or(m);
@@ -10265,7 +10294,12 @@ fn completed_detail_lines(
                     ),
                 ));
             }
-            let cost_total = cost_in + cost_out + cost_cr + cost_cc + cost_sub;
+            let cost_total = cost_in + cost_out + cost_cr + cost_cc + cost_ws + cost_sub;
+            let search_part = if t.web_search_requests.is_some_and(|n| n > 0) {
+                format!("web_search {} · ", format_cost(cost_ws))
+            } else {
+                String::new()
+            };
             let sub_part = if sub_usage.is_empty() {
                 String::new()
             } else {
@@ -10274,7 +10308,7 @@ fn completed_detail_lines(
             lines.push(Line::from(vec![
                 Span::styled("       cost    ", dim()),
                 Span::raw(format!(
-                    "in {} · out {} · cache_read {} · cache_creation {} · {sub_part}",
+                    "in {} · out {} · cache_read {} · cache_creation {} · {search_part}{sub_part}",
                     format_cost(cost_in),
                     format_cost(cost_out),
                     format_cost(cost_cr),
@@ -10713,10 +10747,7 @@ fn model_cost(m: &ModelUsageDoc) -> Option<f64> {
     crate::pricing::priced_cost(
         &m.group,
         &m.model,
-        m.tokens_in,
-        m.tokens_out,
-        m.cache_read,
-        m.cache_creation,
+        &m.token_counts(),
         &std::collections::HashMap::new(),
     )
 }
@@ -12561,6 +12592,8 @@ mod tests {
             tokens_out,
             cache_read: Some(40_000),
             cache_creation: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             last_used_ms: 0,
             in_flight: 0,
             accounts: Vec::new(),
@@ -12820,6 +12853,8 @@ mod tests {
                         tokens_out: 900,
                         cache_read: 0,
                         cache_creation: 0,
+                        cache_creation_extended: 0,
+                        web_search_requests: 0,
                         cost_usd: 1.25,
                     }],
                 },
@@ -13001,6 +13036,8 @@ mod tests {
                     tokens_out: 1,
                     cache_read: 0,
                     cache_creation: 0,
+                    cache_creation_extended: 0,
+                    web_search_requests: 0,
                     cost_usd: 0.0,
                 }],
             })
@@ -13106,6 +13143,8 @@ mod tests {
             tokens_out: 1,
             cache_read: 0,
             cache_creation: 0,
+            cache_creation_extended: 0,
+            web_search_requests: 0,
             cost_usd: 0.1,
             priced: true,
         };
@@ -14805,6 +14844,8 @@ mod tests {
             tokens_out,
             cache_read: 40,
             cache_creation: 4,
+            cache_creation_extended: 0,
+            web_search_requests: 0,
             cost_usd,
             priced: true,
         }
@@ -19791,6 +19832,7 @@ mod tests {
                 output: 2.0,
                 cache_read: 0.1,
                 cache_creation: 1.25,
+                cache_creation_extended: None,
             },
         );
         config.scheduler.save_until = Some(1_800_000_000);
@@ -21071,6 +21113,8 @@ mod tests {
             tokens_out: 5,
             cache_read: None,
             cache_creation: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             last_used_ms: 1,
             in_flight: 0,
             accounts: vec![crate::dashboard::ModelAccountDoc {

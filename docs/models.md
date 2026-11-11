@@ -626,8 +626,10 @@ Not a model sweep: no catalog row, alias or context window changed. Rates read
 
 | Provider | Change | Sources checked |
 | --- | --- | --- |
-| Claude | Added reference prices for `claude-mythos-5-2` ($8.00 in / $40.00 out / $0.20 cache read / $10.00 cache write, 5m), `claude-mythos-5-1` ($10.00 / $50.00 / $0.25 / $12.50) and `claude-mythos-5` ($10.00 / $50.00 / $1.00 / $12.50). All three are limited availability and are not catalog rows; before this a request naming them was priced at the Opus tier. 1-hour writes ($16 / $20 / $20) are not modeled. | [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
-| Codex / OpenAI | `gpt-5.6-terra` cache write 0 → $2.50 and `gpt-5.6-luna` 0 → $0.25 (the "30m write" column, 1.25× input; the model pages state the same multiplier). The 12-hour write rates ($5.00 / $0.50) are not modeled. `gpt-5.5` (and the codex fallback that uses its row) lists no cache-write rate; the prompt-caching guide says models before GPT-5.6 have "no additional cache-write charge", so a written token bills as ordinary input and the row's write rate is now its input rate ($5.00, was 0 — written tokens left fresh input with the cache-write fix and would otherwise be free). | [pricing](https://developers.openai.com/api/docs/pricing), [prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), [gpt-5.6-terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), [gpt-5.6-luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
+| Claude | Added reference prices for `claude-mythos-5-2` ($8.00 in / $40.00 out / $0.20 cache read / $10.00 cache write, 5m), `claude-mythos-5-1` ($10.00 / $50.00 / $0.25 / $12.50) and `claude-mythos-5` ($10.00 / $50.00 / $1.00 / $12.50). All three are limited availability and are not catalog rows; before this a request naming them was priced at the Opus tier. 1-hour writes are $16 / $20 / $20 (see the next row). | [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Claude | 1-hour cache writes are priced at their own rate, 2× input, on every row (Fable 5.2 / Mythos 5.2 $16, Fable 5.1 / 5 and Mythos 5.1 / 5 $20, Opus 5.5 $8, Opus 5 / 4.x $10, Sonnet 5.5 / 5 $4, Sonnet 4.6 / 4.5 $6, Haiku 5.5 $0.20, Haiku 4.5 $2), on the 1-hour part each response reports in `usage.cache_creation.ephemeral_1h_input_tokens`; the rest of the writes keep the 5-minute rate. Before this every write was priced at the 5-minute rate. Server web searches (`usage.server_tool_use.web_search_requests`) add $10 per 1,000 searches; web fetch has no extra charge and is not counted. | [pricing](https://platform.claude.com/docs/en/about-claude/pricing), [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) |
+| Codex / OpenAI | `gpt-5.6-terra` cache write 0 → $2.50 and `gpt-5.6-luna` 0 → $0.25 (the "30m write" column, 1.25× input; the model pages state the same multiplier). `gpt-5.5` (and the codex fallback that uses its row) lists no cache-write rate; the prompt-caching guide says models before GPT-5.6 have "no additional cache-write charge", so a written token bills as ordinary input and the row's write rate is now its input rate ($5.00, was 0 — written tokens left fresh input with the cache-write fix and would otherwise be free). | [pricing](https://developers.openai.com/api/docs/pricing), [prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), [gpt-5.6-terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), [gpt-5.6-luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
+| Codex / OpenAI | 12-hour cache writes are priced at their own rate, 2.5× input, on every GPT-5.6 and later row (see [the table below](#current-openai-cache-write-reference-prices)), on the 12-hour part each response reports in `input_tokens_details.cache_write_tokens_details.ttl_12h_tokens`; the rest keep the 30-minute rate. `gpt-5.5` has no separate write charge at either TTL, so a write at any TTL bills at its input rate. | [pricing](https://developers.openai.com/api/docs/pricing), [prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create) |
 | Grok / xAI | No separate cache-write price is listed, so `grok-4.5` / `grok-4.6` / `grok-4.7` (and the grok fallback) price a written token at the input rate: write rate 0 → $2.00. | [models](https://docs.x.ai/developers/models) |
 
 ## Model sweep: 2026-11-10
@@ -718,15 +720,21 @@ Checked all three subscription providers against their current primary sources:
 USD per million tokens, verified 2026-10-08 against [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
 and [Haiku 5.5 specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview),
 re-checked 2026-11-10, when the Fable 5.2 row was added, and 2026-11-11, when the
-Mythos rows were added:
+Mythos rows and the 1-hour write rates were added:
 
 | Model / prompt length | Input | Output | Cache read | Cache write, 5m | Cache write, 1h |
 | --- | --- | --- | --- | --- | --- |
 | Haiku 5.5, ≤100,000 tokens | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 |
 | Haiku 5.5, >100,000 tokens | $0.50 | $2.50 | $0.05 | $0.625 | $1.00 |
+| Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
 | Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
+| Sonnet 5 | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
+| Sonnet 4.6 / 4.5 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Opus 5.5 | $4.00 | $20.00 | $0.20 | $5.00 | $8.00 |
+| Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Fable 5.2 | $8.00 | $40.00 | $0.20 | $10.00 | $16.00 |
 | Fable 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
+| Fable 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 | Mythos 5.2 (limited availability, added 2026-11-11) | $8.00 | $40.00 | $0.20 | $10.00 | $16.00 |
 | Mythos 5.1 (limited availability, added 2026-11-11) | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
 | Mythos 5 (limited availability, added 2026-11-11) | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
@@ -741,14 +749,50 @@ non-default-sampling request naming a 4.5 id still reaches Haiku 4.5 and keeps
 its 4.5 id and price
 ([alias stability](#alias-semantics)).
 
+Server web search is $10 per 1,000 searches on top of the tokens; web fetch has
+no extra charge (same pricing page, read 2026-11-11).
+
 **Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
-≤100K tier and 5-minute cache writes. It does **not** apply Haiku's >100K tier
-(5× all rates), 1-hour write rates, service-tier premiums or historical prices.
-Aggregated counters do not retain the request-length/TTL detail needed to
-reconstruct these charges; crossing 100K in accumulated monthly usage does not
-mean any individual request crossed it. Displayed costs can therefore understate
-long-context/1h-cache API cost. These are API-equivalent estimates, never a
-subscription invoice. Existing config price overrides still take precedence.
+≤100K tier, the 5-minute write rate for the writes a response does not report
+as 1-hour, and the 1-hour rate for those it does (`usage.cache_creation.
+ephemeral_1h_input_tokens`, since 2026-11-11; earlier history has no split and
+keeps the 5-minute price). Each request's server web searches add $10 per
+1,000. It does **not** apply Haiku's >100K tier (5× all rates), service-tier
+premiums or historical prices. Aggregates keep the 1-hour write subset and the
+search count, so they price as the sum of their requests; crossing 100K in
+accumulated monthly usage does not mean any individual request crossed it, so
+displayed costs can still understate long-context API cost. These are
+API-equivalent estimates, never a subscription invoice. Existing config price
+overrides still take precedence: an override without `cache_creation_extended`
+prices 1-hour writes at its own `cache_creation` rate
+([configuration](configuration.md)). The web-search fee is not a token rate and
+is not overridden.
+
+### Current OpenAI cache-write reference prices
+
+USD per million tokens, the "30m write" and "12h write" columns of the
+[OpenAI pricing page](https://developers.openai.com/api/docs/pricing) (standard
+tier, ≤272K input), read 2026-11-11. Writes are a part of input; the 12-hour
+part is the one a response reports in
+`input_tokens_details.cache_write_tokens_details.ttl_12h_tokens`.
+
+| Model | Input | Cache write, 30m | Cache write, 12h |
+| --- | --- | --- | --- |
+| gpt-6-astra | $10.00 | $12.50 | $25.00 |
+| gpt-6.1-sol | $2.00 | $2.50 | $5.00 |
+| gpt-6.1-terra | $1.00 | $1.25 | $2.50 |
+| gpt-6-sol | $2.00 | $2.50 | $5.00 |
+| gpt-6-luna | $0.10 | $0.125 | $0.25 |
+| gpt-5.6-sol | $4.00 | $5.00 | $10.00 |
+| gpt-5.6-terra | $2.00 | $2.50 | $5.00 |
+| gpt-5.6-luna | $0.20 | $0.25 | $0.50 |
+| gpt-5.5 | $5.00 | $5.00 (input rate) | $5.00 (input rate) |
+
+`gpt-5.5` and earlier models have "no additional cache-write charge"
+([prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)):
+a written token bills as ordinary input, so its write rate at either TTL is the
+input rate. grok rows likewise carry the input rate as the write rate (xAI
+lists no cache-write price); Gemini rows have no write rate.
 
 Haiku 5.5's published API limits are metadata, not a new live subscription
 compatibility claim. See the [provider contract](provider-compatibility.md#haiku-55-catalog-update).

@@ -711,6 +711,12 @@ pub struct DashboardDoc {
     pub events: Vec<crate::config::EventBanner>,
 }
 
+/// `skip_serializing_if` for the additive #278 counters: a zero is omitted, so
+/// a document without extended-TTL writes or web searches is unchanged.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Serde default for additive `bool` fields that default ON.
 fn default_true() -> bool {
     true
@@ -925,6 +931,12 @@ pub struct UsageStatDoc {
     pub cache_read: u64,
     #[serde(default)]
     pub cache_creation: u64,
+    /// Extended-TTL subset of `cache_creation` (Anthropic 1h, OpenAI 12h)
+    /// and Anthropic web searches (#278). Additive: omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_extended: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub web_search_requests: u64,
     #[serde(default)]
     pub cost_usd: f64,
     /// Whether a price was found for this row's `(group, model)` (config
@@ -1197,6 +1209,12 @@ pub struct ModelUsageDoc {
     pub cache_read: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<u64>,
+    /// Extended-TTL subset of `cache_creation` and web searches (#278).
+    /// Additive: absent when no request reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_extended: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_requests: Option<u64>,
     /// Epoch ms of the last completed request for this model.
     pub last_used_ms: u64,
     /// In-flight requests currently attributed to this model (req11).
@@ -1313,6 +1331,12 @@ pub struct TenantModelDoc {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Extended-TTL subset of `cache_creation` and web searches (#278).
+    /// Additive: omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_extended: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub web_search_requests: u64,
     /// API-equivalent USD cost for this cell (0.0 when nothing prices it).
     pub cost_usd: f64,
 }
@@ -1524,6 +1548,67 @@ pub struct TokensDoc {
     pub cache_read: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<u64>,
+    /// [`TokenCounts::cache_creation_extended`] and
+    /// [`TokenCounts::web_search_requests`] (#278). Additive, absent when
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_extended: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_requests: Option<u64>,
+}
+
+impl From<&TokenCounts> for TokensDoc {
+    fn from(t: &TokenCounts) -> Self {
+        Self {
+            input: t.input,
+            output: t.output,
+            cache_read: t.cache_read,
+            cache_creation: t.cache_creation,
+            cache_creation_extended: t.cache_creation_extended,
+            web_search_requests: t.web_search_requests,
+        }
+    }
+}
+
+impl From<&TokensDoc> for TokenCounts {
+    fn from(t: &TokensDoc) -> Self {
+        Self {
+            input: t.input,
+            output: t.output,
+            cache_read: t.cache_read,
+            cache_creation: t.cache_creation,
+            cache_creation_extended: t.cache_creation_extended,
+            web_search_requests: t.web_search_requests,
+        }
+    }
+}
+
+impl ModelUsageDoc {
+    /// The row's summed counters, for pricing.
+    pub fn token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input: self.tokens_in,
+            output: self.tokens_out,
+            cache_read: self.cache_read,
+            cache_creation: self.cache_creation,
+            cache_creation_extended: self.cache_creation_extended,
+            web_search_requests: self.web_search_requests,
+        }
+    }
+}
+
+impl UsageStatDoc {
+    /// The row's summed counters, for pricing.
+    pub fn token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input: self.tokens_in,
+            output: self.tokens_out,
+            cache_read: Some(self.cache_read),
+            cache_creation: Some(self.cache_creation),
+            cache_creation_extended: Some(self.cache_creation_extended),
+            web_search_requests: Some(self.web_search_requests),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1693,15 +1778,14 @@ fn model_usage_docs(
         tokens_out: m.tokens_out,
         cache_read: m.cache_read,
         cache_creation: m.cache_creation,
+        cache_creation_extended: m.cache_creation_extended,
+        web_search_requests: m.web_search_requests,
         last_used_ms: epoch_ms(m.last_used),
         in_flight: 0,
-        cost_usd: crate::pricing::cost_from_parts(
+        cost_usd: crate::pricing::cost_usd(
             &m.group,
             &m.model,
-            m.tokens_in,
-            m.tokens_out,
-            m.cache_read,
-            m.cache_creation,
+            &m.token_counts(),
             pricing_overrides,
         ),
         accounts: m
@@ -1768,6 +1852,8 @@ fn model_usage_docs(
             tokens_out: 0,
             cache_read: None,
             cache_creation: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             last_used_ms: epoch_ms(now),
             in_flight: n,
             accounts: Vec::new(),
@@ -1994,12 +2080,7 @@ pub(crate) fn dashboard_doc(
                     account: account.clone(),
                     status: *status,
                     duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-                    tokens: tokens.map(|t| TokensDoc {
-                        input: t.input,
-                        output: t.output,
-                        cache_read: t.cache_read,
-                        cache_creation: t.cache_creation,
-                    }),
+                    tokens: tokens.as_ref().map(TokensDoc::from),
                     // Per-request API-equivalent cost: 0.0 unless group, model,
                     // and the upstream token usage are ALL known (Feature D).
                     // Includes the request's sub-usages at their own models'
@@ -2057,10 +2138,7 @@ pub(crate) fn dashboard_doc(
             let cost = crate::pricing::priced_cost(
                 &r.group,
                 &r.model,
-                r.tokens_in,
-                r.tokens_out,
-                Some(r.cache_read),
-                Some(r.cache_creation),
+                &r.token_counts(),
                 &meta.pricing_overrides,
             );
             UsageStatDoc {
@@ -2103,30 +2181,22 @@ pub(crate) fn dashboard_doc(
             let mut models: Vec<TenantModelDoc> = t
                 .models
                 .iter()
-                .map(|((group, model), cell)| {
-                    let tokens = TokenCounts {
-                        input: cell.input,
-                        output: cell.output,
-                        cache_read: Some(cell.cache_read),
-                        cache_creation: Some(cell.cache_creation),
-                        cache_creation_extended: None,
-                        web_search_requests: None,
-                    };
-                    TenantModelDoc {
-                        group: group.clone(),
-                        model: model.clone(),
-                        requests: cell.requests,
-                        tokens_in: cell.input,
-                        tokens_out: cell.output,
-                        cache_read: cell.cache_read,
-                        cache_creation: cell.cache_creation,
-                        cost_usd: crate::pricing::cost_usd(
-                            group,
-                            model,
-                            &tokens,
-                            &meta.pricing_overrides,
-                        ),
-                    }
+                .map(|((group, model), cell)| TenantModelDoc {
+                    group: group.clone(),
+                    model: model.clone(),
+                    requests: cell.requests,
+                    tokens_in: cell.input,
+                    tokens_out: cell.output,
+                    cache_read: cell.cache_read,
+                    cache_creation: cell.cache_creation,
+                    cache_creation_extended: cell.cache_creation_extended,
+                    web_search_requests: cell.web_search_requests,
+                    cost_usd: crate::pricing::cost_usd(
+                        group,
+                        model,
+                        &cell.token_counts(),
+                        &meta.pricing_overrides,
+                    ),
                 })
                 .collect();
             models.sort_by(|a, b| {
@@ -3187,6 +3257,8 @@ mod tests {
             output: 2,
             cache_read: Some(3),
             cache_creation: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
         })
         .expect("serialize");
         assert!(json.contains(r#""cache_read":3"#));
@@ -3259,13 +3331,16 @@ mod tests {
             assert!(!row.label.is_empty(), "server-rendered label present");
             // Priced server-side (T6) at the built-in gpt-5.5 rates: the doc
             // build and a direct pricing call must agree exactly.
-            let want = crate::pricing::cost_from_parts(
+            let want = crate::pricing::cost_usd(
                 "codex",
                 "gpt-5.5",
-                700,
-                300,
-                Some(120),
-                Some(0),
+                &TokenCounts {
+                    input: 700,
+                    output: 300,
+                    cache_read: Some(120),
+                    cache_creation: Some(0),
+                    ..Default::default()
+                },
                 &HashMap::new(),
             );
             assert!(want > 0.0, "seeded model has a nonzero rate");
@@ -3493,6 +3568,134 @@ mod tests {
         assert!((doc.totals.cost_usd - rows).abs() < 1e-9);
     }
 
+    /// #278: extended-TTL writes and web searches are priced per request,
+    /// and every aggregate the document carries — the model rows, the
+    /// hour/day/month usage rows and the tenant cells — keeps the counters
+    /// it needs to price as the sum of its requests, sub-usage included.
+    #[test]
+    fn extended_writes_and_web_searches_price_alike_on_every_aggregate() {
+        let hub = seeded_hub();
+        let request = |id: u64, tokens: TokenCounts, sub_usage: Vec<crate::tui::SubUsage>| {
+            ActivityEvent::RequestFinished {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
+                account: Some("a".into()),
+                status: 200,
+                duration: Duration::from_millis(900),
+                tokens: Some(tokens),
+                group: Some("claude".into()),
+                model: Some("claude-opus-5-5".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
+                tenant: Some("k-split".into()),
+                sub_usage,
+            }
+        };
+        // Opus 5.5: $4 in, $5 5m write, $8 1h write; Fable 5.2 $10 / $16.
+        let a = TokenCounts {
+            cache_creation: Some(1_000_000),
+            cache_creation_extended: Some(600_000),
+            ..Default::default()
+        };
+        let b = TokenCounts {
+            cache_creation: Some(1_000_000),
+            web_search_requests: Some(2),
+            ..Default::default()
+        };
+        let c = TokenCounts {
+            input: 1_000,
+            ..Default::default()
+        };
+        // The sub-usage also carries a search: today's parsers never put one
+        // there, but a sub-usage is priced like any other usage.
+        let advisor = crate::tui::SubUsage {
+            model: Some("claude-fable-5-2".into()),
+            tokens: TokenCounts {
+                cache_creation: Some(1_000_000),
+                cache_creation_extended: Some(1_000_000),
+                web_search_requests: Some(1),
+                ..Default::default()
+            },
+        };
+        let at = now() - Duration::from_secs(1);
+        hub.apply_event(request(21, a, Vec::new()), at);
+        hub.apply_event(request(22, b, Vec::new()), at);
+        hub.apply_event(request(23, c, vec![advisor]), at);
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        let close = |got: f64, want: f64, what: &str| {
+            assert!((got - want).abs() < 1e-9, "{what}: {got} != {want}");
+        };
+        let mut per_request = std::collections::BTreeMap::new();
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request { id, cost_usd, .. } = entry {
+                per_request.insert(*id, *cost_usd);
+            }
+        }
+        close(per_request[&21], 0.4 * 5.0 + 0.6 * 8.0, "1h writes");
+        close(per_request[&22], 5.0 + 0.02, "web searches");
+        close(per_request[&23], 0.004 + 16.01, "a sub-usage's 1h writes");
+        let want = 6.8 + 5.02 + 16.014;
+        let opus = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "claude-opus-5-5")
+            .expect("opus row");
+        assert_eq!(
+            (opus.cache_creation_extended, opus.web_search_requests),
+            (Some(600_000), Some(2))
+        );
+        close(opus.cost_usd, 6.8 + 5.02 + 0.004, "opus row");
+        close(opus.sub_cost_usd, 0.0, "opus has no sub-usage");
+        // The advisor's row is all sub-usage: its `sub_cost_usd` carries the
+        // 1h writes and the search, so the webui's per-request average (cost
+        // minus sub cost) stays 0 for it.
+        let fable = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "claude-fable-5-2")
+            .expect("fable row");
+        close(fable.cost_usd, 16.01, "fable row");
+        close(fable.sub_cost_usd, 16.01, "fable sub cost");
+        let seeded: f64 = seeded_doc().model_usage.iter().map(|m| m.cost_usd).sum();
+        let rows: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
+        close(rows - seeded, want, "model rows");
+        for gran in ["hour", "day", "month"] {
+            let stats: f64 = doc
+                .usage_stats
+                .iter()
+                .filter(|u| u.gran == gran && u.model != "gpt-5.5")
+                .map(|u| u.cost_usd)
+                .sum();
+            close(stats, want, gran);
+        }
+        let tenant = doc
+            .tenant_usage
+            .iter()
+            .find(|t| t.tenant == "k-split")
+            .expect("tenant");
+        close(tenant.cost_usd, want, "tenant");
+        let cells: f64 = tenant.models.iter().map(|m| m.cost_usd).sum();
+        close(cells, want, "tenant cells");
+    }
+
     #[test]
     fn doc_global_cost_reflects_config_pricing_override() {
         // Override gpt-5.5 input to 9.99/1e6, everything else 0 → cost is
@@ -3505,6 +3708,7 @@ mod tests {
                 output: 0.0,
                 cache_read: 0.0,
                 cache_creation: 0.0,
+                cache_creation_extended: None,
             },
         );
         let mut m = meta();
@@ -3730,15 +3934,8 @@ mod tests {
         let doc = seeded_doc();
         let m = &doc.model_usage[0];
         assert_eq!(m.model, "gpt-5.5");
-        let expected = crate::pricing::cost_from_parts(
-            &m.group,
-            &m.model,
-            m.tokens_in,
-            m.tokens_out,
-            m.cache_read,
-            m.cache_creation,
-            &HashMap::new(),
-        );
+        let expected =
+            crate::pricing::cost_usd(&m.group, &m.model, &m.token_counts(), &HashMap::new());
         assert!((m.cost_usd - expected).abs() < 1e-12);
         assert!((m.cost_usd - 0.012_56).abs() < 1e-9, "got {}", m.cost_usd);
     }
