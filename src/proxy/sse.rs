@@ -163,20 +163,32 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
+            // Native `run --codex` passthrough. OpenAI's `input_tokens` is
+            // cache-inclusive: the cache reads (`cached_tokens`) and the cache
+            // writes (`cache_write_tokens`) are disjoint parts of it
+            // (developers.openai.com/api/docs/guides/prompt-caching, read
+            // 2026-11-11), so fresh input is what is left after both and the
+            // writes are cache creation. Same rule as the translate path
+            // (`crate::provider::responses`).
             let usage = value.get("response")?.get("usage")?;
             let input = usage.get("input_tokens")?.as_u64()?;
             let cache = usage
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            let written = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(serde_json::Value::as_u64);
             Some(StreamUsage {
-                input_tokens: input.saturating_sub(cache),
+                input_tokens: input
+                    .saturating_sub(cache)
+                    .saturating_sub(written.unwrap_or(0)),
                 output_tokens: usage
                     .get("output_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
                 cache_read_input_tokens: Some(cache),
-                cache_creation_input_tokens: None,
+                cache_creation_input_tokens: written,
             })
         }
         "message_delta" => {
@@ -906,6 +918,35 @@ mod tests {
             extract_usage("data: {\"type\":\"message_start\",\"message\":{}}"),
             None,
             "missing usage payload is tolerated"
+        );
+    }
+
+    #[test]
+    fn native_responses_usage_treats_cache_writes_as_part_of_input() {
+        // `run --codex` passthrough: OpenAI's `cached_tokens` and
+        // `cache_write_tokens` are both subsets of `input_tokens`, so fresh
+        // input is what is left after both, and the writes are cache
+        // creation (they were dropped before).
+        let event = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12000,\"input_tokens_details\":{\"cached_tokens\":4000,\"cache_write_tokens\":7000},\"output_tokens\":10}}}";
+        assert_eq!(
+            extract_usage(event),
+            Some(StreamUsage {
+                input_tokens: 1_000,
+                output_tokens: 10,
+                cache_read_input_tokens: Some(4_000),
+                cache_creation_input_tokens: Some(7_000),
+            })
+        );
+        // No write field: unchanged behaviour (creation unavailable).
+        let event = "data: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":50,\"input_tokens_details\":{\"cached_tokens\":20},\"output_tokens\":3}}}";
+        assert_eq!(
+            extract_usage(event),
+            Some(StreamUsage {
+                input_tokens: 30,
+                output_tokens: 3,
+                cache_read_input_tokens: Some(20),
+                cache_creation_input_tokens: None,
+            })
         );
     }
 

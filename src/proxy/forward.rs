@@ -4626,7 +4626,15 @@ async fn relay_translate(
                 error_message.unwrap_or_else(|| "codex upstream produced no response".into());
             ctx.log(format!("=== ERROR ===\n{message}"));
             trace.write_error(&message, trace_events_seen, trace_duration_ms);
-            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+            // A failed or cut-short turn still burned the tokens its terminal
+            // event reported (the converter folded them; `raw_usage` says
+            // whether there were any) — book them like the streamed leg does.
+            ctx.emit_finished(
+                state,
+                Some(&account),
+                StatusCode::BAD_GATEWAY,
+                trace_raw_usage.is_some().then(|| token_counts(usage)),
+            );
             error_response(StatusCode::BAD_GATEWAY, "api_error", &message)
         }
     };
