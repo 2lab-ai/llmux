@@ -4729,6 +4729,9 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
                 .collect()
         })
         .unwrap_or_default();
+    let written = usage
+        .get("cache_creation_input_tokens")
+        .and_then(serde_json::Value::as_u64);
     sse::StreamUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -4742,9 +4745,10 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
         cache_read_input_tokens: usage
             .get("cache_read_input_tokens")
             .and_then(serde_json::Value::as_u64),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(serde_json::Value::as_u64),
+        cache_creation_input_tokens: written,
+        // The 1h-TTL subset and the web-search count, read as on the stream.
+        cache_creation_extended: sse::extended_cache_writes(usage, written),
+        web_search_requests: sse::web_search_requests(usage),
         // Sub-inferences the counters above leave out (advisor, compaction,
         // billed declined fallback attempts), billed under their own model.
         sub_usage: sse::uncounted_iterations(usage, &hops).unwrap_or_default(),
@@ -4764,6 +4768,8 @@ fn token_counts(usage: &sse::StreamUsage) -> TokenCounts {
         output: usage.output_tokens,
         cache_read: usage.cache_read_input_tokens,
         cache_creation: usage.cache_creation_input_tokens,
+        cache_creation_extended: usage.cache_creation_extended,
+        web_search_requests: usage.web_search_requests,
     }
 }
 
@@ -4779,6 +4785,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_body_usage_carries_the_extended_ttl_writes_and_web_searches() {
+        // A non-streaming body reads the TTL split and the web-search count
+        // exactly like the stream (prompt-caching and pricing pages, read
+        // 2026-11-11), and both reach the activity event's token counts.
+        let body = br#"{"type":"message","model":"claude-opus-5-5","usage":{"input_tokens":2048,"cache_read_input_tokens":1800,"cache_creation_input_tokens":248,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"output_tokens":503,"server_tool_use":{"web_search_requests":3}}}"#;
+        let t = token_counts(&usage_from_json_body(body));
+        assert_eq!(
+            (
+                t.cache_creation,
+                t.cache_creation_extended,
+                t.web_search_requests
+            ),
+            (Some(248), Some(100), Some(3))
+        );
+        // No split, no server tools: both unknown — priced exactly as before.
+        let t = token_counts(&usage_from_json_body(
+            br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":5,"output_tokens":1}}"#,
+        ));
+        assert_eq!(
+            (
+                t.cache_creation,
+                t.cache_creation_extended,
+                t.web_search_requests
+            ),
+            (Some(5), None, None)
+        );
+    }
+
+    #[test]
     fn json_body_usage_keeps_the_top_level_and_carries_the_advisor_iteration() {
         let body = br#"{"type":"message","usage":{"input_tokens":1760,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":531,"iterations":[{"type":"message","input_tokens":412,"output_tokens":89},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":823,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1612},{"type":"message","input_tokens":1348,"cache_read_input_tokens":412,"output_tokens":442}]}}"#;
         let usage = usage_from_json_body(body);
@@ -4789,6 +4824,8 @@ mod tests {
                 output: 531,
                 cache_read: Some(412),
                 cache_creation: Some(0),
+                cache_creation_extended: None,
+                web_search_requests: None,
             }
         );
         assert_eq!(
@@ -4800,6 +4837,8 @@ mod tests {
                     output: 1612,
                     cache_read: Some(0),
                     cache_creation: Some(0),
+                    cache_creation_extended: None,
+                    web_search_requests: None,
                 },
             }]
         );
@@ -4844,6 +4883,8 @@ mod tests {
                     output: 0,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_extended: None,
+                    web_search_requests: None,
                 },
             }]
         );

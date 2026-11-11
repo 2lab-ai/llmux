@@ -60,6 +60,11 @@ test('advisor and compaction iterations of every round reach llmux; executor ent
  const result=await fakeRun({...basic,_llmux_web_search:true},[start(),{type:'content_block_start',index:0,content_block:{type:'tool_use',id:'internal',name:'WebSearch',input:{}}},{type:'content_block_stop',index:0},...finish('tool_use',{input_tokens:7,output_tokens:3,iterations:[{type:'message',input_tokens:7,output_tokens:3},advisor]}),start({input_tokens:9,output_tokens:1}),...text,...finish('end_turn',{input_tokens:9,output_tokens:5,iterations:[compaction,{type:'message',input_tokens:9,output_tokens:5}]})]);
  assert.deepEqual(result.events.find(e=>e.type==='message_delta').usage,{input_tokens:16,output_tokens:8,iterations:[advisor,compaction]});
 });
+test('cache-write TTL split and server tool counts of every round reach llmux, summed like the counters',async()=>{
+ const round=(input,write,hour,searches)=>({input_tokens:input,output_tokens:1,cache_creation_input_tokens:write,cache_creation:{ephemeral_5m_input_tokens:write-hour,ephemeral_1h_input_tokens:hour},server_tool_use:{web_search_requests:searches}});
+ const result=await fakeRun({...basic,_llmux_web_search:true},[start(round(7,100,60,0)),{type:'content_block_start',index:0,content_block:{type:'tool_use',id:'internal',name:'WebSearch',input:{}}},{type:'content_block_stop',index:0},...finish('tool_use',round(7,100,60,1)),start(round(9,50,50,0)),...text,...finish('end_turn',round(9,50,50,2))]);
+ assert.deepEqual(result.events.find(e=>e.type==='message_delta').usage,{input_tokens:16,output_tokens:2,cache_creation_input_tokens:150,cache_creation:{ephemeral_5m_input_tokens:40,ephemeral_1h_input_tokens:110},server_tool_use:{web_search_requests:3}});
+});
 test('unsupported tool choices fail instead of weakening client requirement',()=>{
  assert.throws(()=>buildRequest({...basic,tool_choice:{type:'any'}},credential,'url','/tmp'),/tool choice/);
 });

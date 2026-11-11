@@ -2109,6 +2109,8 @@ pub(crate) fn dashboard_doc(
                         output: cell.output,
                         cache_read: Some(cell.cache_read),
                         cache_creation: Some(cell.cache_creation),
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     };
                     TenantModelDoc {
                         group: group.clone(),
@@ -2531,6 +2533,8 @@ mod tests {
                     output: 300,
                     cache_read: Some(120),
                     cache_creation: None,
+                    cache_creation_extended: None,
+                    web_search_requests: None,
                 }),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -2715,6 +2719,8 @@ mod tests {
                         output: 0,
                         cache_read: None,
                         cache_creation: None,
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     }),
                     group: Some("claude".into()),
                     model: Some("claude-opus-4-8".into()),
@@ -3348,6 +3354,8 @@ mod tests {
             output: 300,
             cache_read: Some(120),
             cache_creation: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
         };
         let expected = crate::pricing::cost_usd("codex", "gpt-5.5", &tokens, &HashMap::new());
 
@@ -3387,6 +3395,8 @@ mod tests {
             output: 531,
             cache_read: Some(412),
             cache_creation: Some(0),
+            cache_creation_extended: None,
+            web_search_requests: None,
         };
         let advisor = crate::tui::SubUsage {
             model: Some("claude-fable-5-1".into()),
@@ -3395,6 +3405,8 @@ mod tests {
                 output: 1_612,
                 cache_read: Some(0),
                 cache_creation: Some(0),
+                cache_creation_extended: None,
+                web_search_requests: None,
             },
         };
         hub.apply_event(
@@ -3841,6 +3853,8 @@ mod tests {
                 output: 5,
                 cache_read: None,
                 cache_creation: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             group: Some("claude".into()),
             model: Some("sonnet".into()),

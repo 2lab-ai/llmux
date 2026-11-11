@@ -1620,6 +1620,8 @@ impl GeminiSseConverter {
                 .saturating_add(count("thoughtsTokenCount")),
             cache_read_input_tokens: Some(cached),
             cache_creation_input_tokens: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
         };
@@ -2674,6 +2676,8 @@ mod tests {
                 output_tokens: 12,
                 cache_read_input_tokens: Some(40),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }

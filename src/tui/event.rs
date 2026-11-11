@@ -29,6 +29,22 @@ pub struct TokenCounts {
     pub output: u64,
     pub cache_read: Option<u64>,
     pub cache_creation: Option<u64>,
+    /// The extended-TTL SUBSET of `cache_creation` (#278): Anthropic 1-hour
+    /// writes (`usage.cache_creation.ephemeral_1h_input_tokens`) or OpenAI
+    /// 12-hour writes (`input_tokens_details.cache_write_tokens_details.
+    /// ttl_12h_tokens`), clamped to `cache_creation`. The short-TTL part is
+    /// `cache_creation - cache_creation_extended`. `None` = the upstream sent
+    /// no TTL split; such writes are priced at the short-TTL rate, exactly as
+    /// before the split was recorded. Never counted on its own in
+    /// [`Self::total`]. Absent from `activity.jsonl` when `None`, so older
+    /// lines load (and re-serialize) unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_extended: Option<u64>,
+    /// Anthropic server-side web searches the request ran
+    /// (`usage.server_tool_use.web_search_requests`, #278), billed per
+    /// search on top of the tokens. Not a token count. `None` = not reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_requests: Option<u64>,
 }
 
 impl TokenCounts {
@@ -279,7 +295,7 @@ mod token_total_tests {
             input: 182_586,
             output: 319,
             cache_read: Some(0),
-            cache_creation: None,
+            ..Default::default()
         };
         // Turn N+1: conversation GREW, 26624 of the prompt got cached → fresh drops,
         // but cache_read holds it. Real context = 183231 + 188 = 183419.
@@ -287,7 +303,7 @@ mod token_total_tests {
             input: 183_231 - 26_624,
             output: 188,
             cache_read: Some(26_624),
-            cache_creation: None,
+            ..Default::default()
         };
         assert_eq!(a.total(), 182_905);
         assert_eq!(
