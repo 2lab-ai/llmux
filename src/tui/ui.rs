@@ -12568,6 +12568,7 @@ mod tests {
             endpoints: Vec::new(),
             // Old-daemon default: tests exercise the local pricing fallback.
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         }
     }
 
@@ -21074,6 +21075,7 @@ mod tests {
             efforts: Vec::new(),
             endpoints: Vec::new(),
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         }]);
         view.email_anonymous = true;
         view.snapshot.accounts = vec![AccountSnapshot {

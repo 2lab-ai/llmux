@@ -59,10 +59,15 @@ export function solveRates(usageStats) {
   return out;
 }
 
-/** Average cost per request per model — the fallback when a model's rates cannot be solved. */
+/** Average cost per request per model — the fallback when a model's rates cannot be solved. A row's
+ *  `sub_cost_usd` (#278: advisor / compaction / billed fallback work other requests ran on this
+ *  model) is not any of its requests' cost, so it is left out of the average. */
 export function avgPerRequest(modelUsage) {
   const m = new Map();
-  for (const u of modelUsage || []) if (u.requests && u.cost_usd) m.set(u.model, u.cost_usd / u.requests);
+  for (const u of modelUsage || []) {
+    const own = (u.cost_usd || 0) - (u.sub_cost_usd || 0);
+    if (u.requests && own > 0) m.set(u.model, own / u.requests);
+  }
   return m;
 }
 

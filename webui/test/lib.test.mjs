@@ -1,7 +1,7 @@
 // node --test webui/test/
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { solveRates, priceRow, rowTokens } from '../lib/pricing.mjs';
+import { solveRates, priceRow, rowTokens, avgPerRequest } from '../lib/pricing.mjs';
 import { cleanPrompt, buildOverview } from '../lib/overview.mjs';
 import { promptOf, AUX_RE, SessionIndex, requestPage, cursorOf } from '../lib/sessions.mjs';
 import { parseRawMeta, userPrompts } from '../lib/rawmeta.mjs';
@@ -27,6 +27,19 @@ test('a history row is priced with its sub-usages at their own rates (#278)', ()
   assert.equal(priceRow({ ...row, cost_usd: 0.5 }, rates, new Map()), 0.5, 'the daemon cost already includes sub-usage');
   assert.deepEqual(rowTokens(row), { input: 1709, output: 159, cache_read: 0, cache_creation: 0 });
   assert.deepEqual(rowTokens({ tokens: { input: 1, output: 2 } }), { input: 1, output: 2, cache_read: 0, cache_creation: 0 });
+});
+
+test('the per-request average leaves out sub-usage booked under the model (#278)', () => {
+  // One direct Fable request ($0.10) plus $2.00 of advisor work other requests ran on Fable:
+  // the row's cost is $2.10 for one request, but a Fable request averages $0.10.
+  const avg = avgPerRequest([
+    { model: 'fable', requests: 1, cost_usd: 2.10, sub_cost_usd: 2.00 },
+    { model: 'opus', requests: 4, cost_usd: 2.00 },
+    { model: 'advisor-only', requests: 0, cost_usd: 3.00, sub_cost_usd: 3.00 },
+  ]);
+  assert.equal(+avg.get('fable').toFixed(6), 0.1);
+  assert.equal(avg.get('opus'), 0.5, 'a row from an older daemon (no sub_cost_usd) is unchanged');
+  assert.equal(avg.has('advisor-only'), false, 'no requests, no estimate');
 });
 
 test('solveRates refuses a fit that is not linear', () => {
