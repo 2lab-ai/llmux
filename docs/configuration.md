@@ -228,6 +228,30 @@ llmux does not ship Antigravity's OAuth client: you configure it, with the two `
 
 The GCP project is stored per account, not here (see [Gemini accounts](#gemini-accounts)). Model ids, aliases and the Argon tier: [models.md](models.md#gemini).
 
+## Reference price overrides (`pricing`)
+
+`pricing` (optional, default empty) overrides the built-in API-equivalent
+reference rates ([models.md](models.md#current-claude-reference-prices)) per
+model. Keys are model ids, matched case-insensitively after the display suffix
+(`[1m]`) is stripped; an entry replaces the whole built-in row for that model.
+Rates are USD per million tokens:
+
+```json
+"pricing": {
+  "claude-opus-5-5": { "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_creation": 5.0, "cache_creation_extended": 8.0 }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `input` / `output` / `cache_read` | Fresh input, output and cache-read tokens. |
+| `cache_creation` | Cache writes at the default TTL (Anthropic 5 minutes, OpenAI 30 minutes). |
+| `cache_creation_extended` | Optional (2026-11-11, #278). Cache writes at the extended TTL — Anthropic 1 hour, OpenAI 12 hours — applied to the part of a request's writes the response reports at that TTL. Absent means the entry's `cache_creation` rate, so an override written before this field prices exactly as before. |
+
+The Anthropic web-search fee ($10 per 1,000 searches) is a per-search charge,
+not a token rate: an override does not change it. The costs are API-equivalent
+estimates, never a bill.
+
 ## Claude reset grants
 
 `claude_cli_version` (optional, default = the version built into the binary) is the Claude Code version llmux identifies as — `User-Agent: claude-cli/<version> (external, cli)` — when it reads or redeems Claude usage-limit reset grants (`GET /api/oauth/usage?cedar_ember=1`, `POST …/reset_rate_limits`). Anthropic gates those on the client surface and version; when Claude accounts start showing `n/e` with reason `cli_version` in the `rst` column, set this to the currently released Claude Code version. Read at daemon startup; see [operational-reference.md](operational-reference.md#usage-controls-refresh--resets).

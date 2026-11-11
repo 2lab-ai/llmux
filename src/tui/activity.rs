@@ -271,6 +271,10 @@ pub(crate) struct UsageCell {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Extended-TTL subset of `cache_creation` and the web-search count
+    /// (#278) — carried so the cell prices as the sum of its requests.
+    pub cache_creation_extended: u64,
+    pub web_search_requests: u64,
 }
 
 impl UsageCell {
@@ -287,6 +291,12 @@ impl UsageCell {
             self.cache_creation = self
                 .cache_creation
                 .saturating_add(t.cache_creation.unwrap_or(0));
+            self.cache_creation_extended = self
+                .cache_creation_extended
+                .saturating_add(t.cache_creation_extended.unwrap_or(0));
+            self.web_search_requests = self
+                .web_search_requests
+                .saturating_add(t.web_search_requests.unwrap_or(0));
         }
     }
 
@@ -297,6 +307,12 @@ impl UsageCell {
         self.output = self.output.saturating_add(other.output);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+        self.cache_creation_extended = self
+            .cache_creation_extended
+            .saturating_add(other.cache_creation_extended);
+        self.web_search_requests = self
+            .web_search_requests
+            .saturating_add(other.web_search_requests);
     }
 }
 
@@ -459,6 +475,10 @@ struct ModelStats {
     /// tokens no request of this row spent — so its cost can be told apart
     /// from the rows' own requests.
     sub_tokens: TokenCounts,
+    /// Extended-TTL write subset and web searches (#278); `None` until a
+    /// request reported one.
+    cache_creation_extended: Option<u64>,
+    web_search_requests: Option<u64>,
     last_used: Option<SystemTime>,
     /// Which account(s) served this model (req19).
     accounts: HashMap<String, Totals>,
@@ -481,6 +501,10 @@ impl ModelStats {
         self.cache_read = crate::proxy::sse::add_opt(self.cache_read, other.cache_read);
         self.cache_creation = crate::proxy::sse::add_opt(self.cache_creation, other.cache_creation);
         self.sub_tokens = add_tokens(self.sub_tokens, other.sub_tokens);
+        self.cache_creation_extended =
+            crate::proxy::sse::add_opt(self.cache_creation_extended, other.cache_creation_extended);
+        self.web_search_requests =
+            crate::proxy::sse::add_opt(self.web_search_requests, other.web_search_requests);
         self.last_used = match (self.last_used, other.last_used) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -533,10 +557,27 @@ pub(crate) struct ModelUsage {
     pub cache_creation: Option<u64>,
     /// The sub-usage part of the token counters above (#278).
     pub sub_tokens: TokenCounts,
+    pub cache_creation_extended: Option<u64>,
+    pub web_search_requests: Option<u64>,
     pub last_used: SystemTime,
     pub accounts: Vec<ModelAccount>,
     pub efforts: Vec<ModelCount>,
     pub endpoints: Vec<ModelCount>,
+}
+
+impl ModelUsage {
+    /// The row's summed counters, for pricing (the formula is linear, so the
+    /// row prices as the sum of its requests).
+    pub(crate) fn token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input: self.tokens_in,
+            output: self.tokens_out,
+            cache_read: self.cache_read,
+            cache_creation: self.cache_creation,
+            cache_creation_extended: self.cache_creation_extended,
+            web_search_requests: self.web_search_requests,
+        }
+    }
 }
 
 /// Per-account contribution to one model row (req19).
@@ -1241,6 +1282,24 @@ pub(crate) struct TenantModelStats {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Extended-TTL write subset and web searches (#278), so the cell
+    /// prices as the sum of its requests.
+    pub cache_creation_extended: u64,
+    pub web_search_requests: u64,
+}
+
+impl TenantModelStats {
+    /// The cell's summed counters, for pricing.
+    pub(crate) fn token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input: self.input,
+            output: self.output,
+            cache_read: Some(self.cache_read),
+            cache_creation: Some(self.cache_creation),
+            cache_creation_extended: Some(self.cache_creation_extended),
+            web_search_requests: Some(self.web_search_requests),
+        }
+    }
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1706,6 +1765,8 @@ impl ActivityLog {
                 tokens_out: c.output,
                 cache_read: c.cache_read,
                 cache_creation: c.cache_creation,
+                cache_creation_extended: c.cache_creation_extended,
+                web_search_requests: c.web_search_requests,
                 // Priced at doc-build time (the log holds no pricing config);
                 // conservative `false` here so a row that ever bypasses the
                 // doc build renders `—`, never a fabricated $0.
@@ -1824,6 +1885,12 @@ impl ActivityLog {
             if request.is_none() {
                 entry.sub_tokens = add_tokens(entry.sub_tokens, t);
             }
+            entry.cache_creation_extended = crate::proxy::sse::add_opt(
+                entry.cache_creation_extended,
+                t.cache_creation_extended,
+            );
+            entry.web_search_requests =
+                crate::proxy::sse::add_opt(entry.web_search_requests, t.web_search_requests);
         }
         entry.last_used = Some(now);
         if let Some(name) = account {
@@ -1970,6 +2037,12 @@ impl ActivityLog {
                 cell.cache_creation = cell
                     .cache_creation
                     .saturating_add(t.cache_creation.unwrap_or(0));
+                cell.cache_creation_extended = cell
+                    .cache_creation_extended
+                    .saturating_add(t.cache_creation_extended.unwrap_or(0));
+                cell.web_search_requests = cell
+                    .web_search_requests
+                    .saturating_add(t.web_search_requests.unwrap_or(0));
             }
         }
     }
@@ -2045,6 +2118,8 @@ impl ActivityLog {
                     cache_read: stats.cache_read,
                     cache_creation: stats.cache_creation,
                     sub_tokens: stats.sub_tokens,
+                    cache_creation_extended: stats.cache_creation_extended,
+                    web_search_requests: stats.web_search_requests,
                     last_used: stats.last_used.unwrap_or(SystemTime::UNIX_EPOCH),
                     accounts,
                     efforts: sorted_counts(&stats.efforts),
@@ -3447,15 +3522,7 @@ mod tests {
         );
         let cost = |model: &str| {
             let row = rows.iter().find(|r| r.model == model).expect("row");
-            crate::pricing::cost_from_parts(
-                &row.group,
-                &row.model,
-                row.tokens_in,
-                row.tokens_out,
-                row.cache_read,
-                row.cache_creation,
-                &HashMap::new(),
-            )
+            crate::pricing::cost_usd(&row.group, &row.model, &row.token_counts(), &HashMap::new())
         };
         // 1M output tokens: Haiku 4.5 $5.00 vs Haiku 5.5 $0.50.
         assert!((cost("claude-haiku-4-5-20251001") - 5.0).abs() < 1e-9);

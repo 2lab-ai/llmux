@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readTranscript, messagesToEntries, transcriptMeta, listSubagents, recoverMessages, parseResponse } from './transcript.mjs';
-import { solveRates, avgPerRequest, priceRow, rowTokens } from './pricing.mjs';
+import { solveRates, avgPerRequest, priceRow, rowTokens, priceCounts } from './pricing.mjs';
 import { parseRawMeta } from './rawmeta.mjs';
 import { cleanPrompt, promptOf } from './overview.mjs';
 export { promptOf };
@@ -30,6 +30,11 @@ const MAIN_KINDS = new Set(['user', 'sdk', 'other', 'compact', 'recap']);
 const SOMA_CWD = /^\/(?:private\/)?tmp\/U[0-9A-Z]+\/session_/;
 const HOUR = 3600000;
 const KEEP_HOURS = 72;
+// The priced counters of an activity row, summed per bucket model (#278 adds the extended-TTL write
+// subset and the web-search count, so a history bucket prices like the daemon's rows).
+const COUNTS = ['input', 'output', 'cache_read', 'cache_creation', 'cache_creation_extended', 'web_search_requests'];
+const zeroCounts = () => Object.fromEntries(COUNTS.map(k => [k, 0]));
+const addCounts = (into, t) => { for (const k of COUNTS) into[k] += t[k] || 0; };
 
 // Q4 thresholds (spec 26 §Goals 6).
 export const FLAGS = { burstCostHour: 25, burstReq10m: 150, longRunMs: 3 * HOUR, errorBurst: 3, contextPct: 0.8 };
@@ -181,16 +186,16 @@ export class SessionIndex {
     b.n++; if (r.status >= 400 || r.aborted) b.err++;
     if (r.account) b.accounts.set(r.account, (b.accounts.get(r.account) || 0) + 1);
     const t = r.tokens || {};
-    const mt = b.models.get(r.model) || { n: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0, priced: 0 };
-    mt.n++; mt.input += t.input || 0; mt.output += t.output || 0; mt.cache_read += t.cache_read || 0; mt.cache_creation += t.cache_creation || 0;
+    const mt = b.models.get(r.model) || { n: 0, ...zeroCounts(), cost: 0, priced: 0 };
+    mt.n++; addCounts(mt, t);
     if (r.cost_usd != null) { mt.cost += r.cost_usd; mt.priced++; }
     b.models.set(r.model, mt);
     // A history row has no daemon cost: its sub-usages (#278) are priced per model in bucketCost.
     // A daemon row's cost_usd already includes them.
     if (r.cost_usd == null) for (const s of r.sub_usage || []) {
       const k = s.model || r.model, st = s.tokens || {};
-      const e = b.sub.get(k) || { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
-      e.input += st.input || 0; e.output += st.output || 0; e.cache_read += st.cache_read || 0; e.cache_creation += st.cache_creation || 0;
+      const e = b.sub.get(k) || zeroCounts();
+      addCounts(e, st);
       b.sub.set(k, e);
     }
   }
@@ -201,13 +206,13 @@ export class SessionIndex {
       const unpriced = t.n - t.priced;
       if (!unpriced) { c += t.cost; continue; }
       const r = this.rates.get(model);
-      const est = r ? t.input * r.in + t.output * r.out + t.cache_read * r.cr + t.cache_creation * r.cc : (this.avg.get(model) || 0) * t.n;
+      const est = r ? priceCounts(t, r) : (this.avg.get(model) || 0) * t.n;
       // mixed buckets: daemon-priced part is exact; scale the estimate to the unpriced share
       c += t.priced ? t.cost + est * (unpriced / t.n) : est;
     }
     for (const [model, t] of b.sub || []) {
       const r = this.rates.get(model);
-      if (r) c += t.input * r.in + t.output * r.out + t.cache_read * r.cr + t.cache_creation * r.cc;
+      if (r) c += priceCounts(t, r);
     }
     return c;
   }

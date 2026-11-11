@@ -1432,6 +1432,8 @@ pub fn usage_doc(
                         tokens_out: m.tokens_out,
                         cache_read: m.cache_read,
                         cache_creation: m.cache_creation,
+                        cache_creation_extended: 0,
+                        web_search_requests: 0,
                     }
                 })
                 .collect();
