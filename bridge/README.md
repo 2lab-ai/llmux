@@ -53,6 +53,10 @@ SDK-origin account restrictions participate in immediate account failover.
   requests server web search (`_llmux_web_search`). Internal WebSearch calls are
   consumed by the SDK; their output is not an external client tool call. Numeric
   usage snapshots merge within one round and sum across internal search rounds.
+  Each round's `usage.iterations` entries other than `message` / `fallback_message`
+  (advisor, compaction) are forwarded, concatenated, so llmux books them under
+  their own model; the executor and fallback entries are not (merged across
+  rounds they would read as declined fallback attempts).
 - `model`, `output_config.effort`, `thinking` and `max_tokens` map to SDK model,
   effort, thinking and `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. Without thinking/effort,
   thinking is disabled. Auto/none tool choices are supported; forced tool choices
