@@ -27,6 +27,7 @@ use crate::scheduler::select::IneligibleReason;
 use crate::scheduler::window::{
     classify_window_display, QuotaWindow, ScopedQuotaWindow, WindowDisplayState,
 };
+use crate::scheduler::usage::is_polled_kind;
 use crate::scheduler::{select, AccountSnapshot};
 
 use super::activity::{ActivityKey, Completed, CompletedBody, InFlight};
@@ -4582,10 +4583,10 @@ fn account_modal_lines(
             ));
             rows.push(ModalRow::field("next", until(health.next_at)));
         }
-        None if account.credential_kind == "oauth" => {
+        None if is_polled_kind(account.credential_kind) => {
             rows.push(ModalRow::field("health", "not polled yet".into()))
         }
-        // apikey/codex accounts have no Anthropic usage endpoint to poll.
+        // codex/apikey/openrouter accounts have no usage endpoint to poll.
         None => rows.push(ModalRow::field(
             "health",
             format!("n/a ({})", account.credential_kind),
@@ -7988,12 +7989,12 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
 
     // Title row: the poller text at its widest ages (live back-off entries),
     // the live totals; the widest `poll` text over every account.
-    let oauth = accounts
+    let polled = accounts
         .iter()
-        .filter(|a| a.credential_kind == "oauth")
+        .filter(|a| is_polled_kind(a.credential_kind))
         .count();
-    let poller = if oauth == 0 {
-        "no oauth accounts (header-driven only)".to_string()
+    let poller = if polled == 0 {
+        "no polled accounts (header-driven only)".to_string()
     } else {
         let backoff = poller_backoff(view);
         let mut texts = Vec::new();
@@ -8005,7 +8006,7 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
             ];
             for ok in oks {
                 for next in [None, Some(span)] {
-                    texts.push(poller_text(oauth, ok, next, &backoff));
+                    texts.push(poller_text(polled, ok, next, &backoff));
                 }
             }
         }
@@ -8548,21 +8549,22 @@ fn summary_codex_line(model: &str, fast: bool, effort: &str) -> Line<'static> {
     ])
 }
 
-/// One-line usage-poller health: oauth count, last-success age spread,
-/// backing-off accounts, soonest next poll.
+/// One-line usage-poller health: polled-account count (oauth, grok and
+/// gemini — [`is_polled_kind`]), last-success age spread, backing-off
+/// accounts, soonest next poll.
 fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
-    let oauth: Vec<&AccountSnapshot> = view
+    let polled: Vec<&AccountSnapshot> = view
         .snapshot
         .accounts
         .iter()
-        .filter(|a| a.credential_kind == "oauth")
+        .filter(|a| is_polled_kind(a.credential_kind))
         .collect();
-    if oauth.is_empty() {
-        return "no oauth accounts (header-driven only)".into();
+    if polled.is_empty() {
+        return "no polled accounts (header-driven only)".into();
     }
     let mut ok_ages: Vec<Duration> = Vec::new();
     let mut next_in: Option<Duration> = None;
-    for account in &oauth {
+    for account in &polled {
         let Some(health) = view.poll_health(&account.id.0) else {
             continue;
         };
@@ -8578,16 +8580,16 @@ fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
         .min()
         .zip(ok_ages.iter().max())
         .map(|(min, max)| (*min, *max));
-    poller_text(oauth.len(), ok, next_in, &poller_backoff(view))
+    poller_text(polled.len(), ok, next_in, &poller_backoff(view))
 }
 
-/// The `{name}×{failures}` entries of every oauth account whose usage poll
+/// The `{name}×{failures}` entries of every polled account whose usage poll
 /// is currently failing.
 fn poller_backoff(view: &DashboardView) -> Vec<String> {
     view.snapshot
         .accounts
         .iter()
-        .filter(|a| a.credential_kind == "oauth")
+        .filter(|a| is_polled_kind(a.credential_kind))
         .filter_map(|account| {
             let health = view.poll_health(&account.id.0)?;
             (health.consecutive_failures > 0).then(|| {
@@ -8604,15 +8606,15 @@ fn poller_backoff(view: &DashboardView) -> Vec<String> {
 /// [`poller_summary`]'s text from its inputs: `ok` = (youngest, oldest)
 /// last-success age, `next_in` = soonest next poll.
 fn poller_text(
-    oauth: usize,
+    polled: usize,
     ok: Option<(Duration, Duration)>,
     next_in: Option<Duration>,
     backoff: &[String],
 ) -> String {
     if ok.is_none() && backoff.is_empty() {
-        return format!("{oauth} oauth · warming up");
+        return format!("{polled} polled · warming up");
     }
-    let mut out = format!("{oauth} oauth");
+    let mut out = format!("{polled} polled");
     match ok {
         Some((min, max)) if min == max => {
             out.push_str(&format!(" · last ok {} ago", select::compact_duration(min)));
@@ -8876,8 +8878,8 @@ fn poll_text(health: Option<super::PollHealth>, kind: &str, now: SystemTime) -> 
             };
             format!("{last}{next}{backoff}")
         }
-        None if kind == "oauth" => "not polled yet".into(),
-        // apikey/codex accounts have no Anthropic usage endpoint to poll.
+        None if is_polled_kind(kind) => "not polled yet".into(),
+        // codex/apikey/openrouter accounts have no usage endpoint to poll.
         None => format!("n/a ({kind})"),
     }
 }
@@ -12524,6 +12526,48 @@ mod tests {
             // Old-daemon default: tests exercise the local pricing fallback.
             cost_usd: 0.0,
         }
+    }
+
+    /// Every account the usage poller polls (oauth, grok and gemini — see
+    /// `scheduler::usage::is_polled_kind`) counts in the poller line and gets
+    /// a poll-health row; kinds with no usage source (codex, apikey,
+    /// openrouter) stay out. From #179: the line read "1 oauth" while the
+    /// poller was also polling grok and gemini accounts.
+    #[test]
+    fn poller_counts_every_polled_kind_not_just_oauth() {
+        let acct = |name: &str, kind: &'static str, group: BackendGroup| AccountSnapshot {
+            id: crate::scheduler::AccountId(name.into()),
+            healthy: true,
+            auth_failure_status: None,
+            credential_kind: kind,
+            group,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![
+            acct("claude:a@x.com", "oauth", BackendGroup::Claude),
+            acct("grok:g@x.com", "grok", BackendGroup::Grok),
+            acct("gemini:m@x.com", "gemini", BackendGroup::Gemini),
+            acct("codex:c@x.com", "codex", BackendGroup::Codex),
+        ];
+        let summary = poller_summary(&view, SystemTime::now());
+        assert!(
+            summary.starts_with("3 polled"),
+            "oauth + grok + gemini counted, codex excluded: {summary}"
+        );
+        let now = SystemTime::now();
+        assert_eq!(poll_text(None, "grok", now), "not polled yet");
+        assert_eq!(poll_text(None, "gemini", now), "not polled yet");
+        assert_eq!(poll_text(None, "codex", now), "n/a (codex)");
     }
 
     fn view_with(model_usage: Vec<ModelUsageDoc>) -> DashboardView {
@@ -22018,7 +22062,7 @@ mod tests {
     // every other heading; ` detail `, set past the widest title the band
     // can show, moves two cells right with it, and the tail is two shorter.
     const BAND_179_TITLE: &str =
-        "── scheduler · poller 14 oauth · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ────────────────────────────";
+        "── scheduler · poller 17 polled · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5.0G / out 847.6M tok ────────── detail ───────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -23285,7 +23329,12 @@ mod tests {
     /// and the health headline counts the extra AUTH condition (`+3`, was
     /// `+2`); every other row, text and style, unchanged (previous digest
     /// 17_866_181_982_027_554_185).
-    const FOLD_OFF_179X43_DIGEST: u64 = 8_580_461_030_093_644_723;
+    /// Re-pinned 2026-11-11 (#179): the poller line counts every polled
+    /// account — the fixture's 14 oauth plus its grok and gemini accounts —
+    /// so the band title reads `poller 17 polled` (was `poller 14 oauth`).
+    /// Only that line changes, text and style (previous digest
+    /// 8_580_461_030_093_644_723).
+    const FOLD_OFF_179X43_DIGEST: u64 = 4_993_104_869_699_455_335;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
