@@ -1,5 +1,6 @@
 // Session overview: the instructions a person gave, in order, and what the agent did for each.
 // Built from chat entries (transcript or raw-io) plus the llmux request rows of the session.
+import { rowTokens } from './pricing.mjs';
 
 /** Strip harness wrappers (soma-work <speaker>/<context>, Slack link markup) down to what was asked. */
 export function cleanPrompt(s) {
@@ -85,8 +86,10 @@ export function buildOverview(entries, rows, priceOf) {
     let req = 0, cost = 0, tokIn = 0, tokOut = 0;
     for (const r of sorted) {
       if (r.at_ms < from || r.at_ms >= to) continue;
-      req++; cost += priceOf(r); tokOut += (r.tokens && r.tokens.output) || 0;
-      tokIn += r.tokens ? (r.tokens.input || 0) + (r.tokens.cache_read || 0) + (r.tokens.cache_creation || 0) : 0;
+      // Totals count each request's sub-usages too (#278), as its cost does.
+      const t = rowTokens(r);
+      req++; cost += priceOf(r); tokOut += t.output;
+      tokIn += t.input + t.cache_read + t.cache_creation;
     }
     const toolCount = Object.values(tools).reduce((a, b) => a + b, 0);
     return {

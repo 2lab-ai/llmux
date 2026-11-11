@@ -137,6 +137,11 @@ pub(crate) enum CompletedBody {
         /// (src/tui/mod.rs Backend::Local/Remote), so the renderer never
         /// sees a fold-time name.
         client_name: Option<String>,
+        /// The request's sub-usages (#278: advisor / compaction / billed
+        /// fallback attempt, each at its own model). `tokens` stays the
+        /// request's own top-level counters; per-request TOTAL figures (the
+        /// token total and the cost) add these.
+        sub_usage: Vec<SubUsage>,
     },
     Note {
         text: String,
@@ -2298,6 +2303,7 @@ impl ActivityLog {
                         tenant,
                         // Resolved at doc-build time (needs key metadata).
                         client_name: None,
+                        sub_usage,
                     },
                 });
             }

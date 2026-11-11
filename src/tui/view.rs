@@ -364,6 +364,7 @@ impl DashboardView {
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
                     cost_usd: _,
+                    sub_usage,
                 } => Completed {
                     at: ms_time(*at_ms),
                     body: CompletedBody::Request {
@@ -400,6 +401,7 @@ impl DashboardView {
                         // the cell renders blank, never coerced.
                         tenant: tenant.clone(),
                         client_name: client_name.clone(),
+                        sub_usage: sub_usage.clone(),
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {

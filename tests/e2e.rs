@@ -1966,6 +1966,12 @@ async fn advisor_iterations_are_booked_under_the_advisor_model() {
         "priced at the advisor's rates: {fable}"
     );
     assert_eq!(doc["totals"]["requests"], 2);
+    // `/llmux/status` per-account lifetime tokens count the advisor too
+    // (executor 1760 + 10 in / 531 + 5 out, advisor 823 + 100 / 1612 + 20).
+    let totals = proxy_totals(&proxy, &AccountId("a".into())).await;
+    assert_eq!(totals.requests, 2);
+    assert_eq!(totals.input_tokens, 1770 + 923);
+    assert_eq!(totals.output_tokens, 536 + 1632);
 }
 
 /// #278: a turn a FALLBACK model served is booked under that model (the
