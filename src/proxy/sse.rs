@@ -498,9 +498,31 @@ impl UsageObserver {
 
     /// The request's usage: the counters, the sub-usages the top level leaves
     /// out, and the served model of a fallback turn.
+    ///
+    /// On a fallback-served turn the four counters come from the
+    /// `fallback_message` entry: "The top-level `usage` counts describe only
+    /// the attempt that produced the returned message" (refusals-and-
+    /// fallback, read 2026-11-11), while `message_start` may carry the
+    /// DECLINING model's usage and a final `message_delta` need not repeat
+    /// every counter.
     pub fn finish(self) -> StreamUsage {
         let mut usage = self.usage;
         let iterations = self.iterations.unwrap_or(serde_json::Value::Null);
+        if let Some(served) = iterations
+            .get("iterations")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|its| {
+                its.iter()
+                    .rev()
+                    .find(|it| iteration_kind(it) == "fallback_message")
+            })
+        {
+            let count = |key: &str| served.get(key).and_then(serde_json::Value::as_u64);
+            usage.input_tokens = count("input_tokens").unwrap_or(0);
+            usage.output_tokens = count("output_tokens").unwrap_or(0);
+            usage.cache_read_input_tokens = count("cache_read_input_tokens");
+            usage.cache_creation_input_tokens = count("cache_creation_input_tokens");
+        }
         usage.sub_usage = uncounted_iterations(&iterations, &self.hops).unwrap_or_default();
         usage.served_model =
             fallback_served_model(&iterations, &self.hops, self.start_model.as_deref());
@@ -1465,6 +1487,43 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(
             fallback_served_model(&serde_json::Value::Null, &[], Some("m")),
             None
+        );
+    }
+
+    #[test]
+    fn a_fallback_stream_takes_its_top_level_counters_from_the_serving_attempt() {
+        // A pre-output decline: message_start carries the DECLINING model's
+        // usage and the final message_delta omits `input_tokens`. The doc
+        // guarantees top-level == the `fallback_message` entry, so the four
+        // counters come from it — the declining model's input must not stay
+        // in the top level (it would be priced under the serving model AND
+        // again as a sub-usage).
+        let start = r#"data: {"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":535,"cache_read_input_tokens":40,"output_tokens":1}}}"#;
+        let block = r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"bio"}}}"#;
+        let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":264,"iterations":[{"type":"message","model":"claude-fable-5","input_tokens":535,"cache_read_input_tokens":40,"output_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":264}]}}"#;
+        let mut observer = UsageObserver::default();
+        for event in [start, block, delta] {
+            observer.observe(event);
+        }
+        let usage = observer.finish();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens
+            ),
+            (412, 264, Some(0), Some(0)),
+            "the serving attempt's counters, not message_start's"
+        );
+        assert_eq!(usage.served_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            usage.sub_usage,
+            vec![SubUsage {
+                model: Some("claude-fable-5".into()),
+                tokens: tokens(535, 0, Some(40), None),
+            }],
+            "the billed (bio) declined attempt, once"
         );
     }
 
