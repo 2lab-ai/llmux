@@ -618,6 +618,17 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
 
+## Reference price corrections: 2026-11-11
+
+Not a model sweep: no catalog row, alias or context window changed. Rates read
+2026-11-11 from the official pricing pages
+([#278](https://github.com/2lab-ai/llmux/issues/278)).
+
+| Provider | Change | Sources checked |
+| --- | --- | --- |
+| Claude | Added reference prices for `claude-mythos-5-2` ($8.00 in / $40.00 out / $0.20 cache read / $10.00 cache write, 5m), `claude-mythos-5-1` ($10.00 / $50.00 / $0.25 / $12.50) and `claude-mythos-5` ($10.00 / $50.00 / $1.00 / $12.50). All three are limited availability and are not catalog rows; before this a request naming them was priced at the Opus tier. 1-hour writes ($16 / $20 / $20) are not modeled. | [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Codex / OpenAI | `gpt-5.6-terra` cache write 0 → $2.50 and `gpt-5.6-luna` 0 → $0.25 (the "30m write" column, 1.25× input; the model pages state the same multiplier). The 12-hour write rates ($5.00 / $0.50) are not modeled. `gpt-5.5` still lists no cache-write rate. | [pricing](https://developers.openai.com/api/docs/pricing), [gpt-5.6-terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), [gpt-5.6-luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
+
 ## Model sweep: 2026-11-10
 
 Checked all four providers against their current primary sources for 2026-10-23 → 2026-11-10
@@ -705,7 +716,8 @@ Checked all three subscription providers against their current primary sources:
 
 USD per million tokens, verified 2026-10-08 against [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
 and [Haiku 5.5 specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview),
-and re-checked 2026-11-10, when the Fable 5.2 row was added:
+re-checked 2026-11-10, when the Fable 5.2 row was added, and 2026-11-11, when the
+Mythos rows were added:
 
 | Model / prompt length | Input | Output | Cache read | Cache write, 5m | Cache write, 1h |
 | --- | --- | --- | --- | --- | --- |
@@ -714,6 +726,9 @@ and re-checked 2026-11-10, when the Fable 5.2 row was added:
 | Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
 | Fable 5.2 | $8.00 | $40.00 | $0.20 | $10.00 | $16.00 |
 | Fable 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
+| Mythos 5.2 (limited availability, added 2026-11-11) | $8.00 | $40.00 | $0.20 | $10.00 | $16.00 |
+| Mythos 5.1 (limited availability, added 2026-11-11) | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
+| Mythos 5 (limited availability, added 2026-11-11) | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 
 Sonnet 5.5 cache reads were reduced from $0.20 to $0.10 on
 [2026-10-07](https://www.anthropic.com/claude-haiku-5-5). Fable 5.1 now has its
