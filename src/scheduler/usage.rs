@@ -21,6 +21,15 @@ use crate::auth::grok_usage::{self, GrokUsageError};
 use crate::config::{AccountCredential, GeminiConfig, SchedulerConfig};
 use crate::proxy::gemini_project::{self, GeminiProject};
 
+/// The credential kinds this poller has a usage source for: oauth
+/// (`/api/oauth/usage`), grok (`/billing?format=credits`) and gemini
+/// (antigravity quota). Every other kind (codex, apikey, openrouter) is
+/// header-driven only. The TUI's poller line and poll-health rows use this
+/// same predicate, so they count exactly the accounts that are polled.
+pub fn is_polled_kind(kind: &str) -> bool {
+    matches!(kind, "oauth" | "grok" | "gemini")
+}
+
 /// Parsed body of `GET /api/oauth/usage` (Bearer auth): per-window
 /// utilization + resets_at, same shape soma-work polls every 5 minutes.
 ///
@@ -602,7 +611,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
             .snapshot()
             .accounts
             .iter()
-            .filter(|a| matches!(a.credential_kind, "oauth" | "grok" | "gemini"))
+            .filter(|a| is_polled_kind(a.credential_kind))
             .map(|a| a.id.clone())
             .collect();
         self.schedule.retain(|id, _| pollable.contains(id));
