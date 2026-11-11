@@ -1420,6 +1420,8 @@ pub fn usage_doc(
                         output: m.tokens_out,
                         cache_read: Some(m.cache_read),
                         cache_creation: Some(m.cache_creation),
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     };
                     TenantModelDoc {
                         cost_usd: crate::pricing::cost_usd(&m.group, &m.model, &tokens, overrides),
@@ -1578,6 +1580,8 @@ mod tests {
                 output: 50,
                 cache_read: Some(10),
                 cache_creation: Some(5),
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             group: Some("claude".into()),
             model: Some("claude-opus-5-5".into()),
@@ -1599,6 +1603,8 @@ mod tests {
                         output: 1612,
                         cache_read: Some(0),
                         cache_creation: Some(0),
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     },
                 },
                 crate::tui::SubUsage {
@@ -1608,6 +1614,8 @@ mod tests {
                         output: 100,
                         cache_read: None,
                         cache_creation: None,
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     },
                 },
             ],

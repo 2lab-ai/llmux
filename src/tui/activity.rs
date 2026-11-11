@@ -507,6 +507,14 @@ fn add_tokens(a: TokenCounts, b: TokenCounts) -> TokenCounts {
         output: a.output.saturating_add(b.output),
         cache_read: crate::proxy::sse::add_opt(a.cache_read, b.cache_read),
         cache_creation: crate::proxy::sse::add_opt(a.cache_creation, b.cache_creation),
+        cache_creation_extended: crate::proxy::sse::add_opt(
+            a.cache_creation_extended,
+            b.cache_creation_extended,
+        ),
+        web_search_requests: crate::proxy::sse::add_opt(
+            a.web_search_requests,
+            b.web_search_requests,
+        ),
     }
 }
 
@@ -2443,6 +2451,8 @@ mod tests {
                     output: 10,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_extended: None,
+                    web_search_requests: None,
                 }),
                 group: Some("claude".into()),
                 model: Some("claude-fable-5".into()),
@@ -3024,6 +3034,8 @@ mod tests {
             output,
             cache_read,
             cache_creation: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
         })
     }
 
@@ -3416,6 +3428,8 @@ mod tests {
                 output: 1_000_000,
                 cache_read: None,
                 cache_creation: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             "/v1/messages",
         );
@@ -3508,6 +3522,8 @@ mod tests {
                 output: 50,
                 cache_read: Some(10),
                 cache_creation: Some(5),
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             "/v1/messages",
         );
@@ -3528,6 +3544,8 @@ mod tests {
                         output: 1612,
                         cache_read: Some(0),
                         cache_creation: Some(0),
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     },
                 },
                 SubUsage {
@@ -3537,6 +3555,8 @@ mod tests {
                         output: 100,
                         cache_read: None,
                         cache_creation: None,
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     },
                 },
             ];
@@ -3670,6 +3690,34 @@ mod tests {
             .daily_usage()
             .iter()
             .any(|d| d.model == "claude-fable-5-1" && d.tokens_in == 823));
+    }
+
+    /// #278: the extended-TTL write subset and the web-search count are
+    /// additive `tokens` fields. A line written before them loads with both
+    /// `None` and re-serializes byte for byte; a line carrying them keeps
+    /// them through the replay.
+    #[test]
+    fn extended_writes_and_web_searches_are_additive_in_the_persisted_log() {
+        let old = r#"{"v":1,"ts_ms":1000,"id":8,"method":"POST","path":"/v1/messages","endpoint":"anthropic","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":4,"cache_creation":6},"group":"claude","model":"claude-opus-5-5","effort":null,"fast":false,"ttfb_ms":120,"ttft_ms":800,"gen_ms":null,"aborted":false,"user_id":null,"kind":null,"excerpt":null,"tenant":null}"#;
+        let record: PersistedRequest = serde_json::from_str(old).expect("old line loads");
+        let tokens = record.tokens.expect("tokens");
+        assert_eq!(
+            (tokens.cache_creation_extended, tokens.web_search_requests),
+            (None, None)
+        );
+        assert_eq!(serde_json::to_string(&record).expect("line"), old);
+
+        let new = old.replace(
+            r#""cache_creation":6}"#,
+            r#""cache_creation":6,"cache_creation_extended":5,"web_search_requests":2}"#,
+        );
+        let record: PersistedRequest = serde_json::from_str(&new).expect("new line loads");
+        let tokens = record.tokens.expect("tokens");
+        assert_eq!(
+            (tokens.cache_creation_extended, tokens.web_search_requests),
+            (Some(5), Some(2))
+        );
+        assert_eq!(serde_json::to_string(&record).expect("line"), new);
     }
 
     /// Activity client-name: the fold carries the tenant id into the
@@ -4043,6 +4091,8 @@ mod tests {
                 output,
                 cache_read,
                 cache_creation: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             group: Some(group.into()),
             model: Some(model.into()),
@@ -4479,6 +4529,8 @@ mod tests {
                     output,
                     cache_read: None,
                     cache_creation: None,
+                    cache_creation_extended: None,
+                    web_search_requests: None,
                 }),
                 group: Some("codex".into()),
                 model: Some("gpt-5.5".into()),
@@ -4575,6 +4627,8 @@ mod tests {
                 output: 10,
                 cache_read: None,
                 cache_creation: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             group: Some("codex".into()),
             model: Some("gpt-5.5".into()),

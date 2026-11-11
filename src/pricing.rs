@@ -763,6 +763,8 @@ mod tests {
             output,
             cache_read: cr,
             cache_creation: cc,
+            cache_creation_extended: None,
+            web_search_requests: None,
         }
     }
 

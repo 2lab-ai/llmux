@@ -52,7 +52,10 @@ SDK-origin account restrictions participate in immediate account failover.
 - All built-in tools are disabled except `WebSearch` when the ingress explicitly
   requests server web search (`_llmux_web_search`). Internal WebSearch calls are
   consumed by the SDK; their output is not an external client tool call. Numeric
-  usage snapshots merge within one round and sum across internal search rounds.
+  usage snapshots merge within one round and sum across internal search rounds;
+  so do the numeric fields of the `cache_creation` TTL split
+  (`ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`) and of
+  `server_tool_use` (`web_search_requests`), which llmux prices (#278).
   Each round's `usage.iterations` entries other than `message` / `fallback_message`
   (advisor, compaction) are forwarded, concatenated, so llmux books them under
   their own model; the executor and fallback entries are not (merged across

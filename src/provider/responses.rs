@@ -937,6 +937,10 @@ impl ResponsesSseConverter {
                 .unwrap_or(0),
             cache_read_input_tokens: cached,
             cache_creation_input_tokens: cache_write,
+            // GPT-5.6+ 12h writes (`cache_write_tokens_details.ttl_12h_tokens`),
+            // the extended-TTL subset priced at its own rate.
+            cache_creation_extended: crate::proxy::sse::extended_cache_writes(usage, cache_write),
+            web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
         };
@@ -1799,6 +1803,8 @@ mod tests {
                 output_tokens: 302,
                 cache_read_input_tokens: Some(64),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             },
@@ -1822,6 +1828,8 @@ mod tests {
             output_tokens: 302,
             cache_read_input_tokens: Some(64),
             cache_creation_input_tokens: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
         };
