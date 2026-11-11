@@ -36,7 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long we keep watching a drained daemon's pid after the port frees.
 /// hyper releases the listener the instant shutdown starts but keeps the
 /// PROCESS alive until every in-flight connection closes, so "port is free"
-/// never meant "old daemon is gone" — on team-host (2026-09-10..21) `llmux
+/// never meant "old daemon is gone" — on a shared host (2026-09-10..21) `llmux
 /// restart` reported success while pid 91799 kept running for 25 days, its
 /// refresh loop rotating the same OAuth refresh tokens as the new daemon.
 /// Short: this is a courtesy note, not a gate — the successor is already
@@ -462,7 +462,7 @@ async fn shutdown_and_wait(
             // the port) — this is a note about a process that is finishing its
             // own business, so it must not pollute a piped "restarted ..." line.
             // The CLI cannot know which build the old daemon is. A daemon with
-            // the drain deadline exits by itself; an older one (the team-host pid
+            // the drain deadline exits by itself; an older one (the shared-host pid
             // 91799 class) drains forever — so promise nothing, say what to
             // check, and name the manual exit.
             eprintln!("{}", linger_note(pid));
@@ -817,7 +817,7 @@ mod tests {
         assert!(!note.contains("exits by itself"), "{note}");
     }
 
-    /// "The port is free" never meant "the old daemon exited" (team-host: pid
+    /// "The port is free" never meant "the old daemon exited" (shared host: pid
     /// 91799 outlived its port by 25 days), so the liveness probe has to be
     /// right about both answers: this process is alive, a reaped child is not.
     #[cfg(unix)]

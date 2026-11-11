@@ -1247,15 +1247,18 @@ mod tests {
     #[test]
     fn display_settings_survive_doc_to_view_and_default() {
         // A doc from an older daemon (neither field) → the built-in abbrev map
-        // and `used` fill, mirroring the show_fable_weekly additive convention.
+        // (empty) and `remaining` fill, mirroring the show_fable_weekly
+        // additive convention.
         let doc: DashboardDoc = serde_json::from_value(doc_json()).expect("parse doc");
         let view = DashboardView::from_doc(&doc);
         assert_eq!(
-            view.domain_abbrev
-                .get("example.com")
-                .map(String::as_str),
-            Some("ex"),
+            view.domain_abbrev,
+            crate::config::default_domain_abbrev(),
             "absent wire field defaults to the built-in map"
+        );
+        assert!(
+            view.domain_abbrev.is_empty(),
+            "the built-in map names no deployment's domain"
         );
         assert_eq!(
             view.quota_display,
@@ -1273,7 +1276,11 @@ mod tests {
             view.domain_abbrev.get("example.com").map(String::as_str),
             Some("ex")
         );
-        assert!(!view.domain_abbrev.contains_key("example.com"));
+        assert_eq!(
+            view.domain_abbrev.len(),
+            1,
+            "the wire map replaces the default"
+        );
         assert_eq!(view.quota_display, crate::config::QuotaDisplay::Used);
     }
 

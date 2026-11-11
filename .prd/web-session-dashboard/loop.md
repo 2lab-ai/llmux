@@ -14,9 +14,9 @@ without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 
 - Unit gate: `node --test webui/test/` → all pass.
 - Rust gate: `just check` → exit 0 (webui adds no Rust).
 - Observation gate: QA token minted from the host's soma-work secret (admin, ≤ 2 h), Playwright 1600×1000 against the
-  public URL (team-host via `--host-resolver-rules` to [lan-ip]); curl SSO matrix on each host.
+  public URL (team host via `--host-resolver-rules` to its LAN address); curl SSO matrix on each host.
 - Deploy: `rsync` `webui/` → `~/llmux-webui/` (keeps `server.log`, `run.sh`, plists), then
-  `launchctl kickstart -k gui/$UID/ai.2lab.llmux-webui` (owner-mac) or `user/$UID/…` (team-host, no GUI login).
+  `launchctl kickstart -k gui/$UID/ai.2lab.llmux-webui` (owner-mac) or `user/$UID/…` (team host, no GUI login).
 
 ## Re-verification (2026-11-09 16:30 KST)
 
@@ -27,7 +27,7 @@ without the user's llmux key — https://github.com/2lab-ai/soma-work/pull/1065 
   "나머지 더 보기"); pretty view equals `JSON.stringify(body, null, 2)`; the Response leg shows the message assembled from
   342/348 SSE events and its raw view equals `response_body`; 0 page errors · branch e9cf725
 
-- re-verified ✅: H3 (upstream legs) · `up-verify.mjs` on team-host translated exchange #13638 (codex gpt-6-astra, subagent):
+- re-verified ✅: H3 (upstream legs) · `up-verify.mjs` on the team host translated exchange #13638 (codex gpt-6-astra, subagent):
   four legs Request / Upstream Req / Upstream Resp / Response; Upstream Req url = `upstream.url`, 7/7 headers equal with
   credentials redacted, raw equals `upstream.request_body` (806,006 chars), tree opens only `/input/<last>`; Upstream Resp
   33/33 headers equal, raw equals `upstream.response_body` (832,514 chars, 315 SSE events), tree opens the

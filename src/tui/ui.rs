@@ -13910,7 +13910,8 @@ mod tests {
 
     #[test]
     fn row_account_name_strips_group_prefix_and_abbreviates_domain() {
-        let abbrev = crate::config::default_domain_abbrev();
+        let abbrev =
+            std::collections::BTreeMap::from([("example.com".to_string(), "ex".to_string())]);
         assert_eq!(
             row_account_name("claude:ai3@example.com", false, &abbrev),
             "ai3@ex"
@@ -13921,8 +13922,8 @@ mod tests {
         );
         // Unmapped domain: prefix still stripped, domain untouched.
         assert_eq!(
-            row_account_name("claude:x@example.com", false, &abbrev),
-            "x@example.com"
+            row_account_name("claude:x@example.org", false, &abbrev),
+            "x@example.org"
         );
         // No prefix / no email shape: passes through.
         assert_eq!(row_account_name("plainname", false, &abbrev), "plainname");
@@ -19666,6 +19667,10 @@ mod tests {
             },
         );
         config.scheduler.save_until = Some(1_800_000_000);
+        // The built-in abbreviation map is empty, so fill it here.
+        config
+            .domain_abbrev
+            .insert("example.com".into(), "ex".into());
         config.paused_accounts.insert("a@x.com".into());
         config.account_limits.insert(
             "a@x.com".into(),

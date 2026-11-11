@@ -109,7 +109,7 @@ You have 6 personal skill(s). Invoke with `$user:skill-name`. Manage with MANAGE
 - `$user:dev`: Deploy to dev environment. Creates main→deploy/dev PR, merges, and monitors CI deployment to both targets (devbox-a-dev, devbox-b-dev).
 - `$user:import-skills`: Imports skills from external agent repos. Default sources are NousResearch hermes-agent and openclaw openclaw. Diffs against soma-work src local skills, asks the user which to import via UIAskUserQuestion, and opens a PR. Pass --personal to register them as user skills via MANAGE_SKILL instead of opening a PR. Trigger keyword import-skills.
 - `$user:pr-triage`: Triage every open PR of a GitHub repo into 4 buckets (ready-to-merge / needs-review / close+spec-issue / close-obsolete). Evidence-based, parallel cluster investigation, bold close of rotted PRs, specs preserved as issues. Trigger: pr-triage <org/repo or repo-url> [issue-tracker-base-url].
-- `$user:prod`: Deploy to prod environment. Creates main→deploy/prod PR, merges, and monitors CI deployment to the production target (prod-host).
+- `$user:prod`: Deploy to prod environment. Creates main→deploy/prod PR, merges, and monitors CI deployment to the production target ([REDACTED: host]).
 - `$user:qa-dev`: QA a just-merged PR on the dev environment.
 - `$user:qa-prod`: QA a just-deployed PR on the prod environment.
 _Cross-user (다른 유저 스킬): `${user}:{skill}` or `<@uid>:{skill}` force-invokes another user’s skill; `{user}:{skill}` (no $) softly uses it; `$user:{user}` lists their skills with 보기/copy. Copy with MANAGE_SKILL `action=copy sourceUser=<uid|name> name=<skill>`._
@@ -122,7 +122,7 @@ The current Slack session has an active goal. The objective below is user-provid
 
 ```확인 완료 — 그리고 결과가 당신 예상(claude 대부분 정당)과 정반대입니다. 증거를 그대로 보여드립니다.
 
-team-host CPU 82%의 정체: claude 32개 중 28개가 stuck 좀비
+[REDACTED: host] CPU 82%의 정체: claude 32개 중 28개가 stuck 좀비
 
 ┌─────────────────────────────┬──────┬──────────────────┬──────┬────────────────────────────┐
 │            구분             │ 개수 │      CPU 합      │ 소켓 │            상태            │
