@@ -795,10 +795,12 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   `-terra` / `-luna`. A live probe on 2026-09-07 confirmed the ChatGPT-account
   codex backend ACCEPTS `gpt-6-astra` with llmux's existing header set
   (`originator: codex_cli_rs`, no client-version header), so no header change
-  was needed — only adding the slug to the provider passthrough list. Pricing
-  ($10/M input, $50/M output, $1/M cached input, no cache-creation charge)
-  comes from third-party pricing trackers for the 2026-09 launch standard tier,
-  not from an OpenAI page read directly.
+  was needed — only adding the slug to the provider passthrough list. Pricing:
+  $10/M input, $50/M output, $1/M cached input and $12.50/M cache write (30-minute
+  retention), from the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing)
+  (read 2026-10-06, re-checked 2026-11-11; standard tier, ≤272K input). The
+  launch-era row came from third-party trackers and listed no cache-creation
+  charge.
 - **gpt-6.1-terra** — openai/codex
   [models.json @ caae161](https://github.com/openai/codex/blob/caae161dd0c82f2e04e57e6f9d738fafbce503ba/codex-rs/models-manager/models.json)
   (entry added in [commit 126a0ee](https://github.com/openai/codex/commit/126a0ee92ed2c5e73cd8a8f7e37563e8527552d7),
