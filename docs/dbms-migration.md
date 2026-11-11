@@ -16,6 +16,13 @@ so a copy can be checked row for row.
 The metrics columns follow soma-work's `src/metrics/event-store.ts` as of
 soma-work #584 (711e352).
 
+The `usage` table gained a `requests` column in keys-usage schema v2
+(2026-11-11): `1` for a finished request, `0` for a sub-usage row (tokens an
+advisor, compaction or declined fallback attempt spent under its own model —
+not a request). A daemon migrates its store when it opens it, so snapshot a
+store a current daemon has opened; the PostgreSQL schema adds the column to an
+existing `usage` table with the default `1`.
+
 Bookkeeping tables (`meta`, `metrics_jsonl_imports`, `metrics_exports`,
 `metrics_day_rev`) describe the SQLite files and their archives. They are not
 copied, because a server backend keeps its own.

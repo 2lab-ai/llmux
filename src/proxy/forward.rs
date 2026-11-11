@@ -676,7 +676,34 @@ impl ForwardContext {
         status: StatusCode,
         tokens: Option<TokenCounts>,
     ) {
-        self.emit_finished_timed(state, account, status, tokens, sse::StreamTiming::default());
+        self.emit_finished_timed(
+            state,
+            account,
+            status,
+            tokens,
+            Vec::new(),
+            sse::StreamTiming::default(),
+        );
+    }
+
+    /// [`Self::emit_finished`] for a relay that observed upstream usage: the
+    /// top-level counters plus the sub-inferences they leave out
+    /// ([`sse::StreamUsage::sub_usage`]).
+    fn emit_finished_usage(
+        &self,
+        state: &AppState,
+        account: Option<&AccountId>,
+        status: StatusCode,
+        usage: sse::StreamUsage,
+    ) {
+        self.emit_finished_timed(
+            state,
+            account,
+            status,
+            Some(token_counts(&usage)),
+            usage.sub_usage,
+            sse::StreamTiming::default(),
+        );
     }
 
     /// Emit the terminal activity event with the stream-timing landmarks the
@@ -688,6 +715,7 @@ impl ForwardContext {
         account: Option<&AccountId>,
         status: StatusCode,
         tokens: Option<TokenCounts>,
+        sub_usage: Vec<crate::tui::SubUsage>,
         timing: sse::StreamTiming,
     ) {
         let FinishedMeta {
@@ -723,6 +751,7 @@ impl ForwardContext {
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
+            sub_usage,
         });
     }
 
@@ -774,6 +803,7 @@ impl ForwardContext {
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
+            sub_usage: Vec::new(),
         });
         if self.endpoint_origin == crate::tui::Endpoint::OpenAi {
             return super::responses::error(StatusCode::BAD_REQUEST, &message);
@@ -1376,6 +1406,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 kind: None,
                 excerpt: None,
                 tenant,
+                sub_usage: Vec::new(),
             });
             return error_response(status, error_type, &message);
         }
@@ -1402,6 +1433,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             kind: None,
             excerpt: None,
             tenant: tenant.clone(),
+            sub_usage: Vec::new(),
         });
         super::responses::error(status, detail)
     };
@@ -3852,7 +3884,7 @@ async fn relay(
                         account: Some(account.0.clone()),
                         status: status.as_u16(),
                         duration: started.elapsed(),
-                        tokens: Some(token_counts(usage)),
+                        tokens: Some(token_counts(&usage)),
                         group,
                         model,
                         effort,
@@ -3867,6 +3899,7 @@ async fn relay(
                         kind,
                         excerpt,
                         tenant,
+                        sub_usage: usage.sub_usage,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -3917,7 +3950,7 @@ async fn relay(
             Some(&headers),
             upstream_raw,
         );
-        ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
+        ctx.emit_finished_usage(state, Some(&account), status, usage);
         drop(lease);
         axum::body::Body::from(bytes)
     };
@@ -4443,7 +4476,7 @@ async fn relay_translate(
                         account: Some(account.0.clone()),
                         status: StatusCode::OK.as_u16(),
                         duration: started.elapsed(),
-                        tokens: Some(token_counts(usage)),
+                        tokens: Some(token_counts(&usage)),
                         group,
                         model,
                         effort,
@@ -4456,6 +4489,7 @@ async fn relay_translate(
                         kind,
                         excerpt,
                         tenant,
+                        sub_usage: usage.sub_usage,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -4556,7 +4590,7 @@ async fn relay_translate(
                         state,
                         Some(&account),
                         StatusCode::BAD_GATEWAY,
-                        Some(token_counts(usage)),
+                        Some(token_counts(&usage)),
                     );
                     return error_response(StatusCode::BAD_GATEWAY, "api_error", detail);
                 }
@@ -4614,7 +4648,8 @@ async fn relay_translate(
                 state,
                 Some(&account),
                 StatusCode::OK,
-                Some(token_counts(usage)),
+                Some(token_counts(&usage)),
+                usage.sub_usage,
                 timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
@@ -4633,7 +4668,7 @@ async fn relay_translate(
                 state,
                 Some(&account),
                 StatusCode::BAD_GATEWAY,
-                trace_raw_usage.is_some().then(|| token_counts(usage)),
+                trace_raw_usage.is_some().then(|| token_counts(&usage)),
             );
             error_response(StatusCode::BAD_GATEWAY, "api_error", &message)
         }
@@ -4690,12 +4725,15 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
         cache_creation_input_tokens: usage
             .get("cache_creation_input_tokens")
             .and_then(serde_json::Value::as_u64),
+        // Sub-inferences the counters above leave out (advisor, compaction,
+        // declined fallback hops), billed under their own model.
+        sub_usage: sse::uncounted_iterations(usage).unwrap_or_default(),
     }
 }
 
 /// Map observed stream usage into the activity-event token counts, carrying the
 /// optional cache counters through to the model-usage rows.
-fn token_counts(usage: sse::StreamUsage) -> TokenCounts {
+fn token_counts(usage: &sse::StreamUsage) -> TokenCounts {
     TokenCounts {
         input: usage.input_tokens,
         output: usage.output_tokens,
@@ -4714,6 +4752,33 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    #[test]
+    fn json_body_usage_keeps_the_top_level_and_carries_the_advisor_iteration() {
+        let body = br#"{"type":"message","usage":{"input_tokens":1760,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":531,"iterations":[{"type":"message","input_tokens":412,"output_tokens":89},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":823,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1612},{"type":"message","input_tokens":1348,"cache_read_input_tokens":412,"output_tokens":442}]}}"#;
+        let usage = usage_from_json_body(body);
+        assert_eq!(
+            token_counts(&usage),
+            TokenCounts {
+                input: 1760,
+                output: 531,
+                cache_read: Some(412),
+                cache_creation: Some(0),
+            }
+        );
+        assert_eq!(
+            usage.sub_usage,
+            vec![crate::tui::SubUsage {
+                model: Some("claude-fable-5-1".into()),
+                tokens: TokenCounts {
+                    input: 823,
+                    output: 1612,
+                    cache_read: Some(0),
+                    cache_creation: Some(0),
+                },
+            }]
+        );
+    }
 
     /// The refresh-death message must carry the upstream reason, and must call
     /// out the one reason that is NOT "your login expired": a token the

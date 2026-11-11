@@ -16,21 +16,29 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio_stream::StreamExt as _;
 
+use crate::tui::{SubUsage, TokenCounts};
+
 /// Token usage extracted from a message stream. `input_tokens` is the FRESH
 /// (non-cached) prompt count on both providers; the cached components are kept
 /// separately and optionally — `None` means the upstream did not report that
 /// field (rendered "—"), distinct from `Some(0)` (an explicit zero).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
+    /// Anthropic `usage.iterations` entries the four counters above do NOT
+    /// include, each billed at its own model's rates
+    /// ([`uncounted_iterations`]). Empty for every other upstream.
+    pub sub_usage: Vec<SubUsage>,
 }
 
 impl StreamUsage {
     /// Accumulate another observation (saturating). For the optional cache
     /// counters the result is present iff at least one side reported a value.
+    /// `usage.iterations` arrays are cumulative snapshots, so a non-empty
+    /// `sub_usage` REPLACES the one held, never adds to it.
     pub fn add(&mut self, other: StreamUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
@@ -40,7 +48,70 @@ impl StreamUsage {
             self.cache_creation_input_tokens,
             other.cache_creation_input_tokens,
         );
+        if !other.sub_usage.is_empty() {
+            self.sub_usage = other.sub_usage;
+        }
     }
+}
+
+/// The Anthropic `usage.iterations` entries the top-level `usage` counters do
+/// NOT include, as [`SubUsage`]s. `None` when `usage` carries no
+/// `iterations` array (every non-Anthropic upstream, and requests without an
+/// iterating feature).
+///
+/// Which entries the top level covers (all docs read 2026-11-11):
+/// - Normally the `message` entries — the executor. `advisor_message`
+///   ("Advisor tokens are not rolled into the top-level totals",
+///   agents-and-tools/tool-use/advisor-tool), `compaction` ("The top-level
+///   `input_tokens` and `output_tokens` do not include compaction iteration
+///   usage", build-with-claude/compaction-threshold) and any type not known
+///   today are extra, billed at their own model's rates.
+/// - A response a fallback model served is the exception: "The top-level
+///   `usage` counts describe only the attempt that produced the returned
+///   message" — the `fallback_message` entry — while each declined attempt
+///   is a `message` entry billed at its own model's rates
+///   (build-with-claude/refusals-and-fallback). There the `message` entries
+///   are extra, except one naming the model that served the fallback.
+///
+/// An entry with no `type` or with all-zero counters is skipped. The entry's
+/// `model` is kept as reported; `None` means the request's own model.
+pub fn uncounted_iterations(usage: &serde_json::Value) -> Option<Vec<SubUsage>> {
+    fn kind(it: &serde_json::Value) -> &str {
+        it.get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    }
+    fn model(it: &serde_json::Value) -> Option<&str> {
+        it.get("model").and_then(serde_json::Value::as_str)
+    }
+    let iterations = usage.get("iterations")?.as_array()?;
+    let served: Vec<Option<&str>> = iterations
+        .iter()
+        .filter(|it| kind(it) == "fallback_message")
+        .map(model)
+        .collect();
+    let uncounted = iterations
+        .iter()
+        .filter(|it| match kind(it) {
+            "" | "fallback_message" => false,
+            "message" => !served.is_empty() && !served.contains(&model(it)),
+            _ => true,
+        })
+        .map(|it| {
+            let count = |key: &str| it.get(key).and_then(serde_json::Value::as_u64);
+            SubUsage {
+                model: model(it).map(str::to_string),
+                tokens: TokenCounts {
+                    input: count("input_tokens").unwrap_or(0),
+                    output: count("output_tokens").unwrap_or(0),
+                    cache_read: count("cache_read_input_tokens"),
+                    cache_creation: count("cache_creation_input_tokens"),
+                },
+            }
+        })
+        .filter(|sub| sub.tokens.total() > 0)
+        .collect();
+    Some(uncounted)
 }
 
 /// Saturating add of two optional counters where `None` means "unavailable":
@@ -160,6 +231,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 cache_creation_input_tokens: usage
                     .get("cache_creation_input_tokens")
                     .and_then(serde_json::Value::as_u64),
+                sub_usage: uncounted_iterations(usage).unwrap_or_default(),
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -189,15 +261,18 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                     .unwrap_or(0),
                 cache_read_input_tokens: Some(cache),
                 cache_creation_input_tokens: written,
+                sub_usage: Vec::new(),
             })
         }
         "message_delta" => {
-            let output = value.get("usage")?.get("output_tokens")?.as_u64()?;
+            let usage = value.get("usage")?;
+            let output = usage.get("output_tokens")?.as_u64()?;
             Some(StreamUsage {
                 input_tokens: 0,
                 output_tokens: output,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                sub_usage: uncounted_iterations(usage).unwrap_or_default(),
             })
         }
         _ => None,
@@ -206,6 +281,9 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
 
 /// Anthropic message_delta counters are cumulative when present. The SDK
 /// bridge includes final input/cache totals after internal WebSearch rounds.
+/// `usage.iterations` is cumulative too (the final `message_delta` carries the
+/// updated array, advisor-tool "Streaming"), so a delta that carries one
+/// replaces the sub-usages held; one without it keeps them.
 fn observe_usage(event: &str, usage: &mut StreamUsage) {
     let data = event
         .lines()
@@ -224,6 +302,9 @@ fn observe_usage(event: &str, usage: &mut StreamUsage) {
         }
         if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
             usage.cache_creation_input_tokens = Some(n);
+        }
+        if let Some(sub_usage) = uncounted_iterations(u) {
+            usage.sub_usage = sub_usage;
         }
     } else if let Some(observed) = extract_usage(event) {
         usage.add(observed);
@@ -874,6 +955,7 @@ mod tests {
                 // No cache keys in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
             })
         );
     }
@@ -889,6 +971,7 @@ mod tests {
                 // Present in the payload → captured (explicit 0 stays Some(0)).
                 cache_read_input_tokens: Some(40000),
                 cache_creation_input_tokens: Some(0),
+                sub_usage: Vec::new(),
             })
         );
     }
@@ -902,6 +985,7 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
             })
         );
     }
@@ -935,6 +1019,7 @@ mod tests {
                 output_tokens: 10,
                 cache_read_input_tokens: Some(4_000),
                 cache_creation_input_tokens: Some(7_000),
+                sub_usage: Vec::new(),
             })
         );
         // No write field: unchanged behaviour (creation unavailable).
@@ -946,6 +1031,7 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(20),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
             })
         );
     }
@@ -958,12 +1044,14 @@ mod tests {
             output_tokens: 0,
             cache_read_input_tokens: Some(5),
             cache_creation_input_tokens: None,
+            sub_usage: Vec::new(),
         });
         total.add(StreamUsage {
             input_tokens: 0,
             output_tokens: 7,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            sub_usage: Vec::new(),
         });
         assert_eq!(
             total,
@@ -974,6 +1062,7 @@ mod tests {
                 // never reported → stays unavailable.
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
             }
         );
     }
@@ -985,6 +1074,141 @@ mod tests {
         assert_eq!(add_opt(None, Some(4)), Some(4));
         assert_eq!(add_opt(Some(3), Some(4)), Some(7));
     }
+    fn tokens(input: u64, output: u64, read: Option<u64>, write: Option<u64>) -> TokenCounts {
+        TokenCounts {
+            input,
+            output,
+            cache_read: read,
+            cache_creation: write,
+        }
+    }
+
+    /// The advisor-tool example from platform.claude.com/docs/en/agents-and-
+    /// tools/tool-use/advisor-tool ("Usage and billing", read 2026-11-11), as
+    /// the final `message_delta` that carries it on a stream.
+    const ADVISOR_DELTA: &str = r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1760,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":531,"iterations":[{"type":"message","input_tokens":412,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":89},{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":823,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1612},{"type":"message","input_tokens":1348,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":442}]}}"#;
+
+    #[test]
+    fn advisor_iteration_is_sub_usage_and_the_top_level_is_unchanged() {
+        let mut usage = StreamUsage::default();
+        observe_usage(MESSAGE_START, &mut usage);
+        observe_usage(ADVISOR_DELTA, &mut usage);
+        // Top-level executor counters exactly as before.
+        assert_eq!(usage.input_tokens, 1760);
+        assert_eq!(usage.output_tokens, 531);
+        assert_eq!(usage.cache_read_input_tokens, Some(412));
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+        // The advisor is not in them: it rides along under its own model.
+        assert_eq!(
+            usage.sub_usage,
+            vec![SubUsage {
+                model: Some("claude-opus-5-5".into()),
+                tokens: tokens(823, 1612, Some(0), Some(0)),
+            }]
+        );
+    }
+
+    #[test]
+    fn compaction_iteration_names_no_model_and_message_entries_are_covered() {
+        // build-with-claude/compaction-threshold ("Understanding usage",
+        // read 2026-11-11): top-level = the non-compaction iterations.
+        let usage = serde_json::json!({
+            "input_tokens": 23000, "output_tokens": 1000,
+            "iterations": [
+                {"type": "compaction", "input_tokens": 180000, "output_tokens": 3500},
+                {"type": "message", "input_tokens": 23000, "output_tokens": 1000},
+            ],
+        });
+        assert_eq!(
+            uncounted_iterations(&usage),
+            Some(vec![SubUsage {
+                model: None,
+                tokens: tokens(180_000, 3_500, None, None),
+            }])
+        );
+        // Every response carries `iterations` once the beta is on; without a
+        // compaction nothing is extra.
+        let plain = serde_json::json!({"iterations": [
+            {"type": "message", "input_tokens": 5, "output_tokens": 1}]});
+        assert_eq!(uncounted_iterations(&plain), Some(Vec::new()));
+        assert_eq!(
+            uncounted_iterations(&serde_json::json!({"input_tokens": 5})),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_response_books_the_declined_hop_not_the_served_attempt() {
+        // build-with-claude/refusals-and-fallback (read 2026-11-11): "The
+        // top-level usage counts describe only the attempt that produced the
+        // returned message" — the `fallback_message` entry. The declined
+        // `message` hop is billed separately at its own model's rates.
+        let usage = serde_json::json!({
+            "input_tokens": 412, "output_tokens": 264,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            "iterations": [
+                {"type": "message", "model": "claude-fable-5", "input_tokens": 535,
+                 "output_tokens": 0, "cache_read_input_tokens": 0,
+                 "cache_creation_input_tokens": 0},
+                {"type": "fallback_message", "model": "claude-opus-4-8", "input_tokens": 412,
+                 "output_tokens": 264, "cache_read_input_tokens": 0,
+                 "cache_creation_input_tokens": 0},
+            ],
+        });
+        assert_eq!(
+            uncounted_iterations(&usage),
+            Some(vec![SubUsage {
+                model: Some("claude-fable-5".into()),
+                tokens: tokens(535, 0, Some(0), Some(0)),
+            }])
+        );
+    }
+
+    #[test]
+    fn unknown_iteration_types_count_and_empty_or_untyped_entries_do_not() {
+        let usage = serde_json::json!({"iterations": [
+            {"type": "message", "input_tokens": 9, "output_tokens": 9},
+            {"type": "some_future_kind", "model": "claude-x", "input_tokens": 7, "output_tokens": 3},
+            {"type": "advisor_message", "model": "claude-y", "input_tokens": 0, "output_tokens": 0},
+            {"input_tokens": 4, "output_tokens": 4},
+        ]});
+        assert_eq!(
+            uncounted_iterations(&usage),
+            Some(vec![SubUsage {
+                model: Some("claude-x".into()),
+                tokens: tokens(7, 3, None, None),
+            }])
+        );
+    }
+
+    #[test]
+    fn iteration_snapshots_replace_each_other_and_survive_a_later_delta_without_them() {
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"iterations":[{"type":"compaction","input_tokens":100,"output_tokens":10}]}}}"#;
+        let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":20,"iterations":[{"type":"compaction","input_tokens":100,"output_tokens":10},{"type":"advisor_message","model":"claude-z","input_tokens":30,"output_tokens":3},{"type":"message","input_tokens":10,"output_tokens":20}]}}"#;
+        let late = r#"data: {"type":"message_delta","usage":{"output_tokens":21}}"#;
+        let mut usage = StreamUsage::default();
+        observe_usage(start, &mut usage);
+        assert_eq!(usage.sub_usage.len(), 1, "message_start seeds");
+        observe_usage(delta, &mut usage);
+        observe_usage(late, &mut usage);
+        assert_eq!(
+            usage.sub_usage,
+            vec![
+                SubUsage {
+                    model: None,
+                    tokens: tokens(100, 10, None, None),
+                },
+                SubUsage {
+                    model: Some("claude-z".into()),
+                    tokens: tokens(30, 3, None, None),
+                },
+            ],
+            "the cumulative array replaces the earlier one, never doubles it"
+        );
+        assert_eq!(usage.output_tokens, 21);
+    }
+
     #[test]
     fn sdk_internal_round_totals_replace_initial_usage() {
         let mut usage = StreamUsage::default();
