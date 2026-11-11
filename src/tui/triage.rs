@@ -291,9 +291,9 @@ impl AccountSort {
 ///   `dev1@…` < `devteam@…` and `codex:2@…` < `codex:backup@…`.
 ///
 /// ```text
-/// ai[    ]@ex
-/// ai[   1]@ex
-/// ai[  10]@ex
+/// ai[    ]@example.com
+/// ai[   1]@example.com
+/// ai[  10]@example.com
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NatChunk {
@@ -313,8 +313,8 @@ pub(crate) enum NatChunk {
 ///
 /// Per-character (rather than per-word) chunks are what makes the comparison
 /// land on the divergence itself, where [`NatChunk`]'s three kinds decide:
-/// separator < number < letter. Hence `ai@ex` < `ai1@ex` (empty slot
-/// first) and `dev1@ex` < `devteam@ex` / `codex:2@x` < `codex:backup@x`
+/// separator < number < letter. Hence `ai@x` < `ai1@x` (empty slot
+/// first) and `dev1@x` < `devteam@x` / `codex:2@x` < `codex:backup@x`
 /// (a number is not a letter, and does not sort as one).
 ///
 /// Digit runs that spell the same number (`ai01` vs `ai1`) tie here; callers

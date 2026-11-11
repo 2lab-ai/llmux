@@ -136,8 +136,8 @@ pub struct Config {
     /// interactive targets (switch/remove) keep real ids, same layering as
     /// `email_anonymous`. Additive
     /// (`#[serde(default = "default_domain_abbrev")]`): a config without this
-    /// field loads the built-in `{"example.com": "ex"}` map; set `{}`
-    /// explicitly to disable abbreviation.
+    /// field loads the built-in map, which is empty: no domain is abbreviated
+    /// until the operator lists one (`{"example.com": "ex"}`).
     #[serde(default = "default_domain_abbrev")]
     pub domain_abbrev: BTreeMap<String, String>,
     /// Which quantity the TUI quota gauges FILL with: `"remaining"` (default
@@ -356,8 +356,10 @@ pub enum QuotaDisplay {
 }
 
 /// Built-in domain abbreviations for the accounts table (`domain_abbrev`).
+/// Empty: the binary ships no deployment's domain; each operator lists their
+/// own in the config file.
 pub fn default_domain_abbrev() -> BTreeMap<String, String> {
-    BTreeMap::from([("example.com".to_string(), "ex".to_string())])
+    BTreeMap::new()
 }
 
 /// Remote-daemon target for the CLI client commands. All fields optional:

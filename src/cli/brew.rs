@@ -1449,7 +1449,7 @@ mod tests {
             ]
         );
         // A stray-channel Islands cask blocks `brew uninstall <stray formula>`
-        // (live-verified on team-host: "required by llmux-islands") — it must be
+        // (live-verified on a shared host: "required by llmux-islands") — it must be
         // removed first and the target-channel cask installed last.
         assert_eq!(
             consolidate_plan(Channel::Preview, Some(Channel::Stable), &[]),

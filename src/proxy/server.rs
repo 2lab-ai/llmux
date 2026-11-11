@@ -55,7 +55,7 @@ const GEMINI_REFRESH_AHEAD_MS: u64 = 2 * 600 * 1000;
 /// WHY a hard exit exists at all: hyper's graceful shutdown releases the
 /// listener immediately but then waits for EVERY in-flight connection to
 /// close, and a client that never closes its connection waits forever. On
-/// team-host (2026-09-10..21) seven such connections kept a retired daemon (pid
+/// a shared host (2026-09-10..21) seven such connections kept a retired daemon (pid
 /// 91799, started 08-27) alive for 25 days. A retired daemon is not idle: its
 /// background refresh loop kept rotating the SAME OAuth refresh-token family
 /// as its successor, so whichever daemon refreshed second got
@@ -1681,7 +1681,7 @@ pub async fn serve(
     });
     // The drain watchdog. hyper waits for every in-flight connection to close
     // and a stuck client never closes; without this the process lives on
-    // forever (team-host: 25 days) rotating its successor's refresh tokens. When
+    // forever (shared host: 25 days) rotating its successor's refresh tokens. When
     // the deadline wins, the serve future is dropped here and the function
     // falls through to the SAME tail as a clean drain: refresh settle, then
     // return, so `main` returns and the runtime shuts down — which also waits
@@ -4373,7 +4373,7 @@ mod tests {
 
     /// Shutdown must stop the background loops, not just stop accepting
     /// connections: a daemon draining a connection that never closes keeps
-    /// refreshing tokens its successor now owns (team-host 2026-09-10..21). One
+    /// refreshing tokens its successor now owns (shared host 2026-09-10..21). One
     /// `stop_all` aborts every abortable loop AND flips the refresh stop flag.
     #[tokio::test]
     async fn background_tasks_stop_all_stops_every_loop() {
