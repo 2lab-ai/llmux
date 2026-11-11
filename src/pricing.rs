@@ -30,8 +30,10 @@ use crate::tui::activity::normalize_model;
 use crate::tui::TokenCounts;
 
 /// Per-model price table entry. All four rates are **USD per 1,000,000
-/// tokens**. A zero rate means "free / not charged" (e.g. gpt-5.5 lists no
-/// cache-write rate → `cache_creation: 0.0`).
+/// tokens**. A zero rate means "free / not charged". A row whose provider
+/// has no separate cache-write charge carries its INPUT rate as
+/// `cache_creation` (written tokens are not in fresh input, so 0 would make
+/// them free).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelPrice {
     /// Fresh (non-cached) input tokens, USD / 1e6.
@@ -108,10 +110,14 @@ const MYTHOS_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
 /// not modeled. Also the unknown Mythos family fallback.
 const MYTHOS_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
-/// cache_creation 0.0}. The pricing page lists no cache-write rate for
-/// gpt-5.5 (re-read 2026-11-11; later rows do list one). Also the
+/// cache_creation 5.0}. The pricing page lists no cache-write rate for
+/// gpt-5.5 (re-read 2026-11-11; later rows do list one), and the prompt-
+/// caching guide says models before GPT-5.6 have "No additional cache-write
+/// charge" (read 2026-11-11): a written token bills as ordinary input. Fresh
+/// input excludes written tokens (`input - cached - written`), so the write
+/// rate IS the input rate — 0 would make written tokens free. Also the
 /// `group == "codex"` unknown-model fallback.
-const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 5.0);
 /// gpt-5.6-sol (flagship, 2026-07-09 launch). developers.openai.com pricing,
 /// read 2026-10-06: $4 in / $0.40 cached / $5 cache write / $20 out
 /// ("promotional pricing … at least through November 21, 2026"; the page
@@ -161,25 +167,29 @@ const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
 /// $0.50 out.
 const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
 /// grok-4.5 (docs.x.ai/developers/models, read 2026-10-23): $2 in / $6 out /
-/// $0.30 cached input below 200k prompt tokens, no cache-creation charge
-/// (corrected from the $0.50 cached carried since 2026-07-14). The ≥200k tier
+/// $0.30 cached input below 200k prompt tokens (corrected from the $0.50
+/// cached carried since 2026-07-14). xAI lists no cache-write price (re-read
+/// 2026-11-11), so a written token bills as ordinary input: the write rate is
+/// the input rate, never 0 (fresh input excludes written tokens). The ≥200k tier
 /// ($4 / $12 / $0.60) is not modeled — static single tier. Also the
 /// `group == "grok"` unknown-model fallback. Like the codex rows, an
 /// API-list-price EQUIVALENT for subscription traffic, not a billed amount
 /// (docs/grok/spec.md §Compatibility).
-const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.3, 0.0);
+const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.3, 2.0);
 /// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; the $0.50/M cached input
 /// was copied from the grok-4.5 row as it stood when this row landed, and is
 /// LISTED on grok-4.6's own page (docs.x.ai, re-read 2026-09-23) — no longer
 /// an inference. grok-4.5's own listed cached rate is $0.30 (read
 /// 2026-10-23), so the two rows now differ. API-list-price equivalent for
-/// subscription traffic, like the other grok rows.
-const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+/// subscription traffic, like the other grok rows. Write rate = input rate,
+/// as for grok-4.5.
+const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 2.0);
 /// grok-4.7 (docs.x.ai pricing, 2026-09-23): $2 in / $6 out / $0.50 cached
-/// input, no cache-creation charge — unchanged from grok-4.6. The
+/// input, no separate cache-write price (write rate = input rate, as for
+/// grok-4.5) — unchanged from grok-4.6. The
 /// ≥200k-prompt long-context tier (rates double) is not modeled.
 /// API-list-price equivalent for subscription traffic.
-const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 2.0);
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
 /// on the live `GET /api/v1/models` probe of 2026-08-21
@@ -628,23 +638,24 @@ mod tests {
     fn c14_grok_prices_and_group_fallback() {
         let overrides = std::collections::HashMap::new();
         // grok-4.5 (docs.x.ai models, read 2026-10-23): $0.30 cached below
-        // 200k, not the $0.50 that grok-4.6 / grok-4.7 list.
+        // 200k, not the $0.50 that grok-4.6 / grok-4.7 list. No separate
+        // cache-write price: writes bill at the input rate (2026-11-11).
         let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
         assert_eq!(
             (p.input, p.output, p.cache_read, p.cache_creation),
-            (2.0, 6.0, 0.3, 0.0)
+            (2.0, 6.0, 0.3, 2.0)
         );
         let p6 = price_for("grok", "grok-4.6", &overrides).expect("grok-4.6 priced");
         assert_eq!(
             (p6.input, p6.output, p6.cache_read, p6.cache_creation),
-            (2.0, 6.0, 0.5, 0.0)
+            (2.0, 6.0, 0.5, 2.0)
         );
         // grok-4.7 (docs.x.ai 2026-09-23): same rates as 4.6 — the
         // ≥200k-prompt long-context tier is deliberately not modeled.
         let p7 = price_for("grok", "grok-4.7", &overrides).expect("grok-4.7 priced");
         assert_eq!(
             (p7.input, p7.output, p7.cache_read, p7.cache_creation),
-            (2.0, 6.0, 0.5, 0.0)
+            (2.0, 6.0, 0.5, 2.0)
         );
         let f = price_for("grok", "grok-build-0.1", &overrides).expect("group fallback");
         assert_eq!(
@@ -897,15 +908,28 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_5_has_no_cache_creation_charge() {
-        // Codex never bills cache creation; even a huge count costs nothing for it.
-        let cost = cost_usd(
-            "codex",
-            "gpt-5.5",
-            &tc(0, 0, None, Some(1_000_000)),
-            &empty(),
-        );
-        approx(cost, 0.0);
+    fn cache_writes_bill_as_input_on_rows_without_a_separate_write_rate() {
+        // Fresh input excludes cache writes (input - cached - written), so a
+        // row with no separate write rate must price the written tokens at
+        // its input rate, never $0. OpenAI: models before GPT-5.6 have "No
+        // additional cache-write charge" — written tokens bill as ordinary
+        // input (prompt-caching guide, read 2026-11-11). xAI lists no
+        // cache-write price either (docs.x.ai/developers/models, same day).
+        // Usage 12000 in / 4000 cached / 7000 written, as booked:
+        let tokens = tc(1_000, 0, Some(4_000), Some(7_000));
+        for (group, model, input, cached) in [
+            ("codex", "gpt-5.5", 5.0, 0.5),
+            ("codex", "gpt-5.5-codex", 5.0, 0.5),
+            ("codex", "some-future-codex-model", 5.0, 0.5),
+            ("grok", "grok-4.5", 2.0, 0.3),
+            ("grok", "grok-4.6", 2.0, 0.5),
+            ("grok", "grok-4.7", 2.0, 0.5),
+            ("grok", "some-future-grok", 2.0, 0.3),
+        ] {
+            let want = (8_000.0 * input + 4_000.0 * cached) / 1e6;
+            let got = cost_usd(group, model, &tokens, &empty());
+            assert!((got - want).abs() < 1e-12, "{model}: {got} != {want}");
+        }
     }
 
     #[test]
