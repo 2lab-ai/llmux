@@ -1328,6 +1328,55 @@ async fn codex_account_aggregates_non_streaming_requests() {
     assert_eq!(message["usage"]["output_tokens"], 11);
 }
 
+/// A non-streaming codex request whose upstream turn FAILS still books the
+/// usage the failure reported (#278): the client gets the 502, and the codex
+/// model row keeps the tokens the upstream burned instead of recording none.
+#[tokio::test]
+async fn codex_failed_non_streaming_request_books_its_reported_usage() {
+    const FAILED_SSE: &str = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_f"}}"#,
+        "\n\n",
+        "event: response.failed\n",
+        r#"data: {"type":"response.failed","response":{"id":"resp_f","error":{"message":"boom"},"usage":{"input_tokens":40,"input_tokens_details":{"cached_tokens":30},"output_tokens":5}}}"#,
+        "\n\n",
+    );
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(FAILED_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 502);
+    response.bytes().await.unwrap();
+    let mut row = serde_json::Value::Null;
+    for _ in 0..200 {
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(found) = doc["model_usage"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|r| r["group"] == "codex" && r["errors"] == 1)
+                .cloned()
+        }) {
+            row = found;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(row["requests"], 1, "{row}");
+    assert_eq!(row["tokens_in"], 10, "fresh = 40 - 30 cached: {row}");
+    assert_eq!(row["tokens_out"], 5, "{row}");
+    assert_eq!(row["cache_read"], 30, "{row}");
+}
+
 /// Claude Code auto mode's server-side tool-use review request, as a body
 /// fragment. `stream` is spliced in so the same request drives both legs.
 fn safeguarded_request(stream: bool, safeguards: bool) -> String {
