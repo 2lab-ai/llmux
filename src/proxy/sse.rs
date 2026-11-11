@@ -32,13 +32,18 @@ pub struct StreamUsage {
     /// include, each billed at its own model's rates
     /// ([`uncounted_iterations`]). Empty for every other upstream.
     pub sub_usage: Vec<SubUsage>,
+    /// The model that produced the returned message when a FALLBACK model
+    /// served the turn ([`fallback_served_model`]): the four counters above
+    /// are that model's, so it is priced and booked under it. `None` on every
+    /// turn the requested model served.
+    pub served_model: Option<String>,
 }
 
 impl StreamUsage {
     /// Accumulate another observation (saturating). For the optional cache
     /// counters the result is present iff at least one side reported a value.
-    /// `usage.iterations` arrays are cumulative snapshots, so a non-empty
-    /// `sub_usage` REPLACES the one held, never adds to it.
+    /// `sub_usage` / `served_model` are not per-event observations (the
+    /// [`UsageObserver`] derives them once, at the end) and are left alone.
     pub fn add(&mut self, other: StreamUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
@@ -48,16 +53,95 @@ impl StreamUsage {
             self.cache_creation_input_tokens,
             other.cache_creation_input_tokens,
         );
-        if !other.sub_usage.is_empty() {
-            self.sub_usage = other.sub_usage;
-        }
     }
 }
 
+/// Refusal categories Anthropic bills even when the refusal came before any
+/// output: "a refusal that arrives before any output is billed when its
+/// `stop_details.category` is `"bio"`, `"frontier_llm"`, or
+/// `"reasoning_extraction"`" ("How refusals are billed",
+/// https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback,
+/// read 2026-11-11). A refusal that arrived mid-stream (it produced output)
+/// is billed whatever its category.
+pub const BILLED_REFUSAL_CATEGORIES: &[&str] = &["bio", "frontier_llm", "reasoning_extraction"];
+
+/// One Anthropic `fallback` content block — the hand-off from a model that
+/// declined to the one that continues:
+/// `{"type":"fallback","from":{"model":..},"to":{"model":..},"trigger":{"type":"refusal","category":..}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FallbackHop {
+    pub from_model: Option<String>,
+    pub to_model: Option<String>,
+    /// The declining model's refusal category (`None` = null / absent).
+    pub category: Option<String>,
+}
+
+impl FallbackHop {
+    /// Parse one content block; `None` unless it is a `fallback` block.
+    pub fn from_block(block: &serde_json::Value) -> Option<Self> {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("fallback") {
+            return None;
+        }
+        let text = |pointer: &str| {
+            block
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Some(Self {
+            from_model: text("/from/model"),
+            to_model: text("/to/model"),
+            category: text("/trigger/category"),
+        })
+    }
+}
+
+fn iteration_kind(it: &serde_json::Value) -> &str {
+    it.get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn iteration_model(it: &serde_json::Value) -> Option<&str> {
+    it.get("model").and_then(serde_json::Value::as_str)
+}
+
+/// The model that produced the returned message when a FALLBACK model served
+/// the turn, else `None` (the requested model served it: attribution stays).
+/// "The top-level `model` field reports the model that produced the returned
+/// message" (build-with-claude/refusals-and-fallback, read 2026-11-11). A
+/// fallback served when `usage.iterations` has a `fallback_message` entry or
+/// a `fallback` block was seen. The model is read, in order, from that entry,
+/// the last block's `to.model`, then `reported_model` (the JSON body's
+/// `model`, or the stream's `message_start` model — which names the
+/// REQUESTED model when the decline came mid-output, hence last).
+pub fn fallback_served_model(
+    usage: &serde_json::Value,
+    hops: &[FallbackHop],
+    reported_model: Option<&str>,
+) -> Option<String> {
+    let served = usage
+        .get("iterations")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|its| {
+            its.iter()
+                .rev()
+                .find(|it| iteration_kind(it) == "fallback_message")
+        });
+    if served.is_none() && hops.is_empty() {
+        return None;
+    }
+    served
+        .and_then(iteration_model)
+        .or_else(|| hops.last().and_then(|hop| hop.to_model.as_deref()))
+        .or(reported_model)
+        .map(str::to_string)
+}
+
 /// The Anthropic `usage.iterations` entries the top-level `usage` counters do
-/// NOT include, as [`SubUsage`]s. `None` when `usage` carries no
-/// `iterations` array (every non-Anthropic upstream, and requests without an
-/// iterating feature).
+/// NOT include and Anthropic bills, as [`SubUsage`]s. `None` when `usage`
+/// carries no `iterations` array (every non-Anthropic upstream, and requests
+/// without an iterating feature).
 ///
 /// Which entries the top level covers (all docs read 2026-11-11):
 /// - Normally the `message` entries — the executor. `advisor_message`
@@ -69,38 +153,95 @@ impl StreamUsage {
 /// - A response a fallback model served is the exception: "The top-level
 ///   `usage` counts describe only the attempt that produced the returned
 ///   message" — the `fallback_message` entry — while each declined attempt
-///   is a `message` entry billed at its own model's rates
-///   (build-with-claude/refusals-and-fallback). There the `message` entries
-///   are extra, except one naming the model that served the fallback.
+///   is a `message` entry at its own model's rates
+///   (build-with-claude/refusals-and-fallback). A declined attempt is billed
+///   only when it streamed output, or when its refusal category (from the
+///   `fallback` block in `hops` that names it) is in
+///   [`BILLED_REFUSAL_CATEGORIES`]. A block is paired to an attempt by
+///   model; a single unpaired attempt and a single unpaired block are paired
+///   with each other. An attempt left without a category is booked only if it
+///   produced output. A `message` entry naming the served model is that
+///   model's own work and stays covered.
 ///
 /// An entry with no `type` or with all-zero counters is skipped. The entry's
 /// `model` is kept as reported; `None` means the request's own model.
-pub fn uncounted_iterations(usage: &serde_json::Value) -> Option<Vec<SubUsage>> {
-    fn kind(it: &serde_json::Value) -> &str {
-        it.get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    }
-    fn model(it: &serde_json::Value) -> Option<&str> {
-        it.get("model").and_then(serde_json::Value::as_str)
-    }
+pub fn uncounted_iterations(
+    usage: &serde_json::Value,
+    hops: &[FallbackHop],
+) -> Option<Vec<SubUsage>> {
     let iterations = usage.get("iterations")?.as_array()?;
     let served: Vec<Option<&str>> = iterations
         .iter()
-        .filter(|it| kind(it) == "fallback_message")
-        .map(model)
+        .filter(|it| iteration_kind(it) == "fallback_message")
+        .map(iteration_model)
         .collect();
+    let declined: Vec<usize> = iterations
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| {
+            !served.is_empty()
+                && iteration_kind(it) == "message"
+                && !served.contains(&iteration_model(it))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    // Pair each declined attempt with the `fallback` block that names it.
+    let same_model = |a: &str, b: &str| {
+        crate::tui::activity::normalize_model(a)
+            .eq_ignore_ascii_case(&crate::tui::activity::normalize_model(b))
+    };
+    let mut category: std::collections::HashMap<usize, Option<&str>> =
+        std::collections::HashMap::new();
+    let mut used = vec![false; hops.len()];
+    for &index in &declined {
+        let Some(model) = iteration_model(&iterations[index]) else {
+            continue;
+        };
+        if let Some(hop) = (0..hops.len()).find(|&h| {
+            !used[h]
+                && hops[h]
+                    .from_model
+                    .as_deref()
+                    .is_some_and(|from| same_model(from, model))
+        }) {
+            used[hop] = true;
+            category.insert(index, hops[hop].category.as_deref());
+        }
+    }
+    let unpaired: Vec<usize> = declined
+        .iter()
+        .copied()
+        .filter(|index| !category.contains_key(index))
+        .collect();
+    let unused: Vec<usize> = (0..hops.len()).filter(|&h| !used[h]).collect();
+    if let ([index], [hop]) = (unpaired.as_slice(), unused.as_slice()) {
+        category.insert(*index, hops[*hop].category.as_deref());
+    }
+    let billed = |index: usize| {
+        let output = iterations[index]
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        output > 0
+            || category
+                .get(&index)
+                .copied()
+                .flatten()
+                .is_some_and(|c| BILLED_REFUSAL_CATEGORIES.contains(&c))
+    };
     let uncounted = iterations
         .iter()
-        .filter(|it| match kind(it) {
+        .enumerate()
+        .filter(|(index, it)| match iteration_kind(it) {
             "" | "fallback_message" => false,
-            "message" => !served.is_empty() && !served.contains(&model(it)),
+            "message" => declined.contains(index) && billed(*index),
             _ => true,
         })
+        .map(|(_, it)| it)
         .map(|it| {
             let count = |key: &str| it.get(key).and_then(serde_json::Value::as_u64);
             SubUsage {
-                model: model(it).map(str::to_string),
+                model: iteration_model(it).map(str::to_string),
                 tokens: TokenCounts {
                     input: count("input_tokens").unwrap_or(0),
                     output: count("output_tokens").unwrap_or(0),
@@ -231,7 +372,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 cache_creation_input_tokens: usage
                     .get("cache_creation_input_tokens")
                     .and_then(serde_json::Value::as_u64),
-                sub_usage: uncounted_iterations(usage).unwrap_or_default(),
+                sub_usage: Vec::new(),
+                served_model: None,
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -262,6 +404,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 cache_read_input_tokens: Some(cache),
                 cache_creation_input_tokens: written,
                 sub_usage: Vec::new(),
+                served_model: None,
             })
         }
         "message_delta" => {
@@ -272,42 +415,96 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 output_tokens: output,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
-                sub_usage: uncounted_iterations(usage).unwrap_or_default(),
+                sub_usage: Vec::new(),
+                served_model: None,
             })
         }
         _ => None,
     }
 }
 
-/// Anthropic message_delta counters are cumulative when present. The SDK
-/// bridge includes final input/cache totals after internal WebSearch rounds.
-/// `usage.iterations` is cumulative too (the final `message_delta` carries the
-/// updated array, advisor-tool "Streaming"), so a delta that carries one
-/// replaces the sub-usages held; one without it keeps them.
-fn observe_usage(event: &str, usage: &mut StreamUsage) {
-    let data = event
-        .lines()
-        .find_map(|line| line.strip_prefix("data:").map(str::trim));
-    let value = data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
-    if let Some(v) = value.filter(|v| v["type"] == "message_delta") {
-        let u = &v["usage"];
-        if let Some(n) = u["input_tokens"].as_u64() {
-            usage.input_tokens = n;
+/// Usage observer for one relayed Anthropic stream: folds every event, then
+/// [`Self::finish`] yields the request's [`StreamUsage`].
+///
+/// Anthropic `message_delta` counters are cumulative when present (the SDK
+/// bridge includes final input/cache totals after internal WebSearch rounds).
+/// `usage.iterations` is cumulative too (the final `message_delta` carries
+/// the updated array, advisor-tool "Streaming"), so the latest usage object
+/// carrying one is kept; `fallback` content blocks and the `message_start`
+/// model are kept to price a fallback-served turn.
+#[derive(Debug, Default)]
+pub struct UsageObserver {
+    usage: StreamUsage,
+    /// The latest `usage` object that carried `iterations`.
+    iterations: Option<serde_json::Value>,
+    hops: Vec<FallbackHop>,
+    start_model: Option<String>,
+}
+
+impl UsageObserver {
+    /// Fold one complete SSE event. Malformed events are ignored.
+    pub fn observe(&mut self, event: &str) {
+        let data = event
+            .lines()
+            .find_map(|line| line.strip_prefix("data:").map(str::trim));
+        let value = data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
+        let Some(v) = value else {
+            return;
+        };
+        match v["type"].as_str() {
+            Some("message_delta") => {
+                let u = &v["usage"];
+                if let Some(n) = u["input_tokens"].as_u64() {
+                    self.usage.input_tokens = n;
+                }
+                if let Some(n) = u["output_tokens"].as_u64() {
+                    self.usage.output_tokens = n;
+                }
+                if let Some(n) = u["cache_read_input_tokens"].as_u64() {
+                    self.usage.cache_read_input_tokens = Some(n);
+                }
+                if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
+                    self.usage.cache_creation_input_tokens = Some(n);
+                }
+                if u.get("iterations").is_some() {
+                    self.iterations = Some(u.clone());
+                }
+                return;
+            }
+            Some("message_start") => {
+                self.start_model = v
+                    .pointer("/message/model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                if let Some(u) = v
+                    .pointer("/message/usage")
+                    .filter(|u| u.get("iterations").is_some())
+                {
+                    self.iterations = Some(u.clone());
+                }
+            }
+            Some("content_block_start") => {
+                if let Some(hop) = FallbackHop::from_block(&v["content_block"]) {
+                    self.hops.push(hop);
+                }
+                return;
+            }
+            _ => {}
         }
-        if let Some(n) = u["output_tokens"].as_u64() {
-            usage.output_tokens = n;
+        if let Some(observed) = extract_usage(event) {
+            self.usage.add(observed);
         }
-        if let Some(n) = u["cache_read_input_tokens"].as_u64() {
-            usage.cache_read_input_tokens = Some(n);
-        }
-        if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
-            usage.cache_creation_input_tokens = Some(n);
-        }
-        if let Some(sub_usage) = uncounted_iterations(u) {
-            usage.sub_usage = sub_usage;
-        }
-    } else if let Some(observed) = extract_usage(event) {
-        usage.add(observed);
+    }
+
+    /// The request's usage: the counters, the sub-usages the top level leaves
+    /// out, and the served model of a fallback turn.
+    pub fn finish(self) -> StreamUsage {
+        let mut usage = self.usage;
+        let iterations = self.iterations.unwrap_or(serde_json::Value::Null);
+        usage.sub_usage = uncounted_iterations(&iterations, &self.hops).unwrap_or_default();
+        usage.served_model =
+            fallback_served_model(&iterations, &self.hops, self.start_model.as_deref());
+        usage
     }
 }
 
@@ -704,7 +901,7 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
     tokio::spawn(async move {
         let mut events = EventBuffer::new();
-        let mut usage = StreamUsage::default();
+        let mut usage = UsageObserver::default();
         let mut captured: Vec<u8> = Vec::new();
         let mut raw_captured = RawCapture::new(raw_capture_limit);
         let mut error: Option<String> = None;
@@ -757,7 +954,7 @@ where
                             terminal = true;
                         }
                         timing.on_payload(event.as_bytes());
-                        observe_usage(&event, &mut usage);
+                        usage.observe(&event);
                     }
                     // Backpressure: bounded channel; client disconnect drops
                     // the receiver and we stop polling upstream. Send FIRST,
@@ -779,7 +976,7 @@ where
         timing.on_stream_end();
         if let Some(rest) = events.take_remainder() {
             timing.on_payload(rest.as_bytes());
-            observe_usage(&rest, &mut usage);
+            usage.observe(&rest);
         }
         if native_responses && !terminal && !timing.client_gone {
             timing.saw_error_event = true;
@@ -787,7 +984,7 @@ where
                 error = Some("Responses stream ended without a terminal event".into());
             }
         }
-        finish(usage, captured, raw_captured, error, timing);
+        finish(usage.finish(), captured, raw_captured, error, timing);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
@@ -956,6 +1153,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             })
         );
     }
@@ -972,6 +1170,7 @@ mod tests {
                 cache_read_input_tokens: Some(40000),
                 cache_creation_input_tokens: Some(0),
                 sub_usage: Vec::new(),
+                served_model: None,
             })
         );
     }
@@ -986,6 +1185,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             })
         );
     }
@@ -1020,6 +1220,7 @@ mod tests {
                 cache_read_input_tokens: Some(4_000),
                 cache_creation_input_tokens: Some(7_000),
                 sub_usage: Vec::new(),
+                served_model: None,
             })
         );
         // No write field: unchanged behaviour (creation unavailable).
@@ -1032,6 +1233,7 @@ mod tests {
                 cache_read_input_tokens: Some(20),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             })
         );
     }
@@ -1045,6 +1247,7 @@ mod tests {
             cache_read_input_tokens: Some(5),
             cache_creation_input_tokens: None,
             sub_usage: Vec::new(),
+            served_model: None,
         });
         total.add(StreamUsage {
             input_tokens: 0,
@@ -1052,6 +1255,7 @@ mod tests {
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
             sub_usage: Vec::new(),
+            served_model: None,
         });
         assert_eq!(
             total,
@@ -1063,6 +1267,7 @@ mod tests {
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1091,9 +1296,10 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
     #[test]
     fn advisor_iteration_is_sub_usage_and_the_top_level_is_unchanged() {
-        let mut usage = StreamUsage::default();
-        observe_usage(MESSAGE_START, &mut usage);
-        observe_usage(ADVISOR_DELTA, &mut usage);
+        let mut observer = UsageObserver::default();
+        observer.observe(MESSAGE_START);
+        observer.observe(ADVISOR_DELTA);
+        let usage = observer.finish();
         // Top-level executor counters exactly as before.
         assert_eq!(usage.input_tokens, 1760);
         assert_eq!(usage.output_tokens, 531);
@@ -1107,6 +1313,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 tokens: tokens(823, 1612, Some(0), Some(0)),
             }]
         );
+        assert_eq!(usage.served_model, None, "no fallback served this turn");
     }
 
     #[test]
@@ -1121,7 +1328,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             ],
         });
         assert_eq!(
-            uncounted_iterations(&usage),
+            uncounted_iterations(&usage, &[]),
             Some(vec![SubUsage {
                 model: None,
                 tokens: tokens(180_000, 3_500, None, None),
@@ -1131,37 +1338,133 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         // compaction nothing is extra.
         let plain = serde_json::json!({"iterations": [
             {"type": "message", "input_tokens": 5, "output_tokens": 1}]});
-        assert_eq!(uncounted_iterations(&plain), Some(Vec::new()));
+        assert_eq!(uncounted_iterations(&plain, &[]), Some(Vec::new()));
         assert_eq!(
-            uncounted_iterations(&serde_json::json!({"input_tokens": 5})),
+            uncounted_iterations(&serde_json::json!({"input_tokens": 5}), &[]),
             None
         );
     }
 
-    #[test]
-    fn fallback_response_books_the_declined_hop_not_the_served_attempt() {
-        // build-with-claude/refusals-and-fallback (read 2026-11-11): "The
-        // top-level usage counts describe only the attempt that produced the
-        // returned message" — the `fallback_message` entry. The declined
-        // `message` hop is billed separately at its own model's rates.
-        let usage = serde_json::json!({
+    /// The doc's fallback example (refusals-and-fallback, read 2026-11-11):
+    /// `claude-fable-5` declined before any output, `claude-opus-4-8` served.
+    fn fallback_usage(declined_output: u64) -> serde_json::Value {
+        serde_json::json!({
             "input_tokens": 412, "output_tokens": 264,
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
             "iterations": [
                 {"type": "message", "model": "claude-fable-5", "input_tokens": 535,
-                 "output_tokens": 0, "cache_read_input_tokens": 0,
+                 "output_tokens": declined_output, "cache_read_input_tokens": 0,
                  "cache_creation_input_tokens": 0},
                 {"type": "fallback_message", "model": "claude-opus-4-8", "input_tokens": 412,
                  "output_tokens": 264, "cache_read_input_tokens": 0,
                  "cache_creation_input_tokens": 0},
             ],
-        });
-        assert_eq!(
-            uncounted_iterations(&usage),
+        })
+    }
+
+    fn hop(from: Option<&str>, category: Option<&str>) -> FallbackHop {
+        FallbackHop {
+            from_model: from.map(str::to_string),
+            to_model: Some("claude-opus-4-8".into()),
+            category: category.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_declined_fallback_attempt_is_booked_only_when_anthropic_bills_it() {
+        // "How refusals are billed": a refusal before any output is billed
+        // only for the bio / frontier_llm / reasoning_extraction categories;
+        // a mid-stream one (it streamed output) always. The served attempt
+        // (`fallback_message`) is the top level and never extra.
+        let declined = |output: u64| {
             Some(vec![SubUsage {
                 model: Some("claude-fable-5".into()),
-                tokens: tokens(535, 0, Some(0), Some(0)),
+                tokens: tokens(535, output, Some(0), Some(0)),
             }])
+        };
+        let pre_output = fallback_usage(0);
+        assert_eq!(
+            uncounted_iterations(&pre_output, &[hop(Some("claude-fable-5"), Some("cyber"))]),
+            Some(Vec::new()),
+            "cyber before any output is not billed"
+        );
+        assert_eq!(
+            uncounted_iterations(&pre_output, &[hop(Some("claude-fable-5"), None)]),
+            Some(Vec::new()),
+            "a null category is not billed"
+        );
+        for category in BILLED_REFUSAL_CATEGORIES {
+            assert_eq!(
+                uncounted_iterations(&pre_output, &[hop(Some("claude-fable-5"), Some(category))]),
+                declined(0),
+                "{category}"
+            );
+        }
+        // Paired by position when the one hop and the one attempt cannot be
+        // matched by model (an alias echoed in `from.model`).
+        assert_eq!(
+            uncounted_iterations(&pre_output, &[hop(Some("fable-alias"), Some("bio"))]),
+            declined(0)
+        );
+        // No category seen at all: only output decides.
+        assert_eq!(uncounted_iterations(&pre_output, &[]), Some(Vec::new()));
+        let mid_stream = fallback_usage(120);
+        assert_eq!(
+            uncounted_iterations(&mid_stream, &[hop(Some("claude-fable-5"), Some("cyber"))]),
+            declined(120),
+            "a mid-stream refusal bills its input and the output already streamed"
+        );
+        assert_eq!(uncounted_iterations(&mid_stream, &[]), declined(120));
+    }
+
+    #[test]
+    fn a_fallback_served_turn_is_booked_under_the_model_that_served_it() {
+        // "The top-level model field reports the model that produced the
+        // returned message". A mid-output decline: message_start still names
+        // the requested model, so the served one comes from the
+        // `fallback_message` entry (and the `fallback` block's `to.model`).
+        let start = r#"data: {"type":"message_start","message":{"model":"claude-fable-5","usage":{"input_tokens":535,"output_tokens":1}}}"#;
+        let block = r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}}}"#;
+        let delta = format!(
+            "data: {}",
+            serde_json::json!({"type": "message_delta", "usage": fallback_usage(120)})
+        );
+        let mut observer = UsageObserver::default();
+        for event in [start, block, delta.as_str()] {
+            observer.observe(event);
+        }
+        let usage = observer.finish();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (412, 264));
+        assert_eq!(usage.served_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            usage.sub_usage,
+            vec![SubUsage {
+                model: Some("claude-fable-5".into()),
+                tokens: tokens(535, 120, Some(0), Some(0)),
+            }]
+        );
+        // The reported model is the fallback when nothing better names it.
+        assert_eq!(
+            fallback_served_model(
+                &serde_json::json!({"iterations": [{"type": "fallback_message", "input_tokens": 1}]}),
+                &[],
+                Some("claude-opus-4-8"),
+            )
+            .as_deref(),
+            Some("claude-opus-4-8")
+        );
+        // A turn the requested model served keeps its attribution.
+        assert_eq!(
+            fallback_served_model(
+                &serde_json::json!({"iterations": [{"type": "message", "input_tokens": 1}]}),
+                &[],
+                Some("claude-fable-5"),
+            ),
+            None
+        );
+        assert_eq!(
+            fallback_served_model(&serde_json::Value::Null, &[], Some("m")),
+            None
         );
     }
 
@@ -1174,7 +1477,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             {"input_tokens": 4, "output_tokens": 4},
         ]});
         assert_eq!(
-            uncounted_iterations(&usage),
+            uncounted_iterations(&usage, &[]),
             Some(vec![SubUsage {
                 model: Some("claude-x".into()),
                 tokens: tokens(7, 3, None, None),
@@ -1187,11 +1490,14 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"iterations":[{"type":"compaction","input_tokens":100,"output_tokens":10}]}}}"#;
         let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":20,"iterations":[{"type":"compaction","input_tokens":100,"output_tokens":10},{"type":"advisor_message","model":"claude-z","input_tokens":30,"output_tokens":3},{"type":"message","input_tokens":10,"output_tokens":20}]}}"#;
         let late = r#"data: {"type":"message_delta","usage":{"output_tokens":21}}"#;
-        let mut usage = StreamUsage::default();
-        observe_usage(start, &mut usage);
-        assert_eq!(usage.sub_usage.len(), 1, "message_start seeds");
-        observe_usage(delta, &mut usage);
-        observe_usage(late, &mut usage);
+        let mut seeded = UsageObserver::default();
+        seeded.observe(start);
+        assert_eq!(seeded.finish().sub_usage.len(), 1, "message_start seeds");
+        let mut observer = UsageObserver::default();
+        for event in [start, delta, late] {
+            observer.observe(event);
+        }
+        let usage = observer.finish();
         assert_eq!(
             usage.sub_usage,
             vec![
@@ -1211,9 +1517,10 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
     #[test]
     fn sdk_internal_round_totals_replace_initial_usage() {
-        let mut usage = StreamUsage::default();
-        observe_usage(MESSAGE_START, &mut usage);
-        observe_usage("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":50,\"output_tokens\":12,\"cache_read_input_tokens\":20}}",&mut usage);
+        let mut observer = UsageObserver::default();
+        observer.observe(MESSAGE_START);
+        observer.observe("data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":50,\"output_tokens\":12,\"cache_read_input_tokens\":20}}");
+        let usage = observer.finish();
         assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 12);
         assert_eq!(usage.cache_read_input_tokens, Some(20));

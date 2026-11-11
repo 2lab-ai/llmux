@@ -682,6 +682,7 @@ impl ForwardContext {
             status,
             tokens,
             Vec::new(),
+            None,
             sse::StreamTiming::default(),
         );
     }
@@ -702,6 +703,7 @@ impl ForwardContext {
             status,
             Some(token_counts(&usage)),
             usage.sub_usage,
+            usage.served_model,
             sse::StreamTiming::default(),
         );
     }
@@ -709,6 +711,11 @@ impl ForwardContext {
     /// Emit the terminal activity event with the stream-timing landmarks the
     /// relay pump observed (perf telemetry v1): TTFB + first streamed output
     /// delta, both as millis offsets from this request's start.
+    ///
+    /// `served_model` is the model a FALLBACK served the turn on
+    /// ([`sse::StreamUsage::served_model`]): the top-level usage is that
+    /// model's, so the record names it instead of the requested one.
+    #[allow(clippy::too_many_arguments)]
     fn emit_finished_timed(
         &self,
         state: &AppState,
@@ -716,6 +723,7 @@ impl ForwardContext {
         status: StatusCode,
         tokens: Option<TokenCounts>,
         sub_usage: Vec<crate::tui::SubUsage>,
+        served_model: Option<String>,
         timing: sse::StreamTiming,
     ) {
         let FinishedMeta {
@@ -724,6 +732,7 @@ impl ForwardContext {
             effort,
             fast,
         } = self.finished_meta(state);
+        let model = served_model.or(model);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
             endpoint: self.endpoint_origin,
@@ -3886,7 +3895,9 @@ async fn relay(
                         duration: started.elapsed(),
                         tokens: Some(token_counts(&usage)),
                         group,
-                        model,
+                        // A fallback-served turn is booked under the model
+                        // that served it (its top-level usage is that one's).
+                        model: usage.served_model.clone().or(model),
                         effort,
                         fast: Some(fast),
                         ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
@@ -4650,6 +4661,7 @@ async fn relay_translate(
                 StatusCode::OK,
                 Some(token_counts(&usage)),
                 usage.sub_usage,
+                usage.served_model,
                 timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
@@ -4709,6 +4721,18 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
     let Some(usage) = value.get("usage") else {
         return sse::StreamUsage::default();
     };
+    // `fallback` content blocks name each declined attempt's refusal
+    // category; the top-level `model` is the model that produced the message.
+    let hops: Vec<sse::FallbackHop> = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(sse::FallbackHop::from_block)
+                .collect()
+        })
+        .unwrap_or_default();
     sse::StreamUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -4726,8 +4750,13 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
             .get("cache_creation_input_tokens")
             .and_then(serde_json::Value::as_u64),
         // Sub-inferences the counters above leave out (advisor, compaction,
-        // declined fallback hops), billed under their own model.
-        sub_usage: sse::uncounted_iterations(usage).unwrap_or_default(),
+        // billed declined fallback attempts), billed under their own model.
+        sub_usage: sse::uncounted_iterations(usage, &hops).unwrap_or_default(),
+        served_model: sse::fallback_served_model(
+            usage,
+            &hops,
+            value.get("model").and_then(serde_json::Value::as_str),
+        ),
     }
 }
 
@@ -4777,6 +4806,58 @@ mod tests {
                     cache_creation: Some(0),
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn json_fallback_turn_is_priced_under_the_served_model_and_books_only_billed_hops() {
+        // refusals-and-fallback (read 2026-11-11): the top-level `model` is
+        // the model that produced the message; the declined attempt is billed
+        // only for a billed category (or when it streamed output).
+        let body = |category: &str| {
+            serde_json::json!({
+                "type": "message", "model": "claude-opus-4-8",
+                "content": [
+                    {"type": "fallback", "from": {"model": "claude-fable-5"},
+                     "to": {"model": "claude-opus-4-8"},
+                     "trigger": {"type": "refusal", "category": category}},
+                    {"type": "text", "text": "Hi!"},
+                ],
+                "usage": {"input_tokens": 412, "output_tokens": 264,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                    "iterations": [
+                        {"type": "message", "model": "claude-fable-5", "input_tokens": 535,
+                         "output_tokens": 0},
+                        {"type": "fallback_message", "model": "claude-opus-4-8",
+                         "input_tokens": 412, "output_tokens": 264}]},
+            })
+            .to_string()
+        };
+        let unbilled = usage_from_json_body(body("cyber").as_bytes());
+        assert_eq!(unbilled.served_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!((unbilled.input_tokens, unbilled.output_tokens), (412, 264));
+        assert!(unbilled.sub_usage.is_empty(), "{:?}", unbilled.sub_usage);
+        let billed = usage_from_json_body(body("bio").as_bytes());
+        assert_eq!(billed.served_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            billed.sub_usage,
+            vec![crate::tui::SubUsage {
+                model: Some("claude-fable-5".into()),
+                tokens: TokenCounts {
+                    input: 535,
+                    output: 0,
+                    cache_read: None,
+                    cache_creation: None,
+                },
+            }]
+        );
+        // An ordinary response keeps its attribution.
+        assert_eq!(
+            usage_from_json_body(
+                br#"{"model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1}}"#
+            )
+            .served_model,
+            None
         );
     }
 

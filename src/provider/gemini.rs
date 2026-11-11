@@ -1621,6 +1621,7 @@ impl GeminiSseConverter {
             cache_read_input_tokens: Some(cached),
             cache_creation_input_tokens: None,
             sub_usage: Vec::new(),
+            served_model: None,
         };
     }
 
@@ -2674,6 +2675,7 @@ mod tests {
                 cache_read_input_tokens: Some(40),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
         assert_eq!(converter.events_seen(), 4);

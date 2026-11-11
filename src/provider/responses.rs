@@ -938,6 +938,7 @@ impl ResponsesSseConverter {
             cache_read_input_tokens: cached,
             cache_creation_input_tokens: cache_write,
             sub_usage: Vec::new(),
+            served_model: None,
         };
     }
 
@@ -1799,6 +1800,7 @@ mod tests {
                 cache_read_input_tokens: Some(64),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             },
             "a capped turn still bills the tokens it really burned"
         );
@@ -1821,6 +1823,7 @@ mod tests {
             cache_read_input_tokens: Some(64),
             cache_creation_input_tokens: None,
             sub_usage: Vec::new(),
+            served_model: None,
         };
         let failed = json!({"type": "response.failed", "response": {
             "error": {"message": "boom"}, "usage": usage_fixture()}});

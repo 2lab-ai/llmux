@@ -1813,6 +1813,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1853,6 +1854,7 @@ mod tests {
                 cache_read_input_tokens: Some(199_000),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1893,6 +1895,7 @@ mod tests {
                 // `cache_write_tokens` was present (0) → explicit Some(0).
                 cache_creation_input_tokens: Some(0),
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1928,6 +1931,7 @@ mod tests {
                 cache_read_input_tokens: Some(4_000),
                 cache_creation_input_tokens: Some(7_000),
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1960,6 +1964,7 @@ mod tests {
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1988,6 +1993,7 @@ mod tests {
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -2384,6 +2390,7 @@ mod tests {
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
                 sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }

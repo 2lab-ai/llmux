@@ -1968,6 +1968,69 @@ async fn advisor_iterations_are_booked_under_the_advisor_model() {
     assert_eq!(doc["totals"]["requests"], 2);
 }
 
+/// #278: a turn a FALLBACK model served is booked under that model (the
+/// top-level `model` / `fallback_message` entry), on both relays, and a
+/// declined attempt Anthropic does not bill (category `cyber`, no output)
+/// adds nothing; the requested model gets no row.
+#[tokio::test]
+async fn fallback_served_turns_are_booked_under_the_serving_model() {
+    const SSE: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":412,"output_tokens":1}}}"#,
+        "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}}}"#,
+        "\n\n",
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":412,"output_tokens":264,"iterations":[{"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,"output_tokens":264}]}}"#,
+        "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    const JSON: &str = r#"{"id":"m2","type":"message","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}},{"type":"text","text":"Hi"}],"usage":{"input_tokens":10,"output_tokens":5,"iterations":[{"type":"message","model":"claude-fable-5","input_tokens":12,"output_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":10,"output_tokens":5}]}}"#;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(SSE, 64));
+    mock.push(ScriptedResponse::ok(JSON));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let client = reqwest::Client::new();
+    for stream in [true, false] {
+        let body = format!(
+            r#"{{"model":"claude-fable-5","max_tokens":64,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let response = post_messages(&client, &proxy, &body).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+    let mut doc = serde_json::Value::Null;
+    for _ in 0..200 {
+        doc = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if doc["totals"]["requests"] == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rows: Vec<serde_json::Value> = doc["model_usage"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r["group"] == "claude")
+        .collect();
+    assert_eq!(rows.len(), 1, "only the serving model has a row: {rows:?}");
+    assert_eq!(rows[0]["model"], "claude-opus-4-8");
+    assert_eq!(rows[0]["requests"], 2);
+    assert_eq!(rows[0]["tokens_in"], 422);
+    assert_eq!(rows[0]["tokens_out"], 269);
+}
+
 /// A driven request is captured to raw-io (bodies + headers with credential
 /// values redacted) and `GET /llmux/raw-io?id=&at_ms=` serves it back — the
 /// raw request/response viewer's data path (TUI UI-7), proven end to end:
