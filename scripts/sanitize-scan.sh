@@ -33,14 +33,18 @@
 # Known leaks (scripts/sanitize-known-leaks.txt, #610): a commit that is already
 # published cannot be taken back by failing every later PR. Listed by full id —
 # and only if it is already published, so a change cannot list itself: on the
-# PR's base branch for a PR; for a push, on main as it was before the push or on
-# any other published branch or tag (a commit on deploy/dev or a release tag is
-# out, and no push to main can take it back). A listed commit's own commit object
-# is not scanned, and the matching text in the added lines of its diff is
-# tolerated in file contents wherever it persists. Nothing else is: a different hit, another
-# commit adding the same text again (a binary file and a merge's own resolution
-# included) or carrying it anywhere in its commit object, any path name, a branch
-# or tag name, an annotated tag. The list carries commit ids only, never the text.
+# PR's base branch for a PR; for a push, on main as it was before the push, or —
+# when main's list already had the entry before the push — on any other
+# published branch or tag (a commit on deploy/dev or a release tag is out, and
+# no push to main can take it back). So an entry for a commit main does not have
+# takes effect from the push after the one that adds it: one push cannot both
+# add the entry and publish the ref that justifies it. A listed commit's own
+# commit object is not scanned, and the matching text in the added lines of its
+# diff is tolerated in file contents wherever it persists. Nothing else is: a
+# different hit, another commit adding the same text again (a binary file and a
+# merge's own resolution included) or carrying it anywhere in its commit object,
+# any path name, a branch or tag name, an annotated tag. The list carries commit
+# ids only, never the text.
 set -euo pipefail
 if [ -z "${SANITIZE_PATTERNS_SHARED:-}" ]; then echo "SANITIZE_PATTERNS_SHARED env var required" >&2; exit 2; fi
 P="${SANITIZE_PATTERNS_SHARED}${SANITIZE_PATTERNS:+|$SANITIZE_PATTERNS}"
@@ -105,9 +109,8 @@ published_base() {
   fi
 }
 
-# On a push, the branch the event names (`ref` in the event file). Every other
-# branch and tag in the clone was published before this push. A run that cannot
-# name the pushed branch counts no other ref as published.
+# On a push, the branch the event names (`ref` in the event file). A run that
+# cannot name the pushed branch counts no other ref as published.
 pushed_branch() {
   local ref
   [ "${GITHUB_EVENT_NAME:-}" = push ] && [ -n "${GITHUB_EVENT_PATH:-}" ] || return 1
@@ -126,6 +129,13 @@ on_other_published_ref() { # <sha> <pushed branch>
   [ -n "$refs" ]
 }
 
+# The entries main's list had before this push, one id per line. Another branch
+# or tag only counts for these: it may have been created by this very push, but
+# an entry that was already listed was judged by an earlier run.
+listed_before() { # <before sha>
+  git show "$1:scripts/sanitize-known-leaks.txt" 2>/dev/null | awk '$1 ~ /^[0-9a-f]+$/ && length($1) == 40 { print $1 }'
+}
+
 # KNOWN: the matches in listed commits' added lines, one per line. An unreadable
 # listed commit is an error, never an empty exemption.
 KNOWN=$(mktemp "${TMPDIR:-/tmp}/sanitize-known.XXXXXX") || exit 2
@@ -136,6 +146,8 @@ list="$(git rev-parse --show-toplevel)/scripts/sanitize-known-leaks.txt"
 if [ -f "$list" ]; then
   base=$(published_base) || base=''
   pushed=$(pushed_branch) || pushed=''
+  prior=''
+  if [ -n "$pushed" ] && [ -n "$base" ]; then prior=$(listed_before "$base") || prior=''; fi
   while read -r sha _ || [ -n "${sha:-}" ]; do
     case "$sha" in '' | '#'*) continue ;; esac
     if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -147,7 +159,7 @@ if [ -f "$list" ]; then
       continue
     fi
     if { [ -z "$base" ] || ! git merge-base --is-ancestor "$sha" "$base" 2>/dev/null; } &&
-      { [ -z "$pushed" ] || ! on_other_published_ref "$sha" "$pushed"; }; then
+      { [ -z "$pushed" ] || [[ $'\n'"$prior"$'\n' != *$'\n'"$sha"$'\n'* ]] || ! on_other_published_ref "$sha" "$pushed"; }; then
       echo "sanitize-scan: known leak $sha is not on the published base — nothing exempted for it" >&2
       continue
     fi
