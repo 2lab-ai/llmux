@@ -62,6 +62,8 @@ USAGE = {
         ("cache_read", "int"), ("cache_creation", "int"),
         # Schema v2 (#278). A store a current daemon has opened has it.
         ("requests", "int"),
+        # Schema v3 (#278): extended-TTL cache writes and web searches.
+        ("cache_creation_extended", "int"), ("web_search_requests", "int"),
     ],
 }
 METRICS_EVENTS = {

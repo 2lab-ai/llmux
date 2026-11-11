@@ -157,15 +157,25 @@ pub fn export_usage_days(
             "usage.sqlite3 is in {mode} mode, export waits for WAL"
         )));
     }
-    // `requests` (#278: 0 on a sub-usage row) exists once the daemon has
-    // migrated the store; a store it never opened exports one request a row,
-    // which is what every row of that schema is.
-    let has_requests: i64 = conn.query_row(
-        "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'requests'",
-        [],
-        |r| r.get(0),
-    )?;
-    let requests = if has_requests > 0 { "requests" } else { "1" };
+    // Columns a daemon adds when it migrates the store (#278): `requests` (0
+    // on a sub-usage row, schema v2), `cache_creation_extended` and
+    // `web_search_requests` (schema v3). A store it never migrated exports
+    // what every row of that schema is: one request, no extended-TTL writes,
+    // no web searches.
+    let mut added = String::new();
+    for (column, missing) in [
+        ("requests", "1"),
+        ("cache_creation_extended", "0"),
+        ("web_search_requests", "0"),
+    ] {
+        let present: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('usage') WHERE name = ?1",
+            [column],
+            |r| r.get(0),
+        )?;
+        let value = if present > 0 { column } else { missing };
+        added.push_str(&format!(", '{column}', {value}"));
+    }
     let first: Option<i64> = conn.query_row("SELECT min(ts_ms) FROM usage", [], |r| r.get(0))?;
     let Some(first) = first else {
         return Ok(Vec::new());
@@ -182,7 +192,7 @@ pub fn export_usage_days(
             return Err(StoreError::Busy("shutdown".into()));
         }
         let (lo, hi) = bracket(n);
-        match export_day(&conn, &dir, &day, lo, hi, requests, stop) {
+        match export_day(&conn, &dir, &day, lo, hi, &added, stop) {
             Ok(Some((generation, rows))) => written.push((day, generation, rows)),
             Ok(None) => {}
             Err(err @ StoreError::Busy(_)) => return Err(err),
@@ -223,8 +233,10 @@ pub fn export_usage_days(
 /// Version of the exported line shape. Part of every fingerprint, so a day a
 /// binary of another format exported (an older one, after a downgrade) never
 /// matches and is exported again in this format. 2 (#278): lines carry
-/// `requests`. Format 1 fingerprints had no version prefix.
-const EXPORT_FORMAT: u32 = 2;
+/// `requests`. 3 (#278, key-usage schema v3): lines also carry
+/// `cache_creation_extended` and `web_search_requests`. Format 1
+/// fingerprints had no version prefix.
+const EXPORT_FORMAT: u32 = 3;
 
 /// `v<format>:count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the
 /// sum far from i64 overflow.
@@ -233,15 +245,16 @@ fn fingerprint(count: i64, sum_off: i64, max_ts: i64) -> String {
 }
 
 /// Export one local day if its rows changed. `Ok(Some((generation, rows)))`
-/// = a new file was published. `requests` is the SQL for a row's request
-/// count (the column, or `1` on a store without it).
+/// = a new file was published. `added` is the `json_object` tail of the
+/// columns added after v1 (each the column, or its default on a store
+/// without it).
 fn export_day(
     conn: &Connection,
     dir: &Path,
     day: &str,
     lo: i64,
     hi: i64,
-    requests: &str,
+    added: &str,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<(u32, u64)>, StoreError> {
     let (count, sum_off, max_ts): (i64, i64, i64) = conn.query_row(
@@ -262,7 +275,7 @@ fn export_day(
     {
         return Ok(None);
     }
-    let (lines, read_fp) = read_day(conn, lo, hi, day, requests, stop)?;
+    let (lines, read_fp) = read_day(conn, lo, hi, day, added, stop)?;
     if lines.is_empty() {
         return Ok(None);
     }
@@ -279,7 +292,7 @@ fn read_day(
     lo: i64,
     hi: i64,
     day: &str,
-    requests: &str,
+    added: &str,
     stop: &dyn Fn() -> bool,
 ) -> Result<(Vec<String>, String), StoreError> {
     let mut stmt = conn.prepare(&format!(
@@ -287,8 +300,7 @@ fn read_day(
                 json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
                             'grp', grp, 'model', model, 'status', status,
                             'tokens_in', tokens_in, 'tokens_out', tokens_out,
-                            'cache_read', cache_read, 'cache_creation', cache_creation,
-                            'requests', {requests})
+                            'cache_read', cache_read, 'cache_creation', cache_creation{added})
            FROM usage WHERE {DAY_FILTER} ORDER BY ts_ms, event_key"
     ))?;
     let mut rows = stmt.query(rusqlite::params![lo, hi, day])?;
@@ -585,6 +597,117 @@ mod tests {
         assert!(export_usage_days(&db, &today, NEVER)
             .expect("again")
             .is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Key-usage schema v3 changed the line shape again: a day a v2-format
+    /// binary exported (lines with `requests` but without the extended-TTL
+    /// writes and web searches, fingerprint `v2:…`) is exported again in the
+    /// current format, then stays put.
+    #[test]
+    fn a_format_2_export_is_regenerated_with_the_v3_columns() {
+        let (dir, db) = db_with(&[("a", T0), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        Connection::open(&db)
+            .expect("open")
+            .execute(
+                "UPDATE usage SET cache_creation = 9, cache_creation_extended = 6,
+                   web_search_requests = 2 WHERE event_key = 'a'",
+                [],
+            )
+            .expect("split");
+        // What a format-2 binary publishes for these rows.
+        let (lo, hi) = bracket(local_day_number(T0 as i64));
+        let conn = Connection::open(&db).expect("open");
+        let line: String = conn
+            .query_row(
+                &format!(
+                    "SELECT json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
+                            'grp', grp, 'model', model, 'status', status,
+                            'tokens_in', tokens_in, 'tokens_out', tokens_out,
+                            'cache_read', cache_read, 'cache_creation', cache_creation,
+                            'requests', requests)
+                       FROM usage WHERE {DAY_FILTER}"
+                ),
+                rusqlite::params![lo, hi, day0],
+                |r| r.get(0),
+            )
+            .expect("format-2 line");
+        let (count, sum_off, max_ts): (i64, i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*), coalesce(sum(ts_ms - ?1), 0), coalesce(max(ts_ms), 0)
+                       FROM usage WHERE {DAY_FILTER}"
+                ),
+                rusqlite::params![lo, hi, day0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("fingerprint");
+        let ad = archive_dir_for(&db);
+        fs::create_dir_all(&ad).expect("archive dir");
+        publish_day(
+            &ad,
+            &day0,
+            0,
+            None,
+            &[line],
+            format!("v2:{count}:{sum_off}:{max_ts}"),
+            NEVER,
+        )
+        .expect("format-2 publish")
+        .expect("published");
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("upgrade export"),
+            vec![(day0.clone(), 1, 1)],
+            "the format-2 day is exported again"
+        );
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.1.jsonl.zst")));
+        assert_eq!(lines[0]["cache_creation_extended"], 6, "{lines:?}");
+        assert_eq!(lines[0]["web_search_requests"], 2);
+        assert!(export_usage_days(&db, &today, NEVER)
+            .expect("again")
+            .is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #278 schema v3: the extended-TTL write subset and the web-search
+    /// count are exported per row; a store without the columns exports 0.
+    #[test]
+    fn the_export_carries_the_extended_writes_and_web_searches() {
+        let (dir, db) = db_with(&[("a", T0), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        export_usage_days(&db, &today, NEVER).expect("old schema exports");
+        let ad = archive_dir_for(&db);
+        let old = archived_lines(&ad.join(format!("usage-{day0}.jsonl.zst")));
+        assert_eq!(
+            (
+                &old[0]["cache_creation_extended"],
+                &old[0]["web_search_requests"]
+            ),
+            (&serde_json::json!(0), &serde_json::json!(0)),
+            "{old:?}"
+        );
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        Connection::open(&db)
+            .expect("open")
+            .execute(
+                "INSERT INTO usage (event_key, ts_ms, tenant, grp, model, status, cache_creation,
+                   cache_creation_extended, web_search_requests)
+                 VALUES ('b', ?1, 't', 'claude', 'claude-opus-5-5', 200, 9, 6, 2)",
+                [T0 as i64],
+            )
+            .expect("v3 row");
+        export_usage_days(&db, &today, NEVER).expect("export");
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.1.jsonl.zst")));
+        let b = lines
+            .iter()
+            .find(|l| l["event_key"] == "b")
+            .unwrap_or_else(|| panic!("no b in {lines:?}"));
+        assert_eq!(b["cache_creation_extended"], 6);
+        assert_eq!(b["web_search_requests"], 2);
         let _ = fs::remove_dir_all(dir);
     }
 
