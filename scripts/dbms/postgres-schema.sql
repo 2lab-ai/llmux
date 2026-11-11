@@ -44,8 +44,13 @@ CREATE TABLE IF NOT EXISTS usage (
     tokens_in      bigint  NOT NULL DEFAULT 0,
     tokens_out     bigint  NOT NULL DEFAULT 0,
     cache_read     bigint  NOT NULL DEFAULT 0,
-    cache_creation bigint  NOT NULL DEFAULT 0
+    cache_creation bigint  NOT NULL DEFAULT 0,
+    -- 1 = a finished request, 0 = a sub-usage row (tokens billed under
+    -- another model, e.g. an advisor call; schema v2, #278).
+    requests       bigint  NOT NULL DEFAULT 1
 );
+-- A table created before schema v2: every existing row is one request.
+ALTER TABLE usage ADD COLUMN IF NOT EXISTS requests bigint NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage (ts_ms);
 CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage (model, ts_ms);
 

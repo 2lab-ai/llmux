@@ -9347,6 +9347,33 @@ fn e2e_tps(tokens: Option<&TokenCounts>, duration: Duration) -> Option<f64> {
     Some(output as f64 / secs)
 }
 
+/// A finished request's per-request TOTALS (#278): every token it spent —
+/// its own top-level counters plus its sub-usages (advisor / compaction /
+/// billed fallback attempt) — and its API-equivalent cost with each
+/// sub-usage at its own model's rates, from the built-in rate table (the
+/// render path holds no config overrides). The cost is `None` unless
+/// `(group, model)` is known.
+fn request_totals(
+    tokens: &TokenCounts,
+    sub_usage: &[crate::tui::SubUsage],
+    group: Option<&str>,
+    model: Option<&str>,
+) -> (u64, Option<f64>) {
+    let total = tokens
+        .total()
+        .saturating_add(crate::tui::SubUsage::total(sub_usage));
+    let cost = group.zip(model).map(|(group, model)| {
+        crate::pricing::request_cost_usd(
+            group,
+            model,
+            tokens,
+            sub_usage,
+            &std::collections::HashMap::new(),
+        )
+    });
+    (total, cost)
+}
+
 /// Collapsed-row cell for the throughput column: `45t/s` / `7.2t/s`, `—`
 /// when not a throughput sample.
 fn row_tps_label(tokens: Option<&TokenCounts>, duration: Duration) -> String {
@@ -9413,6 +9440,7 @@ impl RowMetrics {
                 group,
                 model,
                 effort,
+                sub_usage,
                 ..
             } = &entry.body
             else {
@@ -9422,17 +9450,13 @@ impl RowMetrics {
             m.meta_w = m.meta_w.max(cells::width(&meta));
             m.dur_w = m.dur_w.max(format::elapsed_secs(*duration).len());
             if let Some(tokens) = tokens {
+                let (total, cost) =
+                    request_totals(tokens, sub_usage, group.as_deref(), model.as_deref());
                 m.tok_w = m
                     .tok_w
-                    .max(format!("{}tok", format::human_count(tokens.total())).len());
+                    .max(format!("{}tok", format::human_count(total)).len());
                 m.tps_w = m.tps_w.max(row_tps_label(Some(tokens), *duration).len());
-                if let (Some(group), Some(model)) = (group, model) {
-                    let cost = crate::pricing::cost_usd(
-                        group,
-                        model,
-                        tokens,
-                        &std::collections::HashMap::new(),
-                    );
+                if let Some(cost) = cost {
                     m.cost_w = m.cost_w.max(format_cost(cost).len());
                 }
             }
@@ -9899,6 +9923,7 @@ fn completed_line(
             excerpt,
             tenant: _,
             client_name,
+            sub_usage,
         } => {
             // Row layout (Z 2026-07-15): every column padded to the frame's
             // max width so rows line up, and the input excerpt LAST, spending
@@ -9929,23 +9954,14 @@ fn completed_line(
             let _ = (method, path);
             let (tok, cost, cost_usd) = match tokens {
                 Some(tokens) => {
-                    let tok = format!("{}tok", format::human_count(tokens.total()));
-                    // API-equivalent cost via the built-in default rate table
-                    // (the render path holds no config overrides). Priced only
-                    // when (group, model) is known.
-                    let (cost, cost_usd) = match (group, model) {
-                        (Some(group), Some(model)) => {
-                            let usd = crate::pricing::cost_usd(
-                                group,
-                                model,
-                                tokens,
-                                &std::collections::HashMap::new(),
-                            );
-                            (format_cost(usd), Some(usd))
-                        }
-                        _ => ("—".to_string(), None),
-                    };
-                    (tok, cost, cost_usd)
+                    // Per-request totals: the request's own tokens and cost
+                    // plus its sub-usages (#278), built-in rate table.
+                    // Priced only when (group, model) is known.
+                    let (total, usd) =
+                        request_totals(tokens, sub_usage, group.as_deref(), model.as_deref());
+                    let tok = format!("{}tok", format::human_count(total));
+                    let cost = usd.map(format_cost).unwrap_or_else(|| "—".to_string());
+                    (tok, cost, usd)
                 }
                 None => ("—".to_string(), "—".to_string(), None),
             };
@@ -10071,6 +10087,7 @@ fn completed_detail_lines(
         excerpt,
         tenant,
         client_name,
+        sub_usage,
     } = &entry.body
     else {
         return Vec::new();
@@ -10203,6 +10220,9 @@ fn completed_detail_lines(
     }
     match tokens {
         Some(t) => {
+            // The request's own columns; `total` adds its sub-usages (#278),
+            // each listed below with its own model, tokens and cost.
+            let (total, _) = request_totals(t, sub_usage, group.as_deref(), model.as_deref());
             lines.push(indent(
                 "tokens",
                 format!(
@@ -10211,12 +10231,13 @@ fn completed_detail_lines(
                     format::human_count(t.output),
                     opt_count(t.cache_read),
                     opt_count(t.cache_creation),
-                    format::human_count(t.total()),
+                    format::human_count(total),
                 ),
             ));
             // Per-component + total API-equivalent cost (item #4). Empty
             // overrides = built-in default rate table. Each component is priced
-            // in isolation via `cost_from_parts`, so the four add up to total.
+            // in isolation via `cost_from_parts`, and each sub-usage (#278) at
+            // its own model's rates, so the parts add up to the total.
             let empty = std::collections::HashMap::new();
             let (g, m) = (
                 group.as_deref().unwrap_or(""),
@@ -10227,11 +10248,33 @@ fn completed_detail_lines(
             let cost_cr = crate::pricing::cost_from_parts(g, m, 0, 0, t.cache_read, None, &empty);
             let cost_cc =
                 crate::pricing::cost_from_parts(g, m, 0, 0, None, t.cache_creation, &empty);
-            let cost_total = cost_in + cost_out + cost_cr + cost_cc;
+            let mut cost_sub = 0.0;
+            for sub in sub_usage {
+                let sub_model = sub.model.as_deref().unwrap_or(m);
+                let usd = crate::pricing::cost_usd(g, sub_model, &sub.tokens, &empty);
+                cost_sub += usd;
+                lines.push(indent(
+                    "sub",
+                    format!(
+                        "{sub_model} · in {} · out {} · cache_read {} · cache_creation {} · {}",
+                        format::human_count(sub.tokens.input),
+                        format::human_count(sub.tokens.output),
+                        opt_count(sub.tokens.cache_read),
+                        opt_count(sub.tokens.cache_creation),
+                        format_cost(usd),
+                    ),
+                ));
+            }
+            let cost_total = cost_in + cost_out + cost_cr + cost_cc + cost_sub;
+            let sub_part = if sub_usage.is_empty() {
+                String::new()
+            } else {
+                format!("sub {} · ", format_cost(cost_sub))
+            };
             lines.push(Line::from(vec![
                 Span::styled("       cost    ", dim()),
                 Span::raw(format!(
-                    "in {} · out {} · cache_read {} · cache_creation {} · ",
+                    "in {} · out {} · cache_read {} · cache_creation {} · {sub_part}",
                     format_cost(cost_in),
                     format_cost(cost_out),
                     format_cost(cost_cr),
@@ -12525,6 +12568,7 @@ mod tests {
             endpoints: Vec::new(),
             // Old-daemon default: tests exercise the local pricing fallback.
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         }
     }
 
@@ -17333,6 +17377,7 @@ mod tests {
                 excerpt: Some("hello world".into()),
                 tenant: Some("k-t1".into()),
                 client_name: Some(client_name.into()),
+                sub_usage: Vec::new(),
             },
         }];
         view
@@ -17432,6 +17477,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         };
         let labels = BTreeMap::new();
@@ -17808,6 +17854,7 @@ mod tests {
                 excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
@@ -17904,6 +17951,81 @@ mod tests {
         assert_eq!(model_total(&m), 21_000);
     }
 
+    /// #278: the collapsed row's token total and `$` cell and the detail's
+    /// totals include the request's sub-usages; the top-level token columns
+    /// and the model stay the request's own.
+    #[test]
+    fn a_request_row_totals_include_its_sub_usage() {
+        let mut entry =
+            completed_request(1_000, Some("claude"), Some("claude-opus-5-5"), 100, 50, 200);
+        let advisor = crate::tui::SubUsage {
+            model: Some("claude-fable-5-1".into()),
+            tokens: crate::tui::TokenCounts {
+                input: 800,
+                output: 1_600,
+                ..Default::default()
+            },
+        };
+        if let CompletedBody::Request { sub_usage, .. } = &mut entry.body {
+            *sub_usage = vec![advisor.clone()];
+        }
+        let none = std::collections::HashMap::new();
+        let executor = crate::tui::TokenCounts {
+            input: 100,
+            output: 50,
+            ..Default::default()
+        };
+        let cost = crate::pricing::cost_usd("claude", "claude-opus-5-5", &executor, &none)
+            + crate::pricing::cost_usd("claude", "claude-fable-5-1", &advisor.tokens, &none);
+        let m = RowMetrics::measure(160, UNIX_EPOCH, &[], &[&entry]);
+        let row: String = completed_line(
+            &entry,
+            false,
+            false,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &m,
+            0,
+            true,
+            GradientCfg::default(),
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+        let total = format::human_count(150 + 2_400);
+        assert!(
+            row.contains(&format!("{total}tok")),
+            "150 + 2400 tokens: {row}"
+        );
+        assert!(
+            row.contains(&format_cost(cost)),
+            "{row} lacks {}",
+            format_cost(cost)
+        );
+        let detail: Vec<String> = completed_detail_lines(&entry, false, &Default::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let tokens = detail
+            .iter()
+            .find(|l| l.contains("tokens"))
+            .expect("tokens line");
+        assert!(tokens.contains("in 100 · out 50"), "{tokens}");
+        assert!(tokens.contains(&format!("total {total}")), "{tokens}");
+        assert!(
+            detail
+                .iter()
+                .any(|l| l.contains("claude-fable-5-1") && l.contains("in 800")),
+            "a line names the sub-usage: {detail:?}"
+        );
+        let cost_line = detail
+            .iter()
+            .find(|l| l.contains("cost"))
+            .expect("cost line");
+        assert!(cost_line.ends_with(&format_cost(cost)), "{cost_line}");
+    }
+
     fn completed_request(
         at_ms: u64,
         group: Option<&str>,
@@ -17940,6 +18062,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         }
     }
@@ -20957,6 +21080,7 @@ mod tests {
             efforts: Vec::new(),
             endpoints: Vec::new(),
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         }]);
         view.email_anonymous = true;
         view.snapshot.accounts = vec![AccountSnapshot {
@@ -21036,6 +21160,7 @@ mod tests {
                     excerpt: None,
                     tenant: None,
                     client_name: None,
+                    sub_usage: Vec::new(),
                 },
             },
             Completed {

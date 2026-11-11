@@ -20,7 +20,9 @@
 //! against their model pages (see the rows). Fable 5.2 from
 //! https://platform.claude.com/docs/en/about-claude/pricing and
 //! gpt-6.1-terra from https://developers.openai.com/api/docs/models/gpt-6.1-terra
-//! (and the pricing page), both read 2026-11-10.
+//! (and the pricing page), both read 2026-11-10. Mythos 5.2 / 5.1 / 5 rows and
+//! the gpt-5.6-terra / gpt-5.6-luna cache-write rates read 2026-11-11 (see
+//! the rows).
 
 use std::collections::HashMap;
 
@@ -28,8 +30,10 @@ use crate::tui::activity::normalize_model;
 use crate::tui::TokenCounts;
 
 /// Per-model price table entry. All four rates are **USD per 1,000,000
-/// tokens**. A zero rate means "free / not charged" (e.g. codex has no
-/// cache-creation charge → `cache_creation: 0.0`).
+/// tokens**. A zero rate means "free / not charged". A row whose provider
+/// has no separate cache-write charge carries its INPUT rate as
+/// `cache_creation` (written tokens are not in fresh input, so 0 would make
+/// them free).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelPrice {
     /// Fresh (non-cached) input tokens, USD / 1e6.
@@ -92,10 +96,28 @@ const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
 /// modeled; there is no long-context tier. CHEAPER than Fable 5 / 5.1, so it
 /// must NOT fall to the `claude-fable-` prefix fallback.
 const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0);
+/// Mythos 5.2 (limited availability): $8 in / $40 out / $0.20 cache read /
+/// $10 cache write (5m), https://platform.claude.com/docs/en/about-claude/pricing,
+/// read 2026-11-11. 1h writes ($16) are not modeled. Before this row the id
+/// fell to the claude group fallback (opus tier).
+const MYTHOS_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0);
+/// Mythos 5.1 (limited availability): $10 in / $50 out / $0.25 cache read /
+/// $12.50 cache write (5m), same page, read 2026-11-11. 1h writes ($20) are
+/// not modeled.
+const MYTHOS_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5);
+/// Mythos 5 (limited availability): $10 in / $50 out / $1 cache read /
+/// $12.50 cache write (5m), same page, read 2026-11-11. 1h writes ($20) are
+/// not modeled. Also the unknown Mythos family fallback.
+const MYTHOS_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
-/// cache_creation 0.0}. Codex has no cache-creation charge. Also the
+/// cache_creation 5.0}. The pricing page lists no cache-write rate for
+/// gpt-5.5 (re-read 2026-11-11; later rows do list one), and the prompt-
+/// caching guide says models before GPT-5.6 have "No additional cache-write
+/// charge" (read 2026-11-11): a written token bills as ordinary input. Fresh
+/// input excludes written tokens (`input - cached - written`), so the write
+/// rate IS the input rate — 0 would make written tokens free. Also the
 /// `group == "codex"` unknown-model fallback.
-const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
+const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 5.0);
 /// gpt-5.6-sol (flagship, 2026-07-09 launch). developers.openai.com pricing,
 /// read 2026-10-06: $4 in / $0.40 cached / $5 cache write / $20 out
 /// ("promotional pricing … at least through November 21, 2026"; the page
@@ -106,14 +128,19 @@ const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 /// the rows re-read on 2026-10-06.
 const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.40, 5.0);
 /// gpt-5.6-terra (mid tier). developers.openai.com/api/docs/models/gpt-5.6-terra,
-/// read 2026-10-23: $2 in / $0.20 cached / $12 out; no cache-write rate is
-/// listed, so that rate stays 0. Corrected from the launch-era (2026-07-10)
-/// $2.50 / $0.25 / $15 row.
-const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.2, 0.0);
+/// read 2026-10-23: $2 in / $0.20 cached / $12 out. Corrected from the
+/// launch-era (2026-07-10) $2.50 / $0.25 / $15 row. Cache write $2.50: the
+/// 30m write column of https://developers.openai.com/api/docs/pricing and the
+/// model page's "1.25x the uncached input token rate", both read 2026-11-11
+/// (was 0). The 12h write rate ($5) is not modeled.
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.2, 2.5);
 /// gpt-5.6-luna (budget tier). developers.openai.com model page, read
-/// 2026-10-06: $0.20 in / $0.02 cached / $1.20 out; no cache-write rate is
-/// listed for it, so that rate stays 0. Corrected from the launch-era $1/$6.
-const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.20, 1.20, 0.02, 0.0);
+/// 2026-10-06: $0.20 in / $0.02 cached / $1.20 out. Corrected from the
+/// launch-era $1/$6. Cache write $0.25: the 30m write column of
+/// https://developers.openai.com/api/docs/pricing and
+/// https://developers.openai.com/api/docs/models/gpt-5.6-luna (1.25x input),
+/// both read 2026-11-11 (was 0). The 12h write rate ($0.50) is not modeled.
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.20, 1.20, 0.02, 0.25);
 /// gpt-6-astra (generation-6 flagship, released 2026-09-03). OpenAI pricing
 /// page, read 2026-10-06 (standard tier, ≤272k input): $10 in / $1 cached /
 /// $12.50 cache write / $50 out. The >272k long-context tier (rates double)
@@ -140,25 +167,29 @@ const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5);
 /// $0.50 out.
 const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125);
 /// grok-4.5 (docs.x.ai/developers/models, read 2026-10-23): $2 in / $6 out /
-/// $0.30 cached input below 200k prompt tokens, no cache-creation charge
-/// (corrected from the $0.50 cached carried since 2026-07-14). The ≥200k tier
+/// $0.30 cached input below 200k prompt tokens (corrected from the $0.50
+/// cached carried since 2026-07-14). xAI lists no cache-write price (re-read
+/// 2026-11-11), so a written token bills as ordinary input: the write rate is
+/// the input rate, never 0 (fresh input excludes written tokens). The ≥200k tier
 /// ($4 / $12 / $0.60) is not modeled — static single tier. Also the
 /// `group == "grok"` unknown-model fallback. Like the codex rows, an
 /// API-list-price EQUIVALENT for subscription traffic, not a billed amount
 /// (docs/grok/spec.md §Compatibility).
-const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.3, 0.0);
+const GROK_4_5: ModelPrice = ModelPrice::new(2.0, 6.0, 0.3, 2.0);
 /// grok-4.6 (docs.x.ai, 2026-08-13): $2 in / $6 out; the $0.50/M cached input
 /// was copied from the grok-4.5 row as it stood when this row landed, and is
 /// LISTED on grok-4.6's own page (docs.x.ai, re-read 2026-09-23) — no longer
 /// an inference. grok-4.5's own listed cached rate is $0.30 (read
 /// 2026-10-23), so the two rows now differ. API-list-price equivalent for
-/// subscription traffic, like the other grok rows.
-const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+/// subscription traffic, like the other grok rows. Write rate = input rate,
+/// as for grok-4.5.
+const GROK_4_6: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 2.0);
 /// grok-4.7 (docs.x.ai pricing, 2026-09-23): $2 in / $6 out / $0.50 cached
-/// input, no cache-creation charge — unchanged from grok-4.6. The
+/// input, no separate cache-write price (write rate = input rate, as for
+/// grok-4.5) — unchanged from grok-4.6. The
 /// ≥200k-prompt long-context tier (rates double) is not modeled.
 /// API-list-price equivalent for subscription traffic.
-const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 0.0);
+const GROK_4_7: ModelPrice = ModelPrice::new(2.0, 6.0, 0.5, 2.0);
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
 /// on the live `GET /api/v1/models` probe of 2026-08-21
@@ -203,6 +234,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-fable-5-2" => Some(FABLE_5_2),
         "claude-fable-5-1" => Some(FABLE_5_1),
         "claude-fable-5" => Some(FABLE_TIER),
+        "claude-mythos-5-2" => Some(MYTHOS_5_2),
+        "claude-mythos-5-1" => Some(MYTHOS_5_1),
+        "claude-mythos-5" => Some(MYTHOS_5),
         "gpt-5.5" => Some(GPT_5_5),
         "gpt-5.6" | "gpt-5.6-sol" => Some(GPT_5_6_SOL),
         "gpt-5.6-terra" => Some(GPT_5_6_TERRA),
@@ -275,6 +309,13 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(FABLE_5_1)
     } else if model_norm_lower.starts_with("claude-fable-") {
         Some(FABLE_TIER)
+    } else if model_norm_lower.starts_with("claude-mythos-5-2-") {
+        // Same version boundary and ordering as the Fable rows above.
+        Some(MYTHOS_5_2)
+    } else if model_norm_lower.starts_with("claude-mythos-5-1-") {
+        Some(MYTHOS_5_1)
+    } else if model_norm_lower.starts_with("claude-mythos-") {
+        Some(MYTHOS_5)
     } else if model_norm_lower.starts_with("gpt-5.5-") {
         // Generation boundary: bare `gpt-5.5` matched exactly above; the
         // prefix branch requires the `-` so `gpt-5.50-*` never takes 5.5
@@ -394,6 +435,30 @@ pub fn cost_usd(
         tokens.cache_creation,
         overrides,
     )
+}
+
+/// API-equivalent USD cost of ONE finished request: its top-level `tokens`
+/// at `(group, model)` rates plus each sub-usage (#278: advisor, compaction,
+/// billed fallback attempt) at its own model's rates (`None` → `model`). The
+/// figure every per-request view shows, so per-request costs add up to the
+/// per-model aggregates that book the same sub-usages under their models.
+pub fn request_cost_usd(
+    group: &str,
+    model: &str,
+    tokens: &TokenCounts,
+    sub_usage: &[crate::tui::SubUsage],
+    overrides: &HashMap<String, ModelPrice>,
+) -> f64 {
+    sub_usage
+        .iter()
+        .fold(cost_usd(group, model, tokens, overrides), |sum, sub| {
+            sum + cost_usd(
+                group,
+                sub.model.as_deref().unwrap_or(model),
+                &sub.tokens,
+                overrides,
+            )
+        })
 }
 
 /// Same as [`cost_usd`] but from the accumulated row fields the dashboard
@@ -573,23 +638,24 @@ mod tests {
     fn c14_grok_prices_and_group_fallback() {
         let overrides = std::collections::HashMap::new();
         // grok-4.5 (docs.x.ai models, read 2026-10-23): $0.30 cached below
-        // 200k, not the $0.50 that grok-4.6 / grok-4.7 list.
+        // 200k, not the $0.50 that grok-4.6 / grok-4.7 list. No separate
+        // cache-write price: writes bill at the input rate (2026-11-11).
         let p = price_for("grok", "grok-4.5", &overrides).expect("grok-4.5 priced");
         assert_eq!(
             (p.input, p.output, p.cache_read, p.cache_creation),
-            (2.0, 6.0, 0.3, 0.0)
+            (2.0, 6.0, 0.3, 2.0)
         );
         let p6 = price_for("grok", "grok-4.6", &overrides).expect("grok-4.6 priced");
         assert_eq!(
             (p6.input, p6.output, p6.cache_read, p6.cache_creation),
-            (2.0, 6.0, 0.5, 0.0)
+            (2.0, 6.0, 0.5, 2.0)
         );
         // grok-4.7 (docs.x.ai 2026-09-23): same rates as 4.6 — the
         // ≥200k-prompt long-context tier is deliberately not modeled.
         let p7 = price_for("grok", "grok-4.7", &overrides).expect("grok-4.7 priced");
         assert_eq!(
             (p7.input, p7.output, p7.cache_read, p7.cache_creation),
-            (2.0, 6.0, 0.5, 0.0)
+            (2.0, 6.0, 0.5, 2.0)
         );
         let f = price_for("grok", "grok-build-0.1", &overrides).expect("group fallback");
         assert_eq!(
@@ -842,15 +908,28 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_5_has_no_cache_creation_charge() {
-        // Codex never bills cache creation; even a huge count costs nothing for it.
-        let cost = cost_usd(
-            "codex",
-            "gpt-5.5",
-            &tc(0, 0, None, Some(1_000_000)),
-            &empty(),
-        );
-        approx(cost, 0.0);
+    fn cache_writes_bill_as_input_on_rows_without_a_separate_write_rate() {
+        // Fresh input excludes cache writes (input - cached - written), so a
+        // row with no separate write rate must price the written tokens at
+        // its input rate, never $0. OpenAI: models before GPT-5.6 have "No
+        // additional cache-write charge" — written tokens bill as ordinary
+        // input (prompt-caching guide, read 2026-11-11). xAI lists no
+        // cache-write price either (docs.x.ai/developers/models, same day).
+        // Usage 12000 in / 4000 cached / 7000 written, as booked:
+        let tokens = tc(1_000, 0, Some(4_000), Some(7_000));
+        for (group, model, input, cached) in [
+            ("codex", "gpt-5.5", 5.0, 0.5),
+            ("codex", "gpt-5.5-codex", 5.0, 0.5),
+            ("codex", "some-future-codex-model", 5.0, 0.5),
+            ("grok", "grok-4.5", 2.0, 0.3),
+            ("grok", "grok-4.6", 2.0, 0.5),
+            ("grok", "grok-4.7", 2.0, 0.5),
+            ("grok", "some-future-grok", 2.0, 0.3),
+        ] {
+            let want = (8_000.0 * input + 4_000.0 * cached) / 1e6;
+            let got = cost_usd(group, model, &tokens, &empty());
+            assert!((got - want).abs() < 1e-12, "{model}: {got} != {want}");
+        }
     }
 
     #[test]
@@ -927,16 +1006,14 @@ mod tests {
         );
         // Model page, read 2026-10-23: $2 in / $0.20 cached / $12 out.
         approx(terra, 2.0);
-        let terra = price_for("codex", "gpt-5.6-terra", &empty()).expect("terra priced");
-        assert_eq!(
-            (
-                terra.input,
-                terra.output,
-                terra.cache_read,
-                terra.cache_creation
-            ),
-            (2.0, 12.0, 0.2, 0.0)
-        );
+        // Pricing page, read 2026-11-11: the 30m write column is $2.50 for
+        // terra and $0.25 for luna (1.25x input, as the model pages state).
+        let rates = |model: &str| {
+            let p = price_for("codex", model, &empty()).expect("priced");
+            (p.input, p.output, p.cache_read, p.cache_creation)
+        };
+        assert_eq!(rates("gpt-5.6-terra"), (2.0, 12.0, 0.2, 2.5));
+        assert_eq!(rates("gpt-5.6-luna"), (0.20, 1.20, 0.02, 0.25));
         let luna = cost_usd(
             "codex",
             "gpt-5.6-luna",
@@ -944,6 +1021,15 @@ mod tests {
             &empty(),
         );
         approx(luna, 1.20);
+        approx(
+            cost_usd(
+                "codex",
+                "gpt-5.6-terra",
+                &tc(0, 0, None, Some(1_000_000)),
+                &empty(),
+            ),
+            2.5,
+        );
     }
 
     #[test]
@@ -1121,6 +1207,40 @@ mod tests {
         // Fable 5.1 keeps its own row, exact and dated.
         assert_eq!(builtin_price("claude-fable-5-1"), Some(FABLE_5_1));
         assert_eq!(builtin_price("claude-fable-5-1-20260901"), Some(FABLE_5_1));
+    }
+
+    #[test]
+    fn mythos_rows_take_their_own_rates_not_the_opus_fallback() {
+        // Pricing page, read 2026-11-11: Mythos 5.2 $8 / $40 / $0.20 / $10,
+        // Mythos 5.1 $10 / $50 / $0.25 / $12.50, Mythos 5 $10 / $50 / $1 /
+        // $12.50 (input / output / cache read / 5m cache write).
+        for (model, want) in [
+            ("claude-mythos-5-2", ModelPrice::new(8.0, 40.0, 0.20, 10.0)),
+            (
+                "claude-mythos-5-2[1m]",
+                ModelPrice::new(8.0, 40.0, 0.20, 10.0),
+            ),
+            (
+                "claude-mythos-5-2-20261109",
+                ModelPrice::new(8.0, 40.0, 0.20, 10.0),
+            ),
+            ("claude-mythos-5-1", ModelPrice::new(10.0, 50.0, 0.25, 12.5)),
+            (
+                "claude-mythos-5-1-20260901",
+                ModelPrice::new(10.0, 50.0, 0.25, 12.5),
+            ),
+            ("claude-mythos-5", ModelPrice::new(10.0, 50.0, 1.0, 12.5)),
+            (
+                "claude-mythos-5[1m]",
+                ModelPrice::new(10.0, 50.0, 1.0, 12.5),
+            ),
+        ] {
+            assert_eq!(price_for("claude", model, &empty()), Some(want), "{model}");
+        }
+        // Version boundary, as for Fable: `claude-mythos-5-20` is not 5.2.
+        let mythos_5 = Some(ModelPrice::new(10.0, 50.0, 1.0, 12.5));
+        assert_eq!(builtin_price("claude-mythos-5-20"), mythos_5);
+        assert_eq!(builtin_price("claude-mythos-5-2x"), mythos_5);
     }
 
     #[test]

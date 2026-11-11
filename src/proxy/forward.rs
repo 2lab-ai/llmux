@@ -676,18 +676,54 @@ impl ForwardContext {
         status: StatusCode,
         tokens: Option<TokenCounts>,
     ) {
-        self.emit_finished_timed(state, account, status, tokens, sse::StreamTiming::default());
+        self.emit_finished_timed(
+            state,
+            account,
+            status,
+            tokens,
+            Vec::new(),
+            None,
+            sse::StreamTiming::default(),
+        );
+    }
+
+    /// [`Self::emit_finished`] for a relay that observed upstream usage: the
+    /// top-level counters plus the sub-inferences they leave out
+    /// ([`sse::StreamUsage::sub_usage`]).
+    fn emit_finished_usage(
+        &self,
+        state: &AppState,
+        account: Option<&AccountId>,
+        status: StatusCode,
+        usage: sse::StreamUsage,
+    ) {
+        self.emit_finished_timed(
+            state,
+            account,
+            status,
+            Some(token_counts(&usage)),
+            usage.sub_usage,
+            usage.served_model,
+            sse::StreamTiming::default(),
+        );
     }
 
     /// Emit the terminal activity event with the stream-timing landmarks the
     /// relay pump observed (perf telemetry v1): TTFB + first streamed output
     /// delta, both as millis offsets from this request's start.
+    ///
+    /// `served_model` is the model a FALLBACK served the turn on
+    /// ([`sse::StreamUsage::served_model`]): the top-level usage is that
+    /// model's, so the record names it instead of the requested one.
+    #[allow(clippy::too_many_arguments)]
     fn emit_finished_timed(
         &self,
         state: &AppState,
         account: Option<&AccountId>,
         status: StatusCode,
         tokens: Option<TokenCounts>,
+        sub_usage: Vec<crate::tui::SubUsage>,
+        served_model: Option<String>,
         timing: sse::StreamTiming,
     ) {
         let FinishedMeta {
@@ -696,6 +732,7 @@ impl ForwardContext {
             effort,
             fast,
         } = self.finished_meta(state);
+        let model = served_model.or(model);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
             endpoint: self.endpoint_origin,
@@ -723,6 +760,7 @@ impl ForwardContext {
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
+            sub_usage,
         });
     }
 
@@ -774,6 +812,7 @@ impl ForwardContext {
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
+            sub_usage: Vec::new(),
         });
         if self.endpoint_origin == crate::tui::Endpoint::OpenAi {
             return super::responses::error(StatusCode::BAD_REQUEST, &message);
@@ -1376,6 +1415,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 kind: None,
                 excerpt: None,
                 tenant,
+                sub_usage: Vec::new(),
             });
             return error_response(status, error_type, &message);
         }
@@ -1402,6 +1442,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             kind: None,
             excerpt: None,
             tenant: tenant.clone(),
+            sub_usage: Vec::new(),
         });
         super::responses::error(status, detail)
     };
@@ -3800,7 +3841,7 @@ async fn relay(
                     false,
                     timing.saw_error_event,
                 );
-                totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                totals.record_usage(&account, &usage);
                 // Best-effort: write the raw record from the FULL raw-io tee
                 // (whatever was captured, even on a mid-stream disconnect/error).
                 // `raw_captured` carries the bounded prefix + the total streamed
@@ -3852,9 +3893,11 @@ async fn relay(
                         account: Some(account.0.clone()),
                         status: status.as_u16(),
                         duration: started.elapsed(),
-                        tokens: Some(token_counts(usage)),
+                        tokens: Some(token_counts(&usage)),
                         group,
-                        model,
+                        // A fallback-served turn is booked under the model
+                        // that served it (its top-level usage is that one's).
+                        model: usage.served_model.clone().or(model),
                         effort,
                         fast: Some(fast),
                         ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
@@ -3867,6 +3910,7 @@ async fn relay(
                         kind,
                         excerpt,
                         tenant,
+                        sub_usage: usage.sub_usage,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -3887,9 +3931,7 @@ async fn relay(
             }
         };
         let usage = usage_from_json_body(&bytes);
-        state
-            .totals
-            .record(&account, 1, usage.input_tokens, usage.output_tokens);
+        state.totals.record_usage(&account, &usage);
         ctx.log(format!(
             "=== RESPONSE BODY ({} bytes) ===\n{}",
             bytes.len(),
@@ -3917,7 +3959,7 @@ async fn relay(
             Some(&headers),
             upstream_raw,
         );
-        ctx.emit_finished(state, Some(&account), status, Some(token_counts(usage)));
+        ctx.emit_finished_usage(state, Some(&account), status, usage);
         drop(lease);
         axum::body::Body::from(bytes)
     };
@@ -4372,7 +4414,7 @@ async fn relay_translate(
                     converter.error_message().is_some(),
                     timing.saw_error_event,
                 );
-                totals.record(&account, 1, usage.input_tokens, usage.output_tokens);
+                totals.record_usage(&account, &usage);
                 // Raw-io capture: request + the FULL emitted-SSE tee (best-effort;
                 // on a client disconnect we still record whatever was delivered).
                 // `raw_captured` carries the bounded prefix + the total emitted
@@ -4443,7 +4485,7 @@ async fn relay_translate(
                         account: Some(account.0.clone()),
                         status: StatusCode::OK.as_u16(),
                         duration: started.elapsed(),
-                        tokens: Some(token_counts(usage)),
+                        tokens: Some(token_counts(&usage)),
                         group,
                         model,
                         effort,
@@ -4456,6 +4498,7 @@ async fn relay_translate(
                         kind,
                         excerpt,
                         tenant,
+                        sub_usage: usage.sub_usage,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -4539,9 +4582,7 @@ async fn relay_translate(
     }
     let _ = converter.on_end();
     let usage = converter.usage();
-    state
-        .totals
-        .record(&account, 1, usage.input_tokens, usage.output_tokens);
+    state.totals.record_usage(&account, &usage);
     // Capture converter-level trace detail BEFORE into_message_json consumes it.
     let trace_raw_usage = converter.raw_usage().cloned();
     let trace_events_seen = converter.events_seen();
@@ -4556,7 +4597,7 @@ async fn relay_translate(
                         state,
                         Some(&account),
                         StatusCode::BAD_GATEWAY,
-                        Some(token_counts(usage)),
+                        Some(token_counts(&usage)),
                     );
                     return error_response(StatusCode::BAD_GATEWAY, "api_error", detail);
                 }
@@ -4614,7 +4655,9 @@ async fn relay_translate(
                 state,
                 Some(&account),
                 StatusCode::OK,
-                Some(token_counts(usage)),
+                Some(token_counts(&usage)),
+                usage.sub_usage,
+                usage.served_model,
                 timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
@@ -4626,7 +4669,15 @@ async fn relay_translate(
                 error_message.unwrap_or_else(|| "codex upstream produced no response".into());
             ctx.log(format!("=== ERROR ===\n{message}"));
             trace.write_error(&message, trace_events_seen, trace_duration_ms);
-            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+            // A failed or cut-short turn still burned the tokens its terminal
+            // event reported (the converter folded them; `raw_usage` says
+            // whether there were any) — book them like the streamed leg does.
+            ctx.emit_finished(
+                state,
+                Some(&account),
+                StatusCode::BAD_GATEWAY,
+                trace_raw_usage.is_some().then(|| token_counts(&usage)),
+            );
             error_response(StatusCode::BAD_GATEWAY, "api_error", &message)
         }
     };
@@ -4666,6 +4717,18 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
     let Some(usage) = value.get("usage") else {
         return sse::StreamUsage::default();
     };
+    // `fallback` content blocks name each declined attempt's refusal
+    // category; the top-level `model` is the model that produced the message.
+    let hops: Vec<sse::FallbackHop> = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(sse::FallbackHop::from_block)
+                .collect()
+        })
+        .unwrap_or_default();
     sse::StreamUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -4682,12 +4745,20 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
         cache_creation_input_tokens: usage
             .get("cache_creation_input_tokens")
             .and_then(serde_json::Value::as_u64),
+        // Sub-inferences the counters above leave out (advisor, compaction,
+        // billed declined fallback attempts), billed under their own model.
+        sub_usage: sse::uncounted_iterations(usage, &hops).unwrap_or_default(),
+        served_model: sse::fallback_served_model(
+            usage,
+            &hops,
+            value.get("model").and_then(serde_json::Value::as_str),
+        ),
     }
 }
 
 /// Map observed stream usage into the activity-event token counts, carrying the
 /// optional cache counters through to the model-usage rows.
-fn token_counts(usage: sse::StreamUsage) -> TokenCounts {
+fn token_counts(usage: &sse::StreamUsage) -> TokenCounts {
     TokenCounts {
         input: usage.input_tokens,
         output: usage.output_tokens,
@@ -4706,6 +4777,85 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    #[test]
+    fn json_body_usage_keeps_the_top_level_and_carries_the_advisor_iteration() {
+        let body = br#"{"type":"message","usage":{"input_tokens":1760,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":531,"iterations":[{"type":"message","input_tokens":412,"output_tokens":89},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":823,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1612},{"type":"message","input_tokens":1348,"cache_read_input_tokens":412,"output_tokens":442}]}}"#;
+        let usage = usage_from_json_body(body);
+        assert_eq!(
+            token_counts(&usage),
+            TokenCounts {
+                input: 1760,
+                output: 531,
+                cache_read: Some(412),
+                cache_creation: Some(0),
+            }
+        );
+        assert_eq!(
+            usage.sub_usage,
+            vec![crate::tui::SubUsage {
+                model: Some("claude-fable-5-1".into()),
+                tokens: TokenCounts {
+                    input: 823,
+                    output: 1612,
+                    cache_read: Some(0),
+                    cache_creation: Some(0),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn json_fallback_turn_is_priced_under_the_served_model_and_books_only_billed_hops() {
+        // refusals-and-fallback (read 2026-11-11): the top-level `model` is
+        // the model that produced the message; the declined attempt is billed
+        // only for a billed category (or when it streamed output).
+        let body = |category: &str| {
+            serde_json::json!({
+                "type": "message", "model": "claude-opus-4-8",
+                "content": [
+                    {"type": "fallback", "from": {"model": "claude-fable-5"},
+                     "to": {"model": "claude-opus-4-8"},
+                     "trigger": {"type": "refusal", "category": category}},
+                    {"type": "text", "text": "Hi!"},
+                ],
+                "usage": {"input_tokens": 412, "output_tokens": 264,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                    "iterations": [
+                        {"type": "message", "model": "claude-fable-5", "input_tokens": 535,
+                         "output_tokens": 0},
+                        {"type": "fallback_message", "model": "claude-opus-4-8",
+                         "input_tokens": 412, "output_tokens": 264}]},
+            })
+            .to_string()
+        };
+        let unbilled = usage_from_json_body(body("cyber").as_bytes());
+        assert_eq!(unbilled.served_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!((unbilled.input_tokens, unbilled.output_tokens), (412, 264));
+        assert!(unbilled.sub_usage.is_empty(), "{:?}", unbilled.sub_usage);
+        let billed = usage_from_json_body(body("bio").as_bytes());
+        assert_eq!(billed.served_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            billed.sub_usage,
+            vec![crate::tui::SubUsage {
+                model: Some("claude-fable-5".into()),
+                tokens: TokenCounts {
+                    input: 535,
+                    output: 0,
+                    cache_read: None,
+                    cache_creation: None,
+                },
+            }]
+        );
+        // An ordinary response keeps its attribution.
+        assert_eq!(
+            usage_from_json_body(
+                br#"{"model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":1}}"#
+            )
+            .served_model,
+            None
+        );
+    }
 
     /// The refresh-death message must carry the upstream reason, and must call
     /// out the one reason that is NOT "your login expired": a token the

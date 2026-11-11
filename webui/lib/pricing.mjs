@@ -59,10 +59,15 @@ export function solveRates(usageStats) {
   return out;
 }
 
-/** Average cost per request per model — the fallback when a model's rates cannot be solved. */
+/** Average cost per request per model — the fallback when a model's rates cannot be solved. A row's
+ *  `sub_cost_usd` (#278: advisor / compaction / billed fallback work other requests ran on this
+ *  model) is not any of its requests' cost, so it is left out of the average. */
 export function avgPerRequest(modelUsage) {
   const m = new Map();
-  for (const u of modelUsage || []) if (u.requests && u.cost_usd) m.set(u.model, u.cost_usd / u.requests);
+  for (const u of modelUsage || []) {
+    const own = (u.cost_usd || 0) - (u.sub_cost_usd || 0);
+    if (u.requests && own > 0) m.set(u.model, own / u.requests);
+  }
   return m;
 }
 
@@ -73,8 +78,25 @@ export function priceTokens(model, t, rates, avg) {
   return (avg && avg.get(model)) || 0;
 }
 
-/** Cost of one activity row: the daemon's own number when it has one, else priced from tokens. */
+/** Cost of one activity row: the daemon's own number when it has one (it already includes the
+ *  row's sub-usages), else priced from tokens — the request's own at its model's rates plus each
+ *  sub-usage (#278: advisor / compaction / billed fallback attempt) at its own model's rates. A
+ *  sub-usage on a model with no solved rate adds nothing (a per-request average would overcount). */
 export function priceRow(row, rates, avg) {
   if (row.cost_usd != null) return row.cost_usd;
-  return priceTokens(row.model, row.tokens, rates, avg);
+  return (row.sub_usage || []).reduce((sum, s) => {
+    const model = s.model || row.model;
+    return sum + (rates && rates.get(model) ? priceTokens(model, s.tokens, rates, null) : 0);
+  }, priceTokens(row.model, row.tokens, rates, avg));
+}
+
+/** One row's token classes with its sub-usages added — what a per-request or per-session TOTAL
+ *  token figure counts. The row's own `tokens` (its top-level columns) stay as they are. */
+export function rowTokens(row) {
+  const out = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  for (const t of [row.tokens, ...(row.sub_usage || []).map(s => s.tokens)]) {
+    if (!t) continue;
+    for (const k of Object.keys(out)) out[k] += t[k] || 0;
+  }
+  return out;
 }

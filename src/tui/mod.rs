@@ -39,7 +39,7 @@ pub(crate) mod triage;
 mod ui;
 pub(crate) mod view;
 
-pub use event::{ActivityEvent, Endpoint, TokenCounts};
+pub use event::{ActivityEvent, Endpoint, SubUsage, TokenCounts};
 
 /// Bound for the proxy→dashboard activity channel (`try_send` +
 /// drop-on-full on the sender side, so a stalled dashboard never
@@ -10883,6 +10883,7 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
+                sub_usage: Vec::new(),
             },
         };
         let first = req(7);
@@ -11109,6 +11110,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         };
         let note = |secs: u64| activity::Completed {
@@ -11223,6 +11225,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         };
         let mut app = remote_app();
@@ -11326,6 +11329,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                sub_usage: Vec::new(),
             },
         };
         let top_key =
@@ -11387,6 +11391,7 @@ mod tests {
             efforts: Vec::new(),
             endpoints: Vec::new(),
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         }];
         v
     }

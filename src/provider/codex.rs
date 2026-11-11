@@ -1812,6 +1812,8 @@ mod tests {
                 // No cached_tokens key in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1851,6 +1853,8 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: Some(199_000),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1890,6 +1894,44 @@ mod tests {
                 cache_read_input_tokens: Some(100_864),
                 // `cache_write_tokens` was present (0) → explicit Some(0).
                 cache_creation_input_tokens: Some(0),
+                sub_usage: Vec::new(),
+                served_model: None,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_writes_are_a_subset_of_input_not_fresh_input() {
+        // OpenAI prompt caching (developers.openai.com/api/docs/guides/
+        // prompt-caching, read 2026-11-11): `cached_tokens` and
+        // `cache_write_tokens` are disjoint parts of `input_tokens`, so the
+        // ordinary input is `input - cached - write` (12000 - 4000 - 7000).
+        // Counting the writes as fresh input too would bill them twice.
+        let (converter, events) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "role": "assistant"}}),
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 12_000,
+                "input_tokens_details": {"cached_tokens": 4_000, "cache_write_tokens": 7_000},
+                "output_tokens": 10
+            }}}),
+        ]);
+        let (_, message_delta) = events.iter().find(|(t, _)| t == "message_delta").unwrap();
+        assert_eq!(message_delta["usage"]["input_tokens"], 1_000);
+        assert_eq!(message_delta["usage"]["cache_read_input_tokens"], 4_000);
+        assert_eq!(message_delta["usage"]["cache_creation_input_tokens"], 7_000);
+        assert_eq!(
+            converter.usage(),
+            StreamUsage {
+                input_tokens: 1_000,
+                output_tokens: 10,
+                cache_read_input_tokens: Some(4_000),
+                cache_creation_input_tokens: Some(7_000),
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1921,6 +1963,8 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -1948,6 +1992,8 @@ mod tests {
                 output_tokens: 9,
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
@@ -2343,6 +2389,8 @@ mod tests {
                 // so cache-read is an explicit Some(0), not unavailable.
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
     }
