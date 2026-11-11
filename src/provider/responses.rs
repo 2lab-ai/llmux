@@ -937,6 +937,7 @@ impl ResponsesSseConverter {
                 .unwrap_or(0),
             cache_read_input_tokens: cached,
             cache_creation_input_tokens: cache_write,
+            sub_usage: Vec::new(),
         };
     }
 
@@ -1488,7 +1489,7 @@ impl SseTransform for ResponsesSseConverter {
     }
 
     fn usage(&self) -> StreamUsage {
-        self.usage
+        self.usage.clone()
     }
 }
 
@@ -1797,6 +1798,7 @@ mod tests {
                 output_tokens: 302,
                 cache_read_input_tokens: Some(64),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
             },
             "a capped turn still bills the tokens it really burned"
         );
@@ -1818,6 +1820,7 @@ mod tests {
             output_tokens: 302,
             cache_read_input_tokens: Some(64),
             cache_creation_input_tokens: None,
+            sub_usage: Vec::new(),
         };
         let failed = json!({"type": "response.failed", "response": {
             "error": {"message": "boom"}, "usage": usage_fixture()}});
@@ -1845,7 +1848,7 @@ mod tests {
                 converter.error_message().is_some(),
                 "{label}: still an error"
             );
-            assert_eq!(converter.usage(), fixture, "{label}");
+            assert_eq!(converter.usage(), fixture.clone(), "{label}");
             assert_eq!(
                 converter.raw_usage(),
                 Some(&usage_fixture()),

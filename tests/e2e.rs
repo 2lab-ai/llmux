@@ -1897,6 +1897,77 @@ async fn get_dashboard(proxy: &Proxy, api_key: Option<&str>) -> reqwest::Respons
     request.send().await.expect("dashboard reachable")
 }
 
+/// #278: an Anthropic advisor sub-inference (`usage.iterations`, type
+/// `advisor_message`) is not in the top-level usage. It is booked under the
+/// advisor's own model on both relays (stream and JSON) without counting as
+/// a request, and the executor's row keeps exactly the top-level numbers.
+#[tokio::test]
+async fn advisor_iterations_are_booked_under_the_advisor_model() {
+    const SSE: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":412,"output_tokens":1}}}"#,
+        "\n\n",
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1760,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":531,"iterations":[{"type":"message","input_tokens":412,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":89},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":823,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1612},{"type":"message","input_tokens":1348,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":442}]}}"#,
+        "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    const JSON: &str = r#"{"id":"m2","type":"message","usage":{"input_tokens":10,"output_tokens":5,"iterations":[{"type":"message","input_tokens":10,"output_tokens":5},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":100,"output_tokens":20}]}}"#;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(SSE, 64));
+    mock.push(ScriptedResponse::ok(JSON));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let client = reqwest::Client::new();
+    for stream in [true, false] {
+        let body = format!(
+            r#"{{"model":"claude-opus-5-5","max_tokens":64,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let response = post_messages(&client, &proxy, &body).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+    let mut doc = serde_json::Value::Null;
+    for _ in 0..200 {
+        doc = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if doc["totals"]["requests"] == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let row = |model: &str| {
+        doc["model_usage"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|r| r["group"] == "claude" && r["model"] == model)
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no {model} row in {doc}"))
+    };
+    let opus = row("claude-opus-5-5");
+    assert_eq!(opus["requests"], 2, "{opus}");
+    assert_eq!(opus["tokens_in"], 1770, "top-level only: {opus}");
+    assert_eq!(opus["tokens_out"], 536, "{opus}");
+    let fable = row("claude-fable-5-1");
+    assert_eq!(
+        fable["requests"], 0,
+        "a sub-usage is not a request: {fable}"
+    );
+    assert_eq!(fable["tokens_in"], 923, "{fable}");
+    assert_eq!(fable["tokens_out"], 1632, "{fable}");
+    assert!(
+        fable["cost_usd"].as_f64().unwrap_or(0.0) > 0.0,
+        "priced at the advisor's rates: {fable}"
+    );
+    assert_eq!(doc["totals"]["requests"], 2);
+}
+
 /// A driven request is captured to raw-io (bodies + headers with credential
 /// values redacted) and `GET /llmux/raw-io?id=&at_ms=` serves it back — the
 /// raw request/response viewer's data path (TUI UI-7), proven end to end:

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::event::{ActivityEvent, TokenCounts};
+use super::event::{ActivityEvent, SubUsage, TokenCounts};
 
 /// Completed-entry ring capacity (matches teamclaude's 200-line log).
 pub(crate) const LOG_CAPACITY: usize = 200;
@@ -269,9 +269,12 @@ pub(crate) struct UsageCell {
 }
 
 impl UsageCell {
-    /// Fold one finished request into the cell.
-    fn add(&mut self, tokens: Option<TokenCounts>) {
-        self.requests = self.requests.saturating_add(1);
+    /// Fold one finished request (`request = true`) or one of its
+    /// sub-usages (`false` — tokens only, never a request) into the cell.
+    fn add(&mut self, request: bool, tokens: Option<TokenCounts>) {
+        if request {
+            self.requests = self.requests.saturating_add(1);
+        }
         if let Some(t) = tokens {
             self.input = self.input.saturating_add(t.input);
             self.output = self.output.saturating_add(t.output);
@@ -726,14 +729,16 @@ impl WindowedBuckets {
         }
     }
 
-    /// Fold one finished, attributed request into the current bucket.
+    /// Fold one finished, attributed request (`request = Some(status)`) or
+    /// one of its sub-usages (`None` — tokens only, never a request) into
+    /// the current bucket.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         group: &str,
         model: &str,
         account: &str,
-        status: u16,
+        request: Option<u16>,
         tokens: Option<TokenCounts>,
         now: SystemTime,
     ) {
@@ -758,11 +763,13 @@ impl WindowedBuckets {
             account.to_string(),
         );
         let entry = bucket.counts.entry(key).or_default();
-        entry.requests = entry.requests.saturating_add(1);
-        if status < 400 {
-            entry.ok = entry.ok.saturating_add(1);
-        } else {
-            entry.errors = entry.errors.saturating_add(1);
+        if let Some(status) = request {
+            entry.requests = entry.requests.saturating_add(1);
+            if status < 400 {
+                entry.ok = entry.ok.saturating_add(1);
+            } else {
+                entry.errors = entry.errors.saturating_add(1);
+            }
         }
         if let Some(t) = tokens {
             entry.tokens_in = entry.tokens_in.saturating_add(t.input);
@@ -940,6 +947,12 @@ pub(crate) struct PersistedRequest {
     /// pre-tenant history can never inflate a live bucket.
     #[serde(default)]
     pub tenant: Option<String>,
+    /// Sub-inferences billed under their own model (`usage.iterations`
+    /// advisor / compaction / declined fallback hops, #278). Additive:
+    /// omitted when empty, so ordinary lines are byte-identical to before
+    /// and pre-field lines load as "none".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_usage: Vec<SubUsage>,
 }
 
 impl PersistedRequest {
@@ -968,6 +981,7 @@ impl PersistedRequest {
             kind,
             excerpt,
             tenant,
+            sub_usage,
         } = event
         else {
             return None;
@@ -999,6 +1013,7 @@ impl PersistedRequest {
             kind: kind.clone(),
             excerpt: excerpt.clone(),
             tenant: tenant.clone(),
+            sub_usage: sub_usage.clone(),
         })
     }
 
@@ -1027,6 +1042,7 @@ impl PersistedRequest {
             kind: self.kind,
             excerpt: self.excerpt,
             tenant: self.tenant,
+            sub_usage: self.sub_usage,
         };
         (event, ts)
     }
@@ -1492,7 +1508,33 @@ impl ActivityLog {
             .collect()
     }
 
-    /// Fold one attributed finished request into the Usage-tab calendar
+    /// Fold one attributed token count into its Tokens-per-Day chart cell
+    /// (UI-3 U14), keyed by the RAW model like the chart always was.
+    fn record_daily(&mut self, group: &str, model: &str, t: TokenCounts, now: SystemTime) {
+        let day = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        let cell = self
+            .daily
+            .entry(day)
+            .or_default()
+            .entry((group.to_string(), model.to_string()))
+            .or_default();
+        cell.input = cell.input.saturating_add(t.input);
+        cell.output = cell.output.saturating_add(t.output);
+        cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+        cell.cache_creation = cell
+            .cache_creation
+            .saturating_add(t.cache_creation.unwrap_or(0));
+        // Keep exactly DAILY_RETAIN_DAYS buckets including today (cutoff
+        // inclusive — the -1 avoids a 91-day window, review R1 nice-to-have 2).
+        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
+        self.daily.retain(|d, _| *d >= cutoff);
+    }
+
+    /// Fold one attributed finished request (`request = true`) or one of its
+    /// sub-usages (`false`: tokens only) into the Usage-tab calendar
     /// buckets (usage-stats). `now` is the event fold time — the startup
     /// replay passes each record's PERSISTED timestamp, so history lands on
     /// its real hour/day/month. Day/month keys use the LOCAL civil calendar
@@ -1502,6 +1544,7 @@ impl ActivityLog {
         &mut self,
         group: &str,
         model: &str,
+        request: bool,
         tokens: Option<TokenCounts>,
         now: SystemTime,
     ) {
@@ -1545,7 +1588,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(tokens);
+                .add(request, tokens);
         }
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
 
@@ -1560,7 +1603,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(tokens);
+                .add(request, tokens);
         }
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
 
@@ -1571,7 +1614,7 @@ impl ActivityLog {
             .or_default()
             .entry(key)
             .or_default()
-            .add(tokens);
+            .add(request, tokens);
     }
 
     /// Pin a fixed UTC offset for usage day/month bucketing (tests only —
@@ -1711,14 +1754,16 @@ impl ActivityLog {
         sum
     }
 
-    /// Fold one attributed completed request into its `(group, model)` row.
+    /// Fold one attributed completed request (`request = Some(status)`) into
+    /// its `(group, model)` row — or one of its sub-usages (`None`): tokens
+    /// and last use only, never a request, effort or endpoint count.
     #[allow(clippy::too_many_arguments)]
     fn record_model(
         &mut self,
         group: &str,
         model: &str,
         account: &Option<String>,
-        status: u16,
+        request: Option<u16>,
         tokens: Option<TokenCounts>,
         effort: &Option<String>,
         path: &str,
@@ -1728,11 +1773,16 @@ impl ActivityLog {
             .models
             .entry((group.to_string(), normalize_model(model)))
             .or_default();
-        entry.requests += 1;
-        if status < 400 {
-            entry.ok += 1;
-        } else {
-            entry.errors += 1;
+        if let Some(status) = request {
+            entry.requests += 1;
+            if status < 400 {
+                entry.ok += 1;
+            } else {
+                entry.errors += 1;
+            }
+            let effort_label = effort.clone().unwrap_or_else(|| "none".to_string());
+            *entry.efforts.entry(effort_label).or_default() += 1;
+            *entry.endpoints.entry(endpoint_class(path)).or_default() += 1;
         }
         if let Some(t) = tokens {
             entry.tokens_in = entry.tokens_in.saturating_add(t.input);
@@ -1742,16 +1792,15 @@ impl ActivityLog {
                 crate::proxy::sse::add_opt(entry.cache_creation, t.cache_creation);
         }
         entry.last_used = Some(now);
-        let effort_label = effort.clone().unwrap_or_else(|| "none".to_string());
-        *entry.efforts.entry(effort_label).or_default() += 1;
-        *entry.endpoints.entry(endpoint_class(path)).or_default() += 1;
         if let Some(name) = account {
             let at = entry.accounts.entry(name.clone()).or_default();
-            at.requests += 1;
-            if status < 400 {
-                at.ok += 1;
-            } else {
-                at.errors += 1;
+            if let Some(status) = request {
+                at.requests += 1;
+                if status < 400 {
+                    at.ok += 1;
+                } else {
+                    at.errors += 1;
+                }
             }
             if let Some(t) = tokens {
                 at.tokens_in = at.tokens_in.saturating_add(t.input);
@@ -1762,7 +1811,7 @@ impl ActivityLog {
             // carries group AND normalized model AND account so providers and
             // accounts never merge. `group`/`model` are normalized inside.
             self.windowed
-                .record(group, model, name, status, tokens, now);
+                .record(group, model, name, request, tokens, now);
         }
     }
 
@@ -1794,7 +1843,13 @@ impl ActivityLog {
     /// brand-new id is merged into `unknown` rather than allocating a new
     /// entry (already-tracked ids and `unknown` always accumulate). This is
     /// counting only — it never affects whether the request was served.
-    fn record_client(&mut self, user_id: Option<&str>, status: u16, tokens: Option<TokenCounts>) {
+    /// `request = None` folds a sub-usage: tokens only, never a request.
+    fn record_client(
+        &mut self,
+        user_id: Option<&str>,
+        request: Option<u16>,
+        tokens: Option<TokenCounts>,
+    ) {
         let key = match user_id {
             Some(id) if !id.is_empty() => {
                 // Cap distinct named clients: an unseen id past the cap is
@@ -1808,11 +1863,13 @@ impl ActivityLog {
             _ => UNKNOWN_CLIENT.to_string(),
         };
         let bucket = self.clients.entry(key).or_default();
-        bucket.requests += 1;
-        if status < 400 {
-            bucket.ok += 1;
-        } else {
-            bucket.errors += 1;
+        if let Some(status) = request {
+            bucket.requests += 1;
+            if status < 400 {
+                bucket.ok += 1;
+            } else {
+                bucket.errors += 1;
+            }
         }
         if let Some(t) = tokens {
             bucket.tokens_in = bucket.tokens_in.saturating_add(t.input);
@@ -1831,7 +1888,7 @@ impl ActivityLog {
     fn record_tenant(
         &mut self,
         tenant: Option<&str>,
-        status: u16,
+        request: Option<u16>,
         tokens: Option<TokenCounts>,
         group: Option<&str>,
         model: Option<&str>,
@@ -1842,11 +1899,13 @@ impl ActivityLog {
             _ => UNKNOWN_CLIENT.to_string(),
         };
         let bucket = self.tenants.entry(key).or_default();
-        bucket.totals.requests += 1;
-        if status < 400 {
-            bucket.totals.ok += 1;
-        } else {
-            bucket.totals.errors += 1;
+        if let Some(status) = request {
+            bucket.totals.requests += 1;
+            if status < 400 {
+                bucket.totals.ok += 1;
+            } else {
+                bucket.totals.errors += 1;
+            }
         }
         if let Some(t) = tokens {
             bucket.totals.tokens_in = bucket.totals.tokens_in.saturating_add(t.input);
@@ -1867,7 +1926,9 @@ impl ActivityLog {
                 .models
                 .entry((group.to_string(), normalize_model(model)))
                 .or_default();
-            cell.requests += 1;
+            if request.is_some() {
+                cell.requests += 1;
+            }
             if let Some(t) = tokens {
                 cell.input = cell.input.saturating_add(t.input);
                 cell.output = cell.output.saturating_add(t.output);
@@ -2085,6 +2146,7 @@ impl ActivityLog {
                 kind,
                 excerpt,
                 tenant,
+                sub_usage,
             } => {
                 let routed = self
                     .in_flight
@@ -2097,11 +2159,11 @@ impl ActivityLog {
                 // counted against its `metadata.user_id` client bucket (the
                 // `unknown` bucket when absent), independent of routing — so
                 // pre-routing failures are attributed too, never dropped.
-                self.record_client(user_id.as_deref(), status, tokens);
+                self.record_client(user_id.as_deref(), Some(status), tokens);
                 // Per-tenant attribution (multi-tenant #22), same independence.
                 self.record_tenant(
                     tenant.as_deref(),
-                    status,
+                    Some(status),
                     tokens,
                     group.as_deref(),
                     model.as_deref(),
@@ -2130,38 +2192,27 @@ impl ActivityLog {
                 // above — no bogus model row. A failed-but-attributed request
                 // still increments the row's error count even with no tokens.
                 if let (Some(group), Some(model)) = (&group, &model) {
-                    self.record_model(group, model, &account, status, tokens, &effort, &path, now);
+                    self.record_model(
+                        group,
+                        model,
+                        &account,
+                        Some(status),
+                        tokens,
+                        &effort,
+                        &path,
+                        now,
+                    );
                     // Tokens-per-day chart fold (UI-3 U14). `now` is the event
                     // fold time — the startup replay passes each record's
                     // PERSISTED timestamp, so history lands on its real day.
                     if let Some(t) = tokens {
-                        let day = now
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs() / 86_400)
-                            .unwrap_or(0);
-                        let cell = self
-                            .daily
-                            .entry(day)
-                            .or_default()
-                            .entry((group.clone(), model.clone()))
-                            .or_default();
-                        cell.input = cell.input.saturating_add(t.input);
-                        cell.output = cell.output.saturating_add(t.output);
-                        cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
-                        cell.cache_creation = cell
-                            .cache_creation
-                            .saturating_add(t.cache_creation.unwrap_or(0));
-                        // Keep exactly DAILY_RETAIN_DAYS buckets including
-                        // today (cutoff inclusive — the -1 avoids a 91-day
-                        // window, review R1 nice-to-have 2).
-                        let cutoff = day.saturating_sub(DAILY_RETAIN_DAYS - 1);
-                        self.daily.retain(|d, _| *d >= cutoff);
+                        self.record_daily(group, model, t, now);
                     }
                     // Usage-tab calendar fold (usage-stats): unlike the chart
                     // fold above, EVERY attributed finished request lands in
                     // its hour/day/month bucket (tokens or not), so the
                     // requests column matches the per-model row semantics.
-                    self.record_usage(group, model, tokens, now);
+                    self.record_usage(group, model, true, tokens, now);
                     // Observed-performance fold (perf telemetry v1): raw sums
                     // per (day, group, model, fast). Same UTC-day bucketing
                     // and retention as the chart fold; replay fills history.
@@ -2188,6 +2239,38 @@ impl ActivityLog {
                     self.perf_day_hwm = self.perf_day_hwm.max(day.min(wall_day + 1));
                     let cutoff = self.perf_day_hwm.saturating_sub(DAILY_RETAIN_DAYS - 1);
                     self.perf_daily.retain(|d, _| *d >= cutoff);
+                }
+                // Sub-usages (#278): tokens the top-level `tokens` leave out,
+                // billed under their own model (`None` = the request's). The
+                // same folds as above, tokens only — a sub-usage is never a
+                // request, so no request/ok/error count, effort, endpoint or
+                // perf sample moves. The completed request row below keeps
+                // the executor's numbers.
+                for sub in &sub_usage {
+                    let tokens = Some(sub.tokens);
+                    let sub_model = sub.model.as_deref().or(model.as_deref());
+                    self.record_client(user_id.as_deref(), None, tokens);
+                    self.record_tenant(
+                        tenant.as_deref(),
+                        None,
+                        tokens,
+                        group.as_deref(),
+                        sub_model,
+                        now,
+                    );
+                    let bucket = match &account {
+                        Some(name) => self.totals.entry(name.clone()).or_default(),
+                        None => &mut self.unrouted,
+                    };
+                    bucket.tokens_in = bucket.tokens_in.saturating_add(sub.tokens.input);
+                    bucket.tokens_out = bucket.tokens_out.saturating_add(sub.tokens.output);
+                    if let (Some(group), Some(sub_model)) = (group.as_deref(), sub_model) {
+                        self.record_model(
+                            group, sub_model, &account, None, tokens, &effort, &path, now,
+                        );
+                        self.record_daily(group, sub_model, sub.tokens, now);
+                        self.record_usage(group, sub_model, false, tokens, now);
+                    }
                 }
                 self.push_health(now, status);
                 self.push(Completed {
@@ -2344,6 +2427,7 @@ mod tests {
                 user_id: Some(uid.into()),
                 kind: Some("user".into()),
                 excerpt: Some(excerpt.into()),
+                sub_usage: Vec::new(),
             };
         let _ = day;
         let mut live = ActivityLog::new(16);
@@ -2461,6 +2545,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 
@@ -2498,6 +2583,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 
@@ -2534,6 +2620,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 
@@ -3250,6 +3337,7 @@ mod tests {
                 kind,
                 excerpt,
                 tenant: _,
+                sub_usage,
             } => ActivityEvent::RequestFinished {
                 id,
                 method,
@@ -3271,6 +3359,7 @@ mod tests {
                 kind,
                 excerpt,
                 tenant: tenant.map(str::to_string),
+                sub_usage,
             },
             other => other,
         }
@@ -3373,6 +3462,186 @@ mod tests {
         // Every finished request is tenant-attributed across the buckets.
         let total: u64 = log.tenant_stats().values().map(|t| t.totals.requests).sum();
         assert_eq!(total, 5, "every finished request tenant-attributed");
+    }
+
+    /// An executor request on `claude-opus-5-5` that ran an advisor on
+    /// `claude-fable-5-1` and a compaction (no model → the request's own),
+    /// keyed to tenant `k-sub`, client `u-sub`, account `acct`.
+    fn finished_with_sub_usage(id: u64) -> ActivityEvent {
+        let mut event = finished_model(
+            id,
+            Some("acct"),
+            "claude",
+            "claude-opus-5-5",
+            None,
+            200,
+            Some(TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: Some(10),
+                cache_creation: Some(5),
+            }),
+            "/v1/messages",
+        );
+        if let ActivityEvent::RequestFinished {
+            sub_usage,
+            tenant,
+            user_id,
+            ..
+        } = &mut event
+        {
+            *tenant = Some("k-sub".into());
+            *user_id = Some("u-sub".into());
+            *sub_usage = vec![
+                SubUsage {
+                    model: Some("claude-fable-5-1".into()),
+                    tokens: TokenCounts {
+                        input: 823,
+                        output: 1612,
+                        cache_read: Some(0),
+                        cache_creation: Some(0),
+                    },
+                },
+                SubUsage {
+                    model: None,
+                    tokens: TokenCounts {
+                        input: 1000,
+                        output: 100,
+                        cache_read: None,
+                        cache_creation: None,
+                    },
+                },
+            ];
+        }
+        event
+    }
+
+    /// #278: a sub-usage is booked under its own model on every token/cost
+    /// aggregate, and is never a request.
+    #[test]
+    fn sub_usage_folds_into_its_own_model_rows_without_counting_a_request() {
+        let now = SystemTime::now();
+        let mut log = ActivityLog::new(50);
+        log.apply(finished_with_sub_usage(1), now);
+
+        let rows = log.model_usage();
+        let row = |model: &str| {
+            rows.iter()
+                .find(|r| r.group == "claude" && r.model == model)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {model} row in {rows:?}"))
+        };
+        let opus = row("claude-opus-5-5");
+        assert_eq!((opus.requests, opus.ok, opus.errors), (1, 1, 0));
+        // The executor's own counters plus the compaction (its model).
+        assert_eq!((opus.tokens_in, opus.tokens_out), (1100, 150));
+        assert_eq!((opus.cache_read, opus.cache_creation), (Some(10), Some(5)));
+        let fable = row("claude-fable-5-1");
+        assert_eq!((fable.requests, fable.ok, fable.errors), (0, 0, 0));
+        assert_eq!((fable.tokens_in, fable.tokens_out), (823, 1612));
+        assert_eq!(fable.accounts.len(), 1);
+        assert_eq!(fable.accounts[0].requests, 0);
+        assert_eq!(fable.accounts[0].tokens_in, 823);
+
+        // The request row in the activity ring keeps the executor numbers.
+        let Some(Completed {
+            body: CompletedBody::Request { tokens, .. },
+            ..
+        }) = log.completed().next()
+        else {
+            panic!("no completed request");
+        };
+        assert_eq!(tokens.map(|t| (t.input, t.output)), Some((100, 50)));
+
+        // Usage tab: one request, the advisor's tokens on their own row.
+        let stats = log.usage_stats(now);
+        let day = |model: &str| {
+            stats
+                .iter()
+                .find(|r| r.gran == "day" && r.model == model)
+                .cloned()
+                .unwrap_or_else(|| panic!("no day row for {model} in {stats:?}"))
+        };
+        assert_eq!(
+            (
+                day("claude-opus-5-5").requests,
+                day("claude-opus-5-5").tokens_in
+            ),
+            (1, 1100)
+        );
+        assert_eq!(
+            (
+                day("claude-fable-5-1").requests,
+                day("claude-fable-5-1").tokens_out
+            ),
+            (0, 1612)
+        );
+        // Tokens-per-day chart.
+        assert!(log
+            .daily_usage()
+            .iter()
+            .any(|d| d.model == "claude-fable-5-1" && d.tokens_in == 823));
+        // Windowed heatmap cell.
+        let cell = log
+            .windowed_rows(StatsWindow::Day, now)
+            .into_iter()
+            .find(|r| r.model == "claude-fable-5-1")
+            .expect("windowed advisor cell");
+        assert_eq!((cell.counts.requests, cell.counts.tokens_in), (0, 823));
+        // Tenant: one request, every token, a priced cell per model.
+        let tenant = log.tenant_stats().get("k-sub").cloned().expect("tenant");
+        assert_eq!(tenant.totals.requests, 1);
+        assert_eq!(tenant.totals.tokens_in, 100 + 823 + 1000);
+        let cell = tenant.models[&("claude".to_string(), "claude-fable-5-1".to_string())];
+        assert_eq!((cell.requests, cell.input, cell.output), (0, 823, 1612));
+        // Account and client totals: tokens grow, requests do not.
+        let acct = log.totals_for("acct");
+        assert_eq!(
+            (acct.requests, acct.tokens_in, acct.tokens_out),
+            (1, 1923, 1762)
+        );
+        let client = log.client_totals("u-sub");
+        assert_eq!((client.requests, client.tokens_in), (1, 1923));
+        assert_eq!(log.totals_global().requests, 1);
+    }
+
+    /// The additive `sub_usage` field round-trips through `activity.jsonl`
+    /// and replays into identical aggregates; a line without it (every line
+    /// written before #278) still loads, and an empty list is not written.
+    #[test]
+    fn sub_usage_round_trips_through_the_persisted_log() {
+        // Millisecond-aligned: the persisted stamp is `ts_ms`.
+        let now = UNIX_EPOCH
+            + Duration::from_millis(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            );
+        let event = finished_with_sub_usage(7);
+        let record = PersistedRequest::from_event(&event, now).expect("record");
+        let line = serde_json::to_string(&record).expect("line");
+        assert!(line.contains("\"sub_usage\""), "{line}");
+        let plain = PersistedRequest::from_event(&finished(8, Some("acct"), Some((1, 1))), now)
+            .expect("record");
+        let plain_line = serde_json::to_string(&plain).expect("line");
+        assert!(!plain_line.contains("sub_usage"), "{plain_line}");
+        let old: PersistedRequest = serde_json::from_str(&plain_line).expect("old line loads");
+        assert!(old.sub_usage.is_empty());
+
+        let dir = TempDir::new();
+        let path = dir.file();
+        let mut live = ActivityLog::new(50);
+        persist_request(Some(&path), &event, now);
+        live.apply(event, now);
+        let mut replayed = ActivityLog::new(50);
+        replayed.load_persisted(Some(&path));
+        assert_eq!(live.model_usage(), replayed.model_usage());
+        assert_eq!(live.tenant_stats(), replayed.tenant_stats());
+        assert!(replayed
+            .daily_usage()
+            .iter()
+            .any(|d| d.model == "claude-fable-5-1" && d.tokens_in == 823));
     }
 
     /// Activity client-name: the fold carries the tenant id into the
@@ -3763,6 +4032,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 
@@ -3862,6 +4132,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 
@@ -4193,6 +4464,7 @@ mod tests {
                 kind: None,
                 excerpt: None,
                 tenant: None,
+                sub_usage: Vec::new(),
             }
         };
         let now = at(1_000);
@@ -4288,6 +4560,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         };
         let now = SystemTime::now();
         let day = |off_back: u64| now - Duration::from_secs(off_back * 86_400);

@@ -39,7 +39,7 @@ pub(crate) mod triage;
 mod ui;
 pub(crate) mod view;
 
-pub use event::{ActivityEvent, Endpoint, TokenCounts};
+pub use event::{ActivityEvent, Endpoint, SubUsage, TokenCounts};
 
 /// Bound for the proxy→dashboard activity channel (`try_send` +
 /// drop-on-full on the sender side, so a stalled dashboard never

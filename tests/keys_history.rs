@@ -897,6 +897,7 @@ impl Proxy {
                 kind: None,
                 excerpt: None,
                 tenant: Some(tenant.into()),
+                sub_usage: Vec::new(),
             })
             .await
             .expect("event accepted");

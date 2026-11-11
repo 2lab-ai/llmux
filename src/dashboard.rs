@@ -266,7 +266,7 @@ impl DashboardHub {
         // push handled by the store's own writer thread — NO disk IO here, so
         // the hub lock is never held across database work.
         if let Some(store) = state.usage_store.as_ref() {
-            if let Some(row) = crate::key_usage::UsageRow::from_event(&event, now) {
+            for row in crate::key_usage::UsageRow::rows_from_event(&event, now) {
                 store.record(row);
             }
         }
@@ -471,6 +471,7 @@ fn trace_event(event: &ActivityEvent) {
             gen_ms: _,
             aborted: _,
             tenant,
+            sub_usage: _,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -2501,6 +2502,7 @@ mod tests {
                 kind: None,
                 excerpt: None,
                 tenant: None,
+                sub_usage: Vec::new(),
             },
             now() - Duration::from_secs(58),
         );
@@ -2684,6 +2686,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
+                    sub_usage: Vec::new(),
                 },
                 at,
             )
@@ -2773,6 +2776,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
+                    sub_usage: Vec::new(),
                 },
                 at,
             )
@@ -3649,6 +3653,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: None,
+                    sub_usage: Vec::new(),
                 },
                 now() - Duration::from_secs(seeded - i),
             );
@@ -3701,6 +3706,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 

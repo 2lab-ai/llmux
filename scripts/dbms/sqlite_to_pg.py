@@ -60,6 +60,8 @@ USAGE = {
         ("grp", "text"), ("model", "text"), ("status", "int"),
         ("tokens_in", "int"), ("tokens_out", "int"),
         ("cache_read", "int"), ("cache_creation", "int"),
+        # Schema v2 (#278). A store a current daemon has opened has it.
+        ("requests", "int"),
     ],
 }
 METRICS_EVENTS = {
