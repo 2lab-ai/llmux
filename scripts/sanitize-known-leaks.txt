@@ -1,4 +1,4 @@
-# Known leaks for the Sanitize Gate (scripts/sanitize-scan.sh): commits already published to main
+# Known leaks for the Sanitize Gate (scripts/sanitize-scan.sh): commits already published (main, other branches, tags)
 # before the gate existed (2026-11-11), which a later PR cannot take back without rewriting history.
 # What such a commit added is tolerated wherever it persists; any other hit still fails, including
 # another commit adding the same text again. One full 40-hex commit id per line, then the reason.
@@ -18,6 +18,7 @@
 17c73eaeadcafb7cb8dff1bf049f091c41a194b1  baseline 2026-11-11 (published before the gate)
 1df4f28f733492900e8bc1f33b571c01c8a1e2a2  baseline 2026-11-11 (published before the gate)
 209731b5c7dfa04841dc670cb3e42e738efbb7f3  baseline 2026-11-11 (published before the gate)
+20e31861e9e3aa5340e6e5e2f2f65af7b51e2cea  baseline 2026-11-11 (published before the gate)
 24ffe136fe75ba6b1260597638a465611ae1a412  baseline 2026-11-11 (published before the gate)
 26aaf98157b454273ed86040ec8c24bdc4a5124e  baseline 2026-11-11 (published before the gate)
 28f34bd2122528035302d6fd805faf3e7f69e4d5  baseline 2026-11-11 (published before the gate)
@@ -35,6 +36,7 @@
 41b71215200c5c3ab060ade6055445aa301af2fc  baseline 2026-11-11 (published before the gate)
 4427deeab711b5fb1970983abcbe320448b9978f  baseline 2026-11-11 (published before the gate)
 4432e3491014db375ee0aab1aaef850e44f68939  baseline 2026-11-11 (published before the gate)
+456735234c1741cae287836d72b3dcbe41445683  baseline 2026-11-11 (published before the gate)
 4b13b77cc3a899f9c81c316085a1e0da21e3506c  baseline 2026-11-11 (published before the gate)
 4b3b07e7b4124225fc42a275db2295160763c60a  baseline 2026-11-11 (published before the gate)
 50460cda73d3e008f6aa5909197b3c5666611b4b  baseline 2026-11-11 (published before the gate)
@@ -46,6 +48,7 @@
 55b254c3cd0895584686ded53e989db9c057e5bd  baseline 2026-11-11 (published before the gate)
 56f7dfa547a3e6849a5fb21fa2b50f94700c1ae6  baseline 2026-11-11 (published before the gate)
 574669e6904deaa4c9dbe08e9201f21867ab3abd  baseline 2026-11-11 (published before the gate)
+5897f4a69e5c9ff1b3fc45908edb22b9a6951f54  baseline 2026-11-11 (published before the gate)
 594e410cdb4bca0c0ada68aef8a45800963362d2  baseline 2026-11-11 (published before the gate)
 5b13432fb25d0af6a8918c96c3411719d7a1e96f  baseline 2026-11-11 (published before the gate)
 5bdd56ed019dd9304ba40d2c38720ddd2920e01e  baseline 2026-11-11 (published before the gate)
@@ -72,6 +75,7 @@
 88d659c51f4b8dbe1e510da776d51892c0908f06  baseline 2026-11-11 (published before the gate)
 8b4dc6b9b2bfb3518a9dad3c6a450de6f872da87  baseline 2026-11-11 (published before the gate)
 8be574b18290d3bcb1b80ea644aa481e95aa2da6  baseline 2026-11-11 (published before the gate)
+8d2fd6092b92d38e9203764ac4c36f6d9c4989f3  baseline 2026-11-11 (published before the gate)
 8d9a698354d08e5fadb827ac9a6b93c447d196e9  baseline 2026-11-11 (published before the gate)
 8e40982577f9173538f1ca2d2a1c40db7bddecde  baseline 2026-11-11 (published before the gate)
 8eb530c29782439e870960842670d8bc241cb11e  baseline 2026-11-11 (published before the gate)
@@ -87,6 +91,7 @@ a4defd57385daac7002c39e0bf4bc65ea705f4a0  baseline 2026-11-11 (published before 
 a5537d278335505944de2936504c8dead4768f47  baseline 2026-11-11 (published before the gate)
 aadae07831db8e83b97f41016aaf00f7803683bd  baseline 2026-11-11 (published before the gate)
 ab0879c808476a56a9d51e2cbe6569013cc97d0f  baseline 2026-11-11 (published before the gate)
+aeaa46dce12b4d2f21b67a39ea18f891b7fdfbb6  baseline 2026-11-11 (published before the gate)
 af015484ca120539ce44fe6e76157dc72fe68f63  baseline 2026-11-11 (published before the gate)
 b6b4f0f9bbc12822f5fba33c3412397f9bc7a8ff  baseline 2026-11-11 (published before the gate)
 b9154bcb81d1455b15a7a85d7ae9762362f4a16a  baseline 2026-11-11 (published before the gate)
@@ -99,6 +104,7 @@ c1f19d416bebc05f20f5aeaaaefd4e0918b7159a  baseline 2026-11-11 (published before 
 c3b8f354a852ff2ea662285c133e2803b67864e8  baseline 2026-11-11 (published before the gate)
 c3bc551ba838ef9a46c2f04399ba50a4c9824b0a  baseline 2026-11-11 (published before the gate)
 c51a55caf8db00310c524496217e1c19f76c6d0b  baseline 2026-11-11 (published before the gate)
+c5cbeb9d003673d579679bdd2478c52e707b22a3  baseline 2026-11-11 (published before the gate)
 c61669307f1b78bdb381c86f69a338d90a546c92  baseline 2026-11-11 (published before the gate)
 c66ad3263a9b4953a21fcdda68ab5276287ff5a6  baseline 2026-11-11 (published before the gate)
 c8c24dba38d750530fcf0a8451ce1b0feb0fdc24  baseline 2026-11-11 (published before the gate)
