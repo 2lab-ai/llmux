@@ -424,18 +424,20 @@ pub struct ResponsesSseConverter {
     /// happens to be last.
     open_pos: Option<usize>,
     saw_tool_use: bool,
-    /// `usage.input_tokens` is the FRESH (non-cached) prompt count, matching
-    /// Anthropic's convention; the cached subset lives in
-    /// `cached_input_tokens`. OpenAI Responses reports the cache-INCLUSIVE
-    /// total, so `complete()` subtracts the cached part — otherwise the
-    /// dashboard counts cached tokens that the Claude side never counts (≈90×
-    /// inflation) and the client's context bar fills on cache reads.
+    /// `usage.input_tokens` is the FRESH (non-cached, non-written) prompt
+    /// count, matching Anthropic's convention; the cached subset lives in
+    /// `cached_input_tokens` and the written one in
+    /// `usage.cache_creation_input_tokens`. OpenAI Responses reports the
+    /// cache-INCLUSIVE total, so `record_usage()` subtracts both parts —
+    /// otherwise the dashboard counts cached tokens that the Claude side never
+    /// counts (≈90× inflation) and the client's context bar fills on cache
+    /// reads.
     usage: StreamUsage,
     cached_input_tokens: u64,
     blocks: Vec<AggBlock>,
     stop_reason: Option<String>,
     error: Option<String>,
-    /// Verbatim upstream `usage` object from `response.completed`, kept for the
+    /// Verbatim upstream `usage` object from the terminal event, kept for the
     /// codex trace (input_tokens / input_tokens_details.cached_tokens /
     /// output_tokens / output_tokens_details.reasoning_tokens / total_tokens) —
     /// the reduced `StreamUsage` drops the reasoning + total splits we want to
@@ -869,14 +871,86 @@ impl ResponsesSseConverter {
         );
     }
 
+    /// Fold the `usage` of one terminal upstream response (`completed`,
+    /// `incomplete` or `failed` — a failed or cut-short turn still burned the
+    /// tokens it reports, and the native passthrough books them the same way,
+    /// `crate::proxy::sse::extract_usage`). Runs before the terminal is
+    /// handled, so a turn that ends in an error keeps its usage. A converter
+    /// that already finished ignores later terminals.
+    fn record_usage(&mut self, response: Option<&Value>) {
+        if self.finished {
+            return;
+        }
+        let Some(usage) = response.and_then(|r| r.get("usage")) else {
+            return;
+        };
+        // Keep the verbatim upstream usage for the codex trace before we
+        // reduce it (the trace wants reasoning + total splits too).
+        self.raw_usage = Some(usage.clone());
+        // OpenAI `input_tokens` is the cache-INCLUSIVE total; the cached
+        // read subset is `input_tokens_details.cached_tokens` and the cache
+        // WRITE subset `input_tokens_details.cache_write_tokens` (disjoint
+        // parts of `input_tokens`: developers.openai.com/api/docs/guides/
+        // prompt-caching, read 2026-11-11). Record fresh = total − cached −
+        // written so codex is comparable to the Anthropic side (which counts
+        // uncached, unwritten input only), preserving the invariant
+        // `total_input == fresh input + cache_read + cache_creation`.
+        let total_input = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let details = usage.get("input_tokens_details");
+        // `cached` is `Some` only when the upstream reported the field, so
+        // the dashboard renders unavailable (not 0) when it is absent.
+        // Clamp to the total: a cache read can never exceed the tokens
+        // actually received (guards a malformed `cached > input` payload) —
+        // and a payload that actually violates the invariant is worth
+        // operator eyes, so the clamp warns with the raw values instead of
+        // silently rewriting them.
+        let cached = details
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .map(|c| {
+                if c > total_input {
+                    tracing::warn!(
+                        cached_tokens = c,
+                        input_tokens = total_input,
+                        provider = self.tag,
+                        "malformed upstream usage (cached_tokens > input_tokens); clamping"
+                    );
+                }
+                c.min(total_input)
+            });
+        // Cache writes are priced at the model's cache-write rate, so they
+        // are cache creation and never fresh input as well.
+        let cache_write = details
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(Value::as_u64);
+        self.cached_input_tokens = cached.unwrap_or(0);
+        self.usage = StreamUsage {
+            input_tokens: total_input
+                .saturating_sub(self.cached_input_tokens)
+                .saturating_sub(cache_write.unwrap_or(0)),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_read_input_tokens: cached,
+            cache_creation_input_tokens: cache_write,
+            sub_usage: Vec::new(),
+            served_model: None,
+        };
+    }
+
     /// Terminal Anthropic tail (`message_delta` + `message_stop`) for one
-    /// upstream response, folding its `usage`. `forced_stop` overrides the
+    /// upstream response. Its `usage` is already folded by
+    /// [`Self::record_usage`]. `forced_stop` overrides the
     /// derived stop reason — [`Self::incomplete`] uses it so an output-cap
     /// hit reports `max_tokens` even when the turn also produced tool calls.
     /// Applying it HERE (the single place a stop reason is chosen) is what
     /// keeps the streamed `message_delta` and the non-stream aggregate from
     /// ever disagreeing.
-    fn complete(&mut self, out: &mut Vec<u8>, response: Option<&Value>, forced_stop: Option<&str>) {
+    fn complete(&mut self, out: &mut Vec<u8>, forced_stop: Option<&str>) {
         if self.finished {
             return;
         }
@@ -908,59 +982,6 @@ impl ResponsesSseConverter {
             Some(_) => self.mark_interrupted_tools(),
         }
         self.flush_all(out);
-        if let Some(usage) = response.and_then(|r| r.get("usage")) {
-            // Keep the verbatim upstream usage for the codex trace before we
-            // reduce it (the trace wants reasoning + total splits too).
-            self.raw_usage = Some(usage.clone());
-            // OpenAI `input_tokens` is the cache-INCLUSIVE total; the cached
-            // subset is `input_tokens_details.cached_tokens`. Record fresh =
-            // total − cached so codex is comparable to the Anthropic side
-            // (which already counts uncached input only), preserving the
-            // invariant `total_input == fresh input + cache_read`.
-            let total_input = usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let details = usage.get("input_tokens_details");
-            // `cached` is `Some` only when the upstream reported the field, so
-            // the dashboard renders unavailable (not 0) when it is absent.
-            // Clamp to the total: a cache read can never exceed the tokens
-            // actually received (guards a malformed `cached > input` payload) —
-            // and a payload that actually violates the invariant is worth
-            // operator eyes, so the clamp warns with the raw values instead of
-            // silently rewriting them.
-            let cached = details
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_u64)
-                .map(|c| {
-                    if c > total_input {
-                        tracing::warn!(
-                            cached_tokens = c,
-                            input_tokens = total_input,
-                            provider = self.tag,
-                            "malformed upstream usage (cached_tokens > input_tokens); clamping"
-                        );
-                    }
-                    c.min(total_input)
-                });
-            // OpenAI carries the cache-WRITE subset in the same details object.
-            // It is 0 on today's wire, but map it to `cache_creation_input_tokens`
-            // so the dashboard's cache split stays correct if it ever isn't.
-            // Codex bills nothing for cache creation, so pricing scores it at 0.
-            let cache_write = details
-                .and_then(|d| d.get("cache_write_tokens"))
-                .and_then(Value::as_u64);
-            self.cached_input_tokens = cached.unwrap_or(0);
-            self.usage = StreamUsage {
-                input_tokens: total_input.saturating_sub(self.cached_input_tokens),
-                output_tokens: usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                cache_read_input_tokens: cached,
-                cache_creation_input_tokens: cache_write,
-            };
-        }
         let stop_reason = match forced_stop {
             Some(reason) => reason,
             None if self.saw_tool_use => "tool_use",
@@ -1008,7 +1029,7 @@ impl ResponsesSseConverter {
             .and_then(|d| d.get("reason"))
             .and_then(Value::as_str);
         match reason {
-            Some("max_output_tokens") => self.complete(out, response, Some("max_tokens")),
+            Some("max_output_tokens") => self.complete(out, Some("max_tokens")),
             Some(other) => self.fail(out, &format!("upstream response incomplete: {other}")),
             None => self.fail(out, "upstream response incomplete: reason missing"),
         }
@@ -1150,9 +1171,9 @@ impl ResponsesSseConverter {
         self.error.as_deref()
     }
 
-    /// Verbatim upstream `usage` object captured at `response.completed`, for
-    /// the codex trace. `None` until a `response.completed` carrying `usage`
-    /// has been folded.
+    /// Verbatim upstream `usage` object captured at the terminal event
+    /// (`response.completed` / `incomplete` / `failed`), for the codex trace.
+    /// `None` until a terminal carrying `usage` has been folded.
     pub fn raw_usage(&self) -> Option<&Value> {
         self.raw_usage.as_ref()
     }
@@ -1404,6 +1425,7 @@ impl SseTransform for ResponsesSseConverter {
             }
             "response.completed" => {
                 let response = value.get("response");
+                self.record_usage(response);
                 // A `response.completed` envelope carrying `status:
                 // "incomplete"` contradicts itself; the status is the truth
                 // about what happened to the turn, so it wins.
@@ -1414,13 +1436,15 @@ impl SseTransform for ResponsesSseConverter {
                 {
                     self.incomplete(&mut out, response);
                 } else {
-                    self.complete(&mut out, response, None);
+                    self.complete(&mut out, None);
                 }
             }
             "response.incomplete" => {
+                self.record_usage(value.get("response"));
                 self.incomplete(&mut out, value.get("response"));
             }
             "response.failed" => {
+                self.record_usage(value.get("response"));
                 // `error` may be the OpenAI object shape ({message}) or the
                 // xAI string shape (external review N4; same class as the
                 // HTTP-error condense fix — never flatten a string error to
@@ -1466,7 +1490,7 @@ impl SseTransform for ResponsesSseConverter {
     }
 
     fn usage(&self) -> StreamUsage {
-        self.usage
+        self.usage.clone()
     }
 }
 
@@ -1775,6 +1799,8 @@ mod tests {
                 output_tokens: 302,
                 cache_read_input_tokens: Some(64),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             },
             "a capped turn still bills the tokens it really burned"
         );
@@ -1783,6 +1809,55 @@ mod tests {
             Some(&usage_fixture()),
             "the trace keeps the verbatim splits on the capped path too"
         );
+    }
+
+    #[test]
+    fn failed_and_incomplete_streams_keep_the_usage_they_report() {
+        // `response.failed` and a non-cap `response.incomplete` still carry
+        // the tokens the upstream burned; the turn fails, the usage is real.
+        // Same for a `response.completed` that fails our own tool-argument
+        // check. The native passthrough already books these (sse.rs).
+        let fixture = StreamUsage {
+            input_tokens: 56,
+            output_tokens: 302,
+            cache_read_input_tokens: Some(64),
+            cache_creation_input_tokens: None,
+            sub_usage: Vec::new(),
+            served_model: None,
+        };
+        let failed = json!({"type": "response.failed", "response": {
+            "error": {"message": "boom"}, "usage": usage_fixture()}});
+        let malformed_tool = vec![
+            json!({"type": "response.output_item.added",
+                   "item": {"type": "function_call", "call_id": "c1", "name": "save",
+                            "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "delta": "[1]"}),
+            json!({"type": "response.completed",
+                   "response": {"usage": usage_fixture()}}),
+        ];
+        for (label, tail) in [
+            ("failed", vec![failed]),
+            (
+                "content_filter",
+                vec![incomplete_event(Some("content_filter"))],
+            ),
+            ("reason missing", vec![incomplete_event(None)]),
+            ("malformed tool args", malformed_tool),
+        ] {
+            let mut stream = vec![json!({"type": "response.created", "response": {"id": "r"}})];
+            stream.extend(tail);
+            let (converter, _) = run(&stream);
+            assert!(
+                converter.error_message().is_some(),
+                "{label}: still an error"
+            );
+            assert_eq!(converter.usage(), fixture.clone(), "{label}");
+            assert_eq!(
+                converter.raw_usage(),
+                Some(&usage_fixture()),
+                "{label}: the trace keeps the verbatim usage"
+            );
+        }
     }
 
     #[test]

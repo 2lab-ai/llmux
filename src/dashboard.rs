@@ -266,7 +266,7 @@ impl DashboardHub {
         // push handled by the store's own writer thread — NO disk IO here, so
         // the hub lock is never held across database work.
         if let Some(store) = state.usage_store.as_ref() {
-            if let Some(row) = crate::key_usage::UsageRow::from_event(&event, now) {
+            for row in crate::key_usage::UsageRow::rows_from_event(&event, now) {
                 store.record(row);
             }
         }
@@ -471,15 +471,21 @@ fn trace_event(event: &ActivityEvent) {
             gen_ms: _,
             aborted: _,
             tenant,
+            sub_usage,
         } => {
-            // API-equivalent USD cost for this request (Feature D). The fold
+            // API-equivalent USD cost for this request (Feature D), its
+            // sub-usages included at their own models' rates (#278). The fold
             // task has no config handle, so the log line uses the built-in
             // default rate table (empty overrides). 0.0 unless group, model,
             // and token usage are all known.
             let cost = match (group, model, tokens) {
-                (Some(g), Some(m), Some(t)) => {
-                    crate::pricing::cost_usd(g, m, t, &std::collections::HashMap::new())
-                }
+                (Some(g), Some(m), Some(t)) => crate::pricing::request_cost_usd(
+                    g,
+                    m,
+                    t,
+                    sub_usage,
+                    &std::collections::HashMap::new(),
+                ),
                 _ => 0.0,
             };
             tracing::info!(
@@ -487,7 +493,10 @@ fn trace_event(event: &ActivityEvent) {
                 account = account.as_deref().unwrap_or("-"),
                 status,
                 duration_ms = duration.as_millis() as u64,
-                tokens = tokens.map(TokenCounts::total).unwrap_or(0),
+                tokens = tokens
+                    .map(TokenCounts::total)
+                    .unwrap_or(0)
+                    .saturating_add(crate::tui::SubUsage::total(sub_usage)),
                 cost = format!("{cost:.4}"),
                 group = group.as_deref().unwrap_or("-"),
                 model = model.as_deref().unwrap_or("-"),
@@ -1209,6 +1218,18 @@ pub struct ModelUsageDoc {
     /// may recompute from the row's tokens as a fallback).
     #[serde(default)]
     pub cost_usd: f64,
+    /// The part of `cost_usd` booked from SUB-USAGES (#278: advisor /
+    /// compaction / billed fallback attempt that requests of any model ran
+    /// on this one) — tokens with no request of this row, so a per-request
+    /// average is `(cost_usd - sub_cost_usd) / requests`. Additive: omitted
+    /// when 0, absent (→ 0) in docs from older daemons.
+    #[serde(default, skip_serializing_if = "is_zero_usd")]
+    pub sub_cost_usd: f64,
+}
+
+/// `skip_serializing_if` helper: an exactly-zero USD amount.
+fn is_zero_usd(usd: &f64) -> bool {
+    *usd == 0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1476,6 +1497,13 @@ pub enum CompletedDoc {
         tenant: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_name: Option<String>,
+        /// Sub-inferences this request ran under their own model (#278:
+        /// advisor / compaction / billed fallback attempt). `tokens` keep the
+        /// request's own top-level counters; `cost_usd` includes these, each
+        /// at its own model's rates. Additive: omitted when empty, absent in
+        /// docs from older daemons.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sub_usage: Vec<crate::tui::SubUsage>,
     },
     Note {
         at_ms: u64,
@@ -1704,6 +1732,12 @@ fn model_usage_docs(
                 requests: c.requests,
             })
             .collect(),
+        sub_cost_usd: crate::pricing::cost_usd(
+            &m.group,
+            &m.model,
+            &m.sub_tokens,
+            pricing_overrides,
+        ),
     };
     let mut docs: Vec<ModelUsageDoc> = hub.model_usage.iter().map(row).collect();
 
@@ -1742,6 +1776,7 @@ fn model_usage_docs(
             // No completed request yet → no accumulated tokens to price.
             // The per-request cost lands on the row once the request finishes.
             cost_usd: 0.0,
+            sub_cost_usd: 0.0,
         });
     }
     // Global total = Σ per-row costs, by construction (in-flight-only rows
@@ -1949,6 +1984,7 @@ pub(crate) fn dashboard_doc(
                     // Fold-time name is always None (no key metadata at the
                     // fold) — the doc resolves it below from `meta`.
                     client_name: _,
+                    sub_usage,
                 } => CompletedDoc::Request {
                     id: *id,
                     at_ms: epoch_ms(entry.at),
@@ -1966,10 +2002,16 @@ pub(crate) fn dashboard_doc(
                     }),
                     // Per-request API-equivalent cost: 0.0 unless group, model,
                     // and the upstream token usage are ALL known (Feature D).
+                    // Includes the request's sub-usages at their own models'
+                    // rates (#278), so these add up to the model rows.
                     cost_usd: match (group, model, tokens) {
-                        (Some(g), Some(m), Some(t)) => {
-                            crate::pricing::cost_usd(g, m, t, &meta.pricing_overrides)
-                        }
+                        (Some(g), Some(m), Some(t)) => crate::pricing::request_cost_usd(
+                            g,
+                            m,
+                            t,
+                            sub_usage,
+                            &meta.pricing_overrides,
+                        ),
                         _ => 0.0,
                     },
                     group: group.clone(),
@@ -1988,6 +2030,7 @@ pub(crate) fn dashboard_doc(
                     // join as `tenant_usage` below and as the in-flight rows
                     // above.
                     client_name: resolve_client_name(tenant.as_ref(), &meta.client_keys),
+                    sub_usage: sub_usage.clone(),
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -2501,6 +2544,7 @@ mod tests {
                 kind: None,
                 excerpt: None,
                 tenant: None,
+                sub_usage: Vec::new(),
             },
             now() - Duration::from_secs(58),
         );
@@ -2684,6 +2728,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
+                    sub_usage: Vec::new(),
                 },
                 at,
             )
@@ -2773,6 +2818,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
+                    sub_usage: Vec::new(),
                 },
                 at,
             )
@@ -3329,6 +3375,112 @@ mod tests {
         }
     }
 
+    /// #278 Done-when: aggregate cost == sum of per-request costs. A request
+    /// that ran an advisor carries the advisor's cost on its own row, so the
+    /// per-request costs add up to the model rows, which book the advisor
+    /// under its own model.
+    #[test]
+    fn per_request_costs_sum_to_the_model_rows_with_an_advisor() {
+        let hub = seeded_hub();
+        let executor = TokenCounts {
+            input: 1_760,
+            output: 531,
+            cache_read: Some(412),
+            cache_creation: Some(0),
+        };
+        let advisor = crate::tui::SubUsage {
+            model: Some("claude-fable-5-1".into()),
+            tokens: TokenCounts {
+                input: 823,
+                output: 1_612,
+                cache_read: Some(0),
+                cache_creation: Some(0),
+            },
+        };
+        hub.apply_event(
+            ActivityEvent::RequestFinished {
+                id: 9,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
+                account: Some("a".into()),
+                status: 200,
+                duration: Duration::from_millis(900),
+                tokens: Some(executor),
+                group: Some("claude".into()),
+                model: Some("claude-opus-5-5".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
+                tenant: None,
+                sub_usage: vec![advisor.clone()],
+            },
+            now() - Duration::from_secs(1),
+        );
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        pool.evaluate(None, &params(), now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        let none = HashMap::new();
+        let want = crate::pricing::cost_usd("claude", "claude-opus-5-5", &executor, &none)
+            + crate::pricing::cost_usd("claude", "claude-fable-5-1", &advisor.tokens, &none);
+        let mut per_request = 0.0;
+        let mut advisor_row = None;
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request {
+                id,
+                cost_usd,
+                sub_usage,
+                ..
+            } = entry
+            {
+                per_request += cost_usd;
+                if *id == 9 {
+                    advisor_row = Some((*cost_usd, sub_usage.clone()));
+                }
+            }
+        }
+        let (cost, sub_usage) = advisor_row.expect("the advisor request row");
+        assert!((cost - want).abs() < 1e-9, "row cost {cost} != {want}");
+        assert_eq!(sub_usage, vec![advisor.clone()]);
+        let rows: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
+        assert!(
+            (per_request - rows).abs() < 1e-9,
+            "sum of per-request costs {per_request} != model rows {rows}"
+        );
+        // The advisor's model row says how much of its cost is sub-usage (no
+        // request of that row), so a per-request average can leave it out.
+        let row = |model: &str| {
+            doc.model_usage
+                .iter()
+                .find(|m| m.model == model)
+                .unwrap_or_else(|| panic!("no {model} row"))
+        };
+        let advisor_cost =
+            crate::pricing::cost_usd("claude", "claude-fable-5-1", &advisor.tokens, &none);
+        let fable = row("claude-fable-5-1");
+        assert_eq!(fable.requests, 0);
+        assert!(
+            (fable.sub_cost_usd - advisor_cost).abs() < 1e-12,
+            "{} != {advisor_cost}",
+            fable.sub_cost_usd
+        );
+        assert_eq!(row("claude-opus-5-5").sub_cost_usd, 0.0);
+        assert!((doc.totals.cost_usd - rows).abs() < 1e-9);
+    }
+
     #[test]
     fn doc_global_cost_reflects_config_pricing_override() {
         // Override gpt-5.5 input to 9.99/1e6, everything else 0 → cost is
@@ -3649,6 +3801,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: None,
+                    sub_usage: Vec::new(),
                 },
                 now() - Duration::from_secs(seeded - i),
             );
@@ -3701,6 +3854,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            sub_usage: Vec::new(),
         }
     }
 

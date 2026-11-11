@@ -48,6 +48,42 @@ impl TokenCounts {
     }
 }
 
+/// Tokens one request spent on a sub-inference that its top-level `tokens`
+/// leave out and that is billed at its OWN model's rates: an Anthropic
+/// `usage.iterations` entry such as an advisor call, a context compaction or
+/// a declined fallback hop ([`crate::proxy::sse::uncounted_iterations`]).
+/// Folded into that model's token/cost rows; never counted as a request.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubUsage {
+    /// The model the sub-inference ran on, when the upstream named it
+    /// (advisor, fallback hops). `None` = the request's own model (e.g. a
+    /// compaction iteration, which names no model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub tokens: TokenCounts,
+}
+
+impl SubUsage {
+    /// Every token of these sub-usages ([`TokenCounts::total`] summed) — what
+    /// a per-request TOTAL token figure adds to the request's own total.
+    pub fn total(sub_usage: &[SubUsage]) -> u64 {
+        sub_usage
+            .iter()
+            .fold(0, |sum, sub| sum.saturating_add(sub.tokens.total()))
+    }
+
+    /// `(input, output)` of these sub-usages — for the per-account
+    /// in/out token counters.
+    pub fn input_output(sub_usage: &[SubUsage]) -> (u64, u64) {
+        sub_usage.iter().fold((0, 0), |(i, o), sub| {
+            (
+                i.saturating_add(sub.tokens.input),
+                o.saturating_add(sub.tokens.output),
+            )
+        })
+    }
+}
+
 /// One observable proxy/scheduler happening, rendered into the activity log.
 ///
 /// `id` correlates the started → routed → finished lifecycle of a single
@@ -191,6 +227,11 @@ pub enum ActivityEvent {
         /// `None` ONLY for replayed history persisted before the field
         /// existed — displayed as `unknown`, never coerced into `local`.
         tenant: Option<String>,
+        /// Sub-inferences billed under their own model that `tokens` leave
+        /// out ([`SubUsage`]). Each folds into its model's token/cost rows
+        /// and NONE of them is a request. Empty for every upstream that
+        /// reports no `usage.iterations`, and on pre-field history.
+        sub_usage: Vec<SubUsage>,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {

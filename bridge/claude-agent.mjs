@@ -242,6 +242,8 @@ export async function run(input, runtime, output = process.stdout) {
         delta = frame;
       } else if (frame.type === 'message_stop') {
         for (const [key,value] of Object.entries(roundUsage)) if (typeof value === 'number') usage[key] = (usage[key] ?? 0) + value;
+        // Advisor/compaction iterations (billed outside the summed counters) reach llmux; message/fallback_message entries are dropped, since merged across rounds they would read as declined fallback attempts.
+        if (Array.isArray(roundUsage.iterations)) usage.iterations = [...(usage.iterations ?? []), ...roundUsage.iterations.filter(i => i?.type !== 'message' && i?.type !== 'fallback_message')];
         if (!external && (internal || request.structured) && delta?.delta?.stop_reason !== 'max_tokens') continue;
         if (!delta) {await failure(502,'SDK omitted the response stop reason.'); break;}
         await event({...delta,usage}); await event(frame); stopped = true; cancel(); break;

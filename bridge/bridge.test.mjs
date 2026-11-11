@@ -54,6 +54,12 @@ test('WebSearch executes internally, indexes continue, usage sums distinct round
  assert.deepEqual(result.events.find(e=>e.type==='message_delta').usage,{input_tokens:16,output_tokens:8});
  assert.deepEqual(await result.options.canUseTool('WebSearch',{query:'evidence'}),{behavior:'allow',updatedInput:{query:'evidence'}});
 });
+test('advisor and compaction iterations of every round reach llmux; executor entries stay summed',async()=>{
+ const advisor={type:'advisor_message',model:'claude-opus-5-5',input_tokens:80,output_tokens:20};
+ const compaction={type:'compaction',input_tokens:50,output_tokens:5};
+ const result=await fakeRun({...basic,_llmux_web_search:true},[start(),{type:'content_block_start',index:0,content_block:{type:'tool_use',id:'internal',name:'WebSearch',input:{}}},{type:'content_block_stop',index:0},...finish('tool_use',{input_tokens:7,output_tokens:3,iterations:[{type:'message',input_tokens:7,output_tokens:3},advisor]}),start({input_tokens:9,output_tokens:1}),...text,...finish('end_turn',{input_tokens:9,output_tokens:5,iterations:[compaction,{type:'message',input_tokens:9,output_tokens:5}]})]);
+ assert.deepEqual(result.events.find(e=>e.type==='message_delta').usage,{input_tokens:16,output_tokens:8,iterations:[advisor,compaction]});
+});
 test('unsupported tool choices fail instead of weakening client requirement',()=>{
  assert.throws(()=>buildRequest({...basic,tool_choice:{type:'any'}},credential,'url','/tmp'),/tool choice/);
 });

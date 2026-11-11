@@ -1328,6 +1328,55 @@ async fn codex_account_aggregates_non_streaming_requests() {
     assert_eq!(message["usage"]["output_tokens"], 11);
 }
 
+/// A non-streaming codex request whose upstream turn FAILS still books the
+/// usage the failure reported (#278): the client gets the 502, and the codex
+/// model row keeps the tokens the upstream burned instead of recording none.
+#[tokio::test]
+async fn codex_failed_non_streaming_request_books_its_reported_usage() {
+    const FAILED_SSE: &str = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"resp_f"}}"#,
+        "\n\n",
+        "event: response.failed\n",
+        r#"data: {"type":"response.failed","response":{"id":"resp_f","error":{"message":"boom"},"usage":{"input_tokens":40,"input_tokens_details":{"cached_tokens":30},"output_tokens":5}}}"#,
+        "\n\n",
+    );
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(FAILED_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+    let response = post_messages(
+        &client,
+        &proxy,
+        r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 502);
+    response.bytes().await.unwrap();
+    let mut row = serde_json::Value::Null;
+    for _ in 0..200 {
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(found) = doc["model_usage"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|r| r["group"] == "codex" && r["errors"] == 1)
+                .cloned()
+        }) {
+            row = found;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(row["requests"], 1, "{row}");
+    assert_eq!(row["tokens_in"], 10, "fresh = 40 - 30 cached: {row}");
+    assert_eq!(row["tokens_out"], 5, "{row}");
+    assert_eq!(row["cache_read"], 30, "{row}");
+}
+
 /// Claude Code auto mode's server-side tool-use review request, as a body
 /// fragment. `stream` is spliced in so the same request drives both legs.
 fn safeguarded_request(stream: bool, safeguards: bool) -> String {
@@ -1846,6 +1895,146 @@ async fn get_dashboard(proxy: &Proxy, api_key: Option<&str>) -> reqwest::Respons
         request = request.header("x-api-key", key);
     }
     request.send().await.expect("dashboard reachable")
+}
+
+/// #278: an Anthropic advisor sub-inference (`usage.iterations`, type
+/// `advisor_message`) is not in the top-level usage. It is booked under the
+/// advisor's own model on both relays (stream and JSON) without counting as
+/// a request, and the executor's row keeps exactly the top-level numbers.
+#[tokio::test]
+async fn advisor_iterations_are_booked_under_the_advisor_model() {
+    const SSE: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":412,"output_tokens":1}}}"#,
+        "\n\n",
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1760,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":531,"iterations":[{"type":"message","input_tokens":412,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":89},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":823,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1612},{"type":"message","input_tokens":1348,"cache_read_input_tokens":412,"cache_creation_input_tokens":0,"output_tokens":442}]}}"#,
+        "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    const JSON: &str = r#"{"id":"m2","type":"message","usage":{"input_tokens":10,"output_tokens":5,"iterations":[{"type":"message","input_tokens":10,"output_tokens":5},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":100,"output_tokens":20}]}}"#;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(SSE, 64));
+    mock.push(ScriptedResponse::ok(JSON));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let client = reqwest::Client::new();
+    for stream in [true, false] {
+        let body = format!(
+            r#"{{"model":"claude-opus-5-5","max_tokens":64,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let response = post_messages(&client, &proxy, &body).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+    let mut doc = serde_json::Value::Null;
+    for _ in 0..200 {
+        doc = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if doc["totals"]["requests"] == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let row = |model: &str| {
+        doc["model_usage"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|r| r["group"] == "claude" && r["model"] == model)
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no {model} row in {doc}"))
+    };
+    let opus = row("claude-opus-5-5");
+    assert_eq!(opus["requests"], 2, "{opus}");
+    assert_eq!(opus["tokens_in"], 1770, "top-level only: {opus}");
+    assert_eq!(opus["tokens_out"], 536, "{opus}");
+    let fable = row("claude-fable-5-1");
+    assert_eq!(
+        fable["requests"], 0,
+        "a sub-usage is not a request: {fable}"
+    );
+    assert_eq!(fable["tokens_in"], 923, "{fable}");
+    assert_eq!(fable["tokens_out"], 1632, "{fable}");
+    assert!(
+        fable["cost_usd"].as_f64().unwrap_or(0.0) > 0.0,
+        "priced at the advisor's rates: {fable}"
+    );
+    assert_eq!(doc["totals"]["requests"], 2);
+    // `/llmux/status` per-account lifetime tokens count the advisor too
+    // (executor 1760 + 10 in / 531 + 5 out, advisor 823 + 100 / 1612 + 20).
+    let totals = proxy_totals(&proxy, &AccountId("a".into())).await;
+    assert_eq!(totals.requests, 2);
+    assert_eq!(totals.input_tokens, 1770 + 923);
+    assert_eq!(totals.output_tokens, 536 + 1632);
+}
+
+/// #278: a turn a FALLBACK model served is booked under that model (the
+/// top-level `model` / `fallback_message` entry), on both relays, and a
+/// declined attempt Anthropic does not bill (category `cyber`, no output)
+/// adds nothing; the requested model gets no row.
+#[tokio::test]
+async fn fallback_served_turns_are_booked_under_the_serving_model() {
+    const SSE: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":412,"output_tokens":1}}}"#,
+        "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}}}"#,
+        "\n\n",
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":412,"output_tokens":264,"iterations":[{"type":"message","model":"claude-fable-5","input_tokens":535,"output_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,"output_tokens":264}]}}"#,
+        "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+    const JSON: &str = r#"{"id":"m2","type":"message","model":"claude-opus-4-8","content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"},"trigger":{"type":"refusal","category":"cyber"}},{"type":"text","text":"Hi"}],"usage":{"input_tokens":10,"output_tokens":5,"iterations":[{"type":"message","model":"claude-fable-5","input_tokens":12,"output_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":10,"output_tokens":5}]}}"#;
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(SSE, 64));
+    mock.push(ScriptedResponse::ok(JSON));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let client = reqwest::Client::new();
+    for stream in [true, false] {
+        let body = format!(
+            r#"{{"model":"claude-fable-5","max_tokens":64,"stream":{stream},"messages":[{{"role":"user","content":"hi"}}]}}"#
+        );
+        let response = post_messages(&client, &proxy, &body).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+    let mut doc = serde_json::Value::Null;
+    for _ in 0..200 {
+        doc = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if doc["totals"]["requests"] == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rows: Vec<serde_json::Value> = doc["model_usage"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r["group"] == "claude")
+        .collect();
+    assert_eq!(rows.len(), 1, "only the serving model has a row: {rows:?}");
+    assert_eq!(rows[0]["model"], "claude-opus-4-8");
+    assert_eq!(rows[0]["requests"], 2);
+    assert_eq!(rows[0]["tokens_in"], 422);
+    assert_eq!(rows[0]["tokens_out"], 269);
 }
 
 /// A driven request is captured to raw-io (bodies + headers with credential

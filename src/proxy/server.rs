@@ -199,6 +199,21 @@ impl UsageTotals {
         entry.output_tokens = entry.output_tokens.saturating_add(output_tokens);
     }
 
+    /// Record one relayed request with the usage it reported: the top-level
+    /// input/output tokens plus those of its sub-usages (#278: advisor /
+    /// compaction / billed fallback attempt), so the lifetime counters
+    /// match the dashboard's account totals. One request, whatever its
+    /// sub-usages.
+    pub fn record_usage(&self, account: &AccountId, usage: &crate::proxy::sse::StreamUsage) {
+        let (sub_in, sub_out) = crate::tui::SubUsage::input_output(&usage.sub_usage);
+        self.record(
+            account,
+            1,
+            usage.input_tokens.saturating_add(sub_in),
+            usage.output_tokens.saturating_add(sub_out),
+        );
+    }
+
     pub fn get(&self, account: &AccountId) -> AccountTotals {
         self.inner
             .lock()

@@ -12,8 +12,9 @@
 //! `usage_ts_idx` range of that day, so no read transaction is held while a
 //! day is compressed or verified and the metering writer is never starved.
 //! Rows are insert-only (`INSERT OR IGNORE`), so a day whose
-//! `count:sum(ts_ms):max(ts_ms)` fingerprint equals its latest manifest's is
-//! skipped without reading its rows. One exporter at a time per directory
+//! `v<format>:count:sum(ts_ms):max(ts_ms)` fingerprint equals its latest
+//! manifest's is skipped without reading its rows; a day exported in another
+//! line format (an older binary) is exported again. One exporter at a time per directory
 //! (`usage-archive/.lock`, also across processes during a rolling restart).
 
 use std::fs::{self, File};
@@ -43,7 +44,8 @@ pub struct UsageManifest {
     pub plain_bytes: u64,
     pub plain_sha256: String,
     pub archive_bytes: u64,
-    /// `count:sum(ts_ms):max(ts_ms)` of the day's rows when exported.
+    /// `v<format>:count:sum(ts_ms):max(ts_ms)` of the day's rows when
+    /// exported (format-1 exports have no `v` prefix).
     #[serde(default)]
     pub fingerprint: String,
     pub zstd: String,
@@ -155,6 +157,15 @@ pub fn export_usage_days(
             "usage.sqlite3 is in {mode} mode, export waits for WAL"
         )));
     }
+    // `requests` (#278: 0 on a sub-usage row) exists once the daemon has
+    // migrated the store; a store it never opened exports one request a row,
+    // which is what every row of that schema is.
+    let has_requests: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'requests'",
+        [],
+        |r| r.get(0),
+    )?;
+    let requests = if has_requests > 0 { "requests" } else { "1" };
     let first: Option<i64> = conn.query_row("SELECT min(ts_ms) FROM usage", [], |r| r.get(0))?;
     let Some(first) = first else {
         return Ok(Vec::new());
@@ -171,7 +182,7 @@ pub fn export_usage_days(
             return Err(StoreError::Busy("shutdown".into()));
         }
         let (lo, hi) = bracket(n);
-        match export_day(&conn, &dir, &day, lo, hi, stop) {
+        match export_day(&conn, &dir, &day, lo, hi, requests, stop) {
             Ok(Some((generation, rows))) => written.push((day, generation, rows)),
             Ok(None) => {}
             Err(err @ StoreError::Busy(_)) => return Err(err),
@@ -209,20 +220,28 @@ pub fn export_usage_days(
     }
 }
 
-/// `count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the sum far
-/// from i64 overflow.
+/// Version of the exported line shape. Part of every fingerprint, so a day a
+/// binary of another format exported (an older one, after a downgrade) never
+/// matches and is exported again in this format. 2 (#278): lines carry
+/// `requests`. Format 1 fingerprints had no version prefix.
+const EXPORT_FORMAT: u32 = 2;
+
+/// `v<format>:count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the
+/// sum far from i64 overflow.
 fn fingerprint(count: i64, sum_off: i64, max_ts: i64) -> String {
-    format!("{count}:{sum_off}:{max_ts}")
+    format!("v{EXPORT_FORMAT}:{count}:{sum_off}:{max_ts}")
 }
 
 /// Export one local day if its rows changed. `Ok(Some((generation, rows)))`
-/// = a new file was published.
+/// = a new file was published. `requests` is the SQL for a row's request
+/// count (the column, or `1` on a store without it).
 fn export_day(
     conn: &Connection,
     dir: &Path,
     day: &str,
     lo: i64,
     hi: i64,
+    requests: &str,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<(u32, u64)>, StoreError> {
     let (count, sum_off, max_ts): (i64, i64, i64) = conn.query_row(
@@ -243,7 +262,7 @@ fn export_day(
     {
         return Ok(None);
     }
-    let (lines, read_fp) = read_day(conn, lo, hi, day, stop)?;
+    let (lines, read_fp) = read_day(conn, lo, hi, day, requests, stop)?;
     if lines.is_empty() {
         return Ok(None);
     }
@@ -260,6 +279,7 @@ fn read_day(
     lo: i64,
     hi: i64,
     day: &str,
+    requests: &str,
     stop: &dyn Fn() -> bool,
 ) -> Result<(Vec<String>, String), StoreError> {
     let mut stmt = conn.prepare(&format!(
@@ -267,7 +287,8 @@ fn read_day(
                 json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
                             'grp', grp, 'model', model, 'status', status,
                             'tokens_in', tokens_in, 'tokens_out', tokens_out,
-                            'cache_read', cache_read, 'cache_creation', cache_creation)
+                            'cache_read', cache_read, 'cache_creation', cache_creation,
+                            'requests', {requests})
            FROM usage WHERE {DAY_FILTER} ORDER BY ts_ms, event_key"
     ))?;
     let mut rows = stmt.query(rusqlite::params![lo, hi, day])?;
@@ -445,6 +466,125 @@ mod tests {
                 .expect("count"),
             3
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn archived_lines(path: &Path) -> Vec<serde_json::Value> {
+        let mut dec =
+            zstd::stream::read::Decoder::new(File::open(path).expect("archive")).expect("zstd");
+        dec.window_log_max(31).expect("window");
+        BufReader::new(dec)
+            .lines()
+            .map(|l| serde_json::from_str(&l.expect("line")).expect("json"))
+            .collect()
+    }
+
+    /// #278: a sub-usage row (tokens under its own model, not a request)
+    /// keeps that distinction in the day export; rows of a store that never
+    /// had the column export as one request each.
+    #[test]
+    fn the_export_carries_the_request_count_of_each_row() {
+        let (dir, db) = db_with(&[("a", T0), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        export_usage_days(&db, &today, NEVER).expect("old schema exports");
+        let ad = archive_dir_for(&db);
+        let old = archived_lines(&ad.join(format!("usage-{day0}.jsonl.zst")));
+        assert_eq!(old[0]["requests"], 1, "{old:?}");
+        // The daemon's migration, then one sub-usage row on the same day.
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        Connection::open(&db)
+            .expect("open")
+            .execute(
+                "INSERT INTO usage (event_key, ts_ms, tenant, grp, model, status, tokens_in, requests)
+                 VALUES ('a#sub0', ?1, 't', 'claude', 'advisor', 200, 9, 0)",
+                [T0 as i64],
+            )
+            .expect("sub row");
+        let out = export_usage_days(&db, &today, NEVER).expect("export");
+        assert_eq!(out, vec![(day0.clone(), 1, 2)]);
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.1.jsonl.zst")));
+        let by_key = |k: &str| {
+            lines
+                .iter()
+                .find(|l| l["event_key"] == k)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {k} in {lines:?}"))
+        };
+        assert_eq!(by_key("a")["requests"], 1);
+        assert_eq!(by_key("a#sub0")["requests"], 0);
+        assert_eq!(by_key("a#sub0")["model"], "advisor");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Upgrade → downgrade → re-upgrade: an older binary re-exports a day in
+    /// its own format (no `requests`) under the same `count:sum:max`
+    /// fingerprint. The current exporter must not take that export as its
+    /// own — the export format version is part of the fingerprint, so the day
+    /// is exported again, with `requests`.
+    #[test]
+    fn an_export_written_by_an_older_format_is_regenerated() {
+        let (dir, db) = db_with(&[("a", T0), ("b", T0 + 1000), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("upgrade export"),
+            vec![(day0.clone(), 0, 2)]
+        );
+        // What a pre-#278 binary publishes for the same rows: its line shape
+        // and its fingerprint.
+        let (lo, hi) = bracket(local_day_number(T0 as i64));
+        let conn = Connection::open(&db).expect("open");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
+                            'grp', grp, 'model', model, 'status', status,
+                            'tokens_in', tokens_in, 'tokens_out', tokens_out,
+                            'cache_read', cache_read, 'cache_creation', cache_creation)
+                   FROM usage WHERE {DAY_FILTER} ORDER BY ts_ms, event_key"
+            ))
+            .expect("old export sql");
+        let old_lines: Vec<String> = stmt
+            .query_map(rusqlite::params![lo, hi, day0], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("lines");
+        let (count, sum_off, max_ts): (i64, i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*), coalesce(sum(ts_ms - ?1), 0), coalesce(max(ts_ms), 0)
+                       FROM usage WHERE {DAY_FILTER}"
+                ),
+                rusqlite::params![lo, hi, day0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("fingerprint");
+        let ad = archive_dir_for(&db);
+        let (last, generation) = latest(&ad, &day0);
+        assert_eq!(generation, 1);
+        publish_day(
+            &ad,
+            &day0,
+            1,
+            last.as_ref(),
+            &old_lines,
+            format!("{count}:{sum_off}:{max_ts}"),
+            NEVER,
+        )
+        .expect("old-style publish")
+        .expect("published");
+        // Re-upgrade: the old-format day is exported again, with `requests`.
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("re-upgrade export"),
+            vec![(day0.clone(), 2, 2)]
+        );
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.2.jsonl.zst")));
+        assert!(lines.iter().all(|l| l["requests"] == 1), "{lines:?}");
+        // …and is then stable.
+        assert!(export_usage_days(&db, &today, NEVER)
+            .expect("again")
+            .is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -9,9 +9,10 @@
 //! Deliberate boundaries:
 //!
 //! - **Metadata only.** A row is `(when, tenant, group, model, status, token
-//!   counts)`. No prompt, no excerpt, no credential, no digest — the panel
-//!   never needs them and the file sits next to the config that does hold
-//!   secrets, so it is created owner-only (0600 in a 0700 directory).
+//!   counts, request count)` — the count is 0 on a sub-usage row (#278). No
+//!   prompt, no excerpt, no credential, no digest — the panel never needs
+//!   them and the file sits next to the config that does hold secrets, so it
+//!   is created owner-only (0600 in a 0700 directory).
 //! - **Keys-only.** `activity.jsonl` keeps serving every other feature
 //!   (activity ring, sessions, per-model stats, infinite scroll). This store
 //!   is additive; nothing is deleted or migrated away from it.
@@ -38,10 +39,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::dashboard::{KeyRowDoc, TenantModelDoc, TenantUsageDoc};
 use crate::tui::activity::normalize_model;
-use crate::tui::{ActivityEvent, TokenCounts};
+use crate::tui::{ActivityEvent, SubUsage, TokenCounts};
 
 /// Schema version stored in `meta`. Bump only with a migration.
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2 (#278): the `requests` column — `1` for a finished request, `0` for a
+/// sub-usage row (tokens booked under another model, not a request).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Schema version of `activity.jsonl` lines this importer understands — the
 /// SAME constant the writer stamps them with ([`crate::tui::activity`]), not a
@@ -289,6 +292,10 @@ pub struct UsageRow {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// `None` = the request itself (one request). `Some(n)` = the request's
+    /// `n`-th sub-usage ([`crate::tui::SubUsage`], #278): tokens booked under
+    /// their own model that are NOT a request (`requests = 0`).
+    pub sub_index: Option<u32>,
 }
 
 impl UsageRow {
@@ -330,7 +337,57 @@ impl UsageRow {
         self
     }
 
-    /// Build a row from a finished-request event folded at `now`. `None` for
+    /// Every row one finished-request event books: the request itself, then
+    /// one per sub-usage. Empty for every other event variant.
+    pub fn rows_from_event(event: &ActivityEvent, now: SystemTime) -> Vec<Self> {
+        let (
+            Some(row),
+            ActivityEvent::RequestFinished {
+                model, sub_usage, ..
+            },
+        ) = (Self::from_event(event, now), event)
+        else {
+            return Vec::new();
+        };
+        row.with_sub_usage(model.as_deref(), sub_usage)
+    }
+
+    /// This request row followed by one row per sub-usage: same identity,
+    /// tenant, group and status, the sub-usage's own model (`None` → the
+    /// request's `request_model`) and tokens, and `sub_index` set so it is
+    /// never counted as a request. Shared by the live fold and the legacy
+    /// import, so both write the same identities.
+    fn with_sub_usage(self, request_model: Option<&str>, sub_usage: &[SubUsage]) -> Vec<Self> {
+        let mut rows = Vec::with_capacity(1 + sub_usage.len());
+        for (index, sub) in sub_usage.iter().enumerate() {
+            let mut row = Self::new(
+                self.ts_ms,
+                self.request_id,
+                Some(&self.tenant),
+                self.group.as_deref(),
+                sub.model.as_deref().or(request_model),
+                self.status,
+            )
+            .with_tokens(
+                sub.tokens.input,
+                sub.tokens.output,
+                sub.tokens.cache_read.unwrap_or(0),
+                sub.tokens.cache_creation.unwrap_or(0),
+            );
+            row.sub_index = Some(u32::try_from(index).unwrap_or(u32::MAX));
+            rows.push(row);
+        }
+        rows.insert(0, self);
+        rows
+    }
+
+    /// `1` for the request row, `0` for a sub-usage row.
+    fn requests(&self) -> u64 {
+        u64::from(self.sub_index.is_none())
+    }
+
+    /// Build the request's own row from a finished-request event folded at
+    /// `now` (no sub-usage rows — see [`Self::rows_from_event`]). `None` for
     /// every other event variant (only completions are metered).
     pub fn from_event(event: &ActivityEvent, now: SystemTime) -> Option<Self> {
         let ActivityEvent::RequestFinished {
@@ -369,7 +426,10 @@ impl UsageRow {
     /// whether it arrives live or through the legacy import, which is what
     /// makes an overlapping import a no-op instead of a double count.
     pub fn event_key(&self) -> String {
-        format!("{}:{}", self.ts_ms, self.request_id)
+        match self.sub_index {
+            None => format!("{}:{}", self.ts_ms, self.request_id),
+            Some(index) => format!("{}:{}#sub{index}", self.ts_ms, self.request_id),
+        }
     }
 }
 
@@ -383,8 +443,9 @@ fn epoch_ms(at: SystemTime) -> u64 {
 // Legacy import
 // ---------------------------------------------------------------------------
 
-/// What one [`UsageDb::import_activity_jsonl`] pass did. `imported +
-/// duplicates + skipped` is every complete line it read.
+/// What one [`UsageDb::import_activity_jsonl`] pass did. `imported` and
+/// `duplicates` count ROWS (a line with sub-usages yields more than one);
+/// `skipped` counts unusable lines.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportOutcome {
     /// Rows newly inserted.
@@ -414,6 +475,9 @@ struct LegacyLine {
     tenant: Option<String>,
     #[serde(default)]
     tokens: Option<TokenCounts>,
+    /// Sub-usages (#278); absent on every line written before them.
+    #[serde(default)]
+    sub_usage: Vec<SubUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +515,7 @@ impl UsageDb {
         Self::init(conn, ":memory:".to_string())
     }
 
-    fn init(conn: Connection, path: String) -> Result<Self, UsageError> {
+    fn init(mut conn: Connection, path: String) -> Result<Self, UsageError> {
         // Wait out a concurrent reader/writer instead of failing the batch:
         // the writer loop cannot retry, a BUSY batch would be lost.
         conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -479,16 +543,16 @@ impl UsageDb {
                  tokens_in      INTEGER NOT NULL DEFAULT 0,
                  tokens_out     INTEGER NOT NULL DEFAULT 0,
                  cache_read     INTEGER NOT NULL DEFAULT 0,
-                 cache_creation INTEGER NOT NULL DEFAULT 0
+                 cache_creation INTEGER NOT NULL DEFAULT 0,
+                 requests       INTEGER NOT NULL DEFAULT 1
              );
              CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage(ts_ms);
              CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage(model, ts_ms);
              CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);",
         )
         .map_err(|e| UsageError::sqlite(&path, e))?;
-        let db = Self { conn, path };
-        db.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
-        Ok(db)
+        migrate(&mut conn).map_err(|e| UsageError::sqlite(&path, e))?;
+        Ok(Self { conn, path })
     }
 
     /// Where this store lives (`:memory:` for the ephemeral one).
@@ -543,9 +607,9 @@ impl UsageDb {
         let from_ms = query.window.from_ms(query.now_ms);
         let to_ms = query.now_ms;
         let mut sql = String::from(
-            "SELECT tenant, grp, model, COUNT(*), \
-             SUM(CASE WHEN status < 400 THEN 1 ELSE 0 END), \
-             SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), \
+            "SELECT tenant, grp, model, SUM(requests), \
+             SUM(CASE WHEN status < 400 THEN requests ELSE 0 END), \
+             SUM(CASE WHEN status >= 400 THEN requests ELSE 0 END), \
              SUM(tokens_in), SUM(tokens_out), SUM(cache_read), SUM(cache_creation), \
              MIN(ts_ms), MAX(ts_ms) \
              FROM usage WHERE ts_ms >= ?1 AND ts_ms <= ?2",
@@ -831,26 +895,39 @@ impl UsageDb {
                 other => Err(UsageError::sqlite(&self.path, other)),
             })
     }
-
-    fn set_meta(&self, key: &str, value: &str) -> Result<(), UsageError> {
-        self.conn
-            .execute(
-                "INSERT INTO meta (k, v) VALUES (?1, ?2) \
-                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                rusqlite::params![key, value],
-            )
-            .map(|_| ())
-            .map_err(|e| UsageError::sqlite(&self.path, e))
-    }
 }
 
 const INSERT_SQL: &str = "INSERT OR IGNORE INTO usage \
-     (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+     (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, requests) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+
+/// Bring a store to [`SCHEMA_VERSION`]. v1 → v2 adds the `requests` column
+/// (existing rows are one request each, the column default). Runs inside an
+/// IMMEDIATE transaction that re-checks the column, so two daemons opening
+/// the same file during a rolling restart cannot both alter it. Additive
+/// only: a v1 daemon can still write a v2 store (its inserts take the
+/// default), though it would count sub-usage rows as requests.
+fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let has_requests: i64 = tx.query_row(
+        "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'requests'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_requests == 0 {
+        tx.execute_batch("ALTER TABLE usage ADD COLUMN requests INTEGER NOT NULL DEFAULT 1")?;
+    }
+    tx.execute(
+        "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        [SCHEMA_VERSION.to_string()],
+    )?;
+    tx.commit()
+}
 
 /// Owned bind values for [`INSERT_SQL`] (owned, so the array outlives the
 /// statement call without borrowing a temporary).
-fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 10] {
+fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 11] {
     use rusqlite::types::Value;
     let text = |v: &Option<String>| match v {
         Some(v) => Value::Text(v.clone()),
@@ -867,6 +944,7 @@ fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 10] {
         Value::Integer(row.tokens_out as i64),
         Value::Integer(row.cache_read as i64),
         Value::Integer(row.cache_creation as i64),
+        Value::Integer(row.requests() as i64),
     ]
 }
 
@@ -936,7 +1014,7 @@ pub(crate) fn read_chunk(
         }
         chunk.bytes += read as u64;
         match parse_legacy_line(&line) {
-            Some(row) => chunk.rows.push(row),
+            Some(rows) => chunk.rows.extend(rows),
             None => chunk.skipped += 1,
         }
     }
@@ -996,7 +1074,8 @@ fn read_head(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize>
     Ok(filled)
 }
 
-fn parse_legacy_line(line: &str) -> Option<UsageRow> {
+/// The rows one persisted line books: the request, then its sub-usages.
+fn parse_legacy_line(line: &str) -> Option<Vec<UsageRow>> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -1013,7 +1092,7 @@ fn parse_legacy_line(line: &str) -> Option<UsageRow> {
         parsed.model.as_deref(),
         parsed.status,
     );
-    Some(match parsed.tokens {
+    let row = match parsed.tokens {
         Some(t) => row.with_tokens(
             t.input,
             t.output,
@@ -1021,7 +1100,8 @@ fn parse_legacy_line(line: &str) -> Option<UsageRow> {
             t.cache_creation.unwrap_or(0),
         ),
         None => row,
-    })
+    };
+    Some(row.with_sub_usage(parsed.model.as_deref(), &parsed.sub_usage))
 }
 
 #[cfg(unix)]
@@ -1482,6 +1562,179 @@ mod tests {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
 
+    /// A finished `claude-opus-5-5` request that also ran an advisor on
+    /// `claude-fable-5-1` and a compaction (no model → the request's own).
+    fn event_with_sub_usage(id: u64) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: Some("a".into()),
+            status: 200,
+            duration: std::time::Duration::from_millis(5),
+            tokens: Some(TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: Some(10),
+                cache_creation: Some(5),
+            }),
+            group: Some("claude".into()),
+            model: Some("claude-opus-5-5".into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: Some("k-sub".into()),
+            sub_usage: vec![
+                crate::tui::SubUsage {
+                    model: Some("claude-fable-5-1".into()),
+                    tokens: TokenCounts {
+                        input: 823,
+                        output: 1612,
+                        cache_read: Some(0),
+                        cache_creation: Some(0),
+                    },
+                },
+                crate::tui::SubUsage {
+                    model: None,
+                    tokens: TokenCounts {
+                        input: 1000,
+                        output: 100,
+                        cache_read: None,
+                        cache_creation: None,
+                    },
+                },
+            ],
+        }
+    }
+
+    fn cell<'a>(report: &'a UsageReport, model: &str) -> &'a ModelUsage {
+        report.tenants[0]
+            .models
+            .iter()
+            .find(|m| m.model == model)
+            .unwrap_or_else(|| panic!("no {model} cell in {report:?}"))
+    }
+
+    /// #278: every sub-usage is its own row under its own model, booked as
+    /// tokens and never as a request; live writes and the legacy import of
+    /// the same `activity.jsonl` line produce the same rows exactly once.
+    #[test]
+    fn sub_usage_rows_book_tokens_under_their_model_without_counting_requests() {
+        let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000_000);
+        let event = event_with_sub_usage(9);
+        let rows = UsageRow::rows_from_event(&event, at);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let mut db = UsageDb::open_in_memory().expect("db");
+        assert_eq!(db.insert_many(&rows).expect("insert"), 3);
+        assert_eq!(db.insert_many(&rows).expect("again"), 0, "idempotent");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        assert_eq!(report.rows, 1, "one request");
+        let tenant = &report.tenants[0];
+        assert_eq!((tenant.requests, tenant.ok, tenant.errors), (1, 1, 0));
+        assert_eq!(tenant.tokens_in, 100 + 823 + 1000);
+        let opus = cell(&report, "claude-opus-5-5");
+        assert_eq!(
+            (opus.requests, opus.tokens_in, opus.tokens_out),
+            (1, 1100, 150)
+        );
+        let fable = cell(&report, "claude-fable-5-1");
+        assert_eq!(
+            (fable.requests, fable.tokens_in, fable.tokens_out),
+            (0, 823, 1612)
+        );
+        assert!(report
+            .available_models
+            .contains(&"claude-fable-5-1".to_string()));
+
+        // The same request imported from activity.jsonl: same identities.
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        let record = crate::tui::activity::PersistedRequest::from_event(&event, at).expect("rec");
+        append(
+            &jsonl,
+            &(serde_json::to_string(&record).expect("line") + "\n"),
+        );
+        let outcome = db
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        assert_eq!((outcome.imported, outcome.duplicates), (0, 3));
+        let mut fresh = UsageDb::open_in_memory().expect("db");
+        let outcome = fresh
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        assert_eq!(outcome.imported, 3);
+        let imported = fresh
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        assert_eq!(imported, report);
+    }
+
+    /// A store written before #278 (no `requests` column) is migrated in
+    /// place on open: every existing row stays one request, and reopening
+    /// is a no-op.
+    #[test]
+    fn a_pre_sub_usage_store_is_migrated_in_place() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("usage.sqlite3");
+        {
+            let conn = Connection::open(&db_path).expect("v1");
+            conn.execute_batch(
+                "CREATE TABLE usage (
+                     event_key TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL,
+                     tenant TEXT NOT NULL, grp TEXT, model TEXT,
+                     status INTEGER NOT NULL,
+                     tokens_in INTEGER NOT NULL DEFAULT 0,
+                     tokens_out INTEGER NOT NULL DEFAULT 0,
+                     cache_read INTEGER NOT NULL DEFAULT 0,
+                     cache_creation INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '1');
+                 INSERT INTO usage (event_key, ts_ms, tenant, grp, model, status, tokens_in)
+                   VALUES ('1:1', 1, 't', 'claude', 'm', 200, 5),
+                          ('2:2', 2, 't', 'claude', 'm', 500, 7);",
+            )
+            .expect("v1 schema");
+        }
+        for _ in 0..2 {
+            let db = UsageDb::open(&db_path).expect("open migrates");
+            let report = db
+                .query(&UsageQuery::new(UsageWindow::All, 10))
+                .expect("query");
+            assert_eq!(report.rows, 2);
+            assert_eq!(
+                (
+                    report.tenants[0].requests,
+                    report.tenants[0].ok,
+                    report.tenants[0].errors
+                ),
+                (2, 1, 1)
+            );
+            assert_eq!(db.row_count().expect("count"), 2);
+            assert_eq!(
+                db.get_meta("schema_version").expect("meta").as_deref(),
+                Some("2")
+            );
+            let has_column: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'requests'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("pragma");
+            assert_eq!(has_column, 1);
+        }
+    }
+
     /// The exporter and other readers must never fail the writer's commits:
     /// a file store runs in WAL with a busy timeout, and a reader holding an
     /// open read transaction does not block an insert batch.
@@ -1510,6 +1763,7 @@ mod tests {
             tokens_out: 1,
             cache_read: 0,
             cache_creation: 0,
+            sub_index: None,
         };
         assert_eq!(db.insert_many(&[row]).expect("insert under a reader"), 1);
         reader.execute_batch("COMMIT;").expect("end");

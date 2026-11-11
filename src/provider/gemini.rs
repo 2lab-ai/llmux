@@ -1620,6 +1620,8 @@ impl GeminiSseConverter {
                 .saturating_add(count("thoughtsTokenCount")),
             cache_read_input_tokens: Some(cached),
             cache_creation_input_tokens: None,
+            sub_usage: Vec::new(),
+            served_model: None,
         };
     }
 
@@ -1900,7 +1902,7 @@ impl SseTransform for GeminiSseConverter {
     }
 
     fn usage(&self) -> StreamUsage {
-        self.usage
+        self.usage.clone()
     }
 }
 
@@ -2672,6 +2674,8 @@ mod tests {
                 output_tokens: 12,
                 cache_read_input_tokens: Some(40),
                 cache_creation_input_tokens: None,
+                sub_usage: Vec::new(),
+                served_model: None,
             }
         );
         assert_eq!(converter.events_seen(), 4);
