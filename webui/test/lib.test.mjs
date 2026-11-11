@@ -29,6 +29,50 @@ test('extended-TTL writes and web searches are solved and priced like the daemon
   const row = { model: 'm', cost_usd: null, tokens: { input: 0, output: 0, cache_read: 0, cache_creation: 1e6, cache_creation_extended: 6e5, web_search_requests: 2 } };
   assert.equal(+priceRow(row, new Map([['m', r]]), new Map()).toFixed(6), +(4e5 * d + 6e5 * e + 2 * f).toFixed(6));
 });
+// Daemon-priced hourly rows of one model: [in, out, cache_read, cache_creation, extended, searches]
+// priced with `rate` (absolute USD/token rates; `ce` applies to the extended part of the writes).
+const daemonRows = (model, rate, rows) => rows.map(([a, b, c, w, x, s]) => ({ gran: 'hour', model, tokens_in: a, tokens_out: b, cache_read: c,
+  cache_creation: w, cache_creation_extended: x, web_search_requests: s,
+  cost_usd: a * rate.in + b * rate.out + c * rate.cr + (w - x) * rate.cc + x * rate.ce + s * (rate.ws || 0) }));
+const opus = { in: 4e-6, out: 20e-6, cr: 0.2e-6, cc: 5e-6, ce: 8e-6 };
+const close = (got, want, what) => assert.ok(Math.abs(got - want) <= Math.abs(want) * 1e-6 + 1e-12, `${what}: ${got} != ${want}`);
+
+test('a model whose every cache write is extended-TTL still solves (#278)', () => {
+  // 40 Opus 5.5 hours, all writes 1h: `cache_creation` and its extended part are the same column.
+  const rows = daemonRows('claude-opus-5-5', opus, Array.from({ length: 40 }, (_, i) => {
+    const w = 2e4 + (i * i * i) % 7777;
+    return [1000 + (i * 7919) % 1000, 200 + (i * i * 31) % 500, 5e4 + (i * 104729) % 9973, w, w, 0];
+  }));
+  const rates = solveRates(rows);
+  assert.ok(rates.has('claude-opus-5-5'), 'solved');
+  const r = rates.get('claude-opus-5-5');
+  close(r.ce, opus.ce, 'extended write rate');
+  // A history row's sub-usage on that model is priced, not dropped.
+  const row = { model: 'claude-opus-5-5', cost_usd: null, tokens: { input: 1e6, output: 0 },
+    sub_usage: [{ model: 'claude-opus-5-5', tokens: { input: 0, output: 1e6 } }] };
+  close(priceRow(row, rates, new Map()), 4 + 20, 'history row with a sub-usage');
+});
+
+test('an override with a discounted extended-TTL write rate solves exactly (#278)', () => {
+  // $5 short-TTL writes, $3 extended: a cheaper extended rate is valid config, not a bad fit.
+  const rate = { ...opus, cc: 5e-6, ce: 3e-6 };
+  const rows = daemonRows('m', rate, [[1000, 2000, 3e6, 1e5, 6e4, 0], [10, 5e4, 9e6, 2e4, 0, 0], [400, 800, 1e5, 9e5, 9e5, 0], [7, 12000, 4e6, 3e3, 1e3, 0], [99, 1, 2e7, 1e4, 5e3, 0]]);
+  const r = solveRates(rows).get('m');
+  assert.ok(r, 'solved');
+  close(r.cc, 5e-6, 'short write rate');
+  close(r.ce, 3e-6, 'extended write rate');
+});
+
+test('without extended writes in the solved rows the extended rate is the short write rate (#278)', () => {
+  // The daemon prices writes it has no extended rate for at the write rate (`None` = same rate).
+  const rows = daemonRows('m', opus, [[1000, 2000, 3e6, 1e5, 0, 0], [10, 5e4, 9e6, 2e4, 0, 0], [400, 800, 1e5, 9e5, 0, 0], [7, 12000, 4e6, 3e3, 0, 0], [99, 1, 2e7, 1e4, 0, 0]]);
+  const r = solveRates(rows).get('m');
+  assert.ok(r, 'solved');
+  close(r.ce, r.cc, 'extended rate falls back to the short write rate');
+  const row = { model: 'm', cost_usd: null, tokens: { input: 0, output: 0, cache_creation: 1e6, cache_creation_extended: 6e5 } };
+  close(priceRow(row, new Map([['m', r]]), new Map()), 5, 'extended writes at the short rate');
+});
+
 test('a history row is priced with its sub-usages at their own rates (#278)', () => {
   const rates = new Map([['exec', { in: 1e-6, out: 2e-6, cr: 0, cc: 0 }], ['adv', { in: 10e-6, out: 20e-6, cr: 0, cc: 0 }]]);
   const row = { model: 'exec', cost_usd: null, tokens: { input: 1000, output: 100 },
