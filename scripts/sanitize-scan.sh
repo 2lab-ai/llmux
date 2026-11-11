@@ -32,10 +32,12 @@
 #
 # Known leaks (scripts/sanitize-known-leaks.txt, #610): a commit that is already
 # published cannot be taken back by failing every later PR. Listed by full id —
-# and only if it is already on the published base (the PR's base branch; main
-# before a push), so a change cannot list itself — its own commit object is not
-# scanned, and the matching text in the added lines of its diff is tolerated in
-# file contents wherever it persists. Nothing else is: a different hit, another
+# and only if it is already published, so a change cannot list itself: on the
+# PR's base branch for a PR; for a push, on main as it was before the push or on
+# any other published branch or tag (a commit on deploy/dev or a release tag is
+# out, and no push to main can take it back). A listed commit's own commit object
+# is not scanned, and the matching text in the added lines of its diff is
+# tolerated in file contents wherever it persists. Nothing else is: a different hit, another
 # commit adding the same text again (a binary file and a merge's own resolution
 # included) or carrying it anywhere in its commit object, any path name, a branch
 # or tag name, an annotated tag. The list carries commit ids only, never the text.
@@ -103,6 +105,27 @@ published_base() {
   fi
 }
 
+# On a push, the branch the event names (`ref` in the event file). Every other
+# branch and tag in the clone was published before this push. A run that cannot
+# name the pushed branch counts no other ref as published.
+pushed_branch() {
+  local ref
+  [ "${GITHUB_EVENT_NAME:-}" = push ] && [ -n "${GITHUB_EVENT_PATH:-}" ] || return 1
+  ref=$(awk 'match($0, /"ref": *"refs\/heads\/[^"]+"/) { s = substr($0, RSTART, RLENGTH); sub(/.*: *"refs\/heads\//, "", s); sub(/"$/, "", s); print s; exit }' "$GITHUB_EVENT_PATH") || return 1
+  [ -n "$ref" ] || return 1
+  printf '%s\n' "$ref"
+}
+
+# Whether a published branch or tag other than the pushed branch contains the commit.
+# Output is captured, not piped into `grep -q`: an early exit would fail the
+# pipeline under pipefail and read as "not published".
+on_other_published_ref() { # <sha> <pushed branch>
+  local refs
+  refs=$(git for-each-ref --contains "$1" --format='%(refname)' refs/remotes/origin refs/tags 2>/dev/null) || return 1
+  refs=$(printf '%s\n' "$refs" | grep -v -x -F -e "refs/remotes/origin/$2" -e refs/remotes/origin/HEAD) || return 1
+  [ -n "$refs" ]
+}
+
 # KNOWN: the matches in listed commits' added lines, one per line. An unreadable
 # listed commit is an error, never an empty exemption.
 KNOWN=$(mktemp "${TMPDIR:-/tmp}/sanitize-known.XXXXXX") || exit 2
@@ -112,6 +135,7 @@ exempt=()
 list="$(git rev-parse --show-toplevel)/scripts/sanitize-known-leaks.txt"
 if [ -f "$list" ]; then
   base=$(published_base) || base=''
+  pushed=$(pushed_branch) || pushed=''
   while read -r sha _ || [ -n "${sha:-}" ]; do
     case "$sha" in '' | '#'*) continue ;; esac
     if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -122,7 +146,8 @@ if [ -f "$list" ]; then
       echo "sanitize-scan: known leak $sha is not a commit in this clone — nothing exempted for it" >&2
       continue
     fi
-    if [ -z "$base" ] || ! git merge-base --is-ancestor "$sha" "$base" 2>/dev/null; then
+    if { [ -z "$base" ] || ! git merge-base --is-ancestor "$sha" "$base" 2>/dev/null; } &&
+      { [ -z "$pushed" ] || ! on_other_published_ref "$sha" "$pushed"; }; then
       echo "sanitize-scan: known leak $sha is not on the published base — nothing exempted for it" >&2
       continue
     fi
