@@ -12,8 +12,9 @@
 //! `usage_ts_idx` range of that day, so no read transaction is held while a
 //! day is compressed or verified and the metering writer is never starved.
 //! Rows are insert-only (`INSERT OR IGNORE`), so a day whose
-//! `count:sum(ts_ms):max(ts_ms)` fingerprint equals its latest manifest's is
-//! skipped without reading its rows. One exporter at a time per directory
+//! `v<format>:count:sum(ts_ms):max(ts_ms)` fingerprint equals its latest
+//! manifest's is skipped without reading its rows; a day exported in another
+//! line format (an older binary) is exported again. One exporter at a time per directory
 //! (`usage-archive/.lock`, also across processes during a rolling restart).
 
 use std::fs::{self, File};
@@ -43,7 +44,8 @@ pub struct UsageManifest {
     pub plain_bytes: u64,
     pub plain_sha256: String,
     pub archive_bytes: u64,
-    /// `count:sum(ts_ms):max(ts_ms)` of the day's rows when exported.
+    /// `v<format>:count:sum(ts_ms):max(ts_ms)` of the day's rows when
+    /// exported (format-1 exports have no `v` prefix).
     #[serde(default)]
     pub fingerprint: String,
     pub zstd: String,
@@ -218,10 +220,16 @@ pub fn export_usage_days(
     }
 }
 
-/// `count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the sum far
-/// from i64 overflow.
+/// Version of the exported line shape. Part of every fingerprint, so a day a
+/// binary of another format exported (an older one, after a downgrade) never
+/// matches and is exported again in this format. 2 (#278): lines carry
+/// `requests`. Format 1 fingerprints had no version prefix.
+const EXPORT_FORMAT: u32 = 2;
+
+/// `v<format>:count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the
+/// sum far from i64 overflow.
 fn fingerprint(count: i64, sum_off: i64, max_ts: i64) -> String {
-    format!("{count}:{sum_off}:{max_ts}")
+    format!("v{EXPORT_FORMAT}:{count}:{sum_off}:{max_ts}")
 }
 
 /// Export one local day if its rows changed. `Ok(Some((generation, rows)))`
@@ -506,6 +514,77 @@ mod tests {
         assert_eq!(by_key("a")["requests"], 1);
         assert_eq!(by_key("a#sub0")["requests"], 0);
         assert_eq!(by_key("a#sub0")["model"], "advisor");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Upgrade → downgrade → re-upgrade: an older binary re-exports a day in
+    /// its own format (no `requests`) under the same `count:sum:max`
+    /// fingerprint. The current exporter must not take that export as its
+    /// own — the export format version is part of the fingerprint, so the day
+    /// is exported again, with `requests`.
+    #[test]
+    fn an_export_written_by_an_older_format_is_regenerated() {
+        let (dir, db) = db_with(&[("a", T0), ("b", T0 + 1000), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("upgrade export"),
+            vec![(day0.clone(), 0, 2)]
+        );
+        // What a pre-#278 binary publishes for the same rows: its line shape
+        // and its fingerprint.
+        let (lo, hi) = bracket(local_day_number(T0 as i64));
+        let conn = Connection::open(&db).expect("open");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
+                            'grp', grp, 'model', model, 'status', status,
+                            'tokens_in', tokens_in, 'tokens_out', tokens_out,
+                            'cache_read', cache_read, 'cache_creation', cache_creation)
+                   FROM usage WHERE {DAY_FILTER} ORDER BY ts_ms, event_key"
+            ))
+            .expect("old export sql");
+        let old_lines: Vec<String> = stmt
+            .query_map(rusqlite::params![lo, hi, day0], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("lines");
+        let (count, sum_off, max_ts): (i64, i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*), coalesce(sum(ts_ms - ?1), 0), coalesce(max(ts_ms), 0)
+                       FROM usage WHERE {DAY_FILTER}"
+                ),
+                rusqlite::params![lo, hi, day0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("fingerprint");
+        let ad = archive_dir_for(&db);
+        let (last, generation) = latest(&ad, &day0);
+        assert_eq!(generation, 1);
+        publish_day(
+            &ad,
+            &day0,
+            1,
+            last.as_ref(),
+            &old_lines,
+            format!("{count}:{sum_off}:{max_ts}"),
+            NEVER,
+        )
+        .expect("old-style publish")
+        .expect("published");
+        // Re-upgrade: the old-format day is exported again, with `requests`.
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("re-upgrade export"),
+            vec![(day0.clone(), 2, 2)]
+        );
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.2.jsonl.zst")));
+        assert!(lines.iter().all(|l| l["requests"] == 1), "{lines:?}");
+        // …and is then stable.
+        assert!(export_usage_days(&db, &today, NEVER)
+            .expect("again")
+            .is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -278,7 +278,9 @@ local day is exported to `usage-archive/usage-YYYY-MM-DD[.N].jsonl.zst` with a
 `.manifest.json` beside it (verified before it is published; a day that
 changes later gets the next generation; nothing is deleted). The database runs
 in WAL mode so the export (one short indexed read per day, skipped when the
-day's `count:sum:max` fingerprint is unchanged) never blocks metering writes;
+day's fingerprint — export format version plus `count:sum:max` — is
+unchanged; a day an older binary exported in its own line format is exported
+again) never blocks metering writes;
 an export only runs once the file is in WAL mode, and one exporter at a time
 holds `usage-archive/.lock`. It runs in its own loop (first run a minute after
 startup, then every 10 minutes, once per local day), so a long raw-io seal
