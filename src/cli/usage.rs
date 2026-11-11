@@ -179,18 +179,21 @@ fn seven_day_usage(window: &serde_json::Value) -> Option<SevenDayUsage> {
     let utilization = window.get("utilization")?.as_f64()?;
     let resets_at = window.get("resets_at")?.as_u64()?;
     let resets_in_secs = window.get("resets_in_secs")?.as_u64()?;
-    let used_percent = round2(utilization.clamp(0.0, 1.0) * 100.0);
-    let remaining_percent = round2(100.0 - used_percent);
-    let elapsed_percent =
-        round2(((WEEK_SECS - resets_in_secs as f64) / WEEK_SECS * 100.0).clamp(0.0, 100.0));
-    let rate = (elapsed_percent >= MIN_ELAPSED_PERCENT_FOR_RATE)
-        .then(|| round2(used_percent / elapsed_percent));
+    let used = utilization.clamp(0.0, 1.0) * 100.0;
+    let elapsed = ((WEEK_SECS - resets_in_secs as f64) / WEEK_SECS * 100.0).clamp(0.0, 100.0);
+    // No pace for a window that has already reset (`resets_in_secs == 0`:
+    // the daemon keeps the old reset time and reads utilization as 0 until a
+    // new observation arrives), nor inside the first 1% of the week. The
+    // cutoff and the division use unrounded values; only the output rounds.
+    let rate = (resets_in_secs > 0 && elapsed >= MIN_ELAPSED_PERCENT_FOR_RATE)
+        .then(|| round2(used / elapsed));
+    let used_percent = round2(used);
     Some(SevenDayUsage {
         used_percent,
-        remaining_percent,
+        remaining_percent: round2(100.0 - used_percent),
         resets_at,
         resets_in_secs,
-        elapsed_percent,
+        elapsed_percent: round2(elapsed),
         rate,
     })
 }
@@ -312,6 +315,24 @@ mod tests {
         // Full week left ⇒ 0% elapsed ⇒ no rate rather than a divide-by-zero.
         let w = pace(0.02, 604_800);
         assert_eq!(w.elapsed_percent, 0.0);
+        assert_eq!(w.rate, None);
+    }
+
+    #[test]
+    fn an_already_reset_window_has_no_pace() {
+        // The daemon keeps the old reset time and reports 0 seconds left and
+        // 0 utilization until the next observation: that is not a 0.00x pace.
+        let w = pace(0.0, 0);
+        assert_eq!(w.elapsed_percent, 100.0);
+        assert_eq!(w.rate, None);
+    }
+
+    #[test]
+    fn the_one_percent_cutoff_uses_the_unrounded_elapsed_share() {
+        // 6,040 s of 604,800 s is 0.9987% of the week: it rounds to 1.00 for
+        // display, but it is still inside the no-pace interval.
+        let w = pace(0.05, 604_800 - 6_040);
+        assert_eq!(w.elapsed_percent, 1.0);
         assert_eq!(w.rate, None);
     }
 
