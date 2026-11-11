@@ -47,10 +47,17 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_creation bigint  NOT NULL DEFAULT 0,
     -- 1 = a finished request, 0 = a sub-usage row (tokens billed under
     -- another model, e.g. an advisor call; schema v2, #278).
-    requests       bigint  NOT NULL DEFAULT 1
+    requests       bigint  NOT NULL DEFAULT 1,
+    -- The extended-TTL subset of cache_creation (Anthropic 1h, OpenAI 12h
+    -- writes) and Anthropic server web searches (schema v3, #278).
+    cache_creation_extended bigint NOT NULL DEFAULT 0,
+    web_search_requests     bigint NOT NULL DEFAULT 0
 );
 -- A table created before schema v2: every existing row is one request.
 ALTER TABLE usage ADD COLUMN IF NOT EXISTS requests bigint NOT NULL DEFAULT 1;
+-- A table created before schema v3: no row had a TTL split or a web search.
+ALTER TABLE usage ADD COLUMN IF NOT EXISTS cache_creation_extended bigint NOT NULL DEFAULT 0;
+ALTER TABLE usage ADD COLUMN IF NOT EXISTS web_search_requests bigint NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage (ts_ms);
 CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage (model, ts_ms);
 
