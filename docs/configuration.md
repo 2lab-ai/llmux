@@ -118,7 +118,12 @@ not probed: their responses carry only per-key token buckets, which fed the
 retired 5h gauge and are no longer read (2026-11-10). Since 2026-07-15 the
 probe also re-fires when an account's freshest window observation goes
 **stale**, so cold subscriptions keep live gauges instead of freezing at
-their first reading.
+their first reading. The probe runs on each provider's smallest tier, named by
+alias and resolved on every probe (2026-11-12): Claude accounts the `haiku`
+owner (previously a pinned Claude 3.5 Haiku id), Codex accounts `luna` at low
+effort (previously `codex.default_model` at the global effort). The quota
+headers are account-scoped — a `gpt-6-astra` and a `gpt-6-luna` reply on the
+same account carried the same limit, usage and reset.
 
 | Key | Default | Meaning |
 |---|---:|---|
