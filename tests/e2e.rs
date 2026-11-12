@@ -8008,7 +8008,9 @@ async fn harness_title_after_clear_waits_for_the_first_main_turn() {
 }
 
 /// Review finding on #290 (P2): a launch hint fresh when the title arrives
-/// (119 s old) must not expire during the bounded wait for a main turn.
+/// (117.5 s old: 2.5 s of slack for a loaded test host, yet past 120 s once
+/// the 3 s wait has run) must not expire during the bounded wait for a main
+/// turn.
 #[tokio::test]
 async fn harness_title_launch_hint_is_judged_at_arrival() {
     let mock = MockUpstream::spawn().await;
@@ -8028,7 +8030,7 @@ async fn harness_title_launch_hint_is_judged_at_arrival() {
         .header("x-llmux-claude-launch-model", "astra")
         .header(
             "x-llmux-claude-launch-time",
-            (epoch_ms_now() - 119_000).to_string(),
+            (epoch_ms_now() - 117_500).to_string(),
         )
         .json(&harness_title("hint-at-arrival", false))
         .send()
