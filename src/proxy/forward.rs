@@ -27,6 +27,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 
+use super::auto_classifier::{Route, Target};
 use super::gemini_project::{self, GeminiProject};
 use super::logging::BODY_LOG_LIMIT;
 use super::server::AppState;
@@ -439,8 +440,20 @@ impl ForwardContext {
     fn codex_meta(&self, state: &AppState) -> (String, Option<String>, bool) {
         self.auto_classifier
             .as_ref()
+            .filter(|r| r.group() == BackendGroup::Codex)
             .map(|r| r.meta())
             .unwrap_or_else(|| state.codex.request_meta(&self.body))
+    }
+
+    fn grok_meta(&self, state: &AppState) -> (String, Option<String>) {
+        self.auto_classifier
+            .as_ref()
+            .filter(|r| r.group() == BackendGroup::Grok)
+            .map(|r| {
+                let (model, effort, _) = r.meta();
+                (model, effort)
+            })
+            .unwrap_or_else(|| state.grok.request_meta(&self.body))
     }
 
     fn translated_body(&self) -> &[u8] {
@@ -475,7 +488,7 @@ impl ForwardContext {
         if let Some(route) = &self.auto_classifier {
             let (model, effort, fast) = route.meta();
             return FinishedMeta {
-                group: Some("codex".into()),
+                group: Some(route.group().as_str().into()),
                 model: Some(model),
                 effort,
                 fast,
@@ -496,7 +509,7 @@ impl ForwardContext {
                 }
             }
             Some(BackendGroup::Grok) => {
-                let (model, effort) = state.grok.request_meta(&self.body);
+                let (model, effort) = self.grok_meta(state);
                 FinishedMeta {
                     group: Some("grok".to_string()),
                     model: Some(model),
@@ -571,7 +584,7 @@ impl ForwardContext {
                 (Some("codex".to_string()), Some(model), effort, fast)
             }
             BackendGroup::Grok => {
-                let (model, effort) = state.grok.request_meta(&self.body);
+                let (model, effort) = self.grok_meta(state);
                 (Some("grok".to_string()), Some(model), effort, false)
             }
             BackendGroup::OpenRouter => (
@@ -1518,7 +1531,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             } else {
                 None
             };
-            let (monitor, gpt) = state
+            let (monitor, main) = state
                 .auto_classifier_sessions
                 .lock()
                 .map(|mut sessions| {
@@ -1531,19 +1544,22 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                     );
                     (
                         monitor,
-                        sessions.gpt_context(tenant.as_deref(), &value, hint),
+                        sessions.main_group(tenant.as_deref(), &value, hint),
                     )
                 })
-                .unwrap_or((false, false));
-            let candidate = if monitor {
-                Some(super::auto_classifier::Route::monitor(
-                    &value,
-                    &state.config.claude_code.auto_classifier_model,
-                ))
-            } else if gpt {
+                .unwrap_or((None, None));
+            // One rule (`.prd/27`): in a Codex or Grok main session, a
+            // recognized harness request naming a Claude tier is served by
+            // the main provider's model for that tier.
+            let grok_pin = state.grok.model();
+            let config = &state.config.claude_code;
+            let candidate = if let Some(main) = monitor {
+                super::internal_requests::monitor_target(&value, main, config, &grok_pin)
+                    .map(|target| super::auto_classifier::Route::monitor(&value, target))
+            } else if let Some(main) = main {
                 task.and_then(|task| {
-                    super::internal_requests::target(&value, &state.config.claude_code)
-                        .map(|model| super::internal_requests::route(&value, task, model))
+                    super::internal_requests::target(&value, task, main, config, &grok_pin)
+                        .map(|target| super::internal_requests::route(&value, task, target))
                 })
             } else {
                 None
@@ -1551,12 +1567,14 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             if let Some(candidate) = candidate {
                 match candidate {
                     Ok(route) => {
+                        let (effective_model, effort, _) = route.meta();
                         tracing::info!(requested_model = model.as_deref().unwrap_or("<none>"),
-                            target_alias = %route.shape.model, effective_model = %route.meta().0,
-                            kind = classified.kind, reason = "gpt_main_session_internal_request",
-                            "routing Claude Code internal request through configured GPT alias");
+                            target_alias = %route.target.body_model(), effective_model = %effective_model,
+                            effort = effort.as_deref().unwrap_or("<client>"), group = %route.group(),
+                            kind = classified.kind, reason = "non_claude_main_session_harness_request",
+                            "routing Claude Code harness request to the main provider's tier model");
+                        group = Some(route.group());
                         auto_classifier = Some(route);
-                        group = Some(BackendGroup::Codex);
                     }
                     Err(message) => {
                         state.emit(ActivityEvent::Error {
@@ -1688,6 +1706,21 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     } else {
         response
     }
+}
+
+/// A routed title request asks for the captured JSON schema as Responses
+/// `text.format` (strict), on whichever provider serves the route.
+fn with_title_format(
+    route: &Route,
+    (mut request, stream): (crate::provider::ProviderRequest, bool),
+) -> Result<(crate::provider::ProviderRequest, bool), ProviderError> {
+    if let Some(format) = &route.title_format {
+        let mut body: serde_json::Value = serde_json::from_slice(&request.body)
+            .map_err(|e| ProviderError::Convert(e.to_string()))?;
+        body["text"] = serde_json::json!({ "format": format });
+        request.body = Bytes::from(body.to_string());
+    }
+    Ok((request, stream))
 }
 
 async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Response {
@@ -2399,29 +2432,25 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         } else if is_translate {
             let built = match served {
                 BackendGroup::Codex => {
-                    let request = if let Some(route) = &ctx.auto_classifier {
-                        state
+                    let request = match ctx.auto_classifier.as_ref().map(|r| (r, &r.target)) {
+                        Some((route, Target::Codex(shape))) => state
                             .codex
-                            .build_request_with_shape(&route.body, &credential, &route.shape)
-                            .and_then(|(mut request, stream)| {
-                                if let Some(format) = &route.title_format {
-                                    let mut body: serde_json::Value =
-                                        serde_json::from_slice(&request.body)
-                                            .map_err(|e| ProviderError::Convert(e.to_string()))?;
-                                    body["text"] = serde_json::json!({"format":format});
-                                    request.body = Bytes::from(body.to_string());
-                                }
-                                Ok((request, stream))
-                            })
-                    } else {
-                        state.codex.build_request(&ctx.body, &credential)
+                            .build_request_with_shape(&route.body, &credential, shape)
+                            .and_then(|out| with_title_format(route, out)),
+                        _ => state.codex.build_request(&ctx.body, &credential),
                     };
                     request.map(|out| (out, state.codex.endpoint().to_string()))
                 }
-                BackendGroup::Grok => state
-                    .grok
-                    .build_request(&ctx.body, &credential)
-                    .map(|out| (out, state.grok.endpoint().to_string())),
+                BackendGroup::Grok => {
+                    let request = match ctx.auto_classifier.as_ref().map(|r| (r, &r.target)) {
+                        Some((route, Target::Grok(shape))) => state
+                            .grok
+                            .build_request_with_shape(&route.body, &credential, shape)
+                            .and_then(|out| with_title_format(route, out)),
+                        _ => state.grok.build_request(&ctx.body, &credential),
+                    };
+                    request.map(|out| (out, state.grok.endpoint().to_string()))
+                }
                 // A body the adapter refuses was already a local 400 at the
                 // step-2 gate (same translation), before any refresh.
                 BackendGroup::Gemini => {
@@ -4131,12 +4160,15 @@ fn translate_converter(
     // thinking (spec §R4); the classifier's pinned route never does.
     let replay = |flavor| responses::requests_thinking(&body).then_some(flavor);
     let converter = match served {
-        BackendGroup::Grok => TranslateConverter::from(
-            state
+        BackendGroup::Grok => TranslateConverter::from(match &ctx.auto_classifier {
+            Some(route) => {
+                responses::ResponsesSseConverter::with_model(route.meta().0).with_tag("grok")
+            }
+            None => state
                 .grok
                 .converter()
                 .with_reasoning_replay(replay(responses::ResponsesFlavor::Grok)),
-        ),
+        }),
         BackendGroup::Gemini => {
             let (stamp, session_id) = ctx
                 .gemini_converter
@@ -4187,7 +4219,12 @@ async fn relay_translate(
     served: BackendGroup,
     upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
-    let quota_headers = if ctx.kind.as_deref() == Some("quota") && ctx.auto_classifier.is_some() {
+    let quota_headers = if ctx.kind.as_deref() == Some("quota")
+        && ctx
+            .auto_classifier
+            .as_ref()
+            .is_some_and(|r| r.group() == BackendGroup::Codex)
+    {
         let mut headers = HeaderMap::new();
         for (name, value) in response.headers() {
             if name.as_str().starts_with("x-codex-") {
@@ -4210,10 +4247,7 @@ async fn relay_translate(
     // model). Grok rides the same trace file as codex (model field
     // identifies the provider).
     let (trace_enabled, trace_model) = match served {
-        BackendGroup::Grok => (
-            state.config.grok.trace,
-            state.grok.request_meta(&ctx.body).0,
-        ),
+        BackendGroup::Grok => (state.config.grok.trace, ctx.grok_meta(state).0),
         BackendGroup::Gemini => (
             state.config.gemini.trace,
             state.gemini.request_meta(&ctx.body).0,

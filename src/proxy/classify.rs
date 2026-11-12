@@ -86,6 +86,11 @@ fn kind_from_signatures(system: &str, last_user: &str, max_tokens: Option<u64>) 
     if last_user.starts_with("[SUGGESTION MODE") {
         return "suggest";
     }
+    // Claude Code's notification status classifier (CLI 2.1.322, captured
+    // 2026-11-12): done / working / blocked for a walked-away agent.
+    if system.contains(crate::proxy::internal_requests::STATUS_SYSTEM) {
+        return "status";
+    }
     if last_user.starts_with("Based on the conversation transcript above") {
         return "audit";
     }

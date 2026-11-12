@@ -1,9 +1,12 @@
-//! Claude Code auto-mode compatibility, scoped to a known GPT main session.
+//! Claude Code harness-request compatibility, scoped to a session whose main
+//! model is served by Codex or Grok (`.prd/27-claude-code-harness-requests.md`).
 //!
 //! This does not evaluate tool safety. It transports the unchanged monitor
-//! prompt to Luna and validates the actual verdict before exposing any bytes.
-//! Session state is bounded, ephemeral, tenant-isolated, and never populated by
-//! subagents, classifier calls, count probes, or other harness control turns.
+//! prompt to the main provider's monitor model and validates the actual verdict
+//! before exposing any bytes. Session state is bounded, ephemeral,
+//! tenant-isolated, and learned only from main turns and the session's own
+//! warmup — never from subagents, classifier calls, count probes, or other
+//! harness control turns.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -12,6 +15,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 use crate::provider::codex::{effective_request_meta, CodexShape};
+use crate::provider::grok::GrokShape;
 use crate::routing::BackendGroup;
 
 pub(crate) const MAIN: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -26,9 +30,40 @@ const CAPACITY: usize = 4096;
 pub const DEADLINE: Duration = Duration::from_secs(60);
 pub const RESPONSE_LIMIT: usize = 1024 * 1024;
 
+/// Per tenant/session: when the entry was written and the provider that serves
+/// the session's main model (`Claude` when it is not a routed provider).
 #[derive(Default)]
 pub struct Sessions {
-    entries: HashMap<(String, String), (Instant, bool)>,
+    entries: HashMap<(String, String), (Instant, BackendGroup)>,
+}
+
+/// The providers whose main sessions get harness requests rerouted.
+pub fn is_routed(group: BackendGroup) -> bool {
+    matches!(group, BackendGroup::Codex | BackendGroup::Grok)
+}
+
+/// The provider a main model belongs to. A custom routing rule that sends a
+/// Claude-named model elsewhere does not make the session a Codex/Grok one:
+/// both the live group and the default classification must agree.
+fn main_provider(group: BackendGroup, model: Option<&str>) -> BackendGroup {
+    if is_routed(group) && crate::routing::Classifier::default().classify(model) == group {
+        group
+    } else {
+        BackendGroup::Claude
+    }
+}
+
+fn is_main_identity(system: &[&str]) -> bool {
+    system.iter().any(|s| s.trim_start().starts_with(MAIN))
+        && !system.iter().any(|s| {
+            s.contains("cc_is_subagent=true") || s.contains("running within the Claude Agent")
+        })
+}
+
+fn has_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty())
 }
 
 fn identity(tenant: Option<&str>, body: &Value) -> Option<(String, String)> {
@@ -67,28 +102,50 @@ pub(super) fn system_blocks(body: &Value) -> Vec<&str> {
 }
 
 impl Sessions {
+    /// The routed provider (Codex or Grok) of this request's session, if known.
     /// Utility lookups never seed state. A bounded bootstrap hint is used only
-    /// for an exact startup quota/title request, never over an observed main choice.
-    pub fn gpt_context(&self, tenant: Option<&str>, body: &Value, hint: Option<&str>) -> bool {
+    /// for an exact startup quota/title request, never over an observed entry.
+    pub fn main_group(
+        &self,
+        tenant: Option<&str>,
+        body: &Value,
+        hint: Option<&str>,
+    ) -> Option<BackendGroup> {
         if let Some(key) = identity(tenant, body) {
-            if let Some((_, gpt)) = self.entries.get(&key) {
-                return *gpt;
+            if let Some((_, group)) = self.entries.get(&key) {
+                return is_routed(*group).then_some(*group);
             }
         }
-        hint.is_some_and(|model| {
-            model.len() <= 128
-                && crate::catalog::catalog("", "", "").iter().any(|m| {
-                    m.group == "codex"
-                        && (m.id == model
-                            || m.aliases
-                                .iter()
-                                .any(|a| a == model.strip_suffix("[1m]").unwrap_or(model)))
-                })
-        })
+        let model = hint.filter(|model| model.len() <= 128)?;
+        let model = model.strip_suffix("[1m]").unwrap_or(model);
+        crate::catalog::catalog("", "", "")
+            .iter()
+            .find(|m| m.id == model || m.aliases.iter().any(|a| a == model))
+            .map(|m| BackendGroup::from_kind(m.group))
+            .filter(|group| is_routed(*group))
+    }
+
+    fn insert(&mut self, key: (String, String), now: Instant, group: BackendGroup) {
+        if self.entries.len() >= CAPACITY && !self.entries.contains_key(&key) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (now, group));
     }
 
     /// Called only for POST /v1/messages while model routing is enabled.
-    /// Returns true only for a monitor in a recently observed GPT main session.
+    /// Returns the session's routed provider only for a monitor request.
+    ///
+    /// A main turn always records the session's provider. A warmup — the
+    /// main identity, `max_tokens: 1`, no tools, sent with the session's main
+    /// model when a session starts — seeds an UNKNOWN session only: the
+    /// title can arrive before the first main turn (live 2026-11-12: 255 ms).
     pub fn observe(
         &mut self,
         tenant: Option<&str>,
@@ -96,44 +153,75 @@ impl Sessions {
         _kind: &str,
         group: BackendGroup,
         now: Instant,
-    ) -> bool {
+    ) -> Option<BackendGroup> {
         self.entries
             .retain(|_, (at, _)| now.saturating_duration_since(*at) < TTL);
-        let Some(key) = identity(tenant, body) else {
-            return false;
-        };
+        let key = identity(tenant, body)?;
         let system = system_blocks(body);
         let monitor = system.iter().any(|s| s.trim_start().starts_with(MONITOR));
         if monitor {
-            return self.entries.get(&key).is_some_and(|(_, gpt)| *gpt);
+            return self
+                .entries
+                .get(&key)
+                .map(|(_, group)| *group)
+                .filter(|group| is_routed(*group));
         }
-        let main = body.get("max_tokens").and_then(Value::as_u64) != Some(1)
-            && system.iter().any(|s| s.trim_start().starts_with(MAIN))
-            && !system.iter().any(|s| {
-                s.contains("cc_is_subagent=true") || s.contains("running within the Claude Agent")
-            })
-            && body
-                .get("tools")
-                .and_then(Value::as_array)
-                .is_some_and(|t| !t.is_empty());
-        if main {
-            if self.entries.len() >= CAPACITY && !self.entries.contains_key(&key) {
-                if let Some(oldest) = self
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (at, _))| *at)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.entries.remove(&oldest);
-                }
-            }
-            let gpt = group == BackendGroup::Codex
-                && crate::routing::Classifier::default()
-                    .classify(body.get("model").and_then(Value::as_str))
-                    == BackendGroup::Codex;
-            self.entries.insert(key, (now, gpt));
+        let warmup = body.get("max_tokens").and_then(Value::as_u64) == Some(1);
+        if !is_main_identity(&system) {
+            return None;
         }
-        false
+        let main_turn = !warmup && has_tools(body);
+        let seed = warmup && !has_tools(body) && !self.entries.contains_key(&key);
+        if main_turn || seed {
+            let provider = main_provider(group, body.get("model").and_then(Value::as_str));
+            self.insert(key, now, provider);
+        }
+        None
+    }
+}
+
+/// A routed harness request's provider and its request-owned shape. The
+/// shape names an alias (`terra`, `luna`, the Grok pin) that resolves on every
+/// request, so a catalog or pin update moves the request with no config edit.
+#[derive(Debug, Clone)]
+pub enum Target {
+    Codex(CodexShape),
+    Grok(GrokShape),
+}
+
+impl Target {
+    pub fn codex(model: &str, effort: Option<String>) -> Self {
+        Self::Codex(CodexShape {
+            model: model.into(),
+            client_model: None,
+            fast: false,
+            effort,
+        })
+    }
+
+    /// `pin` is the Grok provider's configured model: the body names the bare
+    /// `grok` alias, which the provider resolves to this pin.
+    pub fn grok(pin: &str, effort: Option<String>) -> Self {
+        Self::Grok(GrokShape {
+            model: pin.into(),
+            client_model: None,
+            effort,
+        })
+    }
+
+    pub fn group(&self) -> BackendGroup {
+        match self {
+            Self::Codex(_) => BackendGroup::Codex,
+            Self::Grok(_) => BackendGroup::Grok,
+        }
+    }
+
+    /// The model the routed body names: the Codex alias, or bare `grok`.
+    pub fn body_model(&self) -> &str {
+        match self {
+            Self::Codex(shape) => &shape.model,
+            Self::Grok(_) => "grok",
+        }
     }
 }
 
@@ -145,11 +233,11 @@ enum Contract {
 }
 
 /// Per-request override. Original client bytes stay in ForwardContext.body.
-/// A captured request, not a global Codex shape, owns this model and effort.
+/// A captured request, not a global provider shape, owns this model and effort.
 #[derive(Debug)]
 pub struct Route {
     pub body: Bytes,
-    pub shape: CodexShape,
+    pub target: Target,
     contract: Contract,
     stop: Option<&'static str>,
     pub title_format: Option<Value>,
@@ -158,10 +246,10 @@ pub struct Route {
 
 impl Route {
     pub fn new(original: &Value) -> Result<Self, &'static str> {
-        Self::monitor(original, "luna")
+        Self::monitor(original, Target::codex("luna", Some("medium".into())))
     }
 
-    pub fn monitor(original: &Value, model: &str) -> Result<Self, &'static str> {
+    pub fn monitor(original: &Value, target: Target) -> Result<Self, &'static str> {
         if original
             .get("tools")
             .is_some_and(|v| !matches!(v, Value::Array(a) if a.is_empty()))
@@ -190,7 +278,7 @@ impl Route {
             _ => return Err("unsupported auto classifier stop sequence"),
         };
         let mut body = original.clone();
-        body["model"] = json!(model);
+        body["model"] = json!(target.body_model());
         // Local stop handling is ONLY available on this recognized request.
         // Generic Responses translation continues refusing nonempty stops.
         if stop.is_some() {
@@ -200,12 +288,7 @@ impl Route {
         }
         Ok(Self {
             body: Bytes::from(body.to_string()),
-            shape: CodexShape {
-                model: model.into(),
-                client_model: None,
-                fast: false,
-                effort: Some("medium".into()),
-            },
+            target,
             contract,
             stop,
             title_format: None,
@@ -214,20 +297,15 @@ impl Route {
     }
 
     pub fn utility(
-        body: Value,
-        model: &str,
-        effort: Option<String>,
+        mut body: Value,
+        target: Target,
         title_format: Option<Value>,
         omitted_temperature: bool,
     ) -> Self {
+        body["model"] = json!(target.body_model());
         Self {
             body: Bytes::from(body.to_string()),
-            shape: CodexShape {
-                model: model.into(),
-                client_model: None,
-                fast: false,
-                effort,
-            },
+            target,
             contract: Contract::Utility,
             stop: None,
             title_format,
@@ -239,11 +317,21 @@ impl Route {
         !matches!(self.contract, Contract::Utility)
     }
 
+    pub fn group(&self) -> BackendGroup {
+        self.target.group()
+    }
+
+    /// `(upstream model, effort, fast)` this route sends — the activity row,
+    /// usage booking and the model stamped into the client response.
     pub fn meta(&self) -> (String, Option<String>, bool) {
-        effective_request_meta(
-            &serde_json::from_slice(&self.body).unwrap_or(Value::Null),
-            &self.shape,
-        )
+        let body = serde_json::from_slice(&self.body).unwrap_or(Value::Null);
+        match &self.target {
+            Target::Codex(shape) => effective_request_meta(&body, shape),
+            Target::Grok(shape) => {
+                let (model, effort) = crate::provider::grok::effective_request_meta(&body, shape);
+                (model, effort, false)
+            }
+        }
     }
 
     pub fn local_stop(&self) -> bool {
@@ -428,13 +516,21 @@ mod tests {
         let now = Instant::now();
         let mut sessions = Sessions::default();
         let check = monitor(None, false);
-        assert!(!sessions.observe(Some("t1"), &check, "security", BackendGroup::Claude, now));
+        assert!(sessions
+            .observe(Some("t1"), &check, "security", BackendGroup::Claude, now)
+            .is_none());
         sessions.observe(Some("t1"), &main("sol"), "user", BackendGroup::Codex, now);
-        assert!(sessions.observe(Some("t1"), &check, "security", BackendGroup::Claude, now));
-        assert!(!sessions.observe(Some("t2"), &check, "security", BackendGroup::Claude, now));
+        assert!(sessions
+            .observe(Some("t1"), &check, "security", BackendGroup::Claude, now)
+            .is_some());
+        assert!(sessions
+            .observe(Some("t2"), &check, "security", BackendGroup::Claude, now)
+            .is_none());
         let mut other = check.clone();
         other["metadata"]["user_id"] = json!("other");
-        assert!(!sessions.observe(Some("t1"), &other, "security", BackendGroup::Claude, now));
+        assert!(sessions
+            .observe(Some("t1"), &other, "security", BackendGroup::Claude, now)
+            .is_none());
         sessions.observe(
             Some("t1"),
             &main("claude-sonnet-5"),
@@ -442,14 +538,12 @@ mod tests {
             BackendGroup::Claude,
             now,
         );
-        assert!(!sessions.observe(Some("t1"), &check, "security", BackendGroup::Claude, now));
-        assert!(!Sessions::default().observe(
-            Some("t1"),
-            &check,
-            "security",
-            BackendGroup::Claude,
-            now
-        ));
+        assert!(sessions
+            .observe(Some("t1"), &check, "security", BackendGroup::Claude, now)
+            .is_none());
+        assert!(Sessions::default()
+            .observe(Some("t1"), &check, "security", BackendGroup::Claude, now)
+            .is_none());
     }
     #[test]
     fn tool_result_main_updates_but_subagents_controls_and_warmups_do_not() {
@@ -472,21 +566,25 @@ mod tests {
             control["tools"] = json!([]);
             sessions.observe(Some("t"), &control, kind, BackendGroup::Claude, now);
         }
-        assert!(sessions.observe(
-            Some("t"),
-            &monitor(None, false),
-            "security",
-            BackendGroup::Claude,
-            now
-        ));
+        assert!(sessions
+            .observe(
+                Some("t"),
+                &monitor(None, false),
+                "security",
+                BackendGroup::Claude,
+                now
+            )
+            .is_some());
         sessions.observe(Some("t"), &tool, "other", BackendGroup::Claude, now);
-        assert!(!sessions.observe(
-            Some("t"),
-            &monitor(None, false),
-            "security",
-            BackendGroup::Claude,
-            now
-        ));
+        assert!(sessions
+            .observe(
+                Some("t"),
+                &monitor(None, false),
+                "security",
+                BackendGroup::Claude,
+                now
+            )
+            .is_none());
     }
     #[test]
     fn normalized_session_ignores_account_uuid_and_field_order_and_expires() {
@@ -499,16 +597,22 @@ mod tests {
         let mut check = monitor(None, false);
         check["metadata"]["user_id"] =
             json!(r#"{"device_id":"d","account_uuid":"b","session_id":"s"}"#);
-        assert!(sessions.observe(Some("t"), &check, "security", BackendGroup::Claude, now));
-        assert!(!sessions.observe(None, &check, "security", BackendGroup::Claude, now));
+        assert!(sessions
+            .observe(Some("t"), &check, "security", BackendGroup::Claude, now)
+            .is_some());
+        assert!(sessions
+            .observe(None, &check, "security", BackendGroup::Claude, now)
+            .is_none());
         check["metadata"]["user_id"] = agent["metadata"]["user_id"].clone();
-        assert!(!sessions.observe(
-            Some("t"),
-            &check,
-            "security",
-            BackendGroup::Claude,
-            now + TTL
-        ));
+        assert!(sessions
+            .observe(
+                Some("t"),
+                &check,
+                "security",
+                BackendGroup::Claude,
+                now + TTL
+            )
+            .is_none());
         assert!(sessions.entries.is_empty());
     }
     #[test]
@@ -529,18 +633,132 @@ mod tests {
         assert_eq!(sessions.entries.len(), CAPACITY);
         let mut check = monitor(None, false);
         check["metadata"]["user_id"] = json!("s0");
-        assert!(!sessions.observe(
-            Some("t"),
-            &check,
-            "security",
-            BackendGroup::Claude,
-            now + Duration::from_secs(10)
-        ));
+        assert!(sessions
+            .observe(
+                Some("t"),
+                &check,
+                "security",
+                BackendGroup::Claude,
+                now + Duration::from_secs(10)
+            )
+            .is_none());
         for id in ["", "{}", "{invalid", &"x".repeat(2049)] {
             let mut agent = main("sol");
             agent["metadata"]["user_id"] = json!(id);
             assert!(identity(Some("t"), &agent).is_none());
         }
+    }
+    fn warmup(model: &str) -> Value {
+        json!({"model":model,"max_tokens":1,"metadata":{"user_id":"session"},"system":[
+            {"text":"x-anthropic-billing-header: cc_entrypoint=cli;"},{"text":MAIN}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]})
+    }
+    #[test]
+    fn warmup_seeds_only_an_unknown_session_and_a_main_turn_wins() {
+        let now = Instant::now();
+        let mut sessions = Sessions::default();
+        let title = json!({"model":"claude-haiku-5-5","metadata":{"user_id":"session"}});
+        // Live 2026-11-12: the title starts 255 ms before the first main turn.
+        sessions.observe(
+            Some("t"),
+            &warmup("astra"),
+            "user",
+            BackendGroup::Codex,
+            now,
+        );
+        assert_eq!(
+            sessions.main_group(Some("t"), &title, None),
+            Some(BackendGroup::Codex)
+        );
+        // A later warmup never overrides; a main turn always does.
+        sessions.observe(
+            Some("t"),
+            &warmup("claude-opus-5-5"),
+            "user",
+            BackendGroup::Claude,
+            now,
+        );
+        assert_eq!(
+            sessions.main_group(Some("t"), &title, None),
+            Some(BackendGroup::Codex)
+        );
+        sessions.observe(
+            Some("t"),
+            &main("claude-opus-5-5"),
+            "user",
+            BackendGroup::Claude,
+            now,
+        );
+        assert_eq!(sessions.main_group(Some("t"), &title, None), None);
+        // A Claude warmup still beats a stale GPT launch hint for its session.
+        let mut fresh = Sessions::default();
+        fresh.observe(
+            Some("t"),
+            &warmup("claude-opus-5-5"),
+            "user",
+            BackendGroup::Claude,
+            now,
+        );
+        assert_eq!(fresh.main_group(Some("t"), &title, Some("sol")), None);
+        // A warmup carrying tools, or from a subagent, is not a warmup.
+        let mut other = Sessions::default();
+        let mut tooled = warmup("astra");
+        tooled["tools"] = json!([{"name":"Bash"}]);
+        other.observe(Some("t"), &tooled, "user", BackendGroup::Codex, now);
+        let mut subagent = warmup("astra");
+        subagent["system"][0]["text"] = json!("x-anthropic-billing-header: cc_is_subagent=true;");
+        other.observe(Some("t"), &subagent, "user", BackendGroup::Codex, now);
+        assert!(other.entries.is_empty());
+    }
+    #[test]
+    fn grok_main_session_routes_its_monitor_and_hints_resolve_by_catalog_group() {
+        let now = Instant::now();
+        let mut sessions = Sessions::default();
+        sessions.observe(Some("t"), &main("grok"), "user", BackendGroup::Grok, now);
+        assert_eq!(
+            sessions.observe(
+                Some("t"),
+                &monitor(None, false),
+                "security",
+                BackendGroup::Claude,
+                now
+            ),
+            Some(BackendGroup::Grok)
+        );
+        let unknown = json!({"model":"claude-haiku-5-5"});
+        let empty = Sessions::default();
+        assert_eq!(
+            empty.main_group(Some("t"), &unknown, Some("grok")),
+            Some(BackendGroup::Grok)
+        );
+        assert_eq!(
+            empty.main_group(Some("t"), &unknown, Some("astra[1m]")),
+            Some(BackendGroup::Codex)
+        );
+        assert_eq!(
+            empty.main_group(Some("t"), &unknown, Some("claude-opus-5-5[1m]")),
+            None
+        );
+        assert_eq!(empty.main_group(Some("t"), &unknown, Some("made-up")), None);
+    }
+    #[test]
+    fn grok_route_names_the_bare_alias_and_owns_its_effort() {
+        let route = Route::monitor(
+            &monitor(Some("</severity>"), false),
+            Target::grok("grok-4.7", Some("medium".into())),
+        )
+        .unwrap();
+        assert_eq!(route.group(), BackendGroup::Grok);
+        let body: Value = serde_json::from_slice(&route.body).unwrap();
+        assert_eq!(body["model"], "grok");
+        assert_eq!(
+            route.meta(),
+            ("grok-4.7".into(), Some("medium".into()), false)
+        );
+        let mut out = message("<severity>7</severity>");
+        route.finish(&mut out).unwrap();
+        assert_eq!(out["content"][0]["text"], "<severity>7");
+        assert_eq!(out["model"], "grok-4.7");
     }
     #[test]
     fn severity_stage_one_stop_and_stage_two_thinking_are_preserved() {

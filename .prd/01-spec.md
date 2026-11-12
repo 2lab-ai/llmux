@@ -51,11 +51,13 @@ only a foreground process.
   Amended (keys-history K): one LOCAL SQLite file holds per-tenant keys usage metadata so the
   `keys` tab can answer windowed/filtered questions across restarts. Still no analytics service,
   no exporter, no browser UI — and no prompt/response content in it.
-- No general task-content routing (claude-code-router). Narrow compatibility exception:
-  recognized Claude Code internal requests in a GPT main session use configurable
-  Opus→sol/Sonnet→terra/Haiku→luna aliases; monitors separately default to Luna.
-  Exact startup quota/title requests can consume proven launcher context before the first
-  main turn. This is harness compatibility, not arbitrary task-content routing.
+- No general task-content routing (claude-code-router). Narrow compatibility exception
+  ([27](27-claude-code-harness-requests.md)): recognized Claude Code harness requests in a
+  Codex main session use configurable Opus→terra/Sonnet→terra/Haiku→luna aliases (monitors
+  separately default to Luna); in a Grok main session they stay on the `grok` alias at a
+  lowered effort. The session's warmup, or proven launcher context for exact startup
+  quota/title requests, supplies the main provider before the first main turn. This is
+  harness compatibility, not arbitrary task-content routing.
 - No production Gemini/local backends. Stub providers only.
 - Codex/Grok support the bounded PNG/JPEG base64 and client-tool subset in FR4, not arbitrary
   multimodal Messages parity. URL images, unknown blocks, and unsupported media return local 400.

@@ -180,6 +180,19 @@ impl GrokProvider {
         anthropic_body: &[u8],
         credential: &AccountCredential,
     ) -> Result<(ProviderRequest, bool), ProviderError> {
+        self.build_request_with_shape(anthropic_body, credential, &self.shape())
+    }
+
+    /// [`Self::build_request`] under a request-owned `shape` instead of the
+    /// live one: a Claude Code harness request in a Grok main session carries
+    /// its own lowered effort, which must win over the global
+    /// `grok.reasoning_effort` (codex parity: `build_request_with_shape`).
+    pub fn build_request_with_shape(
+        &self,
+        anthropic_body: &[u8],
+        credential: &AccountCredential,
+        shape: &GrokShape,
+    ) -> Result<(ProviderRequest, bool), ProviderError> {
         let AccountCredential::Grok { access_token, .. } = credential else {
             return Err(ProviderError::Auth(
                 "grok provider requires a grok credential".into(),
@@ -191,7 +204,7 @@ impl GrokProvider {
             ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
         })?;
         let (upstream_body, client_stream) =
-            translate_request_with(&body, &self.session_id, &self.shape())?;
+            translate_request_with(&body, &self.session_id, shape)?;
 
         let mut headers = HeaderMap::new();
         let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))

@@ -343,7 +343,7 @@ export class SessionIndex {
       inflight: s.inflight.length,
       inflightKinds: s.inflight.map(r => r.kind),
       requests: rows.length, mainRequests: main.length, subagentRequests: s.kinds.get('subagent') || 0,
-      sideRequests: ['title', 'recap', 'suggest', 'count', 'compact', 'audit'].reduce((a, k) => a + (s.kinds.get(k) || 0), 0),
+      sideRequests: ['title', 'status', 'recap', 'suggest', 'count', 'compact', 'audit'].reduce((a, k) => a + (s.kinds.get(k) || 0), 0),
       errors: rows.filter(r => r.status >= 400 || r.aborted).length,
       // Session totals count each request's sub-usages too (#278), as its cost does.
       tokens_in: sum(r => { const t = rowTokens(r); return t.input + t.cache_read + t.cache_creation; }),

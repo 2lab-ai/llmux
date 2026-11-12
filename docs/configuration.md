@@ -43,7 +43,7 @@ whatever `activity.jsonl` still holds); everything else keeps working.
     "on_empty_group": "error"
   },
   "claude_code": {
-    "gpt_model_mapping": { "opus": "sol", "sonnet": "terra", "haiku": "luna" },
+    "gpt_model_mapping": { "opus": "terra", "sonnet": "terra", "haiku": "luna" },
     "auto_classifier_model": "luna"
   },
   "codex": {
@@ -379,11 +379,21 @@ The account list is an internally-tagged enum, so a config carrying a `type` an 
 
 ## Claude Code internal models (`claude_code`)
 
-With routing enabled and a known GPT main session, implicit Claude Code requests
-use `gpt_model_mapping`: Opus → `sol`, Sonnet → `terra`, Haiku → `luna` by default.
-This includes session titles, quota probes and recognized helper/subagent turns.
-The safety classifier uses the independent `auto_classifier_model` (default `luna`,
-medium effort), regardless of its incoming Sonnet name.
+With routing enabled and a known Codex main session, Claude Code's own requests
+(harness requests) use `gpt_model_mapping`: Opus → `terra`, Sonnet → `terra`,
+Haiku → `luna` by default — only the smaller Codex models. This includes session
+titles, quota probes, the notification status check and recognized helper/subagent
+turns. The safety classifier uses the independent `auto_classifier_model` (default
+`luna`, medium effort), regardless of its incoming Sonnet name. Before 2026-11-12 the
+Opus default was `sol`; a config file written earlier keeps `"opus": "sol"` until you
+change it.
+
+A Grok main session needs no configuration: harness requests stay on the `grok`
+alias (the configured `grok.default_model` pin) with a lowered, request-owned effort
+— low for titles, quota and status checks, medium for the safety classifier, and the
+client's effort capped at low / medium / high for Haiku / Sonnet / Opus helpers. It
+wins over `grok.reasoning_effort`. See
+[Claude Code internal model routing](operational-reference.md#claude-code-internal-model-routing).
 
 Edit these values in the config file and restart the daemon. Partial objects keep
 unspecified defaults. Targets must be known Codex catalog models or aliases; null,

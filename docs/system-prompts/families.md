@@ -29,6 +29,18 @@ Rough: sizes below are **characters** (~4 chars ≈ 1 token English, not exact).
 | bare `"quota"` user turn + `max_tokens: 1` | CLI quota probe | control ping |
 | bare `"Hi"` user turn + `max_tokens: 1`, minimal system | CLI warmup ping | control ping |
 | `The user stepped away and is coming back.` | CLI return recap | control ping |
+| `A user kicked off a Claude Code agent to do a coding task and walked away.` | CLI notification status classifier | control |
+
+**2026-11-12 (CLI 2.1.322) drift.** The warmup ping (`"Hi"`, `max_tokens: 1`, billing
+header + `You are Claude Code…`, no tools) carries the session's **current main model**
+(`astra`, `grok` after a `/model` switch) and is sent when a session starts, before the
+session title. The title (`claude-haiku-5-5`, no tools, `output_config.format` JSON
+schema, `output_config.effort: medium`, no `temperature`) starts about 255 ms before the
+first main turn. The status classifier (`claude-haiku-5-5`, `max_tokens: 3072`, no
+tools, user turn `Current state: … Tool calls so far: … Assistant message tail …`)
+decides done / working / blocked for a phone notification; llmux classifies it
+`status`. In Codex/Grok main sessions all three are routed by
+[`.prd/27`](../../.prd/27-claude-code-harness-requests.md).
 
 Operator spine: [README.md](./README.md). Evidence: [topology.md](./topology.md).
 

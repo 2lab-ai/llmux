@@ -43,7 +43,7 @@ const placeLong = (c) => {
   if (c.place === 'remote') { const d = c.deviceInfo || {}; return `개인 PC${d.os ? ' · ' + d.os + (d.arch ? ' ' + d.arch : '') : ''}${c.device ? ' · 기기 ' + c.device : ''}`; }
   return `${(st.data && st.data.host) || '이 머신'}의 콘솔`;
 };
-const KIND_LABEL = { user: '지시', other: '응답', sdk: 'SDK', subagent: '서브에이전트', title: '제목', recap: '요약', suggest: '다음 입력 제안', count: '토큰 계산', compact: '압축', audit: '감사' };
+const KIND_LABEL = { user: '지시', other: '응답', sdk: 'SDK', subagent: '서브에이전트', title: '제목', status: '상태 판정', recap: '요약', suggest: '다음 입력 제안', count: '토큰 계산', compact: '압축', audit: '감사' };
 const relPath = (p, cwd) => (cwd && p && p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p);
 const refOf = (u) => { const m = /github\.com\/([\w.-]+)\/([\w.-]+)\/(pull|issues)\/(\d+)/.exec(u); return m ? `${m[2]}#${m[4]}` : u.replace(/^https?:\/\//, '').slice(0, 30); };
 

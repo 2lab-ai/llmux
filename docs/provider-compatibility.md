@@ -444,14 +444,17 @@ adds its own identity/reminders: role/content preservation is not byte-identity.
 
 ## Claude Code auto-mode monitors
 
-**2026-10-07 compatibility exception:** a recognized Claude Code security monitor
-for a recently observed GPT main session uses `claude_code.auto_classifier_model` (default alias `luna`) with medium
-effort. It does not inherit global main-model effort or fast mode. Tenant plus
+**2026-10-07 compatibility exception, extended to Grok 2026-11-12:** a recognized
+Claude Code security monitor for a recently observed Codex main session uses
+`claude_code.auto_classifier_model` (default alias `luna`); for a Grok main session it
+uses the Grok pin (`grok` alias). Both run at medium effort and do not inherit global
+main-model effort (including `grok.reasoning_effort`) or fast mode. A session's startup
+warmup (main identity, `max_tokens: 1`, no tools) seeds an unknown session's provider. Tenant plus
 normalized device/session identity isolates concurrent sessions. Main CLI turns
 (including tool-result continuations) update context; subagents and harness control
 requests do not. The state has a six-hour TTL, 4096-entry cap, and no disk recovery.
-Unknown sessions retain normal routing; an unavailable Codex group does not fall
-back to Claude for a mapped monitor. This is a transport/model change, not an
+Unknown sessions retain normal routing; an unavailable Codex or Grok group does not
+fall back to Claude for a mapped monitor. This is a transport/model change, not an
 authorization policy replacement or an assurance that two models judge identically.
 
 | Axis | Monitor behavior and evidence (2026-10-07) |
@@ -463,6 +466,7 @@ authorization policy replacement or an assurance that two models judge identical
 | Streaming/errors | Both client modes buffer and validate the complete actual verdict. Successful upstream stream buffer cap 1 MiB, total request deadline 60 seconds; malformed, failed, incomplete, truncated or oversized output produces an error, never partial approval. E2E `auto_classifier_stage_two_streaming_and_nonstreaming_preserve_real_verdict`, `auto_classifier_failed_incomplete_and_oversize_streams_never_expose_verdict`, `auto_classifier_silent_stream_errors_without_success_verdict` |
 | Usage/counting | Original upstream usage retained, including reasoning. Count endpoint never learns main context or uses this adapter. Raw request remains original; translated upstream and activity identify the configured effective model/medium. E2E `auto_classifier_streaming_stage_one_and_raw_provenance`, `auto_classifier_unknown_session_other_endpoint_and_disabled_routing_are_unchanged` |
 | Auth/endpoint | Existing Codex subscription credentials and `/responses` endpoint; no public OpenAI API assumption. E2E first regression proves success with no Claude account; `auto_classifier_codex_unavailable_never_falls_back_to_claude` covers configured fallback policy too |
+| Grok (2026-11-12) | Same adapter on the Grok `/responses` gateway: the body names bare `grok` (resolves to the pin), request-owned medium effort overrides `grok.reasoning_effort`, `max_tokens` is forwarded with the existing `max_tokens_semantics` warning (live: Stage 1 cap 64 at medium effort completed with 550 reasoning + 7 visible tokens, so the cap did not cut the verdict), verdict buffering/validation/stop handling unchanged. Only a monitor naming a Claude tier is rerouted; an explicit non-tier monitor model keeps normal routing (E2E `harness_monitor_naming_a_non_tier_model_is_not_rerouted`). E2E `harness_requests_in_a_grok_session_use_the_grok_pin_at_lower_effort`; live replay of a captured CLI 2.1.322 Stage 1 monitor (106k-char policy) against `grok-4.7` on 2026-11-12: HTTP 200, `<severity>8`, `stop_reason: stop_sequence`, upstream `reasoning.effort: medium`, no Claude account configured |
 
 These are mock-based routing/contract receipts, not live safety-quality equivalence
 claims. The real CLI 2.1.292 Stage 1 wire shape was observed on 2026-10-07:
@@ -498,20 +502,30 @@ Evidence: `bridge/*.test.mjs` audits the SDK enum and actual SDK error sequence;
 
 ## Claude Code internal tasks
 
-**2026-10-07:** recognized implicit requests in a GPT main session use the
-configurable Opus→`sol`, Sonnet→`terra`, Haiku→`luna` alias mapping. The same tenant
+**2026-10-07, generalized 2026-11-12** ([design](../.prd/27-claude-code-harness-requests.md)):
+recognized implicit requests in a Codex main session use the configurable
+Opus→`terra`, Sonnet→`terra`, Haiku→`luna` alias mapping (Opus was `sol` before
+2026-11-12). In a Grok main session they stay on the `grok` alias with a lowered
+request-owned effort: low for title/quota/status, the client's effort capped at
+low/medium/high for Haiku/Sonnet/Opus helpers. The notification status classifier
+(`A user kicked off a Claude Code agent…`, CLI 2.1.322) is a recognized utility
+request, classified `status`. The same tenant
 and normalized session isolation used by monitors applies. Main execution requests
 remain authoritative even if their text resembles a title/compaction prompt;
 subagents cannot overwrite that choice. Unknown sessions are unchanged, apart from
 an exact initial `quota`/`max_tokens:1` probe or captured no-tools session-title
 request carrying fresh `llmux run` launch context. A title can arrive before the
-first main turn; E2E `internal_routing_title_before_first_main_uses_fresh_hint_without_seeding_session`
-covers that order, configured aliases, stale hints and observed Claude priority.
-Mapped requests never fall back to Claude on Codex exhaustion.
+first main turn (live 2026-11-12: 255 ms earlier); the session's own warmup, which
+names the current main model, seeds the session first. E2Es
+`internal_routing_title_before_first_main_uses_fresh_hint_without_seeding_session` and
+`harness_title_before_first_main_follows_the_gpt_warmup` cover that order, configured
+aliases, stale hints and observed Claude priority; `harness_warmup_never_overrides_a_main_turn_and_codex_tiers_avoid_sol`
+covers warmup precedence. Mapped requests never fall back to Claude on Codex or Grok
+exhaustion.
 
 | Axis | Internal-task behavior and evidence (2026-10-07) |
 | --- | --- |
-| Output/cap | Native title `{title:string}` JSON schema maps to Responses `text.format` with `name:session_title`, `strict:true`. Other title schemas fail locally. `max_tokens` remains omitted/reported, including the quota probe's `1`: this is an availability probe, **not** a one-token billing guarantee. E2E `internal_routing_title_schema_temperature_and_effective_model_both_legs`; strict schema accepted by real Codex Luna gateway probe on 2026-10-07 |
+| Output/cap | Native title `{title:string}` JSON schema maps to Responses `text.format` with `name:session_title`, `strict:true`, on Codex and Grok (live 2026-11-12: the Grok `cli-chat-proxy` gateway accepted it for `grok-4.7` and returned `{"title":"…"}`; Codex `gpt-6-luna` likewise). Other title schemas fail locally. `max_tokens` remains omitted/reported, including the quota probe's `1`: this is an availability probe, **not** a one-token billing guarantee. E2E `internal_routing_title_schema_temperature_and_effective_model_both_legs`; strict schema accepted by real Codex Luna gateway probe on 2026-10-07 |
 | Generation controls | Only recognized no-tools session titles may omit the captured default `temperature:1`; omission is reported in compatibility headers. Other temperatures and generic sampling/stop controls retain local 400. Strict mode validates original controls and refuses loss. Same title E2E |
 | Reasoning | Titles/quota use request-owned low effort; workers preserve valid client effort independently of global main settings. Prior thinking/continuity policy unchanged; security remains medium. E2E `internal_routing_configured_tiers_and_security_override_do_not_hijack_main_switch` |
 | Tools/images | Helpers/subagents use existing bounded client-tool and image conversion/refusal policy. Title/quota signatures require no tools; no new tool or image support is implied. `src/proxy/internal_requests.rs` |
