@@ -533,8 +533,9 @@ pub struct UsageObserver {
     hops: Vec<FallbackHop>,
     start_model: Option<String>,
     /// The stream's `stop_reason` and refusal category (`message_delta`
-    /// `delta.stop_reason` / `delta.stop_details.category`), and whether a
-    /// non-empty content delta was relayed — for [`unbilled_refusal`].
+    /// `delta.stop_reason` / `delta.stop_details.category`), and whether the
+    /// CURRENT attempt relayed a non-empty content delta (reset at each
+    /// `fallback` block) — for [`unbilled_refusal`].
     stop_reason: Option<String>,
     refusal_category: Option<String>,
     streamed_output: bool,
@@ -603,6 +604,10 @@ impl UsageObserver {
             Some("content_block_start") => {
                 if let Some(hop) = FallbackHop::from_block(&v["content_block"]) {
                     self.hops.push(hop);
+                    // A fallback block starts the next attempt: the refusal
+                    // rule applies to the attempt whose counters are priced
+                    // (the last one), so only ITS output counts.
+                    self.streamed_output = false;
                 }
                 return;
             }
@@ -1964,5 +1969,37 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#
             .to_string();
         assert!(!run(&[start, end]).unbilled_refusal);
+    }
+
+    /// #283 review: the refusal rule applies to the attempt whose counters
+    /// the request is priced on. A first attempt that streamed text and then
+    /// declined hands over to a fallback model (a `fallback` block); when
+    /// that final attempt refuses before any output in an unbilled category,
+    /// the request's top-level counters (its `fallback_message` entry) are
+    /// unbilled — the earlier attempt's text does not make them billed (the
+    /// declined attempt itself is booked as a sub-usage, billed because it
+    /// streamed output).
+    #[test]
+    fn the_refusal_rule_follows_the_attempt_the_counters_come_from() {
+        let events = [
+            r#"data: {"type":"message_start","message":{"model":"claude-fable-5-2","usage":{"input_tokens":900,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Here is"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"claude-fable-5-2"},"to":{"model":"claude-opus-5-5"},"trigger":{"type":"refusal","category":"cyber"}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"}},"usage":{"output_tokens":0,"iterations":[{"type":"message","model":"claude-fable-5-2","input_tokens":900,"output_tokens":5},{"type":"fallback_message","model":"claude-opus-5-5","input_tokens":950,"output_tokens":0}]}}"#,
+        ];
+        let mut observer = UsageObserver::default();
+        for event in events {
+            observer.observe(event);
+        }
+        let usage = observer.finish();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (950, 0));
+        assert!(usage.unbilled_refusal, "{usage:?}");
+        assert_eq!(usage.sub_usage.len(), 1, "the declined attempt is billed");
+        // Text the FINAL attempt streamed still makes it billed.
+        let mut observer = UsageObserver::default();
+        for event in [events[0], events[2], events[1], events[3]] {
+            observer.observe(event);
+        }
+        assert!(!observer.finish().unbilled_refusal);
     }
 }
