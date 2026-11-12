@@ -8006,3 +8006,35 @@ async fn harness_title_after_clear_waits_for_the_first_main_turn() {
         "bounded wait: {waited:?}"
     );
 }
+
+/// Review finding on #290 (P2): a launch hint fresh when the title arrives
+/// (119 s old) must not expire during the bounded wait for a main turn.
+#[tokio::test]
+async fn harness_title_launch_hint_is_judged_at_arrival() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse(r#"{"title":"Fixture folder"}"#),
+        256,
+    ));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at-codex")],
+        "error",
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-claude-launch-model", "astra")
+        .header(
+            "x-llmux-claude-launch-time",
+            (epoch_ms_now() - 119_000).to_string(),
+        )
+        .json(&harness_title("hint-at-arrival", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the hint was fresh on arrival");
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(message["model"], resolved_alias("luna"));
+}

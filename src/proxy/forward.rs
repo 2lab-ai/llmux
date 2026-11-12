@@ -1514,12 +1514,6 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
             let task = super::internal_requests::task(&value, classified.kind);
-            // A title can start before its session's first main turn, with no
-            // warmup (after `/clear`) and no fresh launch hint: wait, bounded,
-            // for that main turn so the title follows the session's model.
-            if task == Some(super::internal_requests::Task::Title) {
-                wait_for_first_main(state, tenant.as_deref(), &value).await;
-            }
             let hint = if matches!(
                 task,
                 Some(super::internal_requests::Task::Quota | super::internal_requests::Task::Title)
@@ -1537,6 +1531,13 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             } else {
                 None
             };
+            // A title can start before its session's first main turn, with no
+            // warmup (after `/clear`): wait, bounded, for that main turn so the
+            // title follows the session's model. The launch hint above was
+            // judged at arrival, so the wait cannot expire it.
+            if task == Some(super::internal_requests::Task::Title) {
+                wait_for_first_main(state, tenant.as_deref(), &value).await;
+            }
             let (monitor, main) = state
                 .auto_classifier_sessions
                 .lock()
