@@ -210,8 +210,16 @@ impl DashboardHub {
     }
 
     /// Fold one proxy/scheduler event: last-switch + poller-health pane
-    /// state, then the activity log itself.
-    pub fn apply_event(&self, event: ActivityEvent, now: SystemTime) {
+    /// state, then the activity log itself. A finished request's price class
+    /// is resolved here first ([`crate::pricing::classify_finished`]).
+    pub fn apply_event(&self, mut event: ActivityEvent, now: SystemTime) {
+        crate::pricing::classify_finished(&mut event, now);
+        self.apply_classified(event, now);
+    }
+
+    /// [`Self::apply_event`] for an event whose price class is already
+    /// resolved at `now` (the fold resolves it once, before its trace line).
+    fn apply_classified(&self, event: ActivityEvent, now: SystemTime) {
         let mut state = self.lock();
         match &event {
             ActivityEvent::AccountSwitched { from, to, reason } => {
@@ -253,6 +261,9 @@ impl DashboardHub {
             }
             _ => {}
         }
+        // The request's price class was resolved once, at the instant it is
+        // recorded (#278): the trace line, the persisted line, the key-usage
+        // rows and the fold below all carry the same classes.
         // Persist finished requests before folding (req-persist A/C). Borrow,
         // not move: `apply` still consumes the event below. The append target
         // is `None` until the daemon armed persistence in `load_from_state_dir`,
@@ -375,12 +386,7 @@ pub async fn fold(
         tokio::select! {
             event = events.recv() => {
                 match event {
-                    Some(event) => {
-                        if trace_events {
-                            trace_event(&event);
-                        }
-                        hub.apply_event(event, SystemTime::now());
-                    }
+                    Some(event) => fold_event(&hub, event, SystemTime::now(), trace_events),
                     None => return, // every sender gone — server is down
                 }
             }
@@ -397,6 +403,17 @@ pub async fn fold(
             }
         }
     }
+}
+
+/// Fold one activity event at `now`: resolve a finished request's price
+/// class ONCE (#278), then its tracing line (daemon mode) and the hub, so the
+/// logged cost is the cost the request is recorded and aggregated at.
+fn fold_event(hub: &DashboardHub, mut event: ActivityEvent, now: SystemTime, trace_events: bool) {
+    crate::pricing::classify_finished(&mut event, now);
+    if trace_events {
+        trace_event(&event);
+    }
+    hub.apply_classified(event, now);
 }
 
 /// Resolve a tenant attribution id to its display name: the key's name for
@@ -472,6 +489,7 @@ fn trace_event(event: &ActivityEvent) {
             aborted: _,
             tenant,
             sub_usage,
+            price_class,
         } => {
             // API-equivalent USD cost for this request (Feature D), its
             // sub-usages included at their own models' rates (#278). The fold
@@ -482,6 +500,7 @@ fn trace_event(event: &ActivityEvent) {
                 (Some(g), Some(m), Some(t)) => crate::pricing::request_cost_usd(
                     g,
                     m,
+                    *price_class,
                     t,
                     sub_usage,
                     &std::collections::HashMap::new(),
@@ -937,6 +956,12 @@ pub struct UsageStatDoc {
     pub cache_creation_extended: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub web_search_requests: u64,
+    /// The part of the row's tokens in each non-standard price class (#278:
+    /// long-context, Fast, dated rates, unbilled refusal), each with its own
+    /// cost; the rest is the standard class. Additive: omitted when empty,
+    /// absent (= all standard) in docs from older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_classes: Vec<crate::pricing::ClassShare>,
     #[serde(default)]
     pub cost_usd: f64,
     /// Whether a price was found for this row's `(group, model)` (config
@@ -1215,6 +1240,10 @@ pub struct ModelUsageDoc {
     pub cache_creation_extended: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_search_requests: Option<u64>,
+    /// Non-standard price-class parts of the row's tokens, each with its own
+    /// cost (#278; see [`UsageStatDoc::price_classes`]). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_classes: Vec<crate::pricing::ClassShare>,
     /// Epoch ms of the last completed request for this model.
     pub last_used_ms: u64,
     /// In-flight requests currently attributed to this model (req11).
@@ -1337,6 +1366,10 @@ pub struct TenantModelDoc {
     pub cache_creation_extended: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub web_search_requests: u64,
+    /// Non-standard price-class parts of the cell's tokens, each with its
+    /// own cost (#278; see [`UsageStatDoc::price_classes`]). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_classes: Vec<crate::pricing::ClassShare>,
     /// API-equivalent USD cost for this cell (0.0 when nothing prices it).
     pub cost_usd: f64,
 }
@@ -1478,7 +1511,8 @@ pub enum CompletedDoc {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
-        /// Codex fast mode was in effect (`Some(false)` for claude; `None` =
+        /// The Fast tier was in effect (codex, or served Claude fast mode;
+        /// `None` =
         /// pre-field replayed history — "unknown"). Additive both ways:
         /// absent (→ `None`) in docs written before this field existed, and
         /// `None` is skipped on the wire so an OLDER attach client's plain
@@ -1528,6 +1562,14 @@ pub enum CompletedDoc {
         /// docs from older daemons.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         sub_usage: Vec<crate::tui::SubUsage>,
+        /// The request's price class (#278, #283): which rates `cost_usd`
+        /// took. Additive: omitted when standard, absent (= standard) in docs
+        /// from older daemons.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::pricing::PriceClass::is_standard"
+        )]
+        price_class: crate::pricing::PriceClass,
     },
     Note {
         at_ms: u64,
@@ -1768,60 +1810,68 @@ fn model_usage_docs(
     now: SystemTime,
     pricing_overrides: &HashMap<String, crate::pricing::ModelPrice>,
 ) -> (Vec<ModelUsageDoc>, f64) {
-    let row = |m: &ModelUsage| ModelUsageDoc {
-        group: m.group.clone(),
-        model: m.model.clone(),
-        requests: m.requests,
-        ok: m.ok,
-        errors: m.errors,
-        tokens_in: m.tokens_in,
-        tokens_out: m.tokens_out,
-        cache_read: m.cache_read,
-        cache_creation: m.cache_creation,
-        cache_creation_extended: m.cache_creation_extended,
-        web_search_requests: m.web_search_requests,
-        last_used_ms: epoch_ms(m.last_used),
-        in_flight: 0,
-        cost_usd: crate::pricing::cost_usd(
+    let row = |m: &ModelUsage| {
+        let mut price_classes = m.classes.shares();
+        let cost_usd = crate::pricing::price_shares(
             &m.group,
             &m.model,
             &m.token_counts(),
+            &mut price_classes,
             pricing_overrides,
-        ),
-        accounts: m
-            .accounts
-            .iter()
-            .map(|a| ModelAccountDoc {
-                name: a.name.clone(),
-                requests: a.requests,
-                ok: a.ok,
-                errors: a.errors,
-                tokens_in: a.tokens_in,
-                tokens_out: a.tokens_out,
-            })
-            .collect(),
-        efforts: m
-            .efforts
-            .iter()
-            .map(|c| ModelCountDoc {
-                label: c.label.clone(),
-                requests: c.requests,
-            })
-            .collect(),
-        endpoints: m
-            .endpoints
-            .iter()
-            .map(|c| ModelCountDoc {
-                label: c.label.clone(),
-                requests: c.requests,
-            })
-            .collect(),
-        sub_cost_usd: crate::pricing::cost_usd(
-            &m.group,
-            &m.model,
-            &m.sub_tokens,
-            pricing_overrides,
-        ),
+        )
+        .unwrap_or(0.0);
+        ModelUsageDoc {
+            group: m.group.clone(),
+            model: m.model.clone(),
+            requests: m.requests,
+            ok: m.ok,
+            errors: m.errors,
+            tokens_in: m.tokens_in,
+            tokens_out: m.tokens_out,
+            cache_read: m.cache_read,
+            cache_creation: m.cache_creation,
+            cache_creation_extended: m.cache_creation_extended,
+            web_search_requests: m.web_search_requests,
+            price_classes,
+            last_used_ms: epoch_ms(m.last_used),
+            in_flight: 0,
+            cost_usd,
+            accounts: m
+                .accounts
+                .iter()
+                .map(|a| ModelAccountDoc {
+                    name: a.name.clone(),
+                    requests: a.requests,
+                    ok: a.ok,
+                    errors: a.errors,
+                    tokens_in: a.tokens_in,
+                    tokens_out: a.tokens_out,
+                })
+                .collect(),
+            efforts: m
+                .efforts
+                .iter()
+                .map(|c| ModelCountDoc {
+                    label: c.label.clone(),
+                    requests: c.requests,
+                })
+                .collect(),
+            endpoints: m
+                .endpoints
+                .iter()
+                .map(|c| ModelCountDoc {
+                    label: c.label.clone(),
+                    requests: c.requests,
+                })
+                .collect(),
+            sub_cost_usd: crate::pricing::aggregate_cost_usd(
+                &m.group,
+                &m.model,
+                &m.sub_tokens,
+                &m.sub_classes,
+                pricing_overrides,
+            ),
+        }
     };
     let mut docs: Vec<ModelUsageDoc> = hub.model_usage.iter().map(row).collect();
 
@@ -1854,6 +1904,7 @@ fn model_usage_docs(
             cache_creation: None,
             cache_creation_extended: None,
             web_search_requests: None,
+            price_classes: Vec::new(),
             last_used_ms: epoch_ms(now),
             in_flight: n,
             accounts: Vec::new(),
@@ -2071,6 +2122,7 @@ pub(crate) fn dashboard_doc(
                     // fold) — the doc resolves it below from `meta`.
                     client_name: _,
                     sub_usage,
+                    price_class,
                 } => CompletedDoc::Request {
                     id: *id,
                     at_ms: epoch_ms(entry.at),
@@ -2089,6 +2141,7 @@ pub(crate) fn dashboard_doc(
                         (Some(g), Some(m), Some(t)) => crate::pricing::request_cost_usd(
                             g,
                             m,
+                            *price_class,
                             t,
                             sub_usage,
                             &meta.pricing_overrides,
@@ -2112,6 +2165,7 @@ pub(crate) fn dashboard_doc(
                     // above.
                     client_name: resolve_client_name(tenant.as_ref(), &meta.client_keys),
                     sub_usage: sub_usage.clone(),
+                    price_class: *price_class,
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -2135,15 +2189,18 @@ pub(crate) fn dashboard_doc(
         .usage_stats
         .iter()
         .map(|r| {
-            let cost = crate::pricing::priced_cost(
+            let mut price_classes = r.price_classes.clone();
+            let cost = crate::pricing::price_shares(
                 &r.group,
                 &r.model,
                 &r.token_counts(),
+                &mut price_classes,
                 &meta.pricing_overrides,
             );
             UsageStatDoc {
                 priced: cost.is_some(),
                 cost_usd: cost.unwrap_or(0.0),
+                price_classes,
                 ..r.clone()
             }
         })
@@ -2181,22 +2238,29 @@ pub(crate) fn dashboard_doc(
             let mut models: Vec<TenantModelDoc> = t
                 .models
                 .iter()
-                .map(|((group, model), cell)| TenantModelDoc {
-                    group: group.clone(),
-                    model: model.clone(),
-                    requests: cell.requests,
-                    tokens_in: cell.input,
-                    tokens_out: cell.output,
-                    cache_read: cell.cache_read,
-                    cache_creation: cell.cache_creation,
-                    cache_creation_extended: cell.cache_creation_extended,
-                    web_search_requests: cell.web_search_requests,
-                    cost_usd: crate::pricing::cost_usd(
+                .map(|((group, model), cell)| {
+                    let mut price_classes = cell.classes.shares();
+                    let cost_usd = crate::pricing::price_shares(
                         group,
                         model,
                         &cell.token_counts(),
+                        &mut price_classes,
                         &meta.pricing_overrides,
-                    ),
+                    )
+                    .unwrap_or(0.0);
+                    TenantModelDoc {
+                        group: group.clone(),
+                        model: model.clone(),
+                        requests: cell.requests,
+                        tokens_in: cell.input,
+                        tokens_out: cell.output,
+                        cache_read: cell.cache_read,
+                        cache_creation: cell.cache_creation,
+                        cache_creation_extended: cell.cache_creation_extended,
+                        web_search_requests: cell.web_search_requests,
+                        price_classes,
+                        cost_usd,
+                    }
                 })
                 .collect();
             models.sort_by(|a, b| {
@@ -2619,6 +2683,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
             now() - Duration::from_secs(58),
         );
@@ -2805,6 +2870,7 @@ mod tests {
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
                     sub_usage: Vec::new(),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 at,
             )
@@ -2895,6 +2961,7 @@ mod tests {
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
                     sub_usage: Vec::new(),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 at,
             )
@@ -3329,10 +3396,10 @@ mod tests {
             assert_eq!(row.cache_read, 120);
             assert_eq!(row.cache_creation, 0);
             assert!(!row.label.is_empty(), "server-rendered label present");
-            // Priced server-side (T6) at the built-in gpt-5.5 rates: the doc
-            // build and a direct pricing call must agree exactly.
-            let want = crate::pricing::cost_usd(
-                "codex",
+            // Priced server-side (T6) at the built-in gpt-5.5 rates — the
+            // seeded request ran in codex Fast mode, so its Fast rates (#278):
+            // the doc build and a direct pricing call must agree exactly.
+            let want = fast_cost(
                 "gpt-5.5",
                 &TokenCounts {
                     input: 700,
@@ -3341,7 +3408,6 @@ mod tests {
                     cache_creation: Some(0),
                     ..Default::default()
                 },
-                &HashMap::new(),
             );
             assert!(want > 0.0, "seeded model has a nonzero rate");
             assert!((row.cost_usd - want).abs() < 1e-12, "doc cost == pricing");
@@ -3419,11 +3485,21 @@ mod tests {
         );
     }
 
+    /// The seeded request's cost: codex Fast mode on `model` (#278).
+    fn fast_cost(model: &str, tokens: &TokenCounts) -> f64 {
+        let fast = crate::pricing::PriceClass {
+            fast: true,
+            ..crate::pricing::PriceClass::STANDARD
+        };
+        crate::pricing::class_cost("codex", model, fast, tokens, &HashMap::new()).unwrap_or(0.0)
+    }
+
     #[test]
     fn doc_carries_api_equivalent_cost_with_default_pricing() {
         // The single completed request is codex/gpt-5.5 with input=700,
-        // output=300, cache_read=120. Under the built-in gpt-5.5 rates
-        // {5.0, 30.0, 0.5, 0.0} per 1e6: 0.0035 + 0.009 + 0.00006 = 0.01256.
+        // output=300, cache_read=120, in Fast mode. Under the built-in
+        // gpt-5.5 Fast rates {12.5, 75.0, 1.25} per 1e6 (2.5x Standard):
+        // 0.00875 + 0.0225 + 0.00015 = 0.0314.
         let tokens = TokenCounts {
             input: 700,
             output: 300,
@@ -3432,7 +3508,7 @@ mod tests {
             cache_creation_extended: None,
             web_search_requests: None,
         };
-        let expected = crate::pricing::cost_usd("codex", "gpt-5.5", &tokens, &HashMap::new());
+        let expected = fast_cost("gpt-5.5", &tokens);
 
         let doc = seeded_doc();
         // Global total = sum of per-model row costs (here, the one codex row).
@@ -3442,8 +3518,8 @@ mod tests {
             doc.totals.cost_usd
         );
         assert!(
-            (expected - 0.012_56).abs() < 1e-9,
-            "sanity: expected gpt-5.5 cost is 0.01256, got {expected}"
+            (expected - 0.0314).abs() < 1e-9,
+            "sanity: expected gpt-5.5 Fast cost is 0.0314, got {expected}"
         );
 
         // Per-request activity line carries the same cost.
@@ -3483,6 +3559,7 @@ mod tests {
                 cache_creation_extended: None,
                 web_search_requests: None,
             },
+            price_class: crate::pricing::PriceClass::STANDARD,
         };
         hub.apply_event(
             ActivityEvent::RequestFinished {
@@ -3507,6 +3584,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 sub_usage: vec![advisor.clone()],
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
             now() - Duration::from_secs(1),
         );
@@ -3598,6 +3676,7 @@ mod tests {
                 excerpt: None,
                 tenant: Some("k-split".into()),
                 sub_usage,
+                price_class: crate::pricing::PriceClass::STANDARD,
             }
         };
         // Opus 5.5: $4 in, $5 5m write, $8 1h write; Fable 5.2 $10 / $16.
@@ -3625,6 +3704,7 @@ mod tests {
                 web_search_requests: Some(1),
                 ..Default::default()
             },
+            price_class: crate::pricing::PriceClass::STANDARD,
         };
         let at = now() - Duration::from_secs(1);
         hub.apply_event(request(21, a, Vec::new()), at);
@@ -3696,6 +3776,418 @@ mod tests {
         close(cells, want, "tenant cells");
     }
 
+    /// #278 PR 3: each request is priced in its own class — long context,
+    /// Fast, the dated rates of its day, a sub-usage on its own prompt — and
+    /// every aggregate the document carries (model rows, hour/day/month
+    /// usage rows, tenant cells) costs exactly the sum of its requests.
+    #[test]
+    fn every_aggregate_prices_each_request_in_its_own_class() {
+        let hub = DashboardHub::default();
+        // 2026-12-02 12:00 UTC: Gemini 4 Argon's December rates apply.
+        let day = u64::from(crate::pricing::RateDay::ymd(2026, 12, 2).0);
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(day * 86_400 + 12 * 3_600);
+        let view_at = at + Duration::from_secs(60);
+        let request = |id: u64,
+                       group: &str,
+                       model: &str,
+                       tokens: TokenCounts,
+                       fast: bool,
+                       sub_usage: Vec<crate::tui::SubUsage>| {
+            ActivityEvent::RequestFinished {
+                id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
+                account: Some("a".into()),
+                status: 200,
+                duration: Duration::from_millis(900),
+                tokens: Some(tokens),
+                group: Some(group.into()),
+                model: Some(model.into()),
+                effort: None,
+                fast: Some(fast),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: None,
+                kind: None,
+                excerpt: None,
+                tenant: Some("k-class".into()),
+                sub_usage,
+                price_class: crate::pricing::PriceClass::STANDARD,
+            }
+        };
+        let t = |input: u64, cache_read: u64, output: u64| TokenCounts {
+            input,
+            output,
+            cache_read: Some(cache_read),
+            ..Default::default()
+        };
+        let compaction = crate::tui::SubUsage {
+            model: None,
+            tokens: t(150_000, 0, 2_000),
+            price_class: crate::pricing::PriceClass::STANDARD,
+        };
+        for event in [
+            // gpt-6.1-terra: long ($2 / $7.50), Fast ($2 / $10), standard,
+            // long + Fast ($4 / $0.20 cached / $15).
+            request(
+                31,
+                "codex",
+                "gpt-6.1-terra",
+                t(300_000, 0, 1_000),
+                false,
+                Vec::new(),
+            ),
+            request(
+                32,
+                "codex",
+                "gpt-6.1-terra",
+                t(1_000, 0, 500),
+                true,
+                Vec::new(),
+            ),
+            request(
+                33,
+                "codex",
+                "gpt-6.1-terra",
+                t(10_000, 0, 0),
+                false,
+                Vec::new(),
+            ),
+            request(
+                34,
+                "codex",
+                "gpt-6.1-terra",
+                t(1_000, 280_000, 100),
+                true,
+                Vec::new(),
+            ),
+            // Argon on its December rates ($4).
+            request(35, "gemini", "argon", t(1_000_000, 0, 0), false, Vec::new()),
+            // grok-4.7 at exactly 200,000: long ($4 / $12).
+            request(
+                36,
+                "grok",
+                "grok-4.7",
+                t(200_000, 0, 1_000),
+                false,
+                Vec::new(),
+            ),
+            // A short Haiku 5.5 request whose compaction sub-usage is long
+            // (5x: $0.50 / $2.50).
+            request(
+                37,
+                "claude",
+                "claude-haiku-5-5",
+                t(1_000, 0, 0),
+                false,
+                vec![compaction],
+            ),
+        ] {
+            hub.apply_event(event, at);
+        }
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), view_at);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(view_at),
+            &UsageTotals::default(),
+            &params(),
+            view_at,
+            &meta(),
+        );
+        let close = |got: f64, want: f64, what: &str| {
+            assert!((got - want).abs() < 1e-9, "{what}: {got} != {want}");
+        };
+        let mut per_request = std::collections::BTreeMap::new();
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request { id, cost_usd, .. } = entry {
+                per_request.insert(*id, *cost_usd);
+            }
+        }
+        close(per_request[&31], 0.6 + 0.0075, "long terra");
+        close(per_request[&32], 0.002 + 0.005, "fast terra");
+        close(per_request[&33], 0.01, "standard terra");
+        close(per_request[&34], 0.004 + 0.056 + 0.0015, "long fast terra");
+        close(per_request[&35], 4.0, "argon on 2026-12-02");
+        close(per_request[&36], 0.8 + 0.012, "long grok");
+        close(per_request[&37], 0.0001 + 0.075 + 0.005, "long compaction");
+        let total: f64 = per_request.values().sum();
+        let row = |model: &str| {
+            doc.model_usage
+                .iter()
+                .find(|m| m.model == model)
+                .unwrap_or_else(|| panic!("{model} row"))
+        };
+        close(row("gpt-6.1-terra").cost_usd, 0.686, "terra row");
+        assert_eq!(
+            row("gpt-6.1-terra").price_classes.len(),
+            3,
+            "long, fast, both"
+        );
+        close(row("argon").cost_usd, 4.0, "argon row");
+        close(row("claude-haiku-5-5").cost_usd, 0.0801, "haiku row");
+        close(row("claude-haiku-5-5").sub_cost_usd, 0.08, "haiku sub cost");
+        let rows: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
+        close(rows, total, "model rows");
+        for gran in ["hour", "day", "month"] {
+            let stats: f64 = doc
+                .usage_stats
+                .iter()
+                .filter(|u| u.gran == gran)
+                .map(|u| u.cost_usd)
+                .sum();
+            close(stats, total, gran);
+        }
+        let tenant = doc
+            .tenant_usage
+            .iter()
+            .find(|t| t.tenant == "k-class")
+            .expect("tenant");
+        close(tenant.cost_usd, total, "tenant");
+        let cells: f64 = tenant.models.iter().map(|m| m.cost_usd).sum();
+        close(cells, total, "tenant cells");
+        // Each share carries its own cost: the standard remainder of a row
+        // is its cost minus its shares'.
+        let terra = row("gpt-6.1-terra");
+        let shares: f64 = terra.price_classes.iter().map(|s| s.cost_usd).sum();
+        close(terra.cost_usd - shares, 0.01, "terra standard remainder");
+    }
+
+    /// #283: a request the proxy marked as an unbilled Anthropic refusal
+    /// costs 0 on every path the document carries — its activity row, its
+    /// model row, the usage rows and the tenant cell — while its tokens stay
+    /// visible; the mark means nothing outside the claude group.
+    #[test]
+    fn an_unbilled_refusal_costs_nothing_on_every_aggregate() {
+        let hub = DashboardHub::default();
+        let at = now() - Duration::from_secs(1);
+        let refusal = |id: u64, group: &str, model: &str| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens: Some(TokenCounts {
+                input: 1_000_000,
+                ..Default::default()
+            }),
+            group: Some(group.into()),
+            model: Some(model.into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: Some("k-refusal".into()),
+            sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::UNBILLED,
+        };
+        hub.apply_event(refusal(41, "claude", "claude-fable-5-2"), at);
+        hub.apply_event(refusal(42, "gemini", "gemini-3.8-flash"), at);
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request {
+                id: 41,
+                cost_usd,
+                tokens,
+                price_class,
+                ..
+            } = entry
+            {
+                assert_eq!(*cost_usd, 0.0);
+                assert_eq!(tokens.as_ref().map(|t| t.input), Some(1_000_000));
+                assert!(price_class.unbilled);
+            }
+        }
+        let fable = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "claude-fable-5-2")
+            .expect("fable row");
+        assert_eq!((fable.cost_usd, fable.tokens_in), (0.0, 1_000_000));
+        for u in doc
+            .usage_stats
+            .iter()
+            .filter(|u| u.model == "claude-fable-5-2")
+        {
+            assert_eq!((u.cost_usd, u.tokens_in, u.priced), (0.0, 1_000_000, true));
+        }
+        // Gemini is priced as usual (Flash $0.75 per million input).
+        let flash = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "gemini-3.8-flash")
+            .expect("flash row");
+        assert!((flash.cost_usd - 0.75).abs() < 1e-9, "{}", flash.cost_usd);
+        let tenant = doc
+            .tenant_usage
+            .iter()
+            .find(|t| t.tenant == "k-refusal")
+            .expect("tenant");
+        assert!((tenant.cost_usd - 0.75).abs() < 1e-9, "{}", tenant.cost_usd);
+    }
+
+    /// #278 review: the daemon's `request finished` line prices the request
+    /// in the class the hub records it in — a Fast gpt-6.1-sol request with
+    /// 100k fresh input logs $0.40 (Fast), the cost its activity row and model
+    /// row carry, not the $0.20 Standard price.
+    #[test]
+    fn the_request_finished_line_logs_the_recorded_class_cost() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let hub = DashboardHub::default();
+        let event = ActivityEvent::RequestFinished {
+            id: 51,
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+            endpoint: crate::tui::Endpoint::OpenAi,
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens: Some(TokenCounts {
+                input: 100_000,
+                ..Default::default()
+            }),
+            group: Some("codex".into()),
+            model: Some("gpt-6.1-sol".into()),
+            effort: None,
+            fast: Some(true),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: None,
+            sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let subscriber = tracing_subscriber::registry().with(crate::logging::ChannelLayer::new(tx));
+        tracing::subscriber::with_default(subscriber, || {
+            fold_event(&hub, event, now(), true);
+        });
+        let line = rx.try_recv().expect("request finished line");
+        assert!(line.text.contains("request finished"), "{}", line.text);
+        assert!(line.text.contains(" cost=0.4000"), "{}", line.text);
+        let doc = seeded_free_doc(&hub);
+        let row = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "gpt-6.1-sol")
+            .expect("row");
+        assert!((row.cost_usd - 0.4).abs() < 1e-9, "{}", row.cost_usd);
+    }
+
+    /// The document of `hub` at [`now`], with no other traffic seeded.
+    fn seeded_free_doc(hub: &DashboardHub) -> DashboardDoc {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), now());
+        dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        )
+    }
+
+    /// Items 6 and 7: an Opus 5.5 request the proxy recorded as served in
+    /// fast mode (`fast`) with US-only inference (the class mark) costs 2.2x
+    /// standard on its activity row and every aggregate; a Haiku 5.5 one has
+    /// no fast price, so its 1M-token prompt takes the long tier ($0.50)
+    /// times the 1.1x only.
+    #[test]
+    fn claude_fast_mode_and_us_inference_price_alike_on_every_aggregate() {
+        let hub = DashboardHub::default();
+        let at = now() - Duration::from_secs(1);
+        let event = |id: u64, model: &str| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens: Some(TokenCounts {
+                input: 1_000_000,
+                ..Default::default()
+            }),
+            group: Some("claude".into()),
+            model: Some(model.into()),
+            effort: None,
+            fast: Some(true),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: Some("k-us".into()),
+            sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass {
+                us_inference: true,
+                ..crate::pricing::PriceClass::STANDARD
+            },
+        };
+        hub.apply_event(event(61, "claude-opus-5-5"), at);
+        hub.apply_event(event(62, "claude-haiku-5-5"), at);
+        let doc = seeded_free_doc(&hub);
+        let close = |got: f64, want: f64, what: &str| {
+            assert!((got - want).abs() < 1e-9, "{what}: {got} != {want}");
+        };
+        let mut per_request = std::collections::BTreeMap::new();
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request { id, cost_usd, .. } = entry {
+                per_request.insert(*id, *cost_usd);
+            }
+        }
+        close(per_request[&61], 4.0 * 2.0 * 1.1, "opus fast + us");
+        close(
+            per_request[&62],
+            0.50 * 1.1,
+            "haiku long + us, no fast price",
+        );
+        let total = per_request[&61] + per_request[&62];
+        let rows: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
+        close(rows, total, "model rows");
+        for gran in ["hour", "day", "month"] {
+            let stats: f64 = doc
+                .usage_stats
+                .iter()
+                .filter(|u| u.gran == gran)
+                .map(|u| u.cost_usd)
+                .sum();
+            close(stats, total, gran);
+        }
+        let tenant = doc
+            .tenant_usage
+            .iter()
+            .find(|t| t.tenant == "k-us")
+            .expect("tenant");
+        close(tenant.cost_usd, total, "tenant");
+    }
+
     #[test]
     fn doc_global_cost_reflects_config_pricing_override() {
         // Override gpt-5.5 input to 9.99/1e6, everything else 0 → cost is
@@ -3708,7 +4200,7 @@ mod tests {
                 output: 0.0,
                 cache_read: 0.0,
                 cache_creation: 0.0,
-                cache_creation_extended: None,
+                ..crate::pricing::ModelPrice::zero()
             },
         );
         let mut m = meta();
@@ -3929,15 +4421,16 @@ mod tests {
     #[test]
     fn model_row_cost_matches_pricing_from_parts() {
         // The seeded row is codex/gpt-5.5 with 700 in / 300 out / 120
-        // cache-read: 700*5/1e6 + 300*30/1e6 + 120*0.5/1e6 = 0.01256
-        // (meta() carries no pricing overrides).
+        // cache-read, all of it one Fast request (#278): 700*12.5/1e6 +
+        // 300*75/1e6 + 120*1.25/1e6 = 0.0314 (meta() carries no pricing
+        // overrides). The row keeps the Fast tokens as a class share.
         let doc = seeded_doc();
         let m = &doc.model_usage[0];
         assert_eq!(m.model, "gpt-5.5");
-        let expected =
-            crate::pricing::cost_usd(&m.group, &m.model, &m.token_counts(), &HashMap::new());
+        let expected = fast_cost(&m.model, &m.token_counts());
         assert!((m.cost_usd - expected).abs() < 1e-12);
-        assert!((m.cost_usd - 0.012_56).abs() < 1e-9, "got {}", m.cost_usd);
+        assert!((m.cost_usd - 0.0314).abs() < 1e-9, "got {}", m.cost_usd);
+        assert_eq!(m.price_classes.len(), 1);
     }
 
     #[test]
@@ -4011,6 +4504,7 @@ mod tests {
                     excerpt: None,
                     tenant: None,
                     sub_usage: Vec::new(),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 now() - Duration::from_secs(seeded - i),
             );
@@ -4066,6 +4560,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 

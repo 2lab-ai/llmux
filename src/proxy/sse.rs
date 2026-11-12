@@ -44,6 +44,124 @@ pub struct StreamUsage {
     /// are that model's, so it is priced and booked under it. `None` on every
     /// turn the requested model served.
     pub served_model: Option<String>,
+    /// The response is an Anthropic refusal Anthropic does not bill (#283):
+    /// `stop_reason: "refusal"` before any output (no output tokens) with a
+    /// `stop_details.category` outside [`BILLED_REFUSAL_CATEGORIES`]
+    /// ([`unbilled_refusal`]). Its tokens are still recorded; the request is
+    /// priced at 0 ([`crate::pricing::PriceClass::UNBILLED`]).
+    pub unbilled_refusal: bool,
+    /// The tier the response says served the request, when it says so:
+    /// Anthropic `usage.speed` (`"fast"` / `"standard"`). `None` = not
+    /// reported, and always on the codex paths, whose backend does not
+    /// report the served tier (it answers `service_tier: "default"` to a
+    /// priority request); the requested tier is recorded then.
+    pub served_fast: Option<bool>,
+    /// Anthropic `usage.inference_geo` was `"us"` (US-only inference).
+    pub us_inference: bool,
+    /// How each of [`Self::sub_usage`]'s speed is known, index for index
+    /// ([`SubSpeed`]); applied by [`Self::mark_sub_speeds`].
+    pub sub_speeds: Vec<SubSpeed>,
+}
+
+/// How the speed (Claude fast mode) of one sub-usage is decided (#278).
+/// "Each [fallback] entry names a `model` and can override ... `speed` for
+/// that attempt only" (build-with-claude/refusals-and-fallback, read
+/// 2026-11-12), so a sub-usage has its own speed:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubSpeed {
+    /// Its `usage.iterations` entry reported `speed` (`true` = fast).
+    Reported(bool),
+    /// A declined fallback attempt that reported none: it ran at the speed
+    /// the request asked for that attempt ([`RequestedSpeed::attempt_fast`]).
+    Declined,
+    /// An advisor call that reported none: standard. The advisor is "a
+    /// separate sub-inference billed at the advisor model's rates"
+    /// (agents-and-tools/tool-use/advisor-tool, read 2026-11-12) and fast
+    /// mode is requested for the request's own model only.
+    Advisor,
+    /// Any other entry (a compaction, an unknown type) that reported none:
+    /// it ran inside the request on the request's model, at the request's
+    /// served speed.
+    Executor,
+}
+
+/// The Claude speed a request asked for (#278): its top-level `speed` and
+/// each `fallbacks[]` entry's override. Read from the request body only when
+/// it mentions `speed` at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestedSpeed {
+    /// `speed: "fast"` on the request.
+    pub fast: bool,
+    /// `(model, fast)` of each fallback entry that overrides `speed`.
+    pub fallbacks: Vec<(String, bool)>,
+}
+
+impl RequestedSpeed {
+    /// Parse the speeds a Messages request body asks for.
+    pub fn from_body(body: &[u8]) -> Self {
+        if !body.windows(7).any(|w| w == b"\"speed\"") {
+            return Self::default();
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Self::default();
+        };
+        fn speed(v: &serde_json::Value) -> Option<&str> {
+            v.get("speed").and_then(serde_json::Value::as_str)
+        }
+        Self {
+            fast: speed(&value) == Some("fast"),
+            fallbacks: value
+                .get("fallbacks")
+                .and_then(serde_json::Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let model = entry.get("model")?.as_str()?;
+                            Some((model.to_string(), speed(entry)? == "fast"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The speed a declined attempt on `model` ran at: its fallback entry's
+    /// override when it has one, else the request's own `speed` (the
+    /// requested model's attempt, or an entry that does not override it).
+    pub fn attempt_fast(&self, model: Option<&str>) -> bool {
+        let same = |a: &str, b: &str| {
+            crate::tui::activity::normalize_model(a)
+                .eq_ignore_ascii_case(&crate::tui::activity::normalize_model(b))
+        };
+        model
+            .and_then(|model| {
+                self.fallbacks
+                    .iter()
+                    .find(|(entry, _)| same(entry, model))
+                    .map(|(_, fast)| *fast)
+            })
+            .unwrap_or(self.fast)
+    }
+}
+
+impl StreamUsage {
+    /// Mark each sub-usage's speed on its price class (the proxy's mark the
+    /// hub resolves, [`crate::pricing::classify_finished`]), per
+    /// [`SubSpeed`]: its own reported speed, else the request's speed for
+    /// that attempt, standard for an advisor call, the served top-level
+    /// speed for anything else.
+    pub fn mark_sub_speeds(&mut self, requested: &RequestedSpeed) {
+        let served = self.served_fast.unwrap_or(requested.fast);
+        for (sub, speed) in self.sub_usage.iter_mut().zip(&self.sub_speeds) {
+            sub.price_class.fast = match speed {
+                SubSpeed::Reported(fast) => *fast,
+                SubSpeed::Declined => requested.attempt_fast(sub.model.as_deref()),
+                SubSpeed::Advisor => false,
+                SubSpeed::Executor => served,
+            };
+        }
+    }
 }
 
 impl StreamUsage {
@@ -63,7 +181,32 @@ impl StreamUsage {
         self.cache_creation_extended =
             add_opt(self.cache_creation_extended, other.cache_creation_extended);
         self.web_search_requests = add_opt(self.web_search_requests, other.web_search_requests);
+        self.served_fast = other.served_fast.or(self.served_fast);
+        self.us_inference |= other.us_inference;
     }
+}
+
+/// The served Claude speed of one usage object: `usage.speed` `"fast"` →
+/// `Some(true)`, any other reported value (`"standard"`) → `Some(false)`,
+/// absent → `None` ("The response `usage` object includes a `speed` field
+/// that indicates which speed was used", build-with-claude/fast-mode, read
+/// 2026-11-12).
+pub fn served_speed(usage: &serde_json::Value) -> Option<bool> {
+    usage
+        .get("speed")
+        .and_then(serde_json::Value::as_str)
+        .map(|speed| speed == "fast")
+}
+
+/// Whether one usage object reports US-only inference: `usage.inference_geo`
+/// `"us"` ("The response `usage` object includes an `inference_geo` field
+/// indicating where inference ran", manage-claude/data-residency, read
+/// 2026-11-12).
+pub fn us_inference(usage: &serde_json::Value) -> bool {
+    usage
+        .get("inference_geo")
+        .and_then(serde_json::Value::as_str)
+        == Some("us")
 }
 
 /// Refusal categories Anthropic bills even when the refusal came before any
@@ -74,6 +217,27 @@ impl StreamUsage {
 /// read 2026-11-11). A refusal that arrived mid-stream (it produced output)
 /// is billed whatever its category.
 pub const BILLED_REFUSAL_CATEGORIES: &[&str] = &["bio", "frontier_llm", "reasoning_extraction"];
+
+/// Whether a response is an Anthropic refusal Anthropic does not bill (#283):
+/// "a refusal that arrives before any output is billed when its
+/// `stop_details.category` is `"bio"`, `"frontier_llm"`, or
+/// `"reasoning_extraction"`. ... A refusal before any output in any other
+/// category, or with a `null` category, is not billed" ("How refusals are
+/// billed", build-with-claude/refusals-and-fallback, read 2026-11-11). Before
+/// any output means no output tokens and, on a stream, no content delta
+/// relayed; a refusal after output ("mid-stream") bills its input and the
+/// output already streamed, like any request.
+pub fn unbilled_refusal(
+    stop_reason: Option<&str>,
+    category: Option<&str>,
+    output_tokens: u64,
+    streamed_output: bool,
+) -> bool {
+    stop_reason == Some("refusal")
+        && output_tokens == 0
+        && !streamed_output
+        && !category.is_some_and(|c| BILLED_REFUSAL_CATEGORIES.contains(&c))
+}
 
 /// One Anthropic `fallback` content block — the hand-off from a model that
 /// declined to the one that continues:
@@ -179,6 +343,16 @@ pub fn uncounted_iterations(
     usage: &serde_json::Value,
     hops: &[FallbackHop],
 ) -> Option<Vec<SubUsage>> {
+    uncounted_iterations_with_speeds(usage, hops)
+        .map(|subs| subs.into_iter().map(|(sub, _)| sub).collect())
+}
+
+/// [`uncounted_iterations`] with how each sub-usage's speed is decided
+/// ([`SubSpeed`]).
+pub fn uncounted_iterations_with_speeds(
+    usage: &serde_json::Value,
+    hops: &[FallbackHop],
+) -> Option<Vec<(SubUsage, SubSpeed)>> {
     let iterations = usage.get("iterations")?.as_array()?;
     let served: Vec<Option<&str>> = iterations
         .iter()
@@ -250,7 +424,15 @@ pub fn uncounted_iterations(
         .map(|(_, it)| it)
         .map(|it| {
             let count = |key: &str| it.get(key).and_then(serde_json::Value::as_u64);
-            SubUsage {
+            let speed = match served_speed(it) {
+                Some(fast) => SubSpeed::Reported(fast),
+                None => match iteration_kind(it) {
+                    "message" => SubSpeed::Declined,
+                    "advisor_message" => SubSpeed::Advisor,
+                    _ => SubSpeed::Executor,
+                },
+            };
+            let sub = SubUsage {
                 model: iteration_model(it).map(str::to_string),
                 tokens: TokenCounts {
                     input: count("input_tokens").unwrap_or(0),
@@ -266,9 +448,11 @@ pub fn uncounted_iterations(
                     ),
                     web_search_requests: None,
                 },
-            }
+                price_class: crate::pricing::PriceClass::STANDARD,
+            };
+            (sub, speed)
         })
-        .filter(|sub| sub.tokens.total() > 0)
+        .filter(|(sub, _)| sub.tokens.total() > 0)
         .collect();
     Some(uncounted)
 }
@@ -432,6 +616,10 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 web_search_requests: web_search_requests(usage),
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: served_speed(usage),
+                us_inference: us_inference(usage),
+                sub_speeds: Vec::new(),
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -465,6 +653,14 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                // Not `response.service_tier`: the codex backend answers
+                // "default" even for a priority request (see
+                // `the_native_responses_passthrough_ignores_the_codex_service_tier`),
+                // so the requested tier stands.
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         }
         "message_delta" => {
@@ -479,6 +675,10 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         }
         _ => None,
@@ -501,6 +701,13 @@ pub struct UsageObserver {
     iterations: Option<serde_json::Value>,
     hops: Vec<FallbackHop>,
     start_model: Option<String>,
+    /// The stream's `stop_reason` and refusal category (`message_delta`
+    /// `delta.stop_reason` / `delta.stop_details.category`), and whether the
+    /// CURRENT attempt relayed a non-empty content delta (reset at each
+    /// `fallback` block) — for [`unbilled_refusal`].
+    stop_reason: Option<String>,
+    refusal_category: Option<String>,
+    streamed_output: bool,
 }
 
 impl UsageObserver {
@@ -515,6 +722,16 @@ impl UsageObserver {
         };
         match v["type"].as_str() {
             Some("message_delta") => {
+                if let Some(reason) = v
+                    .pointer("/delta/stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.stop_reason = Some(reason.to_string());
+                    self.refusal_category = v
+                        .pointer("/delta/stop_details/category")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
                 let u = &v["usage"];
                 if let Some(n) = u["input_tokens"].as_u64() {
                     self.usage.input_tokens = n;
@@ -536,6 +753,12 @@ impl UsageObserver {
                 if let Some(n) = web_search_requests(u) {
                     self.usage.web_search_requests = Some(n);
                 }
+                if let Some(fast) = served_speed(u) {
+                    self.usage.served_fast = Some(fast);
+                }
+                if us_inference(u) {
+                    self.usage.us_inference = true;
+                }
                 if u.get("iterations").is_some() {
                     self.iterations = Some(u.clone());
                 }
@@ -556,6 +779,16 @@ impl UsageObserver {
             Some("content_block_start") => {
                 if let Some(hop) = FallbackHop::from_block(&v["content_block"]) {
                     self.hops.push(hop);
+                    // A fallback block starts the next attempt: the refusal
+                    // rule applies to the attempt whose counters are priced
+                    // (the last one), so only ITS output counts.
+                    self.streamed_output = false;
+                }
+                return;
+            }
+            Some("content_block_delta") => {
+                if !self.streamed_output && contains_content_delta(event.as_bytes()) {
+                    self.streamed_output = true;
                 }
                 return;
             }
@@ -603,7 +836,17 @@ impl UsageObserver {
             usage.cache_creation_extended =
                 extended_cache_writes(served, usage.cache_creation_input_tokens);
         }
-        usage.sub_usage = uncounted_iterations(&iterations, &self.hops).unwrap_or_default();
+        (usage.sub_usage, usage.sub_speeds) =
+            uncounted_iterations_with_speeds(&iterations, &self.hops)
+                .unwrap_or_default()
+                .into_iter()
+                .unzip();
+        usage.unbilled_refusal = unbilled_refusal(
+            self.stop_reason.as_deref(),
+            self.refusal_category.as_deref(),
+            usage.output_tokens,
+            self.streamed_output,
+        );
         usage.served_model =
             fallback_served_model(&iterations, &self.hops, self.start_model.as_deref());
         usage
@@ -1258,6 +1501,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1277,6 +1524,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1294,6 +1545,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1331,6 +1586,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
         // No write field: unchanged behaviour (creation unavailable).
@@ -1346,6 +1605,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1362,6 +1625,10 @@ mod tests {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
+            served_fast: None,
+            us_inference: false,
+            sub_speeds: Vec::new(),
         });
         total.add(StreamUsage {
             input_tokens: 0,
@@ -1372,6 +1639,10 @@ mod tests {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
+            served_fast: None,
+            us_inference: false,
+            sub_speeds: Vec::new(),
         });
         assert_eq!(
             total,
@@ -1386,6 +1657,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -1431,6 +1706,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             vec![SubUsage {
                 model: Some("claude-opus-5-5".into()),
                 tokens: tokens(823, 1612, Some(0), Some(0)),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }]
         );
         assert_eq!(usage.served_model, None, "no fallback served this turn");
@@ -1452,6 +1728,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(vec![SubUsage {
                 model: None,
                 tokens: tokens(180_000, 3_500, None, None),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }])
         );
         // Every response carries `iterations` once the beta is on; without a
@@ -1500,6 +1777,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(vec![SubUsage {
                 model: Some("claude-fable-5".into()),
                 tokens: tokens(535, output, Some(0), Some(0)),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }])
         };
         let pre_output = fallback_usage(0);
@@ -1561,6 +1839,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             vec![SubUsage {
                 model: Some("claude-fable-5".into()),
                 tokens: tokens(535, 120, Some(0), Some(0)),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }]
         );
         // The reported model is the fallback when nothing better names it.
@@ -1659,6 +1938,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             vec![SubUsage {
                 model: Some("claude-fable-5".into()),
                 tokens: tokens(535, 0, Some(40), None),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }],
             "the billed (bio) declined attempt, once"
         );
@@ -1677,6 +1957,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(vec![SubUsage {
                 model: Some("claude-x".into()),
                 tokens: tokens(7, 3, None, None),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }])
         );
     }
@@ -1700,10 +1981,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 SubUsage {
                     model: None,
                     tokens: tokens(100, 10, None, None),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 SubUsage {
                     model: Some("claude-z".into()),
                     tokens: tokens(30, 3, None, None),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
             ],
             "the cumulative array replaces the earlier one, never doubles it"
@@ -1842,5 +2125,138 @@ data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"inp
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].tokens.cache_creation, Some(500));
         assert_eq!(subs[0].tokens.cache_creation_extended, Some(300));
+    }
+
+    /// #283: an Anthropic refusal before any output is not billed unless its
+    /// `stop_details.category` is billed ("How refusals are billed",
+    /// build-with-claude/refusals-and-fallback, read 2026-11-11); a refusal
+    /// after streamed output keeps its price. The tokens stay recorded.
+    #[test]
+    fn a_refusal_before_any_output_in_an_unbilled_category_is_marked() {
+        let start = r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-fable-5-2","usage":{"input_tokens":412,"cache_read_input_tokens":100,"output_tokens":0}}}"#
+            .to_string();
+        let refusal = |category: &str, output: u64| {
+            format!(
+                r#"event: message_delta
+data: {{"type":"message_delta","delta":{{"stop_reason":"refusal","stop_sequence":null,"stop_details":{{"type":"refusal","category":{category},"explanation":null}}}},"usage":{{"output_tokens":{output}}}}}"#
+            )
+        };
+        let text = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Sure"}}"#
+            .to_string();
+        let run = |events: &[String]| {
+            let mut observer = UsageObserver::default();
+            for event in events {
+                observer.observe(event);
+            }
+            observer.finish()
+        };
+        for category in [r#""cyber""#, r#""general_harms""#, "null"] {
+            let usage = run(&[start.clone(), refusal(category, 0)]);
+            assert!(usage.unbilled_refusal, "{category}");
+            assert_eq!(
+                (usage.input_tokens, usage.cache_read_input_tokens),
+                (412, Some(100)),
+                "the tokens stay visible"
+            );
+        }
+        for category in BILLED_REFUSAL_CATEGORIES {
+            let usage = run(&[start.clone(), refusal(&format!("\"{category}\""), 0)]);
+            assert!(!usage.unbilled_refusal, "{category} is billed");
+        }
+        // Mid-stream: output came first, so it bills like any request.
+        assert!(!run(&[start.clone(), text.clone(), refusal(r#""cyber""#, 25)]).unbilled_refusal);
+        assert!(!run(&[start.clone(), text, refusal(r#""cyber""#, 0)]).unbilled_refusal);
+        let end = r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#
+            .to_string();
+        assert!(!run(&[start, end]).unbilled_refusal);
+    }
+
+    /// #283 review: the refusal rule applies to the attempt whose counters
+    /// the request is priced on. A first attempt that streamed text and then
+    /// declined hands over to a fallback model (a `fallback` block); when
+    /// that final attempt refuses before any output in an unbilled category,
+    /// the request's top-level counters (its `fallback_message` entry) are
+    /// unbilled — the earlier attempt's text does not make them billed (the
+    /// declined attempt itself is booked as a sub-usage, billed because it
+    /// streamed output).
+    #[test]
+    fn the_refusal_rule_follows_the_attempt_the_counters_come_from() {
+        let events = [
+            r#"data: {"type":"message_start","message":{"model":"claude-fable-5-2","usage":{"input_tokens":900,"output_tokens":0}}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Here is"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","from":{"model":"claude-fable-5-2"},"to":{"model":"claude-opus-5-5"},"trigger":{"type":"refusal","category":"cyber"}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"}},"usage":{"output_tokens":0,"iterations":[{"type":"message","model":"claude-fable-5-2","input_tokens":900,"output_tokens":5},{"type":"fallback_message","model":"claude-opus-5-5","input_tokens":950,"output_tokens":0}]}}"#,
+        ];
+        let mut observer = UsageObserver::default();
+        for event in events {
+            observer.observe(event);
+        }
+        let usage = observer.finish();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (950, 0));
+        assert!(usage.unbilled_refusal, "{usage:?}");
+        assert_eq!(usage.sub_usage.len(), 1, "the declined attempt is billed");
+        // Text the FINAL attempt streamed still makes it billed.
+        let mut observer = UsageObserver::default();
+        for event in [events[0], events[2], events[1], events[3]] {
+            observer.observe(event);
+        }
+        assert!(!observer.finish().unbilled_refusal);
+    }
+
+    /// Claude fast mode and US-only inference are read from the SERVED
+    /// usage: "The response `usage` object includes a `speed` field ...
+    /// either "fast" or "standard"" (build-with-claude/fast-mode) and "an
+    /// `inference_geo` field indicating where inference ran"
+    /// (manage-claude/data-residency), both read 2026-11-12.
+    #[test]
+    fn the_served_speed_and_inference_geo_are_read_from_the_usage() {
+        let run = |events: &[&str]| {
+            let mut observer = UsageObserver::default();
+            for event in events {
+                observer.observe(event);
+            }
+            observer.finish()
+        };
+        let usage = run(&[
+            r#"data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":0,"speed":"fast","inference_geo":"us"}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+        ]);
+        assert_eq!((usage.served_fast, usage.us_inference), (Some(true), true));
+        let usage = run(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5,"speed":"standard","inference_geo":"global"}}"#,
+        ]);
+        assert_eq!(
+            (usage.served_fast, usage.us_inference),
+            (Some(false), false)
+        );
+        let usage = run(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+        ]);
+        assert_eq!((usage.served_fast, usage.us_inference), (None, false));
+    }
+
+    /// The codex backend does NOT report the tier that served a request: on
+    /// this machine's raw-io capture (2026-09-08 and 2026-09-10, 3,272
+    /// requests sent with `service_tier: "priority"`) every
+    /// `response.completed` / `response.failed` said `"default"` and every
+    /// `response.created` `"auto"`, unlike the OpenAI API's documented echo.
+    /// So the native passthrough never lets a response tier override the
+    /// requested one (`served_fast` stays `None`).
+    #[test]
+    fn the_native_responses_passthrough_ignores_the_codex_service_tier() {
+        let completed = |tier: &str| {
+            format!(
+                r#"data: {{"type":"response.completed","response":{{"service_tier":{tier},"usage":{{"input_tokens":10,"output_tokens":2}}}}}}"#
+            )
+        };
+        for tier in [r#""priority""#, r#""default""#, r#""auto""#, "null"] {
+            let mut observer = UsageObserver::default();
+            observer.observe(&completed(tier));
+            assert_eq!(observer.finish().served_fast, None, "{tier}");
+        }
     }
 }

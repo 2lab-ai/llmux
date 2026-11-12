@@ -64,6 +64,8 @@ USAGE = {
         ("requests", "int"),
         # Schema v3 (#278): extended-TTL cache writes and web searches.
         ("cache_creation_extended", "int"), ("web_search_requests", "int"),
+        # Schema v4 (#278): the row's price class ('' = standard).
+        ("price_class", "text"),
     ],
 }
 METRICS_EVENTS = {

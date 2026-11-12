@@ -30,6 +30,14 @@ is what every older row means. The PostgreSQL schema adds them to an existing
 `usage` table the same way, and the loader copies them, so snapshot a store a
 current daemon has opened.
 
+Schema v4 (2026-11-12) added `price_class`: the row's price class as compact
+JSON (`{"long_context":true}`, `{"fast":true}`,
+`{"rates_from":"2026-12-01"}`, `{"unbilled":true}`, or a combination), `''`
+for the standard class, which is what every older row means. It is what the
+row is priced at ([models.md](models.md#per-request-price-classes)). The
+PostgreSQL schema adds it as `text NOT NULL DEFAULT ''` and the loader copies
+it.
+
 Bookkeeping tables (`meta`, `metrics_jsonl_imports`, `metrics_exports`,
 `metrics_day_rev`) describe the SQLite files and their archives. They are not
 copied, because a server backend keeps its own.

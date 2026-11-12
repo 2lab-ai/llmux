@@ -159,14 +159,15 @@ pub fn export_usage_days(
     }
     // Columns a daemon adds when it migrates the store (#278): `requests` (0
     // on a sub-usage row, schema v2), `cache_creation_extended` and
-    // `web_search_requests` (schema v3). A store it never migrated exports
-    // what every row of that schema is: one request, no extended-TTL writes,
-    // no web searches.
+    // `web_search_requests` (schema v3), `price_class` (schema v4). A store
+    // it never migrated exports what every row of that schema is: one
+    // request, no extended-TTL writes, no web searches, the standard class.
     let mut added = String::new();
     for (column, missing) in [
         ("requests", "1"),
         ("cache_creation_extended", "0"),
         ("web_search_requests", "0"),
+        ("price_class", "''"),
     ] {
         let present: i64 = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('usage') WHERE name = ?1",
@@ -234,9 +235,10 @@ pub fn export_usage_days(
 /// binary of another format exported (an older one, after a downgrade) never
 /// matches and is exported again in this format. 2 (#278): lines carry
 /// `requests`. 3 (#278, key-usage schema v3): lines also carry
-/// `cache_creation_extended` and `web_search_requests`. Format 1
+/// `cache_creation_extended` and `web_search_requests`. 4 (#278, key-usage
+/// schema v4): lines also carry `price_class` (`''` = standard). Format 1
 /// fingerprints had no version prefix.
-const EXPORT_FORMAT: u32 = 3;
+const EXPORT_FORMAT: u32 = 4;
 
 /// `v<format>:count:sum(ts_ms - lo):max(ts_ms)` — offsets from `lo` keep the
 /// sum far from i64 overflow.
@@ -708,6 +710,106 @@ mod tests {
             .unwrap_or_else(|| panic!("no b in {lines:?}"));
         assert_eq!(b["cache_creation_extended"], 6);
         assert_eq!(b["web_search_requests"], 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Key-usage schema v4 (#278) changed the line shape again: a day a
+    /// format-3 binary exported (lines without `price_class`, fingerprint
+    /// `v3:…`) is exported again in the current format, then stays put.
+    #[test]
+    fn a_format_3_export_is_regenerated_with_the_v4_column() {
+        let (dir, db) = db_with(&[("a", T0), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        Connection::open(&db)
+            .expect("open")
+            .execute(
+                r#"UPDATE usage SET price_class = '{"fast":true}' WHERE event_key = 'a'"#,
+                [],
+            )
+            .expect("class");
+        // What a format-3 binary publishes for these rows.
+        let (lo, hi) = bracket(local_day_number(T0 as i64));
+        let conn = Connection::open(&db).expect("open");
+        let line: String = conn
+            .query_row(
+                &format!(
+                    "SELECT json_object('event_key', event_key, 'ts_ms', ts_ms, 'tenant', tenant,
+                            'grp', grp, 'model', model, 'status', status,
+                            'tokens_in', tokens_in, 'tokens_out', tokens_out,
+                            'cache_read', cache_read, 'cache_creation', cache_creation,
+                            'requests', requests, 'cache_creation_extended', cache_creation_extended,
+                            'web_search_requests', web_search_requests)
+                       FROM usage WHERE {DAY_FILTER}"
+                ),
+                rusqlite::params![lo, hi, day0],
+                |r| r.get(0),
+            )
+            .expect("format-3 line");
+        let (count, sum_off, max_ts): (i64, i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*), coalesce(sum(ts_ms - ?1), 0), coalesce(max(ts_ms), 0)
+                       FROM usage WHERE {DAY_FILTER}"
+                ),
+                rusqlite::params![lo, hi, day0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("fingerprint");
+        let ad = archive_dir_for(&db);
+        fs::create_dir_all(&ad).expect("archive dir");
+        publish_day(
+            &ad,
+            &day0,
+            0,
+            None,
+            &[line],
+            format!("v3:{count}:{sum_off}:{max_ts}"),
+            NEVER,
+        )
+        .expect("format-3 publish")
+        .expect("published");
+        assert_eq!(
+            export_usage_days(&db, &today, NEVER).expect("upgrade export"),
+            vec![(day0.clone(), 1, 1)],
+            "the format-3 day is exported again"
+        );
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.1.jsonl.zst")));
+        assert_eq!(lines[0]["price_class"], r#"{"fast":true}"#, "{lines:?}");
+        assert!(export_usage_days(&db, &today, NEVER)
+            .expect("again")
+            .is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #278 schema v4: each row's price class is exported (`''` = the
+    /// standard class); a store without the column exports `''`.
+    #[test]
+    fn the_export_carries_the_price_class() {
+        let (dir, db) = db_with(&[("a", T0), ("now", T0 + DAY)]);
+        let day0 = day_of(T0);
+        let today = day_of(T0 + DAY);
+        export_usage_days(&db, &today, NEVER).expect("old schema exports");
+        let ad = archive_dir_for(&db);
+        let old = archived_lines(&ad.join(format!("usage-{day0}.jsonl.zst")));
+        assert_eq!(old[0]["price_class"], "", "{old:?}");
+        drop(crate::key_usage::UsageDb::open(&db).expect("migrate"));
+        Connection::open(&db)
+            .expect("open")
+            .execute(
+                r#"INSERT INTO usage (event_key, ts_ms, tenant, grp, model, status, tokens_in, price_class)
+                 VALUES ('b', ?1, 't', 'codex', 'gpt-6.1-terra', 200, 300000, '{"long_context":true}')"#,
+                [T0 as i64],
+            )
+            .expect("v4 row");
+        export_usage_days(&db, &today, NEVER).expect("export");
+        let lines = archived_lines(&ad.join(format!("usage-{day0}.1.jsonl.zst")));
+        let b = lines
+            .iter()
+            .find(|l| l["event_key"] == "b")
+            .unwrap_or_else(|| panic!("no b in {lines:?}"));
+        assert_eq!(b["price_class"], r#"{"long_context":true}"#);
         let _ = fs::remove_dir_all(dir);
     }
 

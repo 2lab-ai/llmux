@@ -365,6 +365,7 @@ impl DashboardView {
                     // does not surface it — ui.rs reads the doc field directly.
                     cost_usd: _,
                     sub_usage,
+                    price_class,
                 } => Completed {
                     at: ms_time(*at_ms),
                     body: CompletedBody::Request {
@@ -397,6 +398,7 @@ impl DashboardView {
                         tenant: tenant.clone(),
                         client_name: client_name.clone(),
                         sub_usage: sub_usage.clone(),
+                        price_class: *price_class,
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {

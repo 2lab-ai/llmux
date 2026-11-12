@@ -9139,6 +9139,7 @@ mod tests {
             web_search_requests: 0,
             cost_usd: 0.1,
             priced: true,
+            price_classes: Vec::new(),
         };
         let mut view = empty_view();
         view.usage_stats = vec![row(3), row(2), row(1)]; // 3 day buckets
@@ -9344,6 +9345,7 @@ mod tests {
                     cache_creation_extended: 0,
                     web_search_requests: 0,
                     cost_usd: 0.0,
+                    price_classes: Vec::new(),
                 }],
             }],
             ..Default::default()
@@ -9818,6 +9820,7 @@ mod tests {
             web_search_requests: 0,
             cost_usd: 0.1,
             priced: true,
+            price_classes: Vec::new(),
         };
         let mut view = empty_view();
         // 20 day buckets of two models each: 60 table rows.
@@ -9897,6 +9900,7 @@ mod tests {
             // Cost descending keeps the drawn order model-00 … model-39.
             cost_usd: 100.0 - i as f64,
             priced: true,
+            price_classes: Vec::new(),
         };
         let mut view = empty_view();
         view.usage_stats = (0..40).map(row).collect();
@@ -10892,6 +10896,7 @@ mod tests {
                 kind: Some("user".into()),
                 excerpt: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         };
         let first = req(7);
@@ -11119,6 +11124,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         };
         let note = |secs: u64| activity::Completed {
@@ -11234,6 +11240,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         };
         let mut app = remote_app();
@@ -11338,6 +11345,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         };
         let top_key =
@@ -11402,6 +11410,7 @@ mod tests {
             endpoints: Vec::new(),
             cost_usd: 0.0,
             sub_cost_usd: 0.0,
+            price_classes: Vec::new(),
         }];
         v
     }

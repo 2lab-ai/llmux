@@ -84,6 +84,10 @@ in the TUI or with `llmux keys`; the web page is read-only.
   extended-TTL cache-write rate (Claude 1h, OpenAI 12h) next to the short-TTL one, and the per-search
   web-search fee, so history rows that report them price like the daemon's (2026-11-11, #278). A model
   whose recent writes were all one TTL takes that TTL's rate for the other.
+  A history row is priced in its own price class (long context, Fast, dated rates): the solver fits
+  each class on the `price_classes` parts the daemon prices separately, and the standard rates on the
+  rest of each row. A class with no solved rate falls back to the model's standard rates, which
+  understates it; an unbilled refusal costs nothing (2026-11-12, #278, #283).
 - Context fill is the newest main request's input plus cache plus output, set against the model window.
   A session past 170k tokens counts as a 1M-window session.
 

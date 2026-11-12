@@ -257,6 +257,39 @@ Rates are USD per million tokens:
 | `cache_creation` | Cache writes at the default TTL (Anthropic 5 minutes, OpenAI 30 minutes). |
 | `cache_creation_extended` | Optional (2026-11-11, #278). Cache writes at the extended TTL — Anthropic 1 hour, OpenAI 12 hours — applied to the part of a request's writes the response reports at that TTL. Absent means the entry's `cache_creation` rate, so an override written before this field prices exactly as before. |
 
+| `long_context` | Optional (#278). The rates of a long-context request, as an object with the same five fields (`input`, `output`, `cache_read`, `cache_creation`, optional `cache_creation_extended`). Absent means the entry has no long tier. |
+| `fast` | Optional (#278). The rates of a codex Fast request (same object shape). Absent means no Fast premium. |
+| `us_inference` | Optional (#278). A multiplier on every rate the request's class selects when the response reports US-only inference (`usage.inference_geo: "us"`, claude group); the built-in Claude 4.6+ rows use `1.1`. Absent means no premium. |
+| `fast_long_context` | Optional (#278). The rates of a request that is both long-context and Fast (same object shape); it applies even when the entry has no `long_context`. Absent means the `long_context` rates, else the `fast` rates. |
+
+An entry replaces the whole built-in row, tiers included: an entry without
+`long_context` prices a long request at its own standard rates (flat), one
+without `fast` prices a Fast request (codex Fast or Claude fast mode) at its
+standard rates, and one without `us_inference` adds no US-only premium, even
+when the built-in row has those tiers. Which requests are long-context is NOT
+configurable: the boundary is built-in data per model (OpenAI `> 272,000`,
+xAI `>= 200,000`, Claude Haiku 5.5 `> 100,000` prompt tokens; see
+[models.md](models.md#per-request-price-classes)), so an entry's
+`long_context` rates apply to the requests the model's built-in boundary
+classifies as long, and never on a model with no built-in boundary. A
+`threshold` (or any other unknown key) inside a tier object is rejected when
+the config loads. Built-in dated rate changes (Gemini 4 Argon from
+2026-12-01, Gemini 3.8 Flash from 2027-01-01) do not apply to an entry: it
+prices every day at its own rates. Each request's class is recorded with it,
+so changing an entry reprices history consistently: aggregates still equal
+the sum of their requests.
+
+```json
+"pricing": {
+  "gpt-6.1-sol": {
+    "input": 2.0, "output": 10.0, "cache_read": 0.1, "cache_creation": 2.5,
+    "cache_creation_extended": 5.0,
+    "long_context": { "input": 4.0, "output": 15.0, "cache_read": 0.2, "cache_creation": 5.0, "cache_creation_extended": 10.0 },
+    "fast": { "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_creation": 5.0, "cache_creation_extended": 10.0 }
+  }
+}
+```
+
 The Anthropic web-search fee ($10 per 1,000 searches) is a per-search charge,
 not a token rate: an override does not change it. The costs are API-equivalent
 estimates, never a bill.

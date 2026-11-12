@@ -943,6 +943,13 @@ impl ResponsesSseConverter {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
+            // Never the response's `service_tier`: the codex backend answers
+            // "default" even to a priority request, so the requested tier
+            // stands (see `the_translate_path_ignores_the_codex_service_tier`).
+            served_fast: None,
+            us_inference: false,
+            sub_speeds: Vec::new(),
         };
     }
 
@@ -1782,6 +1789,24 @@ mod tests {
         );
     }
 
+    /// #278 review: the codex backend answers `service_tier: "default"` on
+    /// the terminal event even for a request sent with `priority` (raw-io
+    /// capture of 3,272 such requests, 2026-09-08 / 2026-09-10), so the
+    /// translate path never lets the response tier override the requested
+    /// one.
+    #[test]
+    fn the_translate_path_ignores_the_codex_service_tier() {
+        for tier in [json!("priority"), json!("default"), Value::Null] {
+            let mut event = incomplete_event(Some("max_output_tokens"));
+            event["response"]["service_tier"] = tier.clone();
+            let (converter, _) = run(&[
+                json!({"type": "response.created", "response": {"id": "resp_cap"}}),
+                event,
+            ]);
+            assert_eq!(converter.usage().served_fast, None, "{tier}");
+        }
+    }
+
     #[test]
     fn incomplete_retains_upstream_usage() {
         let (converter, events) = run(&[
@@ -1807,6 +1832,10 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
+                sub_speeds: Vec::new(),
             },
             "a capped turn still bills the tokens it really burned"
         );
@@ -1832,6 +1861,10 @@ mod tests {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
+            served_fast: None,
+            us_inference: false,
+            sub_speeds: Vec::new(),
         };
         let failed = json!({"type": "response.failed", "response": {
             "error": {"message": "boom"}, "usage": usage_fixture()}});

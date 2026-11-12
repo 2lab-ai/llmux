@@ -47,7 +47,10 @@ use crate::tui::{ActivityEvent, SubUsage, TokenCounts};
 /// v3 (#278): `cache_creation_extended` (the extended-TTL subset of
 /// `cache_creation`: Anthropic 1h, OpenAI 12h writes) and
 /// `web_search_requests`, both default 0 — what every older row means.
-pub const SCHEMA_VERSION: u32 = 3;
+/// v4 (#278): `price_class` — the row's price class
+/// ([`crate::pricing::PriceClass`]) as compact JSON, `''` for the standard
+/// class, which is what every older row means.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Schema version of `activity.jsonl` lines this importer understands — the
 /// SAME constant the writer stamps them with ([`crate::tui::activity`]), not a
@@ -258,6 +261,9 @@ pub struct ModelUsage {
     /// Extended-TTL subset of `cache_creation` and web searches (#278).
     pub cache_creation_extended: u64,
     pub web_search_requests: u64,
+    /// The tokens of the non-standard price classes among the counters
+    /// above (#278, schema v4), so the cell prices as the sum of its rows.
+    pub classes: crate::pricing::ClassSplit,
 }
 
 impl ModelUsage {
@@ -321,6 +327,9 @@ pub struct UsageRow {
     /// `n`-th sub-usage ([`crate::tui::SubUsage`], #278): tokens booked under
     /// their own model that are NOT a request (`requests = 0`).
     pub sub_index: Option<u32>,
+    /// The request's (or sub-usage's) price class, resolved when the request
+    /// was recorded (#278, schema v4). Standard on every older row.
+    pub price_class: crate::pricing::PriceClass,
 }
 
 impl UsageRow {
@@ -415,6 +424,7 @@ impl UsageRow {
             )
             .with_counts(&sub.tokens);
             row.sub_index = Some(u32::try_from(index).unwrap_or(u32::MAX));
+            row.price_class = sub.price_class;
             rows.push(row);
         }
         rows.insert(0, self);
@@ -437,13 +447,14 @@ impl UsageRow {
             group,
             model,
             tenant,
+            price_class,
             ..
         } = event
         else {
             return None;
         };
         let ts_ms = epoch_ms(now);
-        let row = Self::new(
+        let mut row = Self::new(
             ts_ms,
             *id,
             tenant.as_deref(),
@@ -451,6 +462,7 @@ impl UsageRow {
             model.as_deref(),
             *status,
         );
+        row.price_class = *price_class;
         Some(match tokens {
             Some(t) => row.with_counts(t),
             None => row,
@@ -513,6 +525,10 @@ struct LegacyLine {
     /// Sub-usages (#278); absent on every line written before them.
     #[serde(default)]
     sub_usage: Vec<SubUsage>,
+    /// The request's price class (#278); absent (standard) on every line
+    /// written before classes.
+    #[serde(default)]
+    price_class: crate::pricing::PriceClass,
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +597,8 @@ impl UsageDb {
                  cache_creation INTEGER NOT NULL DEFAULT 0,
                  requests       INTEGER NOT NULL DEFAULT 1,
                  cache_creation_extended INTEGER NOT NULL DEFAULT 0,
-                 web_search_requests     INTEGER NOT NULL DEFAULT 0
+                 web_search_requests     INTEGER NOT NULL DEFAULT 0,
+                 price_class    TEXT NOT NULL DEFAULT ''
              );
              CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage(ts_ms);
              CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage(model, ts_ms);
@@ -648,7 +665,8 @@ impl UsageDb {
              SUM(CASE WHEN status < 400 THEN requests ELSE 0 END), \
              SUM(CASE WHEN status >= 400 THEN requests ELSE 0 END), \
              SUM(tokens_in), SUM(tokens_out), SUM(cache_read), SUM(cache_creation), \
-             MIN(ts_ms), MAX(ts_ms), SUM(cache_creation_extended), SUM(web_search_requests) \
+             MIN(ts_ms), MAX(ts_ms), SUM(cache_creation_extended), SUM(web_search_requests), \
+             price_class \
              FROM usage WHERE ts_ms >= ?1 AND ts_ms <= ?2",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![
@@ -666,7 +684,9 @@ impl UsageDb {
             }
             sql.push(')');
         }
-        sql.push_str(" GROUP BY tenant, grp, model");
+        // One row per price class too (#278): a cell keeps the tokens of
+        // each non-standard class apart, so it prices as its requests did.
+        sql.push_str(" GROUP BY tenant, grp, model, price_class");
 
         let mut stmt = self
             .conn
@@ -689,6 +709,7 @@ impl UsageDb {
                     last_ms: r.get::<_, i64>(11)? as u64,
                     cache_creation_extended: r.get::<_, i64>(12)? as u64,
                     web_search_requests: r.get::<_, i64>(13)? as u64,
+                    price_class: parse_price_class(&r.get::<_, String>(14)?),
                 })
             })
             .map_err(|e| UsageError::sqlite(&self.path, e))?;
@@ -715,19 +736,45 @@ impl UsageDb {
             entry.last_ms = entry.last_ms.max(row.last_ms);
             // Only model-attributed requests get a breakdown cell; pre-routing
             // failures stay in the tenant totals (same rule as the in-memory
-            // fold), so the two can legitimately disagree on token sums.
+            // fold), so the two can legitimately disagree on token sums. The
+            // price classes of one (group, model) fold into one cell.
             if let (Some(group), Some(model)) = (row.group.clone(), row.model.clone()) {
-                entry.models.push(ModelUsage {
-                    group,
-                    model,
-                    requests: row.requests,
-                    tokens_in: row.tokens_in,
-                    tokens_out: row.tokens_out,
-                    cache_read: row.cache_read,
-                    cache_creation: row.cache_creation,
-                    cache_creation_extended: row.cache_creation_extended,
-                    web_search_requests: row.web_search_requests,
-                });
+                let tokens = TokenCounts {
+                    input: row.tokens_in,
+                    output: row.tokens_out,
+                    cache_read: Some(row.cache_read),
+                    cache_creation: Some(row.cache_creation),
+                    cache_creation_extended: Some(row.cache_creation_extended),
+                    web_search_requests: Some(row.web_search_requests),
+                };
+                let index = match entry
+                    .models
+                    .iter()
+                    .position(|m| m.group == group && m.model == model)
+                {
+                    Some(index) => index,
+                    None => {
+                        entry.models.push(ModelUsage {
+                            group,
+                            model,
+                            ..Default::default()
+                        });
+                        entry.models.len() - 1
+                    }
+                };
+                let cell = &mut entry.models[index];
+                cell.requests += row.requests;
+                cell.tokens_in = cell.tokens_in.saturating_add(row.tokens_in);
+                cell.tokens_out = cell.tokens_out.saturating_add(row.tokens_out);
+                cell.cache_read = cell.cache_read.saturating_add(row.cache_read);
+                cell.cache_creation = cell.cache_creation.saturating_add(row.cache_creation);
+                cell.cache_creation_extended = cell
+                    .cache_creation_extended
+                    .saturating_add(row.cache_creation_extended);
+                cell.web_search_requests = cell
+                    .web_search_requests
+                    .saturating_add(row.web_search_requests);
+                cell.classes.add(row.price_class, &tokens);
             }
         }
 
@@ -940,28 +987,53 @@ impl UsageDb {
 
 const INSERT_SQL: &str = "INSERT OR IGNORE INTO usage \
      (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, requests, \
-      cache_creation_extended, web_search_requests) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
+      cache_creation_extended, web_search_requests, price_class) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+
+/// The stored form of a price class: `''` for the standard class (the
+/// column default, what every pre-v4 row holds), else its compact JSON
+/// (`{"long_context":true}`).
+fn price_class_text(class: &crate::pricing::PriceClass) -> String {
+    if class.is_standard() {
+        return String::new();
+    }
+    serde_json::to_string(class).unwrap_or_default()
+}
+
+/// Read a stored price class. `''` is standard; a class with facts this
+/// binary does not know is read without them; unreadable text is logged and
+/// priced standard rather than failing the query.
+fn parse_price_class(text: &str) -> crate::pricing::PriceClass {
+    if text.is_empty() {
+        return crate::pricing::PriceClass::STANDARD;
+    }
+    serde_json::from_str(text).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, class = text, "unreadable usage price class, priced standard");
+        crate::pricing::PriceClass::STANDARD
+    })
+}
 
 /// Columns added after v1, in order, with their `ADD COLUMN` definition. Each
 /// default is what every row written before the column means: one request,
-/// no extended-TTL writes, no web searches.
-const ADDED_COLUMNS: [(&str, &str); 3] = [
+/// no extended-TTL writes, no web searches, the standard price class.
+const ADDED_COLUMNS: [(&str, &str); 4] = [
     ("requests", "INTEGER NOT NULL DEFAULT 1"),
     ("cache_creation_extended", "INTEGER NOT NULL DEFAULT 0"),
     ("web_search_requests", "INTEGER NOT NULL DEFAULT 0"),
+    ("price_class", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// Bring a store to [`SCHEMA_VERSION`]: v1 → v2 adds `requests`, v2 → v3
-/// `cache_creation_extended` and `web_search_requests` ([`ADDED_COLUMNS`]),
-/// each only if absent. Runs inside an IMMEDIATE transaction that re-checks
+/// `cache_creation_extended` and `web_search_requests`, v3 → v4
+/// `price_class` ([`ADDED_COLUMNS`]), each only if absent. Runs inside an IMMEDIATE transaction that re-checks
 /// every column, so two daemons opening the same file during a rolling
 /// restart cannot both alter it. Additive only: an older daemon can still
 /// read and write a newer store — its inserts name only the columns it knows,
 /// so its rows take the defaults (a v1 daemon counts sub-usage rows as
 /// requests; a v2 daemon books no extended writes or searches and prices
-/// every write at the short-TTL rate), and it re-stamps its own version,
-/// which the next newer open stamps back.
+/// every write at the short-TTL rate; a v3 daemon stores every row as the
+/// standard class and, ignoring the column, prices every cell flat), and it
+/// re-stamps its own version, which the next newer open stamps back.
 fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (column, definition) in ADDED_COLUMNS {
@@ -986,7 +1058,7 @@ fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
 /// Owned bind values for [`INSERT_SQL`] (owned, so the array outlives the
 /// statement call without borrowing a temporary).
-fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 13] {
+fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 14] {
     use rusqlite::types::Value;
     let text = |v: &Option<String>| match v {
         Some(v) => Value::Text(v.clone()),
@@ -1006,6 +1078,7 @@ fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 13] {
         Value::Integer(row.requests() as i64),
         Value::Integer(row.cache_creation_extended as i64),
         Value::Integer(row.web_search_requests as i64),
+        Value::Text(price_class_text(&row.price_class)),
     ]
 }
 
@@ -1024,6 +1097,7 @@ struct GroupRow {
     last_ms: u64,
     cache_creation_extended: u64,
     web_search_requests: u64,
+    price_class: crate::pricing::PriceClass,
 }
 
 fn total_tokens(m: &ModelUsage) -> u64 {
@@ -1155,6 +1229,10 @@ fn parse_legacy_line(line: &str) -> Option<Vec<UsageRow>> {
         parsed.model.as_deref(),
         parsed.status,
     );
+    let row = UsageRow {
+        price_class: parsed.price_class,
+        ..row
+    };
     let row = match parsed.tokens {
         Some(t) => row.with_counts(&t),
         None => row,
@@ -1472,22 +1550,29 @@ pub fn usage_doc(
             let models: Vec<TenantModelDoc> = t
                 .models
                 .into_iter()
-                .map(|m| TenantModelDoc {
-                    cost_usd: crate::pricing::cost_usd(
+                .map(|m| {
+                    let mut price_classes = m.classes.shares();
+                    let cost_usd = crate::pricing::price_shares(
                         &m.group,
                         &m.model,
                         &m.token_counts(),
+                        &mut price_classes,
                         overrides,
-                    ),
-                    group: m.group,
-                    model: m.model,
-                    requests: m.requests,
-                    tokens_in: m.tokens_in,
-                    tokens_out: m.tokens_out,
-                    cache_read: m.cache_read,
-                    cache_creation: m.cache_creation,
-                    cache_creation_extended: m.cache_creation_extended,
-                    web_search_requests: m.web_search_requests,
+                    )
+                    .unwrap_or(0.0);
+                    TenantModelDoc {
+                        cost_usd,
+                        group: m.group,
+                        model: m.model,
+                        requests: m.requests,
+                        tokens_in: m.tokens_in,
+                        tokens_out: m.tokens_out,
+                        cache_read: m.cache_read,
+                        cache_creation: m.cache_creation,
+                        cache_creation_extended: m.cache_creation_extended,
+                        web_search_requests: m.web_search_requests,
+                        price_classes,
+                    }
                 })
                 .collect();
             TenantUsageDoc {
@@ -1661,6 +1746,7 @@ mod tests {
                         cache_creation_extended: None,
                         web_search_requests: None,
                     },
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 crate::tui::SubUsage {
                     model: None,
@@ -1672,8 +1758,10 @@ mod tests {
                         cache_creation_extended: None,
                         web_search_requests: None,
                     },
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
             ],
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -1940,6 +2028,7 @@ mod tests {
                     cache_creation_extended: Some(1_000_000),
                     ..Default::default()
                 },
+                price_class: crate::pricing::PriceClass::STANDARD,
             }];
         }
         event
@@ -1983,6 +2072,7 @@ mod tests {
         let want = crate::pricing::request_cost_usd(
             "claude",
             "claude-opus-5-5",
+            crate::pricing::PriceClass::STANDARD,
             tokens,
             sub_usage,
             &HashMap::new(),
@@ -2039,7 +2129,7 @@ mod tests {
     }
 
     /// A v2 store (#278 PR 1: `requests`, no split columns) is migrated to v3
-    /// in place on open; its rows keep pricing exactly as before (no split,
+    /// (and on to the current version) in place on open; its rows keep pricing exactly as before (no split,
     /// no searches), and reopening is a no-op.
     #[test]
     fn a_v2_store_is_migrated_to_v3_and_prices_as_before() {
@@ -2079,8 +2169,8 @@ mod tests {
         for _ in 0..2 {
             let db = UsageDb::open(&db_path).expect("open migrates");
             assert_eq!(
-                db.get_meta("schema_version").expect("meta").as_deref(),
-                Some("3")
+                db.get_meta("schema_version").expect("meta"),
+                Some(SCHEMA_VERSION.to_string())
             );
             for column in ["cache_creation_extended", "web_search_requests"] {
                 let has: i64 = db
@@ -2105,7 +2195,7 @@ mod tests {
     /// migration (the `requests` column exists, so it only stamps
     /// `schema_version` back to 2) and its 11-column insert, which leaves the
     /// new columns at their default 0 — its rows lose the split and the
-    /// searches, nothing fails. The next v3 open re-stamps 3.
+    /// searches, nothing fails. The next current open re-stamps its version.
     #[test]
     fn an_older_binary_keeps_working_on_a_v3_store() {
         let tmp = TempDir::new();
@@ -2132,8 +2222,8 @@ mod tests {
         }
         let db = UsageDb::open(&db_path).expect("v3 reopens");
         assert_eq!(
-            db.get_meta("schema_version").expect("meta").as_deref(),
-            Some("3")
+            db.get_meta("schema_version").expect("meta"),
+            Some(SCHEMA_VERSION.to_string())
         );
         let report = db
             .query(&UsageQuery::new(UsageWindow::All, 10))
@@ -2147,5 +2237,348 @@ mod tests {
             ),
             (4, 0, 0)
         );
+    }
+
+    /// #278 PR 3: a long-context Haiku 5.5 request with a short compaction
+    /// sub-usage and a Fast codex request, classified as the hub records
+    /// them (2026-11-11 12:00 UTC).
+    fn classified_events() -> Vec<(ActivityEvent, SystemTime)> {
+        let day = u64::from(crate::pricing::RateDay::ymd(2026, 11, 11).0);
+        let at = UNIX_EPOCH + std::time::Duration::from_secs(day * 86_400 + 12 * 3_600);
+        let mut haiku = event_with_sub_usage(11);
+        if let ActivityEvent::RequestFinished {
+            tokens,
+            model,
+            sub_usage,
+            ..
+        } = &mut haiku
+        {
+            *model = Some("claude-haiku-5-5".into());
+            *tokens = Some(TokenCounts {
+                input: 150_000,
+                output: 2_000,
+                cache_read: Some(10),
+                cache_creation: Some(5),
+                ..Default::default()
+            });
+            sub_usage.truncate(2);
+        }
+        let mut codex = event_with_sub_usage(12);
+        if let ActivityEvent::RequestFinished {
+            group,
+            model,
+            fast,
+            sub_usage,
+            ..
+        } = &mut codex
+        {
+            *group = Some("codex".into());
+            *model = Some("gpt-6.1-terra".into());
+            *fast = Some(true);
+            sub_usage.clear();
+        }
+        let mut out = Vec::new();
+        for (i, mut event) in [haiku, codex].into_iter().enumerate() {
+            let at = at + std::time::Duration::from_millis(i as u64);
+            crate::pricing::classify_finished(&mut event, at);
+            out.push((event, at));
+        }
+        out
+    }
+
+    /// #278 PR 3: each row stores its own price class (request and
+    /// sub-usage), the window query keeps each cell's non-standard classes
+    /// apart, and the keys panel's cost == the sum of the per-request costs
+    /// in their classes — live and through the legacy import.
+    #[test]
+    fn price_classes_are_stored_and_priced_per_row() {
+        let events = classified_events();
+        let mut db = UsageDb::open_in_memory().expect("db");
+        let mut want = 0.0;
+        for (event, at) in &events {
+            db.insert_many(&UsageRow::rows_from_event(event, *at))
+                .expect("insert");
+            let ActivityEvent::RequestFinished {
+                group: Some(group),
+                model: Some(model),
+                tokens: Some(tokens),
+                sub_usage,
+                price_class,
+                ..
+            } = event
+            else {
+                panic!("finished");
+            };
+            want += crate::pricing::request_cost_usd(
+                group,
+                model,
+                *price_class,
+                tokens,
+                sub_usage,
+                &HashMap::new(),
+            );
+        }
+        let now_ms = epoch_ms(events[1].1) + 1_000;
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, now_ms))
+            .expect("query");
+        let haiku = cell(&report, "claude-haiku-5-5");
+        // The long request; its short compaction is standard.
+        assert_eq!(haiku.classes.iter().count(), 1, "{haiku:?}");
+        assert_eq!(haiku.tokens_in, 150_000 + 1_000);
+        let doc = usage_doc(
+            report.clone(),
+            &[],
+            &HashMap::new(),
+            UsageHealth::default(),
+            0,
+        );
+        let got = doc.tenants[0].cost_usd;
+        assert!((got - want).abs() < 1e-9, "store {got} != requests {want}");
+        let haiku_doc = doc.tenants[0]
+            .models
+            .iter()
+            .find(|m| m.model == "claude-haiku-5-5")
+            .expect("haiku cell");
+        assert_eq!(haiku_doc.price_classes.len(), 1);
+        // The legacy import of the same activity.jsonl lines.
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        for (event, at) in &events {
+            let record =
+                crate::tui::activity::PersistedRequest::from_event(event, *at).expect("rec");
+            append(
+                &jsonl,
+                &(serde_json::to_string(&record).expect("line") + "\n"),
+            );
+        }
+        let mut fresh = UsageDb::open_in_memory().expect("db");
+        fresh
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        assert_eq!(
+            fresh
+                .query(&UsageQuery::new(UsageWindow::All, now_ms))
+                .expect("query"),
+            report
+        );
+    }
+
+    /// A v3 store (#278 PR 2) is migrated to v4 in place on open: its rows
+    /// have no class, so they stay standard and price exactly as before —
+    /// even a row whose prompt would be long-context today. Reopening is a
+    /// no-op.
+    #[test]
+    fn a_v3_store_is_migrated_to_v4_and_prices_as_before() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("usage.sqlite3");
+        {
+            let conn = Connection::open(&db_path).expect("v3");
+            conn.execute_batch(
+                "CREATE TABLE usage (
+                     event_key TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL,
+                     tenant TEXT NOT NULL, grp TEXT, model TEXT,
+                     status INTEGER NOT NULL,
+                     tokens_in INTEGER NOT NULL DEFAULT 0,
+                     tokens_out INTEGER NOT NULL DEFAULT 0,
+                     cache_read INTEGER NOT NULL DEFAULT 0,
+                     cache_creation INTEGER NOT NULL DEFAULT 0,
+                     requests INTEGER NOT NULL DEFAULT 1,
+                     cache_creation_extended INTEGER NOT NULL DEFAULT 0,
+                     web_search_requests INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '3');
+                 INSERT INTO usage (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out)
+                   VALUES ('1:1', 1, 't', 'codex', 'gpt-6.1-terra', 200, 300000, 1000);",
+            )
+            .expect("v3 schema");
+        }
+        let before = crate::pricing::cost_usd(
+            "codex",
+            "gpt-6.1-terra",
+            &TokenCounts {
+                input: 300_000,
+                output: 1_000,
+                cache_read: Some(0),
+                cache_creation: Some(0),
+                cache_creation_extended: Some(0),
+                web_search_requests: Some(0),
+            },
+            &HashMap::new(),
+        );
+        for _ in 0..2 {
+            let db = UsageDb::open(&db_path).expect("open migrates");
+            assert_eq!(
+                db.get_meta("schema_version").expect("meta").as_deref(),
+                Some("4")
+            );
+            let has: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'price_class'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("pragma");
+            assert_eq!(has, 1);
+            let report = db
+                .query(&UsageQuery::new(UsageWindow::All, 10))
+                .expect("query");
+            assert!(cell(&report, "gpt-6.1-terra").classes.is_empty());
+            let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 0);
+            assert_eq!(doc.tenants[0].cost_usd.to_bits(), before.to_bits());
+        }
+    }
+
+    /// Downgrade: an older (v3) binary opening a v4 store stamps its own
+    /// version and inserts without the class column, so its rows store the
+    /// standard class (priced flat, as that binary prices everything) and
+    /// its queries sum every class flat; nothing fails. The next v4 open
+    /// re-stamps 4 and keeps the v4 rows' classes.
+    #[test]
+    fn an_older_binary_keeps_working_on_a_v4_store() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("usage.sqlite3");
+        {
+            let mut db = UsageDb::open(&db_path).expect("v4");
+            let (event, at) = classified_events().swap_remove(1);
+            db.insert_many(&UsageRow::rows_from_event(&event, at))
+                .expect("fast row");
+        }
+        {
+            let conn = Connection::open(&db_path).expect("v3 binary");
+            conn.execute_batch(
+                "INSERT INTO meta (k, v) VALUES ('schema_version', '3')
+                   ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+                 INSERT OR IGNORE INTO usage
+                   (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, requests,
+                    cache_creation_extended, web_search_requests)
+                   VALUES ('7:7', 7, 'k-sub', 'codex', 'gpt-6.1-terra', 200, 1000, 0, 0, 0, 1, 0, 0);",
+            )
+            .expect("v3 insert into v4");
+        }
+        let db = UsageDb::open(&db_path).expect("v4 reopens");
+        assert_eq!(
+            db.get_meta("schema_version").expect("meta").as_deref(),
+            Some("4")
+        );
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, u64::MAX / 2))
+            .expect("query");
+        let terra = cell(&report, "gpt-6.1-terra");
+        assert_eq!((terra.requests, terra.tokens_in), (2, 100 + 1_000));
+        // Only the v4 row's tokens are Fast.
+        let fast: Vec<_> = terra.classes.iter().collect();
+        assert_eq!(fast.len(), 1);
+        assert!(fast[0].0.fast);
+        assert_eq!(fast[0].1.input, 100);
+    }
+
+    /// #283: an unbilled refusal's row keeps its tokens and costs 0 in the
+    /// keys report, live and through the legacy import.
+    #[test]
+    fn an_unbilled_refusal_is_stored_with_its_tokens_and_costs_nothing() {
+        let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000_000);
+        let mut event = event_with_sub_usage(21);
+        if let ActivityEvent::RequestFinished {
+            sub_usage,
+            price_class,
+            ..
+        } = &mut event
+        {
+            sub_usage.clear();
+            *price_class = crate::pricing::PriceClass::UNBILLED;
+        }
+        crate::pricing::classify_finished(&mut event, at);
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.insert_many(&UsageRow::rows_from_event(&event, at))
+            .expect("insert");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        assert_eq!(cell(&report, "claude-opus-5-5").tokens_in, 100);
+        let doc = usage_doc(
+            report.clone(),
+            &[],
+            &HashMap::new(),
+            UsageHealth::default(),
+            0,
+        );
+        assert_eq!(doc.tenants[0].cost_usd, 0.0);
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        let record = crate::tui::activity::PersistedRequest::from_event(&event, at).expect("rec");
+        append(
+            &jsonl,
+            &(serde_json::to_string(&record).expect("line") + "\n"),
+        );
+        let mut fresh = UsageDb::open_in_memory().expect("db");
+        fresh
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        assert_eq!(
+            fresh
+                .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+                .expect("query"),
+            report
+        );
+    }
+
+    /// Items 6 and 7: the v4 class column stores the US-only and fast facts
+    /// as JSON next to the older ones, a v4 row written before them still
+    /// parses, and the report prices each row in its class.
+    #[test]
+    fn the_class_column_carries_us_inference_and_older_v4_rows_parse() {
+        let class = crate::pricing::PriceClass {
+            fast: true,
+            us_inference: true,
+            ..crate::pricing::PriceClass::STANDARD
+        };
+        assert_eq!(
+            price_class_text(&class),
+            r#"{"fast":true,"us_inference":true}"#
+        );
+        assert_eq!(
+            parse_price_class(r#"{"fast":true,"us_inference":true}"#),
+            class
+        );
+        assert_eq!(
+            parse_price_class(r#"{"fast":true}"#),
+            crate::pricing::PriceClass {
+                fast: true,
+                ..crate::pricing::PriceClass::STANDARD
+            }
+        );
+        let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000_000);
+        let mut event = event_with_sub_usage(31);
+        if let ActivityEvent::RequestFinished {
+            sub_usage,
+            fast,
+            price_class,
+            tokens,
+            ..
+        } = &mut event
+        {
+            sub_usage.clear();
+            *fast = Some(true);
+            *price_class = crate::pricing::PriceClass {
+                us_inference: true,
+                ..crate::pricing::PriceClass::STANDARD
+            };
+            *tokens = Some(TokenCounts {
+                input: 1_000_000,
+                ..Default::default()
+            });
+        }
+        crate::pricing::classify_finished(&mut event, at);
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.insert_many(&UsageRow::rows_from_event(&event, at))
+            .expect("insert");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 0);
+        let got = doc.tenants[0].cost_usd;
+        assert!((got - 4.0 * 2.0 * 1.1).abs() < 1e-9, "{got}");
     }
 }

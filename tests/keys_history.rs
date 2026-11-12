@@ -900,6 +900,7 @@ impl Proxy {
                 excerpt: None,
                 tenant: Some(tenant.into()),
                 sub_usage: Vec::new(),
+                price_class: llmux::pricing::PriceClass::STANDARD,
             })
             .await
             .expect("event accepted");

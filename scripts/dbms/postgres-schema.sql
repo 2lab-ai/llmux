@@ -51,13 +51,18 @@ CREATE TABLE IF NOT EXISTS usage (
     -- The extended-TTL subset of cache_creation (Anthropic 1h, OpenAI 12h
     -- writes) and Anthropic server web searches (schema v3, #278).
     cache_creation_extended bigint NOT NULL DEFAULT 0,
-    web_search_requests     bigint NOT NULL DEFAULT 0
+    web_search_requests     bigint NOT NULL DEFAULT 0,
+    -- The row's price class as compact JSON ('' = standard: long context,
+    -- Fast, dated rates or an unbilled refusal; schema v4, #278).
+    price_class    text    NOT NULL DEFAULT ''
 );
 -- A table created before schema v2: every existing row is one request.
 ALTER TABLE usage ADD COLUMN IF NOT EXISTS requests bigint NOT NULL DEFAULT 1;
 -- A table created before schema v3: no row had a TTL split or a web search.
 ALTER TABLE usage ADD COLUMN IF NOT EXISTS cache_creation_extended bigint NOT NULL DEFAULT 0;
 ALTER TABLE usage ADD COLUMN IF NOT EXISTS web_search_requests bigint NOT NULL DEFAULT 0;
+-- A table created before schema v4: every row is the standard price class.
+ALTER TABLE usage ADD COLUMN IF NOT EXISTS price_class text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage (ts_ms);
 CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage (model, ts_ms);
 

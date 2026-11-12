@@ -106,8 +106,9 @@ pub(crate) enum CompletedBody {
         group: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        /// Codex fast mode was in effect (`Some(false)` for claude; `None`
-        /// only for pre-field replayed history — "unknown", never coerced).
+        /// The Fast tier was in effect (codex, or served Claude fast mode;
+        /// `None` only for pre-field replayed history — "unknown", never
+        /// coerced).
         fast: Option<bool>,
         /// Millis to first upstream body chunk / first streamed output delta
         /// (both from the served attempt's upstream dispatch), plus the
@@ -142,6 +143,9 @@ pub(crate) enum CompletedBody {
         /// request's own top-level counters; per-request TOTAL figures (the
         /// token total and the cost) add these.
         sub_usage: Vec<SubUsage>,
+        /// The request's price class (#278), so its cost takes the rates
+        /// the provider applied to it. Each sub-usage carries its own.
+        price_class: crate::pricing::PriceClass,
     },
     Note {
         text: String,
@@ -264,7 +268,7 @@ const USAGE_DAILY_RETAIN_DAYS: u64 = 180;
 /// a cell counts EVERY attributed finished request — a failed request with no
 /// usage block still shows up in the requests column, mirroring the
 /// per-model row semantics.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UsageCell {
     pub requests: u64,
     pub input: u64,
@@ -275,16 +279,26 @@ pub(crate) struct UsageCell {
     /// (#278) — carried so the cell prices as the sum of its requests.
     pub cache_creation_extended: u64,
     pub web_search_requests: u64,
+    /// The tokens of the non-standard price classes among them (#278), so
+    /// the cell prices as the sum of its requests.
+    pub classes: crate::pricing::ClassSplit,
 }
 
 impl UsageCell {
     /// Fold one finished request (`request = true`) or one of its
-    /// sub-usages (`false` — tokens only, never a request) into the cell.
-    fn add(&mut self, request: bool, tokens: Option<TokenCounts>) {
+    /// sub-usages (`false` — tokens only, never a request) of price `class`
+    /// into the cell.
+    fn add(
+        &mut self,
+        request: bool,
+        tokens: Option<TokenCounts>,
+        class: crate::pricing::PriceClass,
+    ) {
         if request {
             self.requests = self.requests.saturating_add(1);
         }
         if let Some(t) = tokens {
+            self.classes.add(class, &t);
             self.input = self.input.saturating_add(t.input);
             self.output = self.output.saturating_add(t.output);
             self.cache_read = self.cache_read.saturating_add(t.cache_read.unwrap_or(0));
@@ -313,6 +327,7 @@ impl UsageCell {
         self.web_search_requests = self
             .web_search_requests
             .saturating_add(other.web_search_requests);
+        self.classes.merge(&other.classes);
     }
 }
 
@@ -479,6 +494,11 @@ struct ModelStats {
     /// request reported one.
     cache_creation_extended: Option<u64>,
     web_search_requests: Option<u64>,
+    /// The tokens of the non-standard price classes among the counters
+    /// above, and among `sub_tokens` (#278), so the row and its sub-usage
+    /// part price as the sum of their requests.
+    classes: crate::pricing::ClassSplit,
+    sub_classes: crate::pricing::ClassSplit,
     last_used: Option<SystemTime>,
     /// Which account(s) served this model (req19).
     accounts: HashMap<String, Totals>,
@@ -505,6 +525,8 @@ impl ModelStats {
             crate::proxy::sse::add_opt(self.cache_creation_extended, other.cache_creation_extended);
         self.web_search_requests =
             crate::proxy::sse::add_opt(self.web_search_requests, other.web_search_requests);
+        self.classes.merge(&other.classes);
+        self.sub_classes.merge(&other.sub_classes);
         self.last_used = match (self.last_used, other.last_used) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -559,6 +581,10 @@ pub(crate) struct ModelUsage {
     pub sub_tokens: TokenCounts,
     pub cache_creation_extended: Option<u64>,
     pub web_search_requests: Option<u64>,
+    /// Non-standard price-class tokens of the counters above / of
+    /// `sub_tokens` (#278).
+    pub classes: crate::pricing::ClassSplit,
+    pub sub_classes: crate::pricing::ClassSplit,
     pub last_used: SystemTime,
     pub accounts: Vec<ModelAccount>,
     pub efforts: Vec<ModelCount>,
@@ -978,7 +1004,8 @@ pub(crate) struct PersistedRequest {
     pub group: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Codex fast mode was in effect (`Some(false)` for claude). Additive:
+    /// The Fast tier was in effect (codex fast mode, or the served Claude
+    /// fast mode; see `ActivityEvent::RequestFinished::fast`). Additive:
     /// lines persisted before this field existed deserialize to `None` —
     /// "unknown", deliberately NOT `false`, so legacy history can never be
     /// misfiled into the fast=off statistics (perf telemetry v1).
@@ -1025,6 +1052,15 @@ pub(crate) struct PersistedRequest {
     /// and pre-field lines load as "none".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_usage: Vec<SubUsage>,
+    /// The request's price class (#278), resolved when it was recorded.
+    /// Additive: omitted when standard, so ordinary lines are byte-identical
+    /// to before, and every pre-field line loads as standard — priced
+    /// exactly as before classes existed.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pricing::PriceClass::is_standard"
+    )]
+    pub price_class: crate::pricing::PriceClass,
 }
 
 impl PersistedRequest {
@@ -1054,6 +1090,7 @@ impl PersistedRequest {
             excerpt,
             tenant,
             sub_usage,
+            price_class,
         } = event
         else {
             return None;
@@ -1086,6 +1123,7 @@ impl PersistedRequest {
             excerpt: excerpt.clone(),
             tenant: tenant.clone(),
             sub_usage: sub_usage.clone(),
+            price_class: *price_class,
         })
     }
 
@@ -1115,6 +1153,7 @@ impl PersistedRequest {
             excerpt: self.excerpt,
             tenant: self.tenant,
             sub_usage: self.sub_usage,
+            price_class: self.price_class,
         };
         (event, ts)
     }
@@ -1275,7 +1314,7 @@ pub(crate) struct TenantStats {
     pub models: BTreeMap<(String, String), TenantModelStats>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TenantModelStats {
     pub requests: u64,
     pub input: u64,
@@ -1286,6 +1325,8 @@ pub(crate) struct TenantModelStats {
     /// prices as the sum of its requests.
     pub cache_creation_extended: u64,
     pub web_search_requests: u64,
+    /// Non-standard price-class tokens among them (#278).
+    pub classes: crate::pricing::ClassSplit,
 }
 
 impl TenantModelStats {
@@ -1636,6 +1677,7 @@ impl ActivityLog {
         model: &str,
         request: bool,
         tokens: Option<TokenCounts>,
+        class: crate::pricing::PriceClass,
         now: SystemTime,
     ) {
         let epoch_secs = match now.duration_since(UNIX_EPOCH) {
@@ -1678,7 +1720,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(request, tokens);
+                .add(request, tokens, class);
         }
         self.usage_hourly.retain(|h, _| *h >= hour_cutoff);
 
@@ -1693,7 +1735,7 @@ impl ActivityLog {
                 .or_default()
                 .entry(key.clone())
                 .or_default()
-                .add(request, tokens);
+                .add(request, tokens, class);
         }
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
 
@@ -1704,7 +1746,7 @@ impl ActivityLog {
             .or_default()
             .entry(key)
             .or_default()
-            .add(request, tokens);
+            .add(request, tokens, class);
     }
 
     /// Pin a fixed UTC offset for usage day/month bucketing (tests only —
@@ -1767,6 +1809,7 @@ impl ActivityLog {
                 cache_creation: c.cache_creation,
                 cache_creation_extended: c.cache_creation_extended,
                 web_search_requests: c.web_search_requests,
+                price_classes: c.classes.shares(),
                 // Priced at doc-build time (the log holds no pricing config);
                 // conservative `false` here so a row that ever bypasses the
                 // doc build renders `—`, never a fabricated $0.
@@ -1857,6 +1900,7 @@ impl ActivityLog {
         account: &Option<String>,
         request: Option<u16>,
         tokens: Option<TokenCounts>,
+        class: crate::pricing::PriceClass,
         effort: &Option<String>,
         path: &str,
         now: SystemTime,
@@ -1882,8 +1926,10 @@ impl ActivityLog {
             entry.cache_read = crate::proxy::sse::add_opt(entry.cache_read, t.cache_read);
             entry.cache_creation =
                 crate::proxy::sse::add_opt(entry.cache_creation, t.cache_creation);
+            entry.classes.add(class, &t);
             if request.is_none() {
                 entry.sub_tokens = add_tokens(entry.sub_tokens, t);
+                entry.sub_classes.add(class, &t);
             }
             entry.cache_creation_extended = crate::proxy::sse::add_opt(
                 entry.cache_creation_extended,
@@ -1991,6 +2037,7 @@ impl ActivityLog {
         tenant: Option<&str>,
         request: Option<u16>,
         tokens: Option<TokenCounts>,
+        class: crate::pricing::PriceClass,
         group: Option<&str>,
         model: Option<&str>,
         now: SystemTime,
@@ -2031,6 +2078,7 @@ impl ActivityLog {
                 cell.requests += 1;
             }
             if let Some(t) = tokens {
+                cell.classes.add(class, &t);
                 cell.input = cell.input.saturating_add(t.input);
                 cell.output = cell.output.saturating_add(t.output);
                 cell.cache_read = cell.cache_read.saturating_add(t.cache_read.unwrap_or(0));
@@ -2120,6 +2168,8 @@ impl ActivityLog {
                     sub_tokens: stats.sub_tokens,
                     cache_creation_extended: stats.cache_creation_extended,
                     web_search_requests: stats.web_search_requests,
+                    classes: stats.classes.clone(),
+                    sub_classes: stats.sub_classes.clone(),
                     last_used: stats.last_used.unwrap_or(SystemTime::UNIX_EPOCH),
                     accounts,
                     efforts: sorted_counts(&stats.efforts),
@@ -2257,6 +2307,7 @@ impl ActivityLog {
                 excerpt,
                 tenant,
                 sub_usage,
+                price_class,
             } => {
                 let routed = self
                     .in_flight
@@ -2275,6 +2326,7 @@ impl ActivityLog {
                     tenant.as_deref(),
                     Some(status),
                     tokens,
+                    price_class,
                     group.as_deref(),
                     model.as_deref(),
                     now,
@@ -2308,6 +2360,7 @@ impl ActivityLog {
                         &account,
                         Some(status),
                         tokens,
+                        price_class,
                         &effort,
                         &path,
                         now,
@@ -2322,7 +2375,7 @@ impl ActivityLog {
                     // fold above, EVERY attributed finished request lands in
                     // its hour/day/month bucket (tokens or not), so the
                     // requests column matches the per-model row semantics.
-                    self.record_usage(group, model, true, tokens, now);
+                    self.record_usage(group, model, true, tokens, price_class, now);
                     // Observed-performance fold (perf telemetry v1): raw sums
                     // per (day, group, model, fast). Same UTC-day bucketing
                     // and retention as the chart fold; replay fills history.
@@ -2364,6 +2417,7 @@ impl ActivityLog {
                         tenant.as_deref(),
                         None,
                         tokens,
+                        sub.price_class,
                         group.as_deref(),
                         sub_model,
                         now,
@@ -2376,10 +2430,18 @@ impl ActivityLog {
                     bucket.tokens_out = bucket.tokens_out.saturating_add(sub.tokens.output);
                     if let (Some(group), Some(sub_model)) = (group.as_deref(), sub_model) {
                         self.record_model(
-                            group, sub_model, &account, None, tokens, &effort, &path, now,
+                            group,
+                            sub_model,
+                            &account,
+                            None,
+                            tokens,
+                            sub.price_class,
+                            &effort,
+                            &path,
+                            now,
                         );
                         self.record_daily(group, sub_model, sub.tokens, now);
-                        self.record_usage(group, sub_model, false, tokens, now);
+                        self.record_usage(group, sub_model, false, tokens, sub.price_class, now);
                     }
                 }
                 self.push_health(now, status);
@@ -2409,6 +2471,7 @@ impl ActivityLog {
                         // Resolved at doc-build time (needs key metadata).
                         client_name: None,
                         sub_usage,
+                        price_class,
                     },
                 });
             }
@@ -2541,6 +2604,7 @@ mod tests {
                 kind: Some("user".into()),
                 excerpt: Some(excerpt.into()),
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             };
         let _ = day;
         let mut live = ActivityLog::new(16);
@@ -2659,6 +2723,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -2697,6 +2762,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -2734,6 +2800,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -3453,6 +3520,7 @@ mod tests {
                 excerpt,
                 tenant: _,
                 sub_usage,
+                price_class,
             } => ActivityEvent::RequestFinished {
                 id,
                 method,
@@ -3475,6 +3543,7 @@ mod tests {
                 excerpt,
                 tenant: tenant.map(str::to_string),
                 sub_usage,
+                price_class,
             },
             other => other,
         }
@@ -3614,6 +3683,7 @@ mod tests {
                         cache_creation_extended: None,
                         web_search_requests: None,
                     },
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 SubUsage {
                     model: None,
@@ -3625,6 +3695,7 @@ mod tests {
                         cache_creation_extended: None,
                         web_search_requests: None,
                     },
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
             ];
         }
@@ -3707,7 +3778,7 @@ mod tests {
         let tenant = log.tenant_stats().get("k-sub").cloned().expect("tenant");
         assert_eq!(tenant.totals.requests, 1);
         assert_eq!(tenant.totals.tokens_in, 100 + 823 + 1000);
-        let cell = tenant.models[&("claude".to_string(), "claude-fable-5-1".to_string())];
+        let cell = &tenant.models[&("claude".to_string(), "claude-fable-5-1".to_string())];
         assert_eq!((cell.requests, cell.input, cell.output), (0, 823, 1612));
         // Account and client totals: tokens grow, requests do not.
         let acct = log.totals_for("acct");
@@ -3785,6 +3856,101 @@ mod tests {
             (Some(5), Some(2))
         );
         assert_eq!(serde_json::to_string(&record).expect("line"), new);
+    }
+
+    /// #278 PR 3: a request's price class (and each sub-usage's) is part of
+    /// its persisted line, so a replay rebuilds the same per-class
+    /// aggregates; a line written before classes loads as the standard class
+    /// and re-serializes byte for byte (priced exactly as before).
+    #[test]
+    fn price_classes_round_trip_through_the_persisted_log() {
+        let old = r#"{"v":1,"ts_ms":1000,"id":8,"method":"POST","path":"/v1/responses","endpoint":"open_ai","account":"a","status":200,"duration_ms":1500,"tokens":{"input":300000,"output":30,"cache_read":4,"cache_creation":6},"group":"codex","model":"gpt-6.1-terra","effort":null,"fast":true,"ttfb_ms":120,"ttft_ms":800,"gen_ms":null,"aborted":false,"user_id":null,"kind":null,"excerpt":null,"tenant":null}"#;
+        let record: PersistedRequest = serde_json::from_str(old).expect("old line loads");
+        assert_eq!(record.price_class, crate::pricing::PriceClass::STANDARD);
+        assert_eq!(serde_json::to_string(&record).expect("line"), old);
+
+        // A long Fast codex request with a sub-usage, classified as the hub
+        // records it (2026-11-11 12:00 UTC).
+        let day = u64::from(crate::pricing::RateDay::ymd(2026, 11, 11).0);
+        let now = UNIX_EPOCH + Duration::from_secs(day * 86_400 + 12 * 3_600);
+        let mut event = finished_model(
+            9,
+            Some("acct"),
+            "codex",
+            "gpt-6.1-terra",
+            None,
+            200,
+            Some(TokenCounts {
+                input: 300_000,
+                output: 10,
+                ..Default::default()
+            }),
+            "/v1/responses",
+        );
+        if let ActivityEvent::RequestFinished {
+            fast, sub_usage, ..
+        } = &mut event
+        {
+            *fast = Some(true);
+            sub_usage.push(SubUsage {
+                model: Some("gpt-6.1-sol".into()),
+                tokens: TokenCounts {
+                    input: 1_000,
+                    ..Default::default()
+                },
+                // The proxy's mark: this sub-usage ran at the Fast tier
+                // (`StreamUsage::mark_sub_speeds`).
+                price_class: crate::pricing::PriceClass {
+                    fast: true,
+                    ..crate::pricing::PriceClass::STANDARD
+                },
+            });
+        }
+        crate::pricing::classify_finished(&mut event, now);
+        let ActivityEvent::RequestFinished {
+            price_class,
+            sub_usage,
+            ..
+        } = &event
+        else {
+            panic!("finished");
+        };
+        assert!(
+            price_class.long_context && price_class.fast,
+            "{price_class:?}"
+        );
+        // The sub-usage is classified on its own (short) prompt and keeps
+        // its own speed.
+        assert!(!sub_usage[0].price_class.long_context);
+        assert!(sub_usage[0].price_class.fast);
+        let line =
+            serde_json::to_string(&PersistedRequest::from_event(&event, now).expect("record"))
+                .expect("line");
+        assert!(
+            line.contains(r#""price_class":{"long_context":true,"fast":true}"#),
+            "{line}"
+        );
+
+        let dir = TempDir::new();
+        let path = dir.file();
+        let mut live = ActivityLog::new(50);
+        persist_request(Some(&path), &event, now);
+        live.apply(event, now);
+        let mut replayed = ActivityLog::new(50);
+        replayed.load_persisted(Some(&path));
+        assert_eq!(live.model_usage(), replayed.model_usage());
+        assert_eq!(live.tenant_stats(), replayed.tenant_stats());
+        let terra = replayed
+            .model_usage()
+            .into_iter()
+            .find(|m| m.model == "gpt-6.1-terra")
+            .expect("terra row");
+        assert!(!terra.classes.is_empty(), "the long Fast tokens stay apart");
+        let usage = replayed.usage_stats(now + Duration::from_secs(60));
+        assert!(usage
+            .iter()
+            .filter(|u| u.model == "gpt-6.1-terra")
+            .all(|u| u.price_classes.len() == 1));
     }
 
     /// Activity client-name: the fold carries the tenant id into the
@@ -4178,6 +4344,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -4278,6 +4445,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -4612,6 +4780,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }
         };
         let now = at(1_000);
@@ -4710,6 +4879,7 @@ mod tests {
             excerpt: None,
             tenant: None,
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         };
         let now = SystemTime::now();
         let day = |off_back: u64| now - Duration::from_secs(off_back * 86_400);

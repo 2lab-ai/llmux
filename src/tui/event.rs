@@ -62,6 +62,41 @@ impl TokenCounts {
             .saturating_add(self.cache_read.unwrap_or(0))
             .saturating_add(self.cache_creation.unwrap_or(0))
     }
+
+    /// Counter-wise saturating sum; an optional counter is present iff
+    /// either side reported it.
+    pub fn saturating_add(self, other: TokenCounts) -> TokenCounts {
+        let add = crate::proxy::sse::add_opt;
+        TokenCounts {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: add(self.cache_read, other.cache_read),
+            cache_creation: add(self.cache_creation, other.cache_creation),
+            cache_creation_extended: add(
+                self.cache_creation_extended,
+                other.cache_creation_extended,
+            ),
+            web_search_requests: add(self.web_search_requests, other.web_search_requests),
+        }
+    }
+
+    /// Counter-wise saturating difference `self - other` (removing a part
+    /// from the total it was folded into); an optional counter stays as
+    /// absent or present as it is in `self`.
+    pub fn saturating_sub(self, other: TokenCounts) -> TokenCounts {
+        let sub = |a: Option<u64>, b: Option<u64>| a.map(|a| a.saturating_sub(b.unwrap_or(0)));
+        TokenCounts {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_read: sub(self.cache_read, other.cache_read),
+            cache_creation: sub(self.cache_creation, other.cache_creation),
+            cache_creation_extended: sub(
+                self.cache_creation_extended,
+                other.cache_creation_extended,
+            ),
+            web_search_requests: sub(self.web_search_requests, other.web_search_requests),
+        }
+    }
 }
 
 /// Tokens one request spent on a sub-inference that its top-level `tokens`
@@ -77,6 +112,15 @@ pub struct SubUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub tokens: TokenCounts,
+    /// This sub-usage's own price class (#278), resolved from its own
+    /// prompt and model when the request is recorded
+    /// ([`crate::pricing::PriceClass::resolve`]). Absent (standard) on every
+    /// line written before classes, and omitted when standard.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pricing::PriceClass::is_standard"
+    )]
+    pub price_class: crate::pricing::PriceClass,
 }
 
 impl SubUsage {
@@ -189,11 +233,15 @@ pub enum ActivityEvent {
         /// upstream, after the clamp; claude: thinking budget like `"16k"`),
         /// when known.
         effort: Option<String>,
-        /// Whether codex fast mode (`service_tier: "priority"`) was in effect
-        /// for this request. `Some(false)` for claude requests and pre-routing
-        /// failures; `None` ONLY for replayed history persisted before the
-        /// field existed ("unknown" — never coerced to off, so legacy lines
-        /// cannot pollute the fast=off statistics).
+        /// Whether the request was served at the Fast tier: Claude's reported
+        /// `usage.speed: "fast"`, else the requested codex fast mode
+        /// (`service_tier: "priority"` on the request). The codex backend's
+        /// response `service_tier` is not read: it reports "default" even for
+        /// priority requests (raw-io, 3,272 priority requests on 2026-09-08
+        /// and 2026-09-10). Claude requests without a reported speed record
+        /// `Some(false)`, as do pre-routing failures. `None` ONLY for replayed history persisted
+        /// before the field existed ("unknown" — never coerced to off, so
+        /// legacy lines cannot pollute the fast=off statistics).
         fast: Option<bool>,
         /// Time to first successful upstream body chunk (TTFB), millis from
         /// request start. `None` on non-streaming relays, pre-body failures,
@@ -248,6 +296,13 @@ pub enum ActivityEvent {
         /// and NONE of them is a request. Empty for every upstream that
         /// reports no `usage.iterations`, and on pre-field history.
         sub_usage: Vec<SubUsage>,
+        /// The request's price class (#278, #283): the proxy marks only an
+        /// unbilled refusal ([`crate::pricing::PriceClass::UNBILLED`]); the
+        /// dashboard hub resolves the rest from the request's own facts when
+        /// it records the request ([`crate::pricing::classify_finished`]),
+        /// so the persisted line, the key-usage row and every aggregate
+        /// carry the same class. Standard on replayed pre-field history.
+        price_class: crate::pricing::PriceClass,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {
