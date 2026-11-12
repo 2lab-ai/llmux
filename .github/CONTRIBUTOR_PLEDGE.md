@@ -1,6 +1,6 @@
 # Contributor pledge
 
-Pull requests to this repository are reviewed, and their CI runs, only for approved contributors, as listed in [`.github/APPROVED_CONTRIBUTORS`](APPROVED_CONTRIBUTORS). To be added, read this pledge and sign it: on your pull request, comment the sentence at the end, exactly as written. The review bot records your signature and opens a pull request that adds you to the list. A maintainer accepts it by merging it.
+Pull requests to this repository are reviewed, and their CI runs, only for approved contributors, as listed in [`.github/APPROVED_CONTRIBUTORS`](APPROVED_CONTRIBUTORS). To be added, read this pledge and sign it: on your pull request, comment the line at the end, exactly as written (the mention included). The review bot records your signature and opens a pull request that adds you to the list. A maintainer accepts it by merging it.
 
 By signing, I state that:
 
@@ -10,6 +10,8 @@ By signing, I state that:
 4. **I keep secrets out.** The contribution contains no credentials, personal data or private information that is not mine to publish.
 5. **Approval is not acceptance.** Being on the list allows me to open pull requests that are reviewed. It does not grant maintainer authority, approve the scope of a feature, or guarantee that a change is merged. Maintainers may remove me from the list.
 
-To sign, comment this sentence on your pull request:
+To sign, comment this line on your pull request:
 
-> I have read the Contributor Pledge and I agree to it.
+```
+@review-of-legends I have read the Contributor Pledge and I agree to it.
+```
