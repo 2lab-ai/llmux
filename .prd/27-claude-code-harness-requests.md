@@ -77,7 +77,7 @@ Entries remain bounded (4096), expire after 6 hours and are not persisted.
 
 ## Non-goals
 
-- Requests that name a non-tier model stay as they are: `fable`, explicit GPT or Grok ids, and
+- Requests that name a non-tier model stay as they are — the security monitor included: `fable`, explicit GPT or Grok ids, and
   `claude -p` calls a user scripts inside a session. Subagent `fable-5-2` rows in a GPT session are
   the agent file's explicit choice.
 - Compaction keeps the main model. Claude Code sends compact with the main model's own name, so it

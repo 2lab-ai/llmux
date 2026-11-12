@@ -7901,3 +7901,35 @@ async fn harness_warmup_never_overrides_a_main_turn_and_codex_tiers_avoid_sol() 
         assert_ne!(sent["model"], resolved_alias("sol"), "{model}");
     }
 }
+
+/// Review finding (llmux#288): only a monitor naming a Claude tier is
+/// rerouted. A monitor whose model is an explicit non-tier choice keeps normal
+/// routing even in a Codex or Grok main session.
+#[tokio::test]
+async fn harness_monitor_naming_a_non_tier_model_is_not_rerouted() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Hi"),
+        256,
+    ));
+    // Codex only: a monitor naming `claude-fable-5-2` must not reach Codex.
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at-codex")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let warmup = post_messages(&client, &proxy, &harness_warmup("m", "astra").to_string()).await;
+    assert_eq!(warmup.status(), 200);
+    warmup.bytes().await.unwrap();
+    let mut monitor = harness_monitor("m");
+    monitor["model"] = serde_json::json!("claude-fable-5-2");
+    let response = post_messages(&client, &proxy, &monitor.to_string()).await;
+    assert_eq!(
+        response.status(),
+        404,
+        "an explicit fable monitor keeps normal (Claude) routing"
+    );
+    assert_eq!(mock.seen().len(), 1, "only the warmup reached upstream");
+}

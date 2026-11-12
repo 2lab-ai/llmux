@@ -3,7 +3,7 @@
 SSOT: ./ssot.md (frozen) · Spec: ../27-claude-code-harness-requests.md · Done: ./loop.done.md ·
 Repo: 2lab-ai/llmux · Channel: Slack thread 1794465952.178559 · Started: 2026-11-12 (15:46 KST)
 
-Status: R1 closed (5/5 ✅, see loop.done.md). R2 open — the shipped preview on the [owner Mac].
+Status: R1 closed (5/5 ✅), R2 review closed (2/2 ✅) — see loop.done.md. R3 open — the shipped preview on the [owner Mac].
 
 ## Build facts (measured)
 
@@ -15,7 +15,7 @@ Status: R1 closed (5/5 ✅, see loop.done.md). R2 open — the shipped preview o
   at a scratch dir, one Codex and one Grok account copied with refresh disabled (dummy refresh
   token and token endpoint), no Claude account; the production daemon on 3456 is not touched.
 
-## R2 — the shipped preview
+## R3 — the shipped preview
 
 | ID | Gap | Status | Source |
 | --- | --- | --- | --- |

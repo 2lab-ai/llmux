@@ -23,3 +23,18 @@ the main provider, warmup seeds, route target is Codex or Grok · WU2 `internal_
 and per-provider tier policy · WU3 `forward.rs` + `provider/grok.rs` route builds, meters and converts
 on either provider · WU4 `classify.rs` + `webui/` `status` kind · WU5 `schema.rs` default `opus` → `terra`
 · WU6 unit + e2e for A1–A7 (RED on `origin/main` 4/4, GREEN 4/4) · WU7 docs. All ✅.
+
+## R2 — closed 2026-11-12 16:45 KST
+
+- measured 2✅ · result: trinity review findings on llmux#288 resolved · closed rows: G7 G8 · commit/PR: https://github.com/2lab-ai/llmux/pull/288
+
+### Closed rows
+
+| ID | Source | Universe Item | Observable Acceptance | AS-IS Evidence | Status | Gap | Dispatch | Verification Evidence | Last Measured |
+|---|---|---|---|---|---|---|---|---|---|
+| G7 | trinity astra (P2) | Monitor with a non-tier model | explicit `fable`/GPT/Grok monitor model keeps normal routing | `observe` + `Route::monitor` rerouted any monitor in a Codex/Grok session | ✅ | — | `monitor_target` requires a Claude tier | unit `grok_keeps_its_pin_and_lowers_effort_by_tier`; E2E `harness_monitor_naming_a_non_tier_model_is_not_rerouted` | 2026-11-12 16:44 |
+| G8 | trinity fable (P3) | Old-style quota probe (`quota`, `max_tokens: 1`, haiku) | served by the main provider | not live-tested on Grok | ✅ | — | — | isolated build, live: Grok session → `grok-4.7` effort low HTTP 200; GPT session → `gpt-6-luna` low with `x-codex-*` and `x-llmux-quota-mode: availability` | 2026-11-12 16:42 |
+
+### Round section (as it was in loop.md)
+
+Review gate on llmux#288: fable APPROVE (P3 notes), astra REJECT with one P2 (monitor tier gate), grok pending at close. G7 fixed in code; G8 measured live.

@@ -185,11 +185,15 @@ pub fn target(
 
 /// The security monitor's target in a `main` session: Codex uses
 /// `auto_classifier_model` (default `luna`), Grok its pin; both at medium.
+/// Like every harness request, only a monitor naming a Claude tier is
+/// rerouted — an explicit non-tier choice (`fable`, a GPT/Grok id) is kept.
 pub fn monitor_target(
+    body: &Value,
     main: BackendGroup,
     config: &ClaudeCodeConfig,
     grok_pin: &str,
 ) -> Option<Target> {
+    tier(body)?;
     let effort = Some("medium".to_string());
     match main {
         BackendGroup::Codex => Some(Target::codex(&config.auto_classifier_model, effort)),
@@ -290,8 +294,12 @@ mod tests {
             assert_eq!(shape.model, alias, "{model}");
             assert_eq!(shape.effort.as_deref(), effort, "{model}");
         }
-        let Some(Target::Codex(shape)) = monitor_target(BackendGroup::Codex, &config, "grok-4.7")
-        else {
+        let Some(Target::Codex(shape)) = monitor_target(
+            &json!({"model":"claude-sonnet-5[1m]"}),
+            BackendGroup::Codex,
+            &config,
+            "grok-4.7",
+        ) else {
             panic!("codex monitor");
         };
         assert_eq!(
@@ -324,7 +332,13 @@ mod tests {
             assert_eq!(routed.body_model(), "grok");
             assert_eq!(grok_effort(&routed), Some(expected), "{model} {client:?}");
         }
-        let monitor = monitor_target(BackendGroup::Grok, &config, "grok-4.7").unwrap();
+        let monitor = monitor_target(
+            &json!({"model":"claude-sonnet-5"}),
+            BackendGroup::Grok,
+            &config,
+            "grok-4.7",
+        )
+        .unwrap();
         assert_eq!(grok_effort(&monitor), Some("medium"));
         for main in [
             BackendGroup::Claude,
@@ -332,7 +346,9 @@ mod tests {
             BackendGroup::OpenRouter,
         ] {
             assert!(target(&json!({"model":"haiku"}), Task::Title, main, &config, "g").is_none());
-            assert!(monitor_target(main, &config, "g").is_none());
+            assert!(
+                monitor_target(&json!({"model":"claude-sonnet-5"}), main, &config, "g").is_none()
+            );
         }
         assert!(target(
             &json!({"model":"claude-fable-5-2"}),
@@ -342,6 +358,15 @@ mod tests {
             "g"
         )
         .is_none());
+        // A monitor naming a non-tier model is an explicit choice: kept.
+        for model in ["claude-fable-5-2", "gpt-6-astra", "grok-4.6"] {
+            for main in [BackendGroup::Codex, BackendGroup::Grok] {
+                assert!(
+                    monitor_target(&json!({ "model": model }), main, &config, "g").is_none(),
+                    "{model} in {main} session"
+                );
+            }
+        }
     }
     #[test]
     fn launch_timestamp_requires_fresh_nonfuture_value() {

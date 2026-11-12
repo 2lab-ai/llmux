@@ -1554,7 +1554,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             let grok_pin = state.grok.model();
             let config = &state.config.claude_code;
             let candidate = if let Some(main) = monitor {
-                super::internal_requests::monitor_target(main, config, &grok_pin)
+                super::internal_requests::monitor_target(&value, main, config, &grok_pin)
                     .map(|target| super::auto_classifier::Route::monitor(&value, target))
             } else if let Some(main) = main {
                 task.and_then(|task| {
