@@ -233,12 +233,13 @@ pub enum ActivityEvent {
         /// upstream, after the clamp; claude: thinking budget like `"16k"`),
         /// when known.
         effort: Option<String>,
-        /// Whether the request was served at the Fast tier: the tier the
-        /// response reported (Claude `usage.speed: "fast"`, OpenAI
-        /// `service_tier: "priority"`) when it reports one, else the
-        /// requested codex fast mode (`service_tier: "priority"`; Claude
-        /// requests without a reported speed record `Some(false)`, as do
-        /// pre-routing failures). `None` ONLY for replayed history persisted
+        /// Whether the request was served at the Fast tier: Claude's reported
+        /// `usage.speed: "fast"`, else the requested codex fast mode
+        /// (`service_tier: "priority"` on the request). The codex backend's
+        /// response `service_tier` is not read: it reports "default" even for
+        /// priority requests (raw-io, 3,272 priority requests on 2026-09-08
+        /// and 2026-09-10). Claude requests without a reported speed record
+        /// `Some(false)`, as do pre-routing failures. `None` ONLY for replayed history persisted
         /// before the field existed ("unknown" — never coerced to off, so
         /// legacy lines cannot pollute the fast=off statistics).
         fast: Option<bool>,
