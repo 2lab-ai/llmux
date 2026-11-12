@@ -44,6 +44,12 @@ pub struct StreamUsage {
     /// are that model's, so it is priced and booked under it. `None` on every
     /// turn the requested model served.
     pub served_model: Option<String>,
+    /// The response is an Anthropic refusal Anthropic does not bill (#283):
+    /// `stop_reason: "refusal"` before any output (no output tokens) with a
+    /// `stop_details.category` outside [`BILLED_REFUSAL_CATEGORIES`]
+    /// ([`unbilled_refusal`]). Its tokens are still recorded; the request is
+    /// priced at 0 ([`crate::pricing::PriceClass::UNBILLED`]).
+    pub unbilled_refusal: bool,
 }
 
 impl StreamUsage {
@@ -74,6 +80,27 @@ impl StreamUsage {
 /// read 2026-11-11). A refusal that arrived mid-stream (it produced output)
 /// is billed whatever its category.
 pub const BILLED_REFUSAL_CATEGORIES: &[&str] = &["bio", "frontier_llm", "reasoning_extraction"];
+
+/// Whether a response is an Anthropic refusal Anthropic does not bill (#283):
+/// "a refusal that arrives before any output is billed when its
+/// `stop_details.category` is `"bio"`, `"frontier_llm"`, or
+/// `"reasoning_extraction"`. ... A refusal before any output in any other
+/// category, or with a `null` category, is not billed" ("How refusals are
+/// billed", build-with-claude/refusals-and-fallback, read 2026-11-11). Before
+/// any output means no output tokens and, on a stream, no content delta
+/// relayed; a refusal after output ("mid-stream") bills its input and the
+/// output already streamed, like any request.
+pub fn unbilled_refusal(
+    stop_reason: Option<&str>,
+    category: Option<&str>,
+    output_tokens: u64,
+    streamed_output: bool,
+) -> bool {
+    stop_reason == Some("refusal")
+        && output_tokens == 0
+        && !streamed_output
+        && !category.is_some_and(|c| BILLED_REFUSAL_CATEGORIES.contains(&c))
+}
 
 /// One Anthropic `fallback` content block — the hand-off from a model that
 /// declined to the one that continues:
@@ -433,6 +460,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 web_search_requests: web_search_requests(usage),
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -466,6 +494,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         }
         "message_delta" => {
@@ -480,6 +509,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         }
         _ => None,
@@ -502,6 +532,12 @@ pub struct UsageObserver {
     iterations: Option<serde_json::Value>,
     hops: Vec<FallbackHop>,
     start_model: Option<String>,
+    /// The stream's `stop_reason` and refusal category (`message_delta`
+    /// `delta.stop_reason` / `delta.stop_details.category`), and whether a
+    /// non-empty content delta was relayed — for [`unbilled_refusal`].
+    stop_reason: Option<String>,
+    refusal_category: Option<String>,
+    streamed_output: bool,
 }
 
 impl UsageObserver {
@@ -516,6 +552,16 @@ impl UsageObserver {
         };
         match v["type"].as_str() {
             Some("message_delta") => {
+                if let Some(reason) = v
+                    .pointer("/delta/stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    self.stop_reason = Some(reason.to_string());
+                    self.refusal_category = v
+                        .pointer("/delta/stop_details/category")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
                 let u = &v["usage"];
                 if let Some(n) = u["input_tokens"].as_u64() {
                     self.usage.input_tokens = n;
@@ -557,6 +603,12 @@ impl UsageObserver {
             Some("content_block_start") => {
                 if let Some(hop) = FallbackHop::from_block(&v["content_block"]) {
                     self.hops.push(hop);
+                }
+                return;
+            }
+            Some("content_block_delta") => {
+                if !self.streamed_output && contains_content_delta(event.as_bytes()) {
+                    self.streamed_output = true;
                 }
                 return;
             }
@@ -605,6 +657,12 @@ impl UsageObserver {
                 extended_cache_writes(served, usage.cache_creation_input_tokens);
         }
         usage.sub_usage = uncounted_iterations(&iterations, &self.hops).unwrap_or_default();
+        usage.unbilled_refusal = unbilled_refusal(
+            self.stop_reason.as_deref(),
+            self.refusal_category.as_deref(),
+            usage.output_tokens,
+            self.streamed_output,
+        );
         usage.served_model =
             fallback_served_model(&iterations, &self.hops, self.start_model.as_deref());
         usage
@@ -1259,6 +1317,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         );
     }
@@ -1278,6 +1337,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         );
     }
@@ -1295,6 +1355,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         );
     }
@@ -1332,6 +1393,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         );
         // No write field: unchanged behaviour (creation unavailable).
@@ -1347,6 +1409,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             })
         );
     }
@@ -1363,6 +1426,7 @@ mod tests {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
         });
         total.add(StreamUsage {
             input_tokens: 0,
@@ -1373,6 +1437,7 @@ mod tests {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
         });
         assert_eq!(
             total,
@@ -1387,6 +1452,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             }
         );
     }
@@ -1851,5 +1917,52 @@ data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"inp
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].tokens.cache_creation, Some(500));
         assert_eq!(subs[0].tokens.cache_creation_extended, Some(300));
+    }
+
+    /// #283: an Anthropic refusal before any output is not billed unless its
+    /// `stop_details.category` is billed ("How refusals are billed",
+    /// build-with-claude/refusals-and-fallback, read 2026-11-11); a refusal
+    /// after streamed output keeps its price. The tokens stay recorded.
+    #[test]
+    fn a_refusal_before_any_output_in_an_unbilled_category_is_marked() {
+        let start = r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-fable-5-2","usage":{"input_tokens":412,"cache_read_input_tokens":100,"output_tokens":0}}}"#
+            .to_string();
+        let refusal = |category: &str, output: u64| {
+            format!(
+                r#"event: message_delta
+data: {{"type":"message_delta","delta":{{"stop_reason":"refusal","stop_sequence":null,"stop_details":{{"type":"refusal","category":{category},"explanation":null}}}},"usage":{{"output_tokens":{output}}}}}"#
+            )
+        };
+        let text = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Sure"}}"#
+            .to_string();
+        let run = |events: &[String]| {
+            let mut observer = UsageObserver::default();
+            for event in events {
+                observer.observe(event);
+            }
+            observer.finish()
+        };
+        for category in [r#""cyber""#, r#""general_harms""#, "null"] {
+            let usage = run(&[start.clone(), refusal(category, 0)]);
+            assert!(usage.unbilled_refusal, "{category}");
+            assert_eq!(
+                (usage.input_tokens, usage.cache_read_input_tokens),
+                (412, Some(100)),
+                "the tokens stay visible"
+            );
+        }
+        for category in BILLED_REFUSAL_CATEGORIES {
+            let usage = run(&[start.clone(), refusal(&format!("\"{category}\""), 0)]);
+            assert!(!usage.unbilled_refusal, "{category} is billed");
+        }
+        // Mid-stream: output came first, so it bills like any request.
+        assert!(!run(&[start.clone(), text.clone(), refusal(r#""cyber""#, 25)]).unbilled_refusal);
+        assert!(!run(&[start.clone(), text, refusal(r#""cyber""#, 0)]).unbilled_refusal);
+        let end = r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#
+            .to_string();
+        assert!(!run(&[start, end]).unbilled_refusal);
     }
 }

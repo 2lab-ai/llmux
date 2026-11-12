@@ -1624,6 +1624,7 @@ impl GeminiSseConverter {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
         };
     }
 
@@ -2680,6 +2681,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             }
         );
         assert_eq!(converter.events_seen(), 4);

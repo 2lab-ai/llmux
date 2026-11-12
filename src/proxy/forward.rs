@@ -696,6 +696,7 @@ impl ForwardContext {
             tokens,
             Vec::new(),
             None,
+            crate::pricing::PriceClass::STANDARD,
             sse::StreamTiming::default(),
         );
     }
@@ -717,6 +718,7 @@ impl ForwardContext {
             Some(token_counts(&usage)),
             usage.sub_usage,
             usage.served_model,
+            refusal_class(usage.unbilled_refusal),
             sse::StreamTiming::default(),
         );
     }
@@ -728,6 +730,8 @@ impl ForwardContext {
     /// `served_model` is the model a FALLBACK served the turn on
     /// ([`sse::StreamUsage::served_model`]): the top-level usage is that
     /// model's, so the record names it instead of the requested one.
+    /// `price_class` is the proxy's mark ([`refusal_class`]); the dashboard
+    /// hub resolves the rest of the class when it records the request.
     #[allow(clippy::too_many_arguments)]
     fn emit_finished_timed(
         &self,
@@ -737,6 +741,7 @@ impl ForwardContext {
         tokens: Option<TokenCounts>,
         sub_usage: Vec<crate::tui::SubUsage>,
         served_model: Option<String>,
+        price_class: crate::pricing::PriceClass,
         timing: sse::StreamTiming,
     ) {
         let FinishedMeta {
@@ -774,7 +779,7 @@ impl ForwardContext {
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
             sub_usage,
-            price_class: crate::pricing::PriceClass::STANDARD,
+            price_class,
         });
     }
 
@@ -3944,7 +3949,7 @@ async fn relay(
                         excerpt,
                         tenant,
                         sub_usage: usage.sub_usage,
-                        price_class: crate::pricing::PriceClass::STANDARD,
+                        price_class: refusal_class(usage.unbilled_refusal),
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -4698,6 +4703,7 @@ async fn relay_translate(
                 Some(token_counts(&usage)),
                 usage.sub_usage,
                 usage.served_model,
+                refusal_class(usage.unbilled_refusal),
                 timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
@@ -4797,6 +4803,31 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
             &hops,
             value.get("model").and_then(serde_json::Value::as_str),
         ),
+        // #283: a refusal before any output in an unbilled category.
+        unbilled_refusal: sse::unbilled_refusal(
+            value.get("stop_reason").and_then(serde_json::Value::as_str),
+            value
+                .pointer("/stop_details/category")
+                .and_then(serde_json::Value::as_str),
+            usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            false,
+        ),
+    }
+}
+
+/// The price class the proxy marks on a finished request (#283): an unbilled
+/// Anthropic refusal ([`sse::StreamUsage::unbilled_refusal`]) is
+/// [`crate::pricing::PriceClass::UNBILLED`], everything else standard (the
+/// hub resolves its long-context, Fast and dated facts). The mark only
+/// counts on the claude group ([`crate::pricing::PriceClass::resolve`]).
+fn refusal_class(unbilled_refusal: bool) -> crate::pricing::PriceClass {
+    if unbilled_refusal {
+        crate::pricing::PriceClass::UNBILLED
+    } else {
+        crate::pricing::PriceClass::STANDARD
     }
 }
 
@@ -4823,6 +4854,35 @@ mod tests {
     use axum::Router;
 
     use super::*;
+
+    /// #283 on the JSON path: the refusal shape of
+    /// build-with-claude/refusals-and-fallback ("What a refusal looks like",
+    /// read 2026-11-11) is unbilled before any output unless its category is
+    /// billed; its tokens stay recorded.
+    #[test]
+    fn json_refusal_before_any_output_is_unbilled_unless_its_category_is_billed() {
+        let body = |category: &str, output: u64| {
+            format!(
+                r#"{{"id":"msg_01","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":"refusal","stop_details":{{"type":"refusal","category":{category},"explanation":"x"}},"usage":{{"input_tokens":412,"output_tokens":{output}}}}}"#
+            )
+        };
+        for category in [r#""cyber""#, "null"] {
+            let usage = usage_from_json_body(body(category, 0).as_bytes());
+            assert!(usage.unbilled_refusal, "{category}");
+            assert_eq!(usage.input_tokens, 412);
+        }
+        for category in crate::proxy::sse::BILLED_REFUSAL_CATEGORIES {
+            let usage = usage_from_json_body(body(&format!("\"{category}\""), 0).as_bytes());
+            assert!(!usage.unbilled_refusal, "{category}");
+        }
+        assert!(!usage_from_json_body(body(r#""cyber""#, 9).as_bytes()).unbilled_refusal);
+        assert!(
+            !usage_from_json_body(
+                br#"{"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":0}}"#
+            )
+            .unbilled_refusal
+        );
+    }
 
     #[test]
     fn json_body_usage_carries_the_extended_ttl_writes_and_web_searches() {
@@ -7493,6 +7553,63 @@ mod tests {
         assert_eq!(totals.requests, 1);
         assert_eq!(totals.input_tokens, 25);
         assert_eq!(totals.output_tokens, 42);
+    }
+
+    /// #283 end to end through the proxy: a JSON and a streamed refusal before
+    /// any output in an unbilled category are recorded as unbilled refusals
+    /// (their tokens kept); a billed category is not.
+    #[tokio::test]
+    async fn unbilled_refusals_are_marked_on_the_finished_event() {
+        const JSON_CYBER: &str = r#"{"id":"msg_1","type":"message","model":"claude-fable-5-2","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":null},"usage":{"input_tokens":412,"output_tokens":0}}"#;
+        const SSE_CYBER: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-fable-5-2\",\"usage\":{\"input_tokens\":300,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}},\"usage\":{\"output_tokens\":0}}\n\n";
+        const JSON_BIO: &str = r#"{"id":"msg_2","type":"message","model":"claude-fable-5-2","content":[],"stop_reason":"refusal","stop_details":{"type":"refusal","category":"bio","explanation":null},"usage":{"input_tokens":500,"output_tokens":0}}"#;
+        let shared = MockShared::default();
+        {
+            let mut script = shared.script.lock().expect("lock");
+            script.push_back(Scripted::Ok { body: JSON_CYBER });
+            script.push_back(Scripted::OkSse { body: SSE_CYBER });
+            script.push_back(Scripted::Ok { body: JSON_BIO });
+        }
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+        for body in [
+            r#"{"model":"claude-fable-5-2"}"#,
+            r#"{"model":"claude-fable-5-2","stream":true}"#,
+            r#"{"model":"claude-fable-5-2"}"#,
+        ] {
+            let response = forward(&state, client_request(body)).await;
+            let _ = response_body(response).await;
+            // The stream's finish hook runs after its last chunk.
+            let finished = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await {
+                        Some(ActivityEvent::RequestFinished {
+                            tokens,
+                            price_class,
+                            ..
+                        }) => return Some((tokens, price_class)),
+                        Some(_) => continue,
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            .expect("finished in time")
+            .expect("a finished event");
+            let (tokens, class) = finished;
+            let input = tokens.map(|t| t.input).unwrap_or(0);
+            match input {
+                412 | 300 => assert_eq!(
+                    class,
+                    crate::pricing::PriceClass::UNBILLED,
+                    "cyber refusal ({input} input tokens)"
+                ),
+                500 => assert_eq!(class, crate::pricing::PriceClass::STANDARD, "bio is billed"),
+                other => panic!("unexpected request with {other} input tokens"),
+            }
+        }
     }
 
     /// Drive `sse::transform_body` with a REAL HTTP response (the scripted

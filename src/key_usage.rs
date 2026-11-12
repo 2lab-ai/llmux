@@ -2473,4 +2473,54 @@ mod tests {
         assert!(fast[0].0.fast);
         assert_eq!(fast[0].1.input, 100);
     }
+
+    /// #283: an unbilled refusal's row keeps its tokens and costs 0 in the
+    /// keys report, live and through the legacy import.
+    #[test]
+    fn an_unbilled_refusal_is_stored_with_its_tokens_and_costs_nothing() {
+        let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000_000);
+        let mut event = event_with_sub_usage(21);
+        if let ActivityEvent::RequestFinished {
+            sub_usage,
+            price_class,
+            ..
+        } = &mut event
+        {
+            sub_usage.clear();
+            *price_class = crate::pricing::PriceClass::UNBILLED;
+        }
+        crate::pricing::classify_finished(&mut event, at);
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.insert_many(&UsageRow::rows_from_event(&event, at))
+            .expect("insert");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        assert_eq!(cell(&report, "claude-opus-5-5").tokens_in, 100);
+        let doc = usage_doc(
+            report.clone(),
+            &[],
+            &HashMap::new(),
+            UsageHealth::default(),
+            0,
+        );
+        assert_eq!(doc.tenants[0].cost_usd, 0.0);
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        let record = crate::tui::activity::PersistedRequest::from_event(&event, at).expect("rec");
+        append(
+            &jsonl,
+            &(serde_json::to_string(&record).expect("line") + "\n"),
+        );
+        let mut fresh = UsageDb::open_in_memory().expect("db");
+        fresh
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        assert_eq!(
+            fresh
+                .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+                .expect("query"),
+            report
+        );
+    }
 }

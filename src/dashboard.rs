@@ -3943,6 +3943,95 @@ mod tests {
         close(terra.cost_usd - shares, 0.01, "terra standard remainder");
     }
 
+    /// #283: a request the proxy marked as an unbilled Anthropic refusal
+    /// costs 0 on every path the document carries — its activity row, its
+    /// model row, the usage rows and the tenant cell — while its tokens stay
+    /// visible; the mark means nothing outside the claude group.
+    #[test]
+    fn an_unbilled_refusal_costs_nothing_on_every_aggregate() {
+        let hub = DashboardHub::default();
+        let at = now() - Duration::from_secs(1);
+        let refusal = |id: u64, group: &str, model: &str| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens: Some(TokenCounts {
+                input: 1_000_000,
+                ..Default::default()
+            }),
+            group: Some(group.into()),
+            model: Some(model.into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: Some("k-refusal".into()),
+            sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::UNBILLED,
+        };
+        hub.apply_event(refusal(41, "claude", "claude-fable-5-2"), at);
+        hub.apply_event(refusal(42, "gemini", "gemini-3.8-flash"), at);
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request {
+                id: 41,
+                cost_usd,
+                tokens,
+                price_class,
+                ..
+            } = entry
+            {
+                assert_eq!(*cost_usd, 0.0);
+                assert_eq!(tokens.as_ref().map(|t| t.input), Some(1_000_000));
+                assert!(price_class.unbilled);
+            }
+        }
+        let fable = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "claude-fable-5-2")
+            .expect("fable row");
+        assert_eq!((fable.cost_usd, fable.tokens_in), (0.0, 1_000_000));
+        for u in doc
+            .usage_stats
+            .iter()
+            .filter(|u| u.model == "claude-fable-5-2")
+        {
+            assert_eq!((u.cost_usd, u.tokens_in, u.priced), (0.0, 1_000_000, true));
+        }
+        // Gemini is priced as usual (Flash $0.75 per million input).
+        let flash = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "gemini-3.8-flash")
+            .expect("flash row");
+        assert!((flash.cost_usd - 0.75).abs() < 1e-9, "{}", flash.cost_usd);
+        let tenant = doc
+            .tenant_usage
+            .iter()
+            .find(|t| t.tenant == "k-refusal")
+            .expect("tenant");
+        assert!((tenant.cost_usd - 0.75).abs() < 1e-9, "{}", tenant.cost_usd);
+    }
+
     #[test]
     fn doc_global_cost_reflects_config_pricing_override() {
         // Override gpt-5.5 input to 9.99/1e6, everything else 0 → cost is

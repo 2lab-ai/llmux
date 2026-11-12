@@ -943,6 +943,7 @@ impl ResponsesSseConverter {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
         };
     }
 
@@ -1807,6 +1808,7 @@ mod tests {
                 web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
+                unbilled_refusal: false,
             },
             "a capped turn still bills the tokens it really burned"
         );
@@ -1832,6 +1834,7 @@ mod tests {
             web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
+            unbilled_refusal: false,
         };
         let failed = json!({"type": "response.failed", "response": {
             "error": {"message": "boom"}, "usage": usage_fixture()}});
