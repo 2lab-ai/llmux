@@ -484,12 +484,7 @@ impl AppState {
         let idle_prober = Arc::new(
             IdleProber::new(
                 pool.clone(),
-                ReqwestProber::new(
-                    client.clone(),
-                    config.upstream.clone(),
-                    codex.clone(),
-                    config.codex.default_model.clone(),
-                ),
+                ReqwestProber::new(client.clone(), config.upstream.clone(), codex.clone()),
                 config.proxy.idle_probe,
             )
             .with_save_until(settings_live.save_until.clone()),

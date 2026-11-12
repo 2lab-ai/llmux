@@ -19,23 +19,30 @@ use std::sync::Arc;
 use http::{HeaderMap, Method};
 
 use crate::config::AccountCredential;
-use crate::provider::codex::CodexProvider;
+use crate::provider::codex::{CodexProvider, CodexShape};
 use crate::provider::{anthropic, ProviderRequest};
 use crate::scheduler::idle_probe::{ProbeError, Prober};
 
-/// The minimal `POST /v1/messages` probe body for an Anthropic (oauth/apikey)
-/// account: a one-character user turn capped at a single output token. The
-/// model is the smallest current Claude model — a real request that returns a
-/// 200 with the `anthropic-ratelimit-*` headers while spending the least
-/// possible quota.
+/// The minimal `POST /v1/messages` probe body for an Anthropic subscription
+/// account: a one-character user turn capped at a single output token, on
+/// the smallest current Claude model, carrying the Claude Code identity block
+/// a subscription token requires. Live 2026-11-12 on one subscription account:
+/// without that block the request was a 429 `rate_limit_error` with no
+/// `anthropic-ratelimit-unified-*` headers; with it, a 200 carrying all 11; the
+/// previous pinned `claude-3-5-haiku-20241022` answered 404 with none, so the
+/// probe had been learning nothing.
 fn anthropic_probe_body(model: &str) -> bytes::Bytes {
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1,
+        "system": [{ "type": "text", "text": crate::proxy::auto_classifier::MAIN }],
         "messages": [{ "role": "user", "content": "." }],
     });
     bytes::Bytes::from(body.to_string())
 }
+
+/// The beta flag Claude Code sends with a subscription (OAuth) token.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// The `POST /v1/messages` probe body for a Codex account: a one-character
 /// user turn and NO `max_tokens`.
@@ -56,10 +63,36 @@ fn codex_probe_body(model: &str) -> bytes::Bytes {
     bytes::Bytes::from(body.to_string())
 }
 
-/// Default model used for the Anthropic probe. Kept tiny on purpose; any valid
-/// model returns the unified rate-limit headers (the headers are
-/// account-scoped, not model-scoped).
-const ANTHROPIC_PROBE_MODEL: &str = "claude-3-5-haiku-20241022";
+/// The probe is an automatic llmux call, so it runs on each provider's
+/// smallest tier, named by alias and resolved on every probe: a model update
+/// that moves the alias moves the probe (`.prd/27`). The quota headers are
+/// account-scoped, not model-scoped — live 2026-11-12 on one Codex account,
+/// `gpt-6-astra` and `gpt-6-luna` replies carried the same
+/// `x-codex-active-limit`, `x-codex-primary-used-percent` and reset.
+const ANTHROPIC_PROBE_ALIAS: &str = "haiku";
+const CODEX_PROBE_ALIAS: &str = "luna";
+
+/// The catalog owner of the `haiku` alias as an upstream id: the `[1m]`
+/// suffix is client-side metadata, and a one-token probe needs no 1M window.
+fn anthropic_probe_model() -> String {
+    crate::catalog::catalog("", "", "")
+        .into_iter()
+        .find(|m| m.group == "claude" && m.aliases.iter().any(|a| a == ANTHROPIC_PROBE_ALIAS))
+        .map(|m| m.id.strip_suffix("[1m]").unwrap_or(&m.id).to_string())
+        .unwrap_or_else(|| ANTHROPIC_PROBE_ALIAS.to_string())
+}
+
+/// A request-owned Codex shape: the `luna` alias at low effort, independent
+/// of the global `codex.default_model` / `codex.reasoning_effort` that serve
+/// real traffic.
+fn codex_probe_shape() -> CodexShape {
+    CodexShape {
+        model: CODEX_PROBE_ALIAS.to_string(),
+        client_model: None,
+        fast: false,
+        effort: Some("low".to_string()),
+    }
+}
 
 /// Production prober backed by `reqwest`, reusing the proxy's provider hooks.
 #[derive(Clone)]
@@ -70,22 +103,14 @@ pub struct ReqwestProber {
     /// Codex provider (holds the per-process session id + endpoint + shape),
     /// reused so the Codex probe is byte-shaped exactly like a real request.
     codex: Arc<CodexProvider>,
-    /// Codex model slug to request on the probe (config `codex.default_model`).
-    codex_model: String,
 }
 
 impl ReqwestProber {
-    pub fn new(
-        client: reqwest::Client,
-        anthropic_base: String,
-        codex: Arc<CodexProvider>,
-        codex_model: String,
-    ) -> Self {
+    pub fn new(client: reqwest::Client, anthropic_base: String, codex: Arc<CodexProvider>) -> Self {
         Self {
             client,
             anthropic_base,
             codex,
-            codex_model,
         }
     }
 
@@ -99,10 +124,10 @@ impl ReqwestProber {
     ) -> Result<(ProviderRequest, String), ProbeError> {
         match credential {
             AccountCredential::Codex { .. } => {
-                let body = codex_probe_body(&self.codex_model);
+                let body = codex_probe_body(CODEX_PROBE_ALIAS);
                 let (req, _client_stream) = self
                     .codex
-                    .build_request(&body, credential)
+                    .build_request_with_shape(&body, credential, &codex_probe_shape())
                     .map_err(|err| ProbeError::Build(err.to_string()))?;
                 Ok((req, self.codex.endpoint().to_string()))
             }
@@ -138,11 +163,14 @@ impl ReqwestProber {
                 );
                 anthropic::inject_credential(&mut headers, credential)
                     .map_err(|err| ProbeError::Build(err.to_string()))?;
+                if matches!(credential, AccountCredential::Oauth { .. }) {
+                    headers.insert("anthropic-beta", http::HeaderValue::from_static(OAUTH_BETA));
+                }
                 let req = ProviderRequest {
                     method: Method::POST,
                     path: "/v1/messages".to_string(),
                     headers,
-                    body: anthropic_probe_body(ANTHROPIC_PROBE_MODEL),
+                    body: anthropic_probe_body(&anthropic_probe_model()),
                 };
                 Ok((req, self.anthropic_base.clone()))
             }
@@ -188,7 +216,6 @@ mod tests {
             reqwest::Client::new(),
             "http://anthropic.invalid".to_string(),
             codex_provider(),
-            "gpt-5.5".to_string(),
         )
     }
 
@@ -206,10 +233,15 @@ mod tests {
 
     #[test]
     fn anthropic_probe_body_is_minimal() {
-        let bytes = anthropic_probe_body(ANTHROPIC_PROBE_MODEL);
+        let bytes = anthropic_probe_body(&anthropic_probe_model());
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["max_tokens"], 1, "single output token");
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["system"][0]["text"],
+            crate::proxy::auto_classifier::MAIN,
+            "a subscription token needs the Claude Code identity block"
+        );
     }
 
     #[test]
@@ -235,6 +267,13 @@ mod tests {
         assert!(
             req.headers.get(anthropic::X_API_KEY).is_none(),
             "no x-api-key leaked for oauth"
+        );
+        assert_eq!(
+            req.headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some(OAUTH_BETA),
+            "a subscription token needs the oauth beta"
         );
     }
 
@@ -276,5 +315,52 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("acct-a"),
         );
+    }
+
+    #[test]
+    fn probes_use_the_small_tier_aliases_not_pinned_or_main_models() {
+        // Anthropic: the catalog's `haiku` owner, never the retired 3.5 pin.
+        let model = anthropic_probe_model();
+        let owner = crate::catalog::catalog("", "", "")
+            .into_iter()
+            .find(|m| m.aliases.iter().any(|a| a == "haiku"))
+            .expect("catalog carries a haiku owner");
+        assert_eq!(model, owner.id.strip_suffix("[1m]").unwrap_or(&owner.id));
+        assert!(model.starts_with("claude-haiku-"), "{model}");
+        assert_ne!(model, "claude-3-5-haiku-20241022");
+
+        // Codex: `luna` at low effort, even when the live shape serves the
+        // biggest model at the highest effort.
+        let codex = Arc::new(CodexProvider::with_shape(
+            "http://codex.invalid",
+            CodexShape {
+                model: "astra".into(),
+                client_model: None,
+                fast: false,
+                effort: Some("max".into()),
+            },
+        ));
+        let prober = ReqwestProber::new(
+            reqwest::Client::new(),
+            "http://anthropic.invalid".to_string(),
+            codex,
+        );
+        let credential = AccountCredential::Codex {
+            account_id: "acct".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_at_ms: u64::MAX,
+            last_refresh_ms: None,
+        };
+        let (req, _) = prober.build(&credential).expect("codex probe builds");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let luna = crate::provider::codex::effective_request_meta(
+            &serde_json::json!({"model": "luna"}),
+            &codex_probe_shape(),
+        )
+        .0;
+        assert_eq!(body["model"], luna.as_str());
+        assert!(luna.contains("luna"), "{luna}");
+        assert_eq!(body["reasoning"]["effort"], "low");
     }
 }
