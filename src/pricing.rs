@@ -973,6 +973,13 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // date after `claude-opus-4-` is Opus 4: `claude-opus-4-5-*` and the
         // other 4.x generations must miss this branch.
         Some(OPUS_4_1)
+    } else if model_norm_lower.starts_with("claude-opus-4-8-")
+        || is_dated_snapshot(model_norm_lower, "claude-opus-5-")
+    {
+        // Dated Opus 4.8 / Opus 5 snapshots are those models: their fast
+        // mode with them. `claude-opus-5-5-*` matched above; only a date
+        // after `claude-opus-5-` is Opus 5 (`claude-opus-5-50-*` is not).
+        Some(OPUS_TIER_FAST)
     } else if model_norm_lower.starts_with("claude-opus-") {
         Some(OPUS_TIER)
     } else if model_norm_lower.starts_with("claude-sonnet-5-5-") {
@@ -3363,6 +3370,61 @@ mod tests {
         assert!(
             !us.resolve("codex", "gpt-6.1-sol", &t, false, NOV_11)
                 .us_inference
+        );
+    }
+
+    /// #278 review: a dated Opus 5 / Opus 4.8 snapshot is the same model as
+    /// its bare id, so it takes the same row — fast mode (2x) and the US-only
+    /// multiplier (1.1x) — not the plain Opus tier of the `claude-opus-`
+    /// prefix. A response reporting `usage.speed: "fast"` on one prices at
+    /// the fast rates.
+    #[test]
+    fn dated_opus_5_and_4_8_snapshots_keep_their_fast_tier() {
+        let us = PriceClass {
+            us_inference: true,
+            ..PriceClass::STANDARD
+        };
+        for model in [
+            "claude-opus-5-20260701",
+            "claude-opus-4-8-20260415",
+            "claude-opus-4-8-20260415[1m]",
+        ] {
+            let price = price_for("claude", model, &empty()).expect("priced");
+            assert_eq!(price.rates(fast()), price.standard().times(2.0), "{model}");
+            assert_eq!(price.rates(us), price.standard().times(1.1), "{model}");
+        }
+        // Not Opus 5: a longer version number, and Opus 5.5's own row.
+        assert_eq!(
+            builtin_price("claude-opus-5-50-20260701").map(|p| p.fast),
+            Some(None)
+        );
+        assert_eq!(builtin_price("claude-opus-5-5-20260922"), Some(OPUS_5_5));
+        // Through the served usage: 1M input on a dated Opus 4.8 at fast.
+        let mut observer = crate::proxy::sse::UsageObserver::default();
+        observer.observe(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1000000,"output_tokens":0,"speed":"fast"}}}"#,
+        );
+        let usage = observer.finish();
+        let class = PriceClass::STANDARD.resolve(
+            "claude",
+            "claude-opus-4-8-20260415",
+            &TokenCounts {
+                input: usage.input_tokens,
+                ..Default::default()
+            },
+            usage.served_fast.unwrap_or(false),
+            NOV_11,
+        );
+        approx(
+            class_cost(
+                "claude",
+                "claude-opus-4-8-20260415",
+                class,
+                &prompt(1_000_000, 0, 0),
+                &empty(),
+            )
+            .expect("priced"),
+            10.0,
         );
     }
 }
