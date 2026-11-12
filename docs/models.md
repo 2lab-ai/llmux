@@ -631,6 +631,11 @@ Not a model sweep: no catalog row, alias or context window changed. Rates read
 | Codex / OpenAI | `gpt-5.6-terra` cache write 0 → $2.50 and `gpt-5.6-luna` 0 → $0.25 (the "30m write" column, 1.25× input; the model pages state the same multiplier). `gpt-5.5` (and the codex fallback that uses its row) lists no cache-write rate; the prompt-caching guide says models before GPT-5.6 have "no additional cache-write charge", so a written token bills as ordinary input and the row's write rate is now its input rate ($5.00, was 0 — written tokens left fresh input with the cache-write fix and would otherwise be free). | [pricing](https://developers.openai.com/api/docs/pricing), [prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), [gpt-5.6-terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), [gpt-5.6-luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) |
 | Codex / OpenAI | 12-hour cache writes are priced at their own rate, 2.5× input, on every GPT-5.6 and later row (see [the table below](#current-openai-cache-write-reference-prices)), on the 12-hour part each response reports in `input_tokens_details.cache_write_tokens_details.ttl_12h_tokens`; the rest keep the 30-minute rate. `gpt-5.5` has no separate write charge at either TTL, so a write at any TTL bills at its input rate. | [pricing](https://developers.openai.com/api/docs/pricing), [prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching), [Responses API reference](https://developers.openai.com/api/reference/resources/responses/methods/create) |
 | Grok / xAI | No separate cache-write price is listed, so `grok-4.5` / `grok-4.6` / `grok-4.7` (and the grok fallback) price a written token at the input rate: write rate 0 → $2.00. | [models](https://docs.x.ai/developers/models) |
+| Claude | Added reference prices for the retired `claude-opus-4-1` and `claude-opus-4` (and their dated snapshots and `claude-opus-4-0`): $15.00 in / $75.00 out / $1.50 cache read / $18.75 cache write (5m) / $30.00 (1h). Before this they fell to the $5 Opus tier. | [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Claude | Haiku 5.5's long-context tier is priced per request: a prompt over 100,000 tokens (input + cache reads + cache writes) bills the whole request at 5× every rate ($0.50 / $2.50 / $0.05 / $0.625 5m / $1.00 1h). | [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Codex / OpenAI | Long-context tier on every listed GPT row: a prompt over 272,000 tokens bills the whole request at 2× input, cached input and both cache writes and 1.5× output ([table below](#per-request-price-classes)). Codex Fast mode (recorded per request since 2026-09) is priced: 2× Standard on the 6.x and 5.6 rows, long context included; 2.5× on `gpt-5.5` ($12.50 / $1.25 / $75.00). The page lists no long-context Fast rate for `gpt-5.5`, so such a request prices at the long Standard rates. `gpt-5.5-codex` and other unlisted codex ids keep a flat price. | [pricing](https://developers.openai.com/api/docs/pricing) |
+| Grok / xAI | Long-context tier: a prompt of 200,000 tokens or more bills the whole request at 2× ($4.00 / $12.00 and cached $0.60 on `grok-4.5`, $1.00 on `grok-4.6` / `grok-4.7`; writes at the long input rate). | [pricing](https://docs.x.ai/developers/pricing) |
+| Gemini / Google | Dated rates: `gemini-4-argon` is $2.00 / $10.00 / $0.10 through 2026-11-30 and $4.00 / $20.00 / $0.20 from 2026-12-01; Gemini 3.8 Flash is $0.75 / $3.75 / $0.075 through 2026-12-31 and $1.50 / $7.50 / $0.15 from 2027-01-01. Each request is priced at the rates of its own UTC day. | [pricing](https://aistudio.google.com/docs/pricing) |
 
 ## Model sweep: 2026-11-10
 
@@ -752,21 +757,21 @@ its 4.5 id and price
 Server web search is $10 per 1,000 searches on top of the tokens; web fetch has
 no extra charge (same pricing page, read 2026-11-11).
 
-**Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
-≤100K tier, the 5-minute write rate for the writes a response does not report
-as 1-hour, and the 1-hour rate for those it does (`usage.cache_creation.
-ephemeral_1h_input_tokens`, since 2026-11-11; earlier history has no split and
-keeps the 5-minute price). Each request's server web searches add $10 per
-1,000. It does **not** apply Haiku's >100K tier (5× all rates), service-tier
-premiums or historical prices. Aggregates keep the 1-hour write subset and the
-search count, so they price as the sum of their requests; crossing 100K in
-accumulated monthly usage does not mean any individual request crossed it, so
-displayed costs can still understate long-context API cost. These are
-API-equivalent estimates, never a subscription invoice. Existing config price
-overrides still take precedence: an override without `cache_creation_extended`
-prices 1-hour writes at its own `cache_creation` rate
-([configuration](configuration.md)). The web-search fee is not a token rate and
-is not overridden.
+**Estimator scope:** `src/pricing.rs` prices each request with the rates of
+its own [price class](#per-request-price-classes): Haiku 5.5's >100K tier is
+applied to a request whose own prompt is over 100,000 tokens, never to a sum.
+Writes a response does not report as 1-hour take the 5-minute rate and those it
+does the 1-hour rate (`usage.cache_creation.ephemeral_1h_input_tokens`, since
+2026-11-11; earlier history has no split and keeps the 5-minute price). Each
+request's server web searches add $10 per 1,000. Claude Fast mode and data
+residency premiums are not applied (llmux records neither). Aggregates keep the
+1-hour write subset, the search count and the tokens of each non-standard
+class, so they price as the sum of their requests. These are API-equivalent
+estimates, never a subscription invoice. Existing config price overrides still
+take precedence: an override without `cache_creation_extended` prices 1-hour
+writes at its own `cache_creation` rate, and one without `long_context` prices
+a long request flat ([configuration](configuration.md#reference-price-overrides-pricing)).
+The web-search fee is not a token rate and is not overridden.
 
 ### Current OpenAI cache-write reference prices
 
@@ -793,6 +798,57 @@ part is the one a response reports in
 a written token bills as ordinary input, so its write rate at either TTL is the
 input rate. grok rows likewise carry the input rate as the write rate (xAI
 lists no cache-write price); Gemini rows have no write rate.
+
+### Per-request price classes
+
+Some rates depend on facts of one request, not of any total (#278, #283). When
+llmux records a finished request it resolves the request's **price class** once
+from those facts and keeps it with the request: in `activity.jsonl`
+(`price_class`, absent for the standard class), in the key-usage store and in
+every aggregate, which keeps the tokens of each non-standard class apart. So a
+model row, a usage row, a tenant cell or a key-usage report costs exactly the
+sum of its requests, and history keeps the rates of its own class. A record
+with no class (everything recorded before 2026-11-12) is the standard class
+and prices as before. A sub-usage (advisor, compaction, billed fallback
+attempt) is classified on its own prompt and model.
+
+| Fact | When | Rates |
+| --- | --- | --- |
+| Long context | The prompt (input + cache reads + cache writes) is over 272,000 tokens on a listed GPT row, 200,000 or more on `grok-4.5` / `grok-4.6` / `grok-4.7` (and the grok fallback), over 100,000 on `claude-haiku-5-5`. Built-in data, not configurable. | The whole request at the long rates below. |
+| Fast | Codex Fast mode (`service_tier: "priority"`) was in effect. | The Fast rates below. |
+| Dated rates | The request's UTC day is on or after a built-in rate change (the pricing page names no time zone, so the change is at 00:00 UTC). | That change's rates. |
+| Unbilled refusal | An Anthropic response with `stop_reason: "refusal"`, no output tokens and a `stop_details.category` that is not `bio`, `frontier_llm` or `reasoning_extraction` (claude group only). | No cost; the tokens stay visible. |
+
+Long-context rates, USD per million tokens (input / cached input / cache write
+30m or 5m / cache write 12h or 1h / output), read 2026-11-11 from the
+[OpenAI](https://developers.openai.com/api/docs/pricing),
+[xAI](https://docs.x.ai/developers/pricing) and
+[Anthropic](https://platform.claude.com/docs/en/about-claude/pricing) pricing
+pages:
+
+| Model | Boundary | Long rates | Fast | Fast + long |
+| --- | --- | --- | --- | --- |
+| gpt-6-astra | > 272,000 | $20 / $2 / $25 / $50 / $75 | 2× Standard | 2× long |
+| gpt-6.1-sol | > 272,000 | $4 / $0.20 / $5 / $10 / $15 | 2× Standard | 2× long |
+| gpt-6.1-terra | > 272,000 | $2 / $0.10 / $2.50 / $5 / $7.50 | 2× Standard | 2× long |
+| gpt-6-sol | > 272,000 | $4 / $0.40 / $5 / $10 / $15 | 2× Standard | 2× long |
+| gpt-6-luna | > 272,000 | $0.20 / $0.02 / $0.25 / $0.50 / $0.75 | 2× Standard | 2× long |
+| gpt-5.6-sol | > 272,000 | $8 / $0.80 / $10 / $20 / $30 | 2× Standard | 2× long |
+| gpt-5.6-terra | > 272,000 | $4 / $0.40 / $5 / $10 / $18 | 2× Standard | 2× long |
+| gpt-5.6-luna | > 272,000 | $0.40 / $0.04 / $0.50 / $1 / $1.80 | 2× Standard | 2× long |
+| gpt-5.5 | > 272,000 | $10 / $1 / $10 (input rate) / $10 / $45 | $12.50 / $1.25 / $75 (2.5×) | long rates (none published) |
+| grok-4.5 | ≥ 200,000 | $4 / $0.60 / $4 (input rate) / — / $12 | — | — |
+| grok-4.6, grok-4.7 | ≥ 200,000 | $4 / $1.00 / $4 (input rate) / — / $12 | — | — |
+| claude-haiku-5-5 | > 100,000 | $0.50 / $0.05 / $0.625 / $1.00 / $2.50 | — | — |
+
+Dated rate changes ([Google pricing](https://aistudio.google.com/docs/pricing),
+read 2026-11-11): `gemini-4-argon` (and `argon`, `gemini-4-argon-*`) $2.00 /
+$10.00 / $0.10 through 2026-11-30, $4.00 / $20.00 / $0.20 from 2026-12-01;
+Gemini 3.8 Flash (every thinking variant, and the gemini fallback) $0.75 /
+$3.75 / $0.075 through 2026-12-31, $1.50 / $7.50 / $0.15 from 2027-01-01.
+
+`gpt-5.6-sol`'s rates are promotional "until November 30, 2026"; OpenAI has not
+published the later price, so the row keeps the current one.
 
 Haiku 5.5's published API limits are metadata, not a new live subscription
 compatibility claim. See the [provider contract](provider-compatibility.md#haiku-55-catalog-update).
@@ -856,7 +912,8 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   same day: released 2026-10-26, 1,050,000 context, 128K max output, $1.00/M
   input, $0.05/M cached input, $1.25/M cache write (30-minute retention),
   $5.00/M output; above 272K input tokens the request bills at 2× input and
-  cache rates and 1.5× output (not modeled). Not probed through the daemon yet.
+  cache rates and 1.5× output (priced per request since 2026-11-12, see
+  [price classes](#per-request-price-classes)). Not probed through the daemon yet.
 - **Codex `[1m]` context window** — live probes through the daemon against the
   ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
   input tokens and was rejected at ~936k (`Your input exceeds the context window
@@ -904,8 +961,9 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
 - **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-23: `grok-4.7`
   is $2.00 in / $6.00 out / $0.50 cached input per 1M tokens (the same page now
   also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
-  grok-4.5). Rates double for prompts ≥200k tokens; llmux does not model that
-  long-context tier.
+  grok-4.5). Rates double for prompts ≥200k tokens; llmux prices that
+  long-context tier per request since 2026-11-12 (see
+  [price classes](#per-request-price-classes)).
 - **Gemini rows** — added 2026-10-15 as the `GEMINI_MODELS` const in
   `src/catalog.rs`. Ids, context and output: the live `fetchAvailableModels`
   read on 2026-10-15 (`gemini-3.8-flash-high`, `-medium`, `-low`; ctx
@@ -920,5 +978,8 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
 - **Gemini pricing** — [ai.google.dev pricing](https://ai.google.dev/gemini-api/docs/pricing),
   updated 2026-10-14: 3.8 Flash $0.75 in / $3.75 out / $0.075 cached input per
   1M tokens through 2026-12-31, Argon $2.00 / $10.00 / $0.10 through
-  2026-11-30 (both then double). llmux uses these for cost display only;
+  2026-11-30 (both then double; re-read 2026-11-11 at
+  [aistudio.google.com/docs/pricing](https://aistudio.google.com/docs/pricing),
+  where ai.google.dev pricing now redirects — llmux prices each request at the
+  rates of its own UTC day). llmux uses these for cost display only;
   Antigravity subscription traffic is not billed per token.

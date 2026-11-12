@@ -9366,6 +9366,7 @@ fn request_totals(
         crate::pricing::request_cost_usd(
             group,
             model,
+            crate::pricing::PriceClass::STANDARD,
             tokens,
             sub_usage,
             &std::collections::HashMap::new(),
@@ -19832,7 +19833,7 @@ mod tests {
                 output: 2.0,
                 cache_read: 0.1,
                 cache_creation: 1.25,
-                cache_creation_extended: None,
+                ..crate::pricing::ModelPrice::zero()
             },
         );
         config.scheduler.save_until = Some(1_800_000_000);

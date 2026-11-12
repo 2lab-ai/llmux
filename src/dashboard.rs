@@ -482,6 +482,7 @@ fn trace_event(event: &ActivityEvent) {
                 (Some(g), Some(m), Some(t)) => crate::pricing::request_cost_usd(
                     g,
                     m,
+                    crate::pricing::PriceClass::STANDARD,
                     t,
                     sub_usage,
                     &std::collections::HashMap::new(),
@@ -2089,6 +2090,7 @@ pub(crate) fn dashboard_doc(
                         (Some(g), Some(m), Some(t)) => crate::pricing::request_cost_usd(
                             g,
                             m,
+                            crate::pricing::PriceClass::STANDARD,
                             t,
                             sub_usage,
                             &meta.pricing_overrides,
@@ -3708,7 +3710,7 @@ mod tests {
                 output: 0.0,
                 cache_read: 0.0,
                 cache_creation: 0.0,
-                cache_creation_extended: None,
+                ..crate::pricing::ModelPrice::zero()
             },
         );
         let mut m = meta();

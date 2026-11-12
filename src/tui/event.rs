@@ -62,6 +62,41 @@ impl TokenCounts {
             .saturating_add(self.cache_read.unwrap_or(0))
             .saturating_add(self.cache_creation.unwrap_or(0))
     }
+
+    /// Counter-wise saturating sum; an optional counter is present iff
+    /// either side reported it.
+    pub fn saturating_add(self, other: TokenCounts) -> TokenCounts {
+        let add = crate::proxy::sse::add_opt;
+        TokenCounts {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            cache_read: add(self.cache_read, other.cache_read),
+            cache_creation: add(self.cache_creation, other.cache_creation),
+            cache_creation_extended: add(
+                self.cache_creation_extended,
+                other.cache_creation_extended,
+            ),
+            web_search_requests: add(self.web_search_requests, other.web_search_requests),
+        }
+    }
+
+    /// Counter-wise saturating difference `self - other` (removing a part
+    /// from the total it was folded into); an optional counter stays as
+    /// absent or present as it is in `self`.
+    pub fn saturating_sub(self, other: TokenCounts) -> TokenCounts {
+        let sub = |a: Option<u64>, b: Option<u64>| a.map(|a| a.saturating_sub(b.unwrap_or(0)));
+        TokenCounts {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_read: sub(self.cache_read, other.cache_read),
+            cache_creation: sub(self.cache_creation, other.cache_creation),
+            cache_creation_extended: sub(
+                self.cache_creation_extended,
+                other.cache_creation_extended,
+            ),
+            web_search_requests: sub(self.web_search_requests, other.web_search_requests),
+        }
+    }
 }
 
 /// Tokens one request spent on a sub-inference that its top-level `tokens`

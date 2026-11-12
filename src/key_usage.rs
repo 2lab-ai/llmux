@@ -1983,6 +1983,7 @@ mod tests {
         let want = crate::pricing::request_cost_usd(
             "claude",
             "claude-opus-5-5",
+            crate::pricing::PriceClass::STANDARD,
             tokens,
             sub_usage,
             &HashMap::new(),

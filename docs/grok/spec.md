@@ -56,7 +56,7 @@ core with thin per-provider adapters.
 | Passive quota headers | 200 responses carry kind-first `x-ratelimit-{limit,remaining}-{requests,tokens}` (live capture: 900 req / 15M tok, no reset header) | live probes 2026-07-14 (llmux-evidence/2026-07-14-grok-group-usage) |
 | Pricing (API list price, for cost display) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge | docs.x.ai grok-4.5 (web, 2026-07-14) |
 | Pricing — grok-4.6 (API list price) | in $2.00/M, out $6.00/M, cached-in listed $0.50/M (docs.x.ai 2026-09-23; carried from grok-4.5 when first recorded 2026-08-13) | docs.x.ai grok-4.6 (web, 2026-08-13 / re-read 2026-09-23) |
-| Pricing — grok-4.7 (API list price) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge; rates double for prompts ≥200K (tier not modeled) | docs.x.ai grok-4.7 (web, 2026-09-23) |
+| Pricing — grok-4.7 (API list price) | in $2.00/M, out $6.00/M, cached-in $0.50/M, no cache-write charge; rates double for prompts ≥200K (priced per request since 2026-11-11, [price classes](../models.md#per-request-price-classes)) | docs.x.ai grok-4.7 (web, 2026-09-23) |
 | Effort default upstream | `high` when unspecified | docs.x.ai reasoning (web, 2026-07-14) |
 
 ## Requirements → design
