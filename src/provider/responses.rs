@@ -944,8 +944,10 @@ impl ResponsesSseConverter {
             sub_usage: Vec::new(),
             served_model: None,
             unbilled_refusal: false,
-            // The tier that served the request, when the response says.
-            served_fast: response.and_then(crate::proxy::sse::served_service_tier),
+            // Never the response's `service_tier`: the codex backend answers
+            // "default" even to a priority request, so the requested tier
+            // stands (see `the_translate_path_ignores_the_codex_service_tier`).
+            served_fast: None,
             us_inference: false,
         };
     }
@@ -1786,23 +1788,21 @@ mod tests {
         );
     }
 
-    /// #278 review (P3): the translate path records the tier that served the
-    /// request (`response.service_tier`, `priority` = Fast; Responses API
-    /// reference, read 2026-11-12) instead of trusting the requested one.
+    /// #278 review: the codex backend answers `service_tier: "default"` on
+    /// the terminal event even for a request sent with `priority` (raw-io
+    /// capture of 3,272 such requests, 2026-09-08 / 2026-09-10), so the
+    /// translate path never lets the response tier override the requested
+    /// one.
     #[test]
-    fn the_served_service_tier_is_read_from_the_terminal_response() {
-        for (tier, want) in [
-            (json!("priority"), Some(true)),
-            (json!("default"), Some(false)),
-            (Value::Null, None),
-        ] {
+    fn the_translate_path_ignores_the_codex_service_tier() {
+        for tier in [json!("priority"), json!("default"), Value::Null] {
             let mut event = incomplete_event(Some("max_output_tokens"));
             event["response"]["service_tier"] = tier.clone();
             let (converter, _) = run(&[
                 json!({"type": "response.created", "response": {"id": "resp_cap"}}),
                 event,
             ]);
-            assert_eq!(converter.usage().served_fast, want, "{tier}");
+            assert_eq!(converter.usage().served_fast, None, "{tier}");
         }
     }
 

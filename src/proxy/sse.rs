@@ -51,9 +51,10 @@ pub struct StreamUsage {
     /// priced at 0 ([`crate::pricing::PriceClass::UNBILLED`]).
     pub unbilled_refusal: bool,
     /// The tier the response says served the request, when it says so:
-    /// Anthropic `usage.speed` (`"fast"` / `"standard"`), OpenAI
-    /// `response.service_tier` (`"priority"` = Fast). `None` = not reported;
-    /// the requested tier is recorded then.
+    /// Anthropic `usage.speed` (`"fast"` / `"standard"`). `None` = not
+    /// reported, and always on the codex paths, whose backend does not
+    /// report the served tier (it answers `service_tier: "default"` to a
+    /// priority request); the requested tier is recorded then.
     pub served_fast: Option<bool>,
     /// Anthropic `usage.inference_geo` was `"us"` (US-only inference).
     pub us_inference: bool,
@@ -102,18 +103,6 @@ pub fn us_inference(usage: &serde_json::Value) -> bool {
         .get("inference_geo")
         .and_then(serde_json::Value::as_str)
         == Some("us")
-}
-
-/// The OpenAI tier that served a Responses request: `response.service_tier`
-/// `"priority"` (Fast) → `Some(true)`, any other reported tier → `Some(false)`,
-/// absent or null → `None` ("the response body will include the
-/// `service_tier` value based on the processing mode actually used to serve
-/// the request", Responses API reference, read 2026-11-12).
-pub fn served_service_tier(response: &serde_json::Value) -> Option<bool> {
-    response
-        .get("service_tier")
-        .and_then(serde_json::Value::as_str)
-        .map(|tier| tier == "priority")
 }
 
 /// Refusal categories Anthropic bills even when the refusal came before any
@@ -517,8 +506,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
             // 2026-11-11), so fresh input is what is left after both and the
             // writes are cache creation. Same rule as the translate path
             // (`crate::provider::responses`).
-            let response = value.get("response")?;
-            let usage = response.get("usage")?;
+            let usage = value.get("response")?.get("usage")?;
             let input = usage.get("input_tokens")?.as_u64()?;
             let cache = usage
                 .pointer("/input_tokens_details/cached_tokens")
@@ -542,7 +530,11 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
-                served_fast: served_service_tier(response),
+                // Not `response.service_tier`: the codex backend answers
+                // "default" even for a priority request (see
+                // `the_native_responses_passthrough_ignores_the_codex_service_tier`),
+                // so the requested tier stands.
+                served_fast: None,
                 us_inference: false,
             })
         }
@@ -2109,25 +2101,24 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
         assert_eq!((usage.served_fast, usage.us_inference), (None, false));
     }
 
-    /// OpenAI reports the tier that served the request: "the response body
-    /// will include the `service_tier` value based on the processing mode
-    /// actually used to serve the request" — `priority` for Fast (Responses
-    /// API reference, read 2026-11-12). The native passthrough reads it.
+    /// The codex backend does NOT report the tier that served a request: on
+    /// this machine's raw-io capture (2026-09-08 and 2026-09-10, 3,272
+    /// requests sent with `service_tier: "priority"`) every
+    /// `response.completed` / `response.failed` said `"default"` and every
+    /// `response.created` `"auto"`, unlike the OpenAI API's documented echo.
+    /// So the native passthrough never lets a response tier override the
+    /// requested one (`served_fast` stays `None`).
     #[test]
-    fn the_native_responses_passthrough_reads_the_served_service_tier() {
+    fn the_native_responses_passthrough_ignores_the_codex_service_tier() {
         let completed = |tier: &str| {
             format!(
                 r#"data: {{"type":"response.completed","response":{{"service_tier":{tier},"usage":{{"input_tokens":10,"output_tokens":2}}}}}}"#
             )
         };
-        for (tier, want) in [
-            (r#""priority""#, Some(true)),
-            (r#""default""#, Some(false)),
-            ("null", None),
-        ] {
+        for tier in [r#""priority""#, r#""default""#, r#""auto""#, "null"] {
             let mut observer = UsageObserver::default();
             observer.observe(&completed(tier));
-            assert_eq!(observer.finish().served_fast, want, "{tier}");
+            assert_eq!(observer.finish().served_fast, None, "{tier}");
         }
     }
 }

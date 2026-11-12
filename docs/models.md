@@ -822,7 +822,7 @@ attempt) is classified on its own prompt and model.
 | Fact | When | Rates |
 | --- | --- | --- |
 | Long context | The prompt (input + cache reads + cache writes) is over 272,000 tokens on a listed GPT row, 200,000 or more on `grok-4.5` / `grok-4.6` / `grok-4.7` (and the grok fallback), over 100,000 on `claude-haiku-5-5`. Built-in data, not configurable. | The whole request at the long rates below. |
-| Fast | The request was served at the Fast tier: codex Fast mode (the response's `service_tier: "priority"`, or the requested tier when the response does not report one) or Claude fast mode (the response's `usage.speed: "fast"`). | The Fast rates below; Claude fast mode is 2× every standard rate on Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5 and Opus 4.8 ($16 / $80, $16 / $80, $8 / $40, $10 / $50, $10 / $50, cache rates doubled too). Rows with no fast price stay standard. |
+| Fast | The request was served at the Fast tier: codex Fast mode (the requested `service_tier: "priority"`: the codex backend does not report the tier that served a request — it answered `"default"` to every priority request in llmux's raw-io capture) or Claude fast mode (the response's `usage.speed: "fast"`). | The Fast rates below; Claude fast mode is 2× every standard rate on Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5 and Opus 4.8 ($16 / $80, $16 / $80, $8 / $40, $10 / $50, $10 / $50, cache rates doubled too). Rows with no fast price stay standard. |
 | US-only inference | The response's `usage.inference_geo` is `"us"` (claude group). | 1.1× every rate the other facts select (on top of fast mode, and of Haiku 5.5's long tier), on Claude 4.6 and later rows. |
 | Dated rates | The request's UTC day is on or after a built-in rate change (the pricing page names no time zone, so the change is at 00:00 UTC). | That change's rates. |
 | Unbilled refusal | An Anthropic response with `stop_reason: "refusal"`, no output tokens and a `stop_details.category` that is not `bio`, `frontier_llm` or `reasoning_extraction` (claude group only). | No cost; the tokens stay visible. |
@@ -868,9 +868,12 @@ request that asked for fast mode but ran at standard speed (`usage.speed:
 prices at 1.1× without the request parameter. Opus 4.5 and Sonnet 4.5 share
 their price rows with Opus 4.6 / 4.7 and Sonnet 4.6; they reject
 `inference_geo`, so they never report US-only inference. llmux does not price
-Claude's Priority Tier, Batch or regional cloud-platform rates. An OpenAI
-`service_tier` other than `priority` (`default`, `flex`, `ultrafast`) prices at
-the Standard rates; llmux never requests flex or Ultrafast.
+Claude's Priority Tier, Batch or regional cloud-platform rates. A codex
+request is Fast when llmux sent `service_tier: "priority"`; the response's
+`service_tier` is not used, because the codex backend reports `"default"` for
+priority requests (the OpenAI API documents an echo of the served tier, the
+ChatGPT codex backend does not give one). llmux never requests flex or
+Ultrafast.
 
 `gpt-5.6-sol`'s rates are promotional "until November 30, 2026"; OpenAI has not
 published the later price, so the row keeps the current one.
