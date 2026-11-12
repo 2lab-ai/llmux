@@ -23,19 +23,26 @@ use crate::provider::codex::{CodexProvider, CodexShape};
 use crate::provider::{anthropic, ProviderRequest};
 use crate::scheduler::idle_probe::{ProbeError, Prober};
 
-/// The minimal `POST /v1/messages` probe body for an Anthropic (oauth/apikey)
-/// account: a one-character user turn capped at a single output token. The
-/// model is the smallest current Claude model — a real request that returns a
-/// 200 with the `anthropic-ratelimit-*` headers while spending the least
-/// possible quota.
+/// The minimal `POST /v1/messages` probe body for an Anthropic subscription
+/// account: a one-character user turn capped at a single output token, on
+/// the smallest current Claude model, carrying the Claude Code identity block
+/// a subscription token requires. Live 2026-11-12 on one subscription account:
+/// without that block the request was a 429 `rate_limit_error` with no
+/// `anthropic-ratelimit-unified-*` headers; with it, a 200 carrying all 11; the
+/// previous pinned `claude-3-5-haiku-20241022` answered 404 with none, so the
+/// probe had been learning nothing.
 fn anthropic_probe_body(model: &str) -> bytes::Bytes {
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1,
+        "system": [{ "type": "text", "text": crate::proxy::auto_classifier::MAIN }],
         "messages": [{ "role": "user", "content": "." }],
     });
     bytes::Bytes::from(body.to_string())
 }
+
+/// The beta flag Claude Code sends with a subscription (OAuth) token.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// The `POST /v1/messages` probe body for a Codex account: a one-character
 /// user turn and NO `max_tokens`.
@@ -156,6 +163,9 @@ impl ReqwestProber {
                 );
                 anthropic::inject_credential(&mut headers, credential)
                     .map_err(|err| ProbeError::Build(err.to_string()))?;
+                if matches!(credential, AccountCredential::Oauth { .. }) {
+                    headers.insert("anthropic-beta", http::HeaderValue::from_static(OAUTH_BETA));
+                }
                 let req = ProviderRequest {
                     method: Method::POST,
                     path: "/v1/messages".to_string(),
@@ -227,6 +237,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["max_tokens"], 1, "single output token");
         assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["system"][0]["text"],
+            crate::proxy::auto_classifier::MAIN,
+            "a subscription token needs the Claude Code identity block"
+        );
     }
 
     #[test]
@@ -252,6 +267,13 @@ mod tests {
         assert!(
             req.headers.get(anthropic::X_API_KEY).is_none(),
             "no x-api-key leaked for oauth"
+        );
+        assert_eq!(
+            req.headers
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some(OAUTH_BETA),
+            "a subscription token needs the oauth beta"
         );
     }
 
