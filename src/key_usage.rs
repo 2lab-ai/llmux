@@ -44,7 +44,10 @@ use crate::tui::{ActivityEvent, SubUsage, TokenCounts};
 /// Schema version stored in `meta`. Bump only with a migration.
 /// v2 (#278): the `requests` column — `1` for a finished request, `0` for a
 /// sub-usage row (tokens booked under another model, not a request).
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3 (#278): `cache_creation_extended` (the extended-TTL subset of
+/// `cache_creation`: Anthropic 1h, OpenAI 12h writes) and
+/// `web_search_requests`, both default 0 — what every older row means.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Schema version of `activity.jsonl` lines this importer understands — the
 /// SAME constant the writer stamps them with ([`crate::tui::activity`]), not a
@@ -252,6 +255,24 @@ pub struct ModelUsage {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// Extended-TTL subset of `cache_creation` and web searches (#278).
+    pub cache_creation_extended: u64,
+    pub web_search_requests: u64,
+}
+
+impl ModelUsage {
+    /// The cell's summed counters, for pricing (linear, so the cell prices
+    /// as the sum of its rows).
+    pub fn token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input: self.tokens_in,
+            output: self.tokens_out,
+            cache_read: Some(self.cache_read),
+            cache_creation: Some(self.cache_creation),
+            cache_creation_extended: Some(self.cache_creation_extended),
+            web_search_requests: Some(self.web_search_requests),
+        }
+    }
 }
 
 /// The result of one [`UsageQuery`]: the matched tenant rows plus the filter
@@ -292,6 +313,10 @@ pub struct UsageRow {
     pub tokens_out: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
+    /// The extended-TTL subset of `cache_creation` (Anthropic 1h, OpenAI
+    /// 12h) and the Anthropic web searches (#278); 0 when not reported.
+    pub cache_creation_extended: u64,
+    pub web_search_requests: u64,
     /// `None` = the request itself (one request). `Some(n)` = the request's
     /// `n`-th sub-usage ([`crate::tui::SubUsage`], #278): tokens booked under
     /// their own model that are NOT a request (`requests = 0`).
@@ -337,6 +362,26 @@ impl UsageRow {
         self
     }
 
+    /// [`Self::with_tokens`] from a request's (or sub-usage's) counters,
+    /// the extended-TTL write subset and the web searches included; a
+    /// counter the upstream did not report is stored as 0. The extended
+    /// subset is clamped to the write total, as every parser clamps it (a
+    /// hand-edited `activity.jsonl` line could claim more).
+    pub fn with_counts(self, t: &TokenCounts) -> Self {
+        let mut row = self.with_tokens(
+            t.input,
+            t.output,
+            t.cache_read.unwrap_or(0),
+            t.cache_creation.unwrap_or(0),
+        );
+        row.cache_creation_extended = t
+            .cache_creation_extended
+            .unwrap_or(0)
+            .min(row.cache_creation);
+        row.web_search_requests = t.web_search_requests.unwrap_or(0);
+        row
+    }
+
     /// Every row one finished-request event books: the request itself, then
     /// one per sub-usage. Empty for every other event variant.
     pub fn rows_from_event(event: &ActivityEvent, now: SystemTime) -> Vec<Self> {
@@ -368,12 +413,7 @@ impl UsageRow {
                 sub.model.as_deref().or(request_model),
                 self.status,
             )
-            .with_tokens(
-                sub.tokens.input,
-                sub.tokens.output,
-                sub.tokens.cache_read.unwrap_or(0),
-                sub.tokens.cache_creation.unwrap_or(0),
-            );
+            .with_counts(&sub.tokens);
             row.sub_index = Some(u32::try_from(index).unwrap_or(u32::MAX));
             rows.push(row);
         }
@@ -412,12 +452,7 @@ impl UsageRow {
             *status,
         );
         Some(match tokens {
-            Some(t) => row.with_tokens(
-                t.input,
-                t.output,
-                t.cache_read.unwrap_or(0),
-                t.cache_creation.unwrap_or(0),
-            ),
+            Some(t) => row.with_counts(t),
             None => row,
         })
     }
@@ -544,7 +579,9 @@ impl UsageDb {
                  tokens_out     INTEGER NOT NULL DEFAULT 0,
                  cache_read     INTEGER NOT NULL DEFAULT 0,
                  cache_creation INTEGER NOT NULL DEFAULT 0,
-                 requests       INTEGER NOT NULL DEFAULT 1
+                 requests       INTEGER NOT NULL DEFAULT 1,
+                 cache_creation_extended INTEGER NOT NULL DEFAULT 0,
+                 web_search_requests     INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS usage_ts_idx ON usage(ts_ms);
              CREATE INDEX IF NOT EXISTS usage_model_ts_idx ON usage(model, ts_ms);
@@ -611,7 +648,7 @@ impl UsageDb {
              SUM(CASE WHEN status < 400 THEN requests ELSE 0 END), \
              SUM(CASE WHEN status >= 400 THEN requests ELSE 0 END), \
              SUM(tokens_in), SUM(tokens_out), SUM(cache_read), SUM(cache_creation), \
-             MIN(ts_ms), MAX(ts_ms) \
+             MIN(ts_ms), MAX(ts_ms), SUM(cache_creation_extended), SUM(web_search_requests) \
              FROM usage WHERE ts_ms >= ?1 AND ts_ms <= ?2",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![
@@ -650,6 +687,8 @@ impl UsageDb {
                     cache_creation: r.get::<_, i64>(9)? as u64,
                     first_ms: r.get::<_, i64>(10)? as u64,
                     last_ms: r.get::<_, i64>(11)? as u64,
+                    cache_creation_extended: r.get::<_, i64>(12)? as u64,
+                    web_search_requests: r.get::<_, i64>(13)? as u64,
                 })
             })
             .map_err(|e| UsageError::sqlite(&self.path, e))?;
@@ -686,6 +725,8 @@ impl UsageDb {
                     tokens_out: row.tokens_out,
                     cache_read: row.cache_read,
                     cache_creation: row.cache_creation,
+                    cache_creation_extended: row.cache_creation_extended,
+                    web_search_requests: row.web_search_requests,
                 });
             }
         }
@@ -898,24 +939,42 @@ impl UsageDb {
 }
 
 const INSERT_SQL: &str = "INSERT OR IGNORE INTO usage \
-     (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, requests) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+     (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, requests, \
+      cache_creation_extended, web_search_requests) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
 
-/// Bring a store to [`SCHEMA_VERSION`]. v1 → v2 adds the `requests` column
-/// (existing rows are one request each, the column default). Runs inside an
-/// IMMEDIATE transaction that re-checks the column, so two daemons opening
-/// the same file during a rolling restart cannot both alter it. Additive
-/// only: a v1 daemon can still write a v2 store (its inserts take the
-/// default), though it would count sub-usage rows as requests.
+/// Columns added after v1, in order, with their `ADD COLUMN` definition. Each
+/// default is what every row written before the column means: one request,
+/// no extended-TTL writes, no web searches.
+const ADDED_COLUMNS: [(&str, &str); 3] = [
+    ("requests", "INTEGER NOT NULL DEFAULT 1"),
+    ("cache_creation_extended", "INTEGER NOT NULL DEFAULT 0"),
+    ("web_search_requests", "INTEGER NOT NULL DEFAULT 0"),
+];
+
+/// Bring a store to [`SCHEMA_VERSION`]: v1 → v2 adds `requests`, v2 → v3
+/// `cache_creation_extended` and `web_search_requests` ([`ADDED_COLUMNS`]),
+/// each only if absent. Runs inside an IMMEDIATE transaction that re-checks
+/// every column, so two daemons opening the same file during a rolling
+/// restart cannot both alter it. Additive only: an older daemon can still
+/// read and write a newer store — its inserts name only the columns it knows,
+/// so its rows take the defaults (a v1 daemon counts sub-usage rows as
+/// requests; a v2 daemon books no extended writes or searches and prices
+/// every write at the short-TTL rate), and it re-stamps its own version,
+/// which the next newer open stamps back.
 fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let has_requests: i64 = tx.query_row(
-        "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'requests'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_requests == 0 {
-        tx.execute_batch("ALTER TABLE usage ADD COLUMN requests INTEGER NOT NULL DEFAULT 1")?;
+    for (column, definition) in ADDED_COLUMNS {
+        let present: i64 = tx.query_row(
+            "SELECT count(*) FROM pragma_table_info('usage') WHERE name = ?1",
+            [column],
+            |r| r.get(0),
+        )?;
+        if present == 0 {
+            tx.execute_batch(&format!(
+                "ALTER TABLE usage ADD COLUMN {column} {definition}"
+            ))?;
+        }
     }
     tx.execute(
         "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
@@ -927,7 +986,7 @@ fn migrate(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
 /// Owned bind values for [`INSERT_SQL`] (owned, so the array outlives the
 /// statement call without borrowing a temporary).
-fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 11] {
+fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 13] {
     use rusqlite::types::Value;
     let text = |v: &Option<String>| match v {
         Some(v) => Value::Text(v.clone()),
@@ -945,6 +1004,8 @@ fn insert_values(row: &UsageRow) -> [rusqlite::types::Value; 11] {
         Value::Integer(row.cache_read as i64),
         Value::Integer(row.cache_creation as i64),
         Value::Integer(row.requests() as i64),
+        Value::Integer(row.cache_creation_extended as i64),
+        Value::Integer(row.web_search_requests as i64),
     ]
 }
 
@@ -961,6 +1022,8 @@ struct GroupRow {
     cache_creation: u64,
     first_ms: u64,
     last_ms: u64,
+    cache_creation_extended: u64,
+    web_search_requests: u64,
 }
 
 fn total_tokens(m: &ModelUsage) -> u64 {
@@ -1093,12 +1156,7 @@ fn parse_legacy_line(line: &str) -> Option<Vec<UsageRow>> {
         parsed.status,
     );
     let row = match parsed.tokens {
-        Some(t) => row.with_tokens(
-            t.input,
-            t.output,
-            t.cache_read.unwrap_or(0),
-            t.cache_creation.unwrap_or(0),
-        ),
+        Some(t) => row.with_counts(&t),
         None => row,
     };
     Some(row.with_sub_usage(parsed.model.as_deref(), &parsed.sub_usage))
@@ -1414,23 +1472,22 @@ pub fn usage_doc(
             let models: Vec<TenantModelDoc> = t
                 .models
                 .into_iter()
-                .map(|m| {
-                    let tokens = TokenCounts {
-                        input: m.tokens_in,
-                        output: m.tokens_out,
-                        cache_read: Some(m.cache_read),
-                        cache_creation: Some(m.cache_creation),
-                    };
-                    TenantModelDoc {
-                        cost_usd: crate::pricing::cost_usd(&m.group, &m.model, &tokens, overrides),
-                        group: m.group,
-                        model: m.model,
-                        requests: m.requests,
-                        tokens_in: m.tokens_in,
-                        tokens_out: m.tokens_out,
-                        cache_read: m.cache_read,
-                        cache_creation: m.cache_creation,
-                    }
+                .map(|m| TenantModelDoc {
+                    cost_usd: crate::pricing::cost_usd(
+                        &m.group,
+                        &m.model,
+                        &m.token_counts(),
+                        overrides,
+                    ),
+                    group: m.group,
+                    model: m.model,
+                    requests: m.requests,
+                    tokens_in: m.tokens_in,
+                    tokens_out: m.tokens_out,
+                    cache_read: m.cache_read,
+                    cache_creation: m.cache_creation,
+                    cache_creation_extended: m.cache_creation_extended,
+                    web_search_requests: m.web_search_requests,
                 })
                 .collect();
             TenantUsageDoc {
@@ -1578,6 +1635,8 @@ mod tests {
                 output: 50,
                 cache_read: Some(10),
                 cache_creation: Some(5),
+                cache_creation_extended: None,
+                web_search_requests: None,
             }),
             group: Some("claude".into()),
             model: Some("claude-opus-5-5".into()),
@@ -1599,6 +1658,8 @@ mod tests {
                         output: 1612,
                         cache_read: Some(0),
                         cache_creation: Some(0),
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     },
                 },
                 crate::tui::SubUsage {
@@ -1608,6 +1669,8 @@ mod tests {
                         output: 100,
                         cache_read: None,
                         cache_creation: None,
+                        cache_creation_extended: None,
+                        web_search_requests: None,
                     },
                 },
             ],
@@ -1719,19 +1782,22 @@ mod tests {
                 (2, 1, 1)
             );
             assert_eq!(db.row_count().expect("count"), 2);
+            // Straight to the current version: v1 → v3 in one open.
             assert_eq!(
-                db.get_meta("schema_version").expect("meta").as_deref(),
-                Some("2")
+                db.get_meta("schema_version").expect("meta"),
+                Some(SCHEMA_VERSION.to_string())
             );
-            let has_column: i64 = db
-                .conn
-                .query_row(
-                    "SELECT count(*) FROM pragma_table_info('usage') WHERE name = 'requests'",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("pragma");
-            assert_eq!(has_column, 1);
+            for (column, _) in ADDED_COLUMNS {
+                let has_column: i64 = db
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM pragma_table_info('usage') WHERE name = ?1",
+                        [column],
+                        |r| r.get(0),
+                    )
+                    .expect("pragma");
+                assert_eq!(has_column, 1, "{column}");
+            }
         }
     }
 
@@ -1764,6 +1830,7 @@ mod tests {
             cache_read: 0,
             cache_creation: 0,
             sub_index: None,
+            ..Default::default()
         };
         assert_eq!(db.insert_many(&[row]).expect("insert under a reader"), 1);
         reader.execute_batch("COMMIT;").expect("end");
@@ -1848,5 +1915,237 @@ mod tests {
             .expect("import after refill");
         assert_eq!(outcome.imported, 4, "the refilled content is read");
         assert_eq!(db.row_count().unwrap(), 8);
+    }
+
+    /// A `claude-opus-5-5` request with 1h writes and web searches, and an
+    /// advisor sub-usage on `claude-fable-5-2` with its own 1h writes.
+    fn event_with_split(id: u64) -> ActivityEvent {
+        let mut event = event_with_sub_usage(id);
+        if let ActivityEvent::RequestFinished {
+            tokens, sub_usage, ..
+        } = &mut event
+        {
+            *tokens = Some(TokenCounts {
+                input: 100,
+                output: 50,
+                cache_read: Some(10),
+                cache_creation: Some(1_000_000),
+                cache_creation_extended: Some(600_000),
+                web_search_requests: Some(3),
+            });
+            *sub_usage = vec![crate::tui::SubUsage {
+                model: Some("claude-fable-5-2".into()),
+                tokens: TokenCounts {
+                    cache_creation: Some(1_000_000),
+                    cache_creation_extended: Some(1_000_000),
+                    ..Default::default()
+                },
+            }];
+        }
+        event
+    }
+
+    /// #278: the extended-TTL write subset and the web searches are stored
+    /// per row (request and sub-usage), summed per cell, and priced like the
+    /// request: the keys panel's cost == the sum of the per-request costs.
+    #[test]
+    fn extended_writes_and_web_searches_are_stored_and_priced_per_row() {
+        let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000_000);
+        let event = event_with_split(5);
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.insert_many(&UsageRow::rows_from_event(&event, at))
+            .expect("insert");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        let opus = cell(&report, "claude-opus-5-5");
+        assert_eq!(
+            (opus.cache_creation_extended, opus.web_search_requests),
+            (600_000, 3)
+        );
+        let fable = cell(&report, "claude-fable-5-2");
+        assert_eq!(fable.cache_creation_extended, 1_000_000);
+        let doc = usage_doc(
+            report.clone(),
+            &[],
+            &HashMap::new(),
+            UsageHealth::default(),
+            0,
+        );
+        let ActivityEvent::RequestFinished {
+            tokens: Some(tokens),
+            sub_usage,
+            ..
+        } = &event
+        else {
+            panic!("finished");
+        };
+        let want = crate::pricing::request_cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            tokens,
+            sub_usage,
+            &HashMap::new(),
+        );
+        let got = doc.tenants[0].cost_usd;
+        assert!((got - want).abs() < 1e-9, "store {got} != requests {want}");
+        // The legacy import of the same activity.jsonl line keeps them too.
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        let record = crate::tui::activity::PersistedRequest::from_event(&event, at).expect("rec");
+        append(
+            &jsonl,
+            &(serde_json::to_string(&record).expect("line") + "\n"),
+        );
+        let mut fresh = UsageDb::open_in_memory().expect("db");
+        fresh
+            .import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        assert_eq!(
+            fresh
+                .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+                .expect("query"),
+            report
+        );
+    }
+
+    /// A hand-edited `activity.jsonl` line can claim more extended-TTL writes
+    /// than writes; the stored subset is clamped to the total, as every
+    /// parser clamps it, so the store never prices a write that was not made.
+    #[test]
+    fn an_imported_extended_count_is_clamped_to_the_write_total() {
+        let mut line: serde_json::Value =
+            serde_json::from_str(line(1_000, 1, "t").trim()).expect("line");
+        line["tokens"] = serde_json::json!({
+            "input": 1, "output": 1, "cache_creation": 5, "cache_creation_extended": 9
+        });
+        let tmp = TempDir::new();
+        let jsonl = tmp.path().join("activity.jsonl");
+        append(&jsonl, &format!("{line}\n"));
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.import_activity_jsonl(&jsonl, len(&jsonl))
+            .expect("import");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000))
+            .expect("query");
+        let m1 = cell(&report, "m1");
+        assert_eq!((m1.cache_creation, m1.cache_creation_extended), (5, 5));
+        // No write total at all: nothing to be a subset of.
+        let row = UsageRow::new(1, 2, None, None, None, 200).with_counts(&TokenCounts {
+            cache_creation_extended: Some(9),
+            ..Default::default()
+        });
+        assert_eq!(row.cache_creation_extended, 0);
+    }
+
+    /// A v2 store (#278 PR 1: `requests`, no split columns) is migrated to v3
+    /// in place on open; its rows keep pricing exactly as before (no split,
+    /// no searches), and reopening is a no-op.
+    #[test]
+    fn a_v2_store_is_migrated_to_v3_and_prices_as_before() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("usage.sqlite3");
+        {
+            let conn = Connection::open(&db_path).expect("v2");
+            conn.execute_batch(
+                "CREATE TABLE usage (
+                     event_key TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL,
+                     tenant TEXT NOT NULL, grp TEXT, model TEXT,
+                     status INTEGER NOT NULL,
+                     tokens_in INTEGER NOT NULL DEFAULT 0,
+                     tokens_out INTEGER NOT NULL DEFAULT 0,
+                     cache_read INTEGER NOT NULL DEFAULT 0,
+                     cache_creation INTEGER NOT NULL DEFAULT 0,
+                     requests INTEGER NOT NULL DEFAULT 1);
+                 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO meta VALUES ('schema_version', '2');
+                 INSERT INTO usage (event_key, ts_ms, tenant, grp, model, status, tokens_in, cache_creation)
+                   VALUES ('1:1', 1, 't', 'claude', 'claude-opus-5-5', 200, 5, 1000000);",
+            )
+            .expect("v2 schema");
+        }
+        let before = crate::pricing::cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            &TokenCounts {
+                input: 5,
+                output: 0,
+                cache_read: Some(0),
+                cache_creation: Some(1_000_000),
+                ..Default::default()
+            },
+            &HashMap::new(),
+        );
+        for _ in 0..2 {
+            let db = UsageDb::open(&db_path).expect("open migrates");
+            assert_eq!(
+                db.get_meta("schema_version").expect("meta").as_deref(),
+                Some("3")
+            );
+            for column in ["cache_creation_extended", "web_search_requests"] {
+                let has: i64 = db
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM pragma_table_info('usage') WHERE name = ?1",
+                        [column],
+                        |r| r.get(0),
+                    )
+                    .expect("pragma");
+                assert_eq!(has, 1, "{column}");
+            }
+            let report = db
+                .query(&UsageQuery::new(UsageWindow::All, 10))
+                .expect("query");
+            let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 0);
+            assert_eq!(doc.tenants[0].cost_usd.to_bits(), before.to_bits());
+        }
+    }
+
+    /// Downgrade: an older (v2) binary opening a v3 store runs its own
+    /// migration (the `requests` column exists, so it only stamps
+    /// `schema_version` back to 2) and its 11-column insert, which leaves the
+    /// new columns at their default 0 — its rows lose the split and the
+    /// searches, nothing fails. The next v3 open re-stamps 3.
+    #[test]
+    fn an_older_binary_keeps_working_on_a_v3_store() {
+        let tmp = TempDir::new();
+        let db_path = tmp.path().join("usage.sqlite3");
+        drop(UsageDb::open(&db_path).expect("v3"));
+        {
+            let conn = Connection::open(&db_path).expect("v2 binary");
+            conn.execute_batch(
+                "INSERT INTO meta (k, v) VALUES ('schema_version', '2')
+                   ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+                 INSERT OR IGNORE INTO usage
+                   (event_key, ts_ms, tenant, grp, model, status, tokens_in, tokens_out, cache_read, cache_creation, requests)
+                   VALUES ('7:7', 7, 't', 'claude', 'claude-opus-5-5', 200, 1, 2, 3, 4, 1);",
+            )
+            .expect("v2 insert into v3");
+            let v2_query: (i64, i64) = conn
+                .query_row(
+                    "SELECT SUM(requests), SUM(cache_creation) FROM usage WHERE ts_ms >= 0",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("v2 query");
+            assert_eq!(v2_query, (1, 4));
+        }
+        let db = UsageDb::open(&db_path).expect("v3 reopens");
+        assert_eq!(
+            db.get_meta("schema_version").expect("meta").as_deref(),
+            Some("3")
+        );
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 10))
+            .expect("query");
+        let opus = cell(&report, "claude-opus-5-5");
+        assert_eq!(
+            (
+                opus.cache_creation,
+                opus.cache_creation_extended,
+                opus.web_search_requests
+            ),
+            (4, 0, 0)
+        );
     }
 }

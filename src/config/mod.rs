@@ -1087,12 +1087,18 @@ mod tests {
         let raw = r#"{
             "version": 1,
             "pricing": {
-                "gpt-5.5": { "input": 9.99, "output": 0.0, "cache_read": 0.0, "cache_creation": 0.0 }
+                "gpt-5.5": { "input": 9.99, "output": 0.0, "cache_read": 0.0, "cache_creation": 0.0 },
+                "claude-opus-5-5": { "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_creation": 5.0, "cache_creation_extended": 8.0 }
             }
         }"#;
         let config: Config = serde_json::from_str(raw).expect("pricing config parses");
         let price = config.pricing.get("gpt-5.5").expect("override present");
         assert_eq!(price.input, 9.99);
+        // #278: the extended-TTL write rate is optional; absent = the
+        // override's `cache_creation` rate.
+        assert_eq!(price.cache_creation_extended, None);
+        let opus = config.pricing.get("claude-opus-5-5").expect("override");
+        assert_eq!(opus.cache_creation_extended, Some(8.0));
         let reparsed: Config =
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("re-parse");

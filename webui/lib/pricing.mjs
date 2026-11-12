@@ -1,11 +1,30 @@
 // Per-model token rates recovered from the daemon's own priced aggregates.
 // `usage_stats` rows (hour/day × model) carry tokens and the daemon-computed `cost_usd`, which is linear:
-//   cost = in·a + out·b + cache_read·c + cache_creation·d
-// Solving those rows by least squares gives the rates the daemon used (overrides included), so
-// history rows that carry tokens but no cost can be priced without copying src/pricing.rs.
+//   cost = in·a + out·b + cache_read·c + short writes·d + extended writes·e + web_search_requests·f
+// (#278: the extended-TTL writes — Anthropic 1h, OpenAI 12h — are the `cache_creation_extended` part of
+// `cache_creation`, the short-TTL writes the rest; `d` and `e` are both absolute write rates and `f` is
+// the per-search fee.) Solving those rows by least squares gives the rates the daemon used (overrides
+// included), so history rows that carry tokens but no cost can be priced without copying src/pricing.rs.
 
-const COLS = ['tokens_in', 'tokens_out', 'cache_read', 'cache_creation'];
-const SCALE = 1e-6; // work in millions of tokens so the normal equations stay well conditioned
+/** The extended (`ext`) and short (`short`) parts of a row's cache writes — disjoint counts, so a model
+ *  whose writes are all one TTL still has independent columns. */
+function writes(cc, ext) {
+  const total = cc || 0;
+  const extended = Math.min(ext || 0, total);
+  return { short: total - extended, extended };
+}
+
+// One solver column per rate: its key in the rate object, its count on a `usage_stats` row, and the
+// unit it is solved in (millions of tokens, thousands of searches) so the normal equations stay well
+// conditioned.
+const COLS = [
+  { key: 'in', get: r => r.tokens_in || 0, scale: 1e-6 },
+  { key: 'out', get: r => r.tokens_out || 0, scale: 1e-6 },
+  { key: 'cr', get: r => r.cache_read || 0, scale: 1e-6 },
+  { key: 'cc', get: r => writes(r.cache_creation, r.cache_creation_extended).short, scale: 1e-6 },
+  { key: 'ce', get: r => writes(r.cache_creation, r.cache_creation_extended).extended, scale: 1e-6 },
+  { key: 'ws', get: r => r.web_search_requests || 0, scale: 1e-3 },
+];
 
 function solve(A, b) {
   const n = b.length;
@@ -24,7 +43,11 @@ function solve(A, b) {
   return M.map((row, i) => row[n] / row[i]);
 }
 
-/** @returns {Map<string, {in:number,out:number,cr:number,cc:number}>} USD per token, per model */
+/** @returns {Map<string, {in:number,out:number,cr:number,cc:number,ce:number,ws:number}>} USD per token
+ *  (`cc`: short-TTL write, `ce`: extended-TTL write; `ws`: USD per web search), per model. A column no
+ *  solved row has is 0, except the write rates: an unobserved extended rate is the short one (the
+ *  daemon's rule for a row with no extended rate), and an unobserved short rate the extended one (a
+ *  model whose recent writes were all extended; its unsplit history writes get that rate). */
 export function solveRates(usageStats) {
   const byModel = new Map();
   for (const u of usageStats || []) {
@@ -34,26 +57,30 @@ export function solveRates(usageStats) {
   }
   const out = new Map();
   for (const [model, rows] of byModel) {
-    const live = COLS.filter(c => rows.some(r => (r[c] || 0) > 0));
+    const live = COLS.filter(c => rows.some(r => c.get(r) > 0));
     if (!live.length || rows.length < live.length) continue;
     const n = live.length;
     const A = Array.from({ length: n }, () => new Array(n).fill(0));
     const b = new Array(n).fill(0);
     for (const r of rows) {
-      const x = live.map(c => (r[c] || 0) * SCALE);
+      const x = live.map(c => c.get(r) * c.scale);
       for (let i = 0; i < n; i++) { b[i] += x[i] * r.cost_usd; for (let j = 0; j < n; j++) A[i][j] += x[i] * x[j]; }
     }
     const sol = solve(A, b);
+    // Every rate is absolute, so a negative one is a bad fit, never a discount.
     if (!sol || sol.some(v => !Number.isFinite(v) || v < -1e-6)) continue;
     // Accept only an exact-looking fit: the daemon's cost is linear, so the residual must be tiny.
     let err = 0, tot = 0;
     for (const r of rows) {
-      const est = live.reduce((a, c, i) => a + (r[c] || 0) * SCALE * sol[i], 0);
+      const est = live.reduce((a, c, i) => a + c.get(r) * c.scale * sol[i], 0);
       err += Math.abs(est - r.cost_usd); tot += r.cost_usd;
     }
     if (tot <= 0 || err / tot > 0.02) continue;
-    const rate = { in: 0, out: 0, cr: 0, cc: 0 };
-    live.forEach((c, i) => { rate[{ tokens_in: 'in', tokens_out: 'out', cache_read: 'cr', cache_creation: 'cc' }[c]] = Math.max(0, sol[i]) * SCALE; });
+    const rate = { in: 0, out: 0, cr: 0, cc: 0, ce: 0, ws: 0 };
+    live.forEach((c, i) => { rate[c.key] = Math.max(0, sol[i]) * c.scale; });
+    const seen = key => live.some(c => c.key === key);
+    if (!seen('ce')) rate.ce = rate.cc;
+    else if (!seen('cc')) rate.cc = rate.ce;
     out.set(model, rate);
   }
   return out;
@@ -71,10 +98,18 @@ export function avgPerRequest(modelUsage) {
   return m;
 }
 
+/** Counters (activity `tokens` shape) priced at solved rates `r`: the short-TTL writes at `cc`, the
+ *  extended ones at `ce` (absent → `cc`, as the daemon prices a row with no extended rate). */
+export function priceCounts(t, r) {
+  const w = writes(t.cache_creation, t.cache_creation_extended);
+  return (t.input || 0) * r.in + (t.output || 0) * r.out + (t.cache_read || 0) * r.cr + w.short * r.cc
+    + w.extended * (r.ce ?? r.cc) + (t.web_search_requests || 0) * (r.ws || 0);
+}
+
 export function priceTokens(model, t, rates, avg) {
   if (!t) return 0;
   const r = rates && rates.get(model);
-  if (r) return (t.input || 0) * r.in + (t.output || 0) * r.out + (t.cache_read || 0) * r.cr + (t.cache_creation || 0) * r.cc;
+  if (r) return priceCounts(t, r);
   return (avg && avg.get(model)) || 0;
 }
 

@@ -1812,6 +1812,8 @@ mod tests {
                 // No cached_tokens key in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
@@ -1853,6 +1855,8 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: Some(199_000),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
@@ -1894,10 +1898,33 @@ mod tests {
                 cache_read_input_tokens: Some(100_864),
                 // `cache_write_tokens` was present (0) → explicit Some(0).
                 cache_creation_input_tokens: Some(0),
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
         );
+    }
+
+    #[test]
+    fn the_12h_write_subset_reaches_the_booked_usage() {
+        // GPT-5.6+ split the writes by TTL in
+        // `input_tokens_details.cache_write_tokens_details` (Responses API
+        // reference + prompt-caching guide, read 2026-11-11); the 12h part is
+        // the extended-TTL subset priced at its own rate.
+        let (converter, _) = run_converter(&[
+            json!({"type": "response.created", "response": {"id": "r"}}),
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 12_000,
+                "input_tokens_details": {"cached_tokens": 4_000, "cache_write_tokens": 7_000,
+                    "cache_write_tokens_details": {"ttl_30m_tokens": 3_000, "ttl_12h_tokens": 4_000}},
+                "output_tokens": 10
+            }}}),
+        ]);
+        let usage = converter.usage();
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.cache_creation_input_tokens, Some(7_000));
+        assert_eq!(usage.cache_creation_extended, Some(4_000));
     }
 
     #[test]
@@ -1930,6 +1957,8 @@ mod tests {
                 output_tokens: 10,
                 cache_read_input_tokens: Some(4_000),
                 cache_creation_input_tokens: Some(7_000),
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
@@ -1963,6 +1992,8 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(100),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
@@ -1992,6 +2023,8 @@ mod tests {
                 output_tokens: 9,
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
@@ -2389,6 +2422,8 @@ mod tests {
                 // so cache-read is an explicit Some(0), not unavailable.
                 cache_read_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }

@@ -23,6 +23,13 @@ not a request). A daemon migrates its store when it opens it, so snapshot a
 store a current daemon has opened; the PostgreSQL schema adds the column to an
 existing `usage` table with the default `1`.
 
+Schema v3 (2026-11-11) added `cache_creation_extended` (the part of
+`cache_creation` written at the extended TTL — Claude 1 hour, OpenAI 12 hours)
+and `web_search_requests` (Claude server web searches), both default `0`, which
+is what every older row means. The PostgreSQL schema adds them to an existing
+`usage` table the same way, and the loader copies them, so snapshot a store a
+current daemon has opened.
+
 Bookkeeping tables (`meta`, `metrics_jsonl_imports`, `metrics_exports`,
 `metrics_day_rev`) describe the SQLite files and their archives. They are not
 copied, because a server backend keeps its own.

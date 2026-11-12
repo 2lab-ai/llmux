@@ -28,6 +28,13 @@ pub struct StreamUsage {
     pub output_tokens: u64,
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
+    /// The extended-TTL subset of `cache_creation_input_tokens` (Anthropic
+    /// 1h, OpenAI 12h writes; [`extended_cache_writes`]). `None` = no split
+    /// reported. See [`TokenCounts::cache_creation_extended`].
+    pub cache_creation_extended: Option<u64>,
+    /// Anthropic `usage.server_tool_use.web_search_requests`
+    /// ([`web_search_requests`]). `None` = not reported.
+    pub web_search_requests: Option<u64>,
     /// Anthropic `usage.iterations` entries the four counters above do NOT
     /// include, each billed at its own model's rates
     /// ([`uncounted_iterations`]). Empty for every other upstream.
@@ -53,6 +60,9 @@ impl StreamUsage {
             self.cache_creation_input_tokens,
             other.cache_creation_input_tokens,
         );
+        self.cache_creation_extended =
+            add_opt(self.cache_creation_extended, other.cache_creation_extended);
+        self.web_search_requests = add_opt(self.web_search_requests, other.web_search_requests);
     }
 }
 
@@ -247,12 +257,57 @@ pub fn uncounted_iterations(
                     output: count("output_tokens").unwrap_or(0),
                     cache_read: count("cache_read_input_tokens"),
                     cache_creation: count("cache_creation_input_tokens"),
+                    // Each entry carries its own `cache_creation` split
+                    // (prompt-caching). Server-tool counts are request-level
+                    // (`usage.server_tool_use`), so never read per entry.
+                    cache_creation_extended: extended_cache_writes(
+                        it,
+                        count("cache_creation_input_tokens"),
+                    ),
+                    web_search_requests: None,
                 },
             }
         })
         .filter(|sub| sub.tokens.total() > 0)
         .collect();
     Some(uncounted)
+}
+
+/// The extended-TTL subset of one usage object's cache writes (#278): the
+/// Anthropic 1-hour writes (`cache_creation.ephemeral_1h_input_tokens`; "The
+/// `cache_creation_input_tokens` field equals the sum of the values in the
+/// `cache_creation` object", build-with-claude/prompt-caching) or the OpenAI
+/// 12-hour writes (`input_tokens_details.cache_write_tokens_details.
+/// ttl_12h_tokens`, which with `ttl_30m_tokens` sums to `cache_write_tokens`:
+/// developers.openai.com/api/docs/guides/prompt-caching and the Responses API
+/// reference), both read 2026-11-11. `total` is the request's cache-write
+/// count; a split larger than it is malformed and clamped to it, and without
+/// a total (never seen on the wire) there is nothing to be a subset of, so
+/// `None`. `None` too when the object carries no split — those writes are
+/// priced at the short-TTL rate, as before the split was recorded.
+pub fn extended_cache_writes(usage: &serde_json::Value, total: Option<u64>) -> Option<u64> {
+    let split = extended_split(usage)?;
+    total.map(|total| split.min(total))
+}
+
+/// The raw extended-TTL count of [`extended_cache_writes`], before the clamp.
+fn extended_split(usage: &serde_json::Value) -> Option<u64> {
+    usage
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .or_else(|| {
+            usage.pointer("/input_tokens_details/cache_write_tokens_details/ttl_12h_tokens")
+        })
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// Anthropic server-side web searches one usage object reports
+/// (`server_tool_use.web_search_requests`, platform.claude.com/docs/en/
+/// about-claude/pricing "Web search tool", read 2026-11-11). Web fetches
+/// (`web_fetch_requests`) are free on the same page and are not read.
+pub fn web_search_requests(usage: &serde_json::Value) -> Option<u64> {
+    usage
+        .pointer("/server_tool_use/web_search_requests")
+        .and_then(serde_json::Value::as_u64)
 }
 
 /// Saturating add of two optional counters where `None` means "unavailable":
@@ -361,17 +416,20 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
         "message_start" => {
             let usage = value.get("message")?.get("usage")?;
             let input = usage.get("input_tokens")?.as_u64()?;
+            // Anthropic prompt-caching counters, present only when the
+            // request used caching — captured opportunistically (req8/9).
+            let written = usage
+                .get("cache_creation_input_tokens")
+                .and_then(serde_json::Value::as_u64);
             Some(StreamUsage {
                 input_tokens: input,
                 output_tokens: 0,
-                // Anthropic prompt-caching counters, present only when the
-                // request used caching — captured opportunistically (req8/9).
                 cache_read_input_tokens: usage
                     .get("cache_read_input_tokens")
                     .and_then(serde_json::Value::as_u64),
-                cache_creation_input_tokens: usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(serde_json::Value::as_u64),
+                cache_creation_input_tokens: written,
+                cache_creation_extended: extended_cache_writes(usage, written),
+                web_search_requests: web_search_requests(usage),
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -403,6 +461,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                     .unwrap_or(0),
                 cache_read_input_tokens: Some(cache),
                 cache_creation_input_tokens: written,
+                cache_creation_extended: extended_cache_writes(usage, written),
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -415,6 +475,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 output_tokens: output,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -466,6 +528,14 @@ impl UsageObserver {
                 if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
                     self.usage.cache_creation_input_tokens = Some(n);
                 }
+                // The TTL split and the web-search count are cumulative like
+                // the counters; the split is clamped to the total at finish.
+                if let Some(n) = extended_split(u) {
+                    self.usage.cache_creation_extended = Some(n);
+                }
+                if let Some(n) = web_search_requests(u) {
+                    self.usage.web_search_requests = Some(n);
+                }
                 if u.get("iterations").is_some() {
                     self.iterations = Some(u.clone());
                 }
@@ -504,9 +574,14 @@ impl UsageObserver {
     /// the attempt that produced the returned message" (refusals-and-
     /// fallback, read 2026-11-11), while `message_start` may carry the
     /// DECLINING model's usage and a final `message_delta` need not repeat
-    /// every counter.
+    /// every counter. So does the extended-TTL write subset (#278).
     pub fn finish(self) -> StreamUsage {
         let mut usage = self.usage;
+        // A later delta may report a total below an earlier split.
+        usage.cache_creation_extended = usage
+            .cache_creation_extended
+            .zip(usage.cache_creation_input_tokens)
+            .map(|(extended, total)| extended.min(total));
         let iterations = self.iterations.unwrap_or(serde_json::Value::Null);
         if let Some(served) = iterations
             .get("iterations")
@@ -522,6 +597,11 @@ impl UsageObserver {
             usage.output_tokens = count("output_tokens").unwrap_or(0);
             usage.cache_read_input_tokens = count("cache_read_input_tokens");
             usage.cache_creation_input_tokens = count("cache_creation_input_tokens");
+            // Its TTL split too (#278): message_start's belongs to the
+            // declining attempt. The web-search count is request-level
+            // (`usage.server_tool_use`) and stays as observed.
+            usage.cache_creation_extended =
+                extended_cache_writes(served, usage.cache_creation_input_tokens);
         }
         usage.sub_usage = uncounted_iterations(&iterations, &self.hops).unwrap_or_default();
         usage.served_model =
@@ -1174,6 +1254,8 @@ mod tests {
                 // No cache keys in the payload → unavailable, not zero.
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -1191,6 +1273,8 @@ mod tests {
                 // Present in the payload → captured (explicit 0 stays Some(0)).
                 cache_read_input_tokens: Some(40000),
                 cache_creation_input_tokens: Some(0),
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -1206,6 +1290,8 @@ mod tests {
                 output_tokens: 42,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -1241,6 +1327,8 @@ mod tests {
                 output_tokens: 10,
                 cache_read_input_tokens: Some(4_000),
                 cache_creation_input_tokens: Some(7_000),
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -1254,6 +1342,8 @@ mod tests {
                 output_tokens: 3,
                 cache_read_input_tokens: Some(20),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             })
@@ -1268,6 +1358,8 @@ mod tests {
             output_tokens: 0,
             cache_read_input_tokens: Some(5),
             cache_creation_input_tokens: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
         });
@@ -1276,6 +1368,8 @@ mod tests {
             output_tokens: 7,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            cache_creation_extended: None,
+            web_search_requests: None,
             sub_usage: Vec::new(),
             served_model: None,
         });
@@ -1288,6 +1382,8 @@ mod tests {
                 // never reported → stays unavailable.
                 cache_read_input_tokens: Some(5),
                 cache_creation_input_tokens: None,
+                cache_creation_extended: None,
+                web_search_requests: None,
                 sub_usage: Vec::new(),
                 served_model: None,
             }
@@ -1307,6 +1403,8 @@ mod tests {
             output,
             cache_read: read,
             cache_creation: write,
+            cache_creation_extended: None,
+            web_search_requests: None,
         }
     }
 
@@ -1491,6 +1589,45 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
+    fn a_fallback_stream_takes_its_extended_writes_from_the_serving_attempt_too() {
+        // The top level of a fallback-served turn is the `fallback_message`
+        // entry, its TTL split included: message_start's split belongs to
+        // the declining attempt and must not ride along.
+        let start = r#"data: {"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":535,"cache_creation_input_tokens":900,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":900},"output_tokens":1}}}"#;
+        let delta = |served: &str| {
+            format!(
+                r#"data: {{"type":"message_delta","usage":{{"output_tokens":264,"iterations":[{{"type":"message","model":"claude-fable-5","input_tokens":535,"cache_creation_input_tokens":900,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":900}},"output_tokens":0}},{{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":412,{served}"output_tokens":264}}]}}}}"#
+            )
+        };
+        let run = |served: &str| {
+            let mut observer = UsageObserver::default();
+            observer.observe(start);
+            observer.observe(&delta(served));
+            observer.finish()
+        };
+        let usage = run(
+            r#""cache_creation_input_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200},"#,
+        );
+        assert_eq!(
+            (
+                usage.cache_creation_input_tokens,
+                usage.cache_creation_extended
+            ),
+            (Some(300), Some(200)),
+            "the serving attempt's split"
+        );
+        let usage = run(r#""cache_creation_input_tokens":300,"#);
+        assert_eq!(
+            (
+                usage.cache_creation_input_tokens,
+                usage.cache_creation_extended
+            ),
+            (Some(300), None),
+            "no split on the serving attempt: none, not the declined one's"
+        );
+    }
+
+    #[test]
     fn a_fallback_stream_takes_its_top_level_counters_from_the_serving_attempt() {
         // A pre-output decline: message_start carries the DECLINING model's
         // usage and the final message_delta omits `input_tokens`. The doc
@@ -1583,5 +1720,127 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 12);
         assert_eq!(usage.cache_read_input_tokens, Some(20));
+    }
+
+    /// The "1-hour cache duration" response example of
+    /// platform.claude.com/docs/en/build-with-claude/prompt-caching (read
+    /// 2026-11-11): `cache_creation_input_tokens` is the sum of the
+    /// `cache_creation` object, 100 of the 248 written tokens at the 1h TTL.
+    const SPLIT_START: &str = r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":2048,"cache_read_input_tokens":1800,"cache_creation_input_tokens":248,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"output_tokens":1}}}"#;
+
+    #[test]
+    fn the_extended_ttl_write_subset_is_read_from_message_start_and_delta() {
+        let mut observer = UsageObserver::default();
+        observer.observe(SPLIT_START);
+        let started = observer.finish();
+        assert_eq!(started.cache_creation_input_tokens, Some(248));
+        assert_eq!(
+            started.cache_creation_extended,
+            Some(100),
+            "message_start carries the 1h subset"
+        );
+        // `message_delta` counters are cumulative and replace the start's;
+        // the split goes with its total (the SDK bridge's summed rounds).
+        let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":9,"cache_creation_input_tokens":548,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":400}}}"#;
+        let mut observer = UsageObserver::default();
+        observer.observe(SPLIT_START);
+        observer.observe(delta);
+        let usage = observer.finish();
+        assert_eq!(
+            (
+                usage.cache_creation_input_tokens,
+                usage.cache_creation_extended
+            ),
+            (Some(548), Some(400)),
+            "the delta's split replaces the start's, never adds to it"
+        );
+        // A delta without a split keeps the start's.
+        let mut observer = UsageObserver::default();
+        observer.observe(SPLIT_START);
+        observer.observe(r#"data: {"type":"message_delta","usage":{"output_tokens":9}}"#);
+        assert_eq!(observer.finish().cache_creation_extended, Some(100));
+        // No split at all: unknown, not zero (priced exactly as before).
+        let mut observer = UsageObserver::default();
+        observer.observe(MESSAGE_START);
+        assert_eq!(observer.finish().cache_creation_extended, None);
+    }
+
+    #[test]
+    fn a_malformed_split_is_clamped_to_the_total() {
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":10,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":99}}}}"#;
+        let usage = extract_usage(start).expect("usage");
+        assert_eq!(
+            (
+                usage.cache_creation_input_tokens,
+                usage.cache_creation_extended
+            ),
+            (Some(10), Some(10))
+        );
+        // A delta that lowers the total below an earlier split re-clamps.
+        let mut observer = UsageObserver::default();
+        observer.observe(SPLIT_START);
+        observer.observe(
+            r#"data: {"type":"message_delta","usage":{"output_tokens":1,"cache_creation_input_tokens":50}}"#,
+        );
+        let usage = observer.finish();
+        assert_eq!(
+            (
+                usage.cache_creation_input_tokens,
+                usage.cache_creation_extended
+            ),
+            (Some(50), Some(50))
+        );
+    }
+
+    #[test]
+    fn native_responses_usage_reads_the_12h_write_subset() {
+        // The worked example of developers.openai.com/api/docs/guides/
+        // prompt-caching (read 2026-11-11): 12,000 input, 4,000 cached,
+        // 7,000 written — 3,000 at 30m and 4,000 at 12h
+        // (`input_tokens_details.cache_write_tokens_details.ttl_12h_tokens`).
+        let event = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":12000,\"input_tokens_details\":{\"cached_tokens\":4000,\"cache_write_tokens\":7000,\"cache_write_tokens_details\":{\"ttl_30m_tokens\":3000,\"ttl_12h_tokens\":4000}},\"output_tokens\":10}}}";
+        let usage = extract_usage(event).expect("usage");
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.cache_creation_input_tokens, Some(7_000));
+        assert_eq!(usage.cache_creation_extended, Some(4_000));
+    }
+
+    #[test]
+    fn web_search_requests_are_read_and_cumulative_deltas_replace_them() {
+        // platform.claude.com/docs/en/about-claude/pricing ("Web search
+        // tool", read 2026-11-11): `usage.server_tool_use.web_search_requests`.
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":105,"output_tokens":1,"server_tool_use":{"web_search_requests":1}}}}"#;
+        let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":6039,"server_tool_use":{"web_search_requests":2}}}"#;
+        let mut observer = UsageObserver::default();
+        observer.observe(start);
+        assert_eq!(observer.finish().web_search_requests, Some(1));
+        let mut observer = UsageObserver::default();
+        observer.observe(start);
+        observer.observe(delta);
+        assert_eq!(
+            observer.finish().web_search_requests,
+            Some(2),
+            "the cumulative delta replaces the start's count"
+        );
+        let mut observer = UsageObserver::default();
+        observer.observe(MESSAGE_START);
+        assert_eq!(observer.finish().web_search_requests, None);
+    }
+
+    #[test]
+    fn a_sub_usage_carries_its_own_extended_writes() {
+        // prompt-caching: the `cache_creation` object also sits inside each
+        // `iterations` entry.
+        let usage = serde_json::json!({"iterations": [
+            {"type": "message", "input_tokens": 9, "output_tokens": 9},
+            {"type": "advisor_message", "model": "claude-opus-5-5", "input_tokens": 7,
+             "output_tokens": 3, "cache_creation_input_tokens": 500,
+             "cache_creation": {"ephemeral_5m_input_tokens": 200, "ephemeral_1h_input_tokens": 300}},
+        ]});
+        let subs = uncounted_iterations(&usage, &[]).expect("iterations");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].tokens.cache_creation, Some(500));
+        assert_eq!(subs[0].tokens.cache_creation_extended, Some(300));
     }
 }
