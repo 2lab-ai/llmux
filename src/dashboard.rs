@@ -1511,7 +1511,8 @@ pub enum CompletedDoc {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
-        /// Codex fast mode was in effect (`Some(false)` for claude; `None` =
+        /// The Fast tier was in effect (codex, or served Claude fast mode;
+        /// `None` =
         /// pre-field replayed history — "unknown"). Additive both ways:
         /// absent (→ `None`) in docs written before this field existed, and
         /// `None` is skipped on the wire so an OLDER attach client's plain
@@ -4108,6 +4109,83 @@ mod tests {
             now(),
             &meta(),
         )
+    }
+
+    /// Items 6 and 7: an Opus 5.5 request the proxy recorded as served in
+    /// fast mode (`fast`) with US-only inference (the class mark) costs 2.2x
+    /// standard on its activity row and every aggregate; a Haiku 5.5 one has
+    /// no fast price, so its 1M-token prompt takes the long tier ($0.50)
+    /// times the 1.1x only.
+    #[test]
+    fn claude_fast_mode_and_us_inference_price_alike_on_every_aggregate() {
+        let hub = DashboardHub::default();
+        let at = now() - Duration::from_secs(1);
+        let event = |id: u64, model: &str| ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens: Some(TokenCounts {
+                input: 1_000_000,
+                ..Default::default()
+            }),
+            group: Some("claude".into()),
+            model: Some(model.into()),
+            effort: None,
+            fast: Some(true),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: Some("k-us".into()),
+            sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass {
+                us_inference: true,
+                ..crate::pricing::PriceClass::STANDARD
+            },
+        };
+        hub.apply_event(event(61, "claude-opus-5-5"), at);
+        hub.apply_event(event(62, "claude-haiku-5-5"), at);
+        let doc = seeded_free_doc(&hub);
+        let close = |got: f64, want: f64, what: &str| {
+            assert!((got - want).abs() < 1e-9, "{what}: {got} != {want}");
+        };
+        let mut per_request = std::collections::BTreeMap::new();
+        for entry in &doc.activity.completed {
+            if let CompletedDoc::Request { id, cost_usd, .. } = entry {
+                per_request.insert(*id, *cost_usd);
+            }
+        }
+        close(per_request[&61], 4.0 * 2.0 * 1.1, "opus fast + us");
+        close(
+            per_request[&62],
+            0.50 * 1.1,
+            "haiku long + us, no fast price",
+        );
+        let total = per_request[&61] + per_request[&62];
+        let rows: f64 = doc.model_usage.iter().map(|m| m.cost_usd).sum();
+        close(rows, total, "model rows");
+        for gran in ["hour", "day", "month"] {
+            let stats: f64 = doc
+                .usage_stats
+                .iter()
+                .filter(|u| u.gran == gran)
+                .map(|u| u.cost_usd)
+                .sum();
+            close(stats, total, gran);
+        }
+        let tenant = doc
+            .tenant_usage
+            .iter()
+            .find(|t| t.tenant == "k-us")
+            .expect("tenant");
+        close(tenant.cost_usd, total, "tenant");
     }
 
     #[test]

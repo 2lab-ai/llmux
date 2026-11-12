@@ -2523,4 +2523,62 @@ mod tests {
             report
         );
     }
+
+    /// Items 6 and 7: the v4 class column stores the US-only and fast facts
+    /// as JSON next to the older ones, a v4 row written before them still
+    /// parses, and the report prices each row in its class.
+    #[test]
+    fn the_class_column_carries_us_inference_and_older_v4_rows_parse() {
+        let class = crate::pricing::PriceClass {
+            fast: true,
+            us_inference: true,
+            ..crate::pricing::PriceClass::STANDARD
+        };
+        assert_eq!(
+            price_class_text(&class),
+            r#"{"fast":true,"us_inference":true}"#
+        );
+        assert_eq!(
+            parse_price_class(r#"{"fast":true,"us_inference":true}"#),
+            class
+        );
+        assert_eq!(
+            parse_price_class(r#"{"fast":true}"#),
+            crate::pricing::PriceClass {
+                fast: true,
+                ..crate::pricing::PriceClass::STANDARD
+            }
+        );
+        let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000_000);
+        let mut event = event_with_sub_usage(31);
+        if let ActivityEvent::RequestFinished {
+            sub_usage,
+            fast,
+            price_class,
+            tokens,
+            ..
+        } = &mut event
+        {
+            sub_usage.clear();
+            *fast = Some(true);
+            *price_class = crate::pricing::PriceClass {
+                us_inference: true,
+                ..crate::pricing::PriceClass::STANDARD
+            };
+            *tokens = Some(TokenCounts {
+                input: 1_000_000,
+                ..Default::default()
+            });
+        }
+        crate::pricing::classify_finished(&mut event, at);
+        let mut db = UsageDb::open_in_memory().expect("db");
+        db.insert_many(&UsageRow::rows_from_event(&event, at))
+            .expect("insert");
+        let report = db
+            .query(&UsageQuery::new(UsageWindow::All, 2_000_000))
+            .expect("query");
+        let doc = usage_doc(report, &[], &HashMap::new(), UsageHealth::default(), 0);
+        let got = doc.tenants[0].cost_usd;
+        assert!((got - 4.0 * 2.0 * 1.1).abs() < 1e-9, "{got}");
+    }
 }

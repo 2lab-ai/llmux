@@ -1817,6 +1817,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -1861,6 +1863,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -1905,6 +1909,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -1965,6 +1971,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -2001,6 +2009,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -2033,6 +2043,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -2433,6 +2445,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }

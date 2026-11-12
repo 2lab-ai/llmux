@@ -697,6 +697,7 @@ impl ForwardContext {
             Vec::new(),
             None,
             crate::pricing::PriceClass::STANDARD,
+            None,
             sse::StreamTiming::default(),
         );
     }
@@ -718,7 +719,8 @@ impl ForwardContext {
             Some(token_counts(&usage)),
             usage.sub_usage,
             usage.served_model,
-            refusal_class(usage.unbilled_refusal),
+            served_class(usage.unbilled_refusal, usage.us_inference),
+            usage.served_fast,
             sse::StreamTiming::default(),
         );
     }
@@ -730,8 +732,11 @@ impl ForwardContext {
     /// `served_model` is the model a FALLBACK served the turn on
     /// ([`sse::StreamUsage::served_model`]): the top-level usage is that
     /// model's, so the record names it instead of the requested one.
-    /// `price_class` is the proxy's mark ([`refusal_class`]); the dashboard
+    /// `price_class` is the proxy's mark ([`served_class`]); the dashboard
     /// hub resolves the rest of the class when it records the request.
+    /// `served_fast` is the tier the response reported serving the request
+    /// at (Claude `usage.speed`, OpenAI `service_tier`); `None` records the
+    /// requested tier.
     #[allow(clippy::too_many_arguments)]
     fn emit_finished_timed(
         &self,
@@ -742,6 +747,7 @@ impl ForwardContext {
         sub_usage: Vec<crate::tui::SubUsage>,
         served_model: Option<String>,
         price_class: crate::pricing::PriceClass,
+        served_fast: Option<bool>,
         timing: sse::StreamTiming,
     ) {
         let FinishedMeta {
@@ -763,7 +769,7 @@ impl ForwardContext {
             group,
             model,
             effort,
-            fast: Some(fast),
+            fast: Some(served_fast.unwrap_or(fast)),
             ttfb_ms: self
                 .dispatched
                 .and_then(|d| timing.first_byte.map(|at| ms_since(d, at))),
@@ -3937,7 +3943,7 @@ async fn relay(
                         // that served it (its top-level usage is that one's).
                         model: usage.served_model.clone().or(model),
                         effort,
-                        fast: Some(fast),
+                        fast: Some(usage.served_fast.unwrap_or(fast)),
                         ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
                         ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
                         // Fixed INSIDE the pump at upstream EOF — finish-side
@@ -3949,7 +3955,7 @@ async fn relay(
                         excerpt,
                         tenant,
                         sub_usage: usage.sub_usage,
-                        price_class: refusal_class(usage.unbilled_refusal),
+                        price_class: served_class(usage.unbilled_refusal, usage.us_inference),
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -4533,7 +4539,7 @@ async fn relay_translate(
                         group,
                         model,
                         effort,
-                        fast: Some(fast),
+                        fast: Some(usage.served_fast.unwrap_or(fast)),
                         ttfb_ms: timing.first_byte.map(|at| ms_since(dispatched, at)),
                         ttft_ms: timing.first_content.map(|at| ms_since(dispatched, at)),
                         gen_ms: timing.gen_ms(),
@@ -4703,7 +4709,8 @@ async fn relay_translate(
                 Some(token_counts(&usage)),
                 usage.sub_usage,
                 usage.served_model,
-                refusal_class(usage.unbilled_refusal),
+                served_class(usage.unbilled_refusal, usage.us_inference),
+                usage.served_fast,
                 timing,
             );
             let mut out = Response::new(axum::body::Body::from(message_bytes));
@@ -4815,19 +4822,26 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
                 .unwrap_or(0),
             false,
         ),
+        // Claude fast mode and US-only inference, as served.
+        served_fast: sse::served_speed(usage),
+        us_inference: sse::us_inference(usage),
     }
 }
 
-/// The price class the proxy marks on a finished request (#283): an unbilled
-/// Anthropic refusal ([`sse::StreamUsage::unbilled_refusal`]) is
-/// [`crate::pricing::PriceClass::UNBILLED`], everything else standard (the
-/// hub resolves its long-context, Fast and dated facts). The mark only
-/// counts on the claude group ([`crate::pricing::PriceClass::resolve`]).
-fn refusal_class(unbilled_refusal: bool) -> crate::pricing::PriceClass {
+/// The price class the proxy marks on a finished request from what the
+/// response reported serving: an unbilled Anthropic refusal
+/// ([`sse::StreamUsage::unbilled_refusal`], #283) is
+/// [`crate::pricing::PriceClass::UNBILLED`]; US-only inference
+/// ([`sse::StreamUsage::us_inference`]) sets `us_inference`. The hub resolves
+/// the rest (long context, Fast, dated rates); both marks only count on the
+/// claude group ([`crate::pricing::PriceClass::resolve`]).
+fn served_class(unbilled_refusal: bool, us_inference: bool) -> crate::pricing::PriceClass {
     if unbilled_refusal {
-        crate::pricing::PriceClass::UNBILLED
-    } else {
-        crate::pricing::PriceClass::STANDARD
+        return crate::pricing::PriceClass::UNBILLED;
+    }
+    crate::pricing::PriceClass {
+        us_inference,
+        ..crate::pricing::PriceClass::STANDARD
     }
 }
 
@@ -4882,6 +4896,25 @@ mod tests {
             )
             .unbilled_refusal
         );
+    }
+
+    /// Claude fast mode and US-only inference on the JSON path: the served
+    /// `usage.speed` and `usage.inference_geo`.
+    #[test]
+    fn json_body_usage_carries_the_served_speed_and_inference_geo() {
+        let usage = usage_from_json_body(
+            br#"{"model":"claude-opus-5-5","usage":{"input_tokens":8,"output_tokens":12,"speed":"fast","inference_geo":"us"}}"#,
+        );
+        assert_eq!((usage.served_fast, usage.us_inference), (Some(true), true));
+        let usage = usage_from_json_body(
+            br#"{"usage":{"input_tokens":8,"output_tokens":12,"speed":"standard","inference_geo":"global"}}"#,
+        );
+        assert_eq!(
+            (usage.served_fast, usage.us_inference),
+            (Some(false), false)
+        );
+        let usage = usage_from_json_body(br#"{"usage":{"input_tokens":8,"output_tokens":12}}"#);
+        assert_eq!((usage.served_fast, usage.us_inference), (None, false));
     }
 
     #[test]
@@ -7610,6 +7643,42 @@ mod tests {
                 other => panic!("unexpected request with {other} input tokens"),
             }
         }
+    }
+
+    /// Claude fast mode and US-only inference reach the finished event from
+    /// the served usage: `fast` is the served speed (Claude requests were
+    /// always recorded `false` before), the class carries the US mark.
+    #[tokio::test]
+    async fn the_served_claude_speed_and_geo_reach_the_finished_event() {
+        const JSON_FAST_US: &str = r#"{"id":"msg_1","type":"message","model":"claude-opus-5-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":12,"speed":"fast","inference_geo":"us"}}"#;
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::Ok { body: JSON_FAST_US });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+        let response = forward(&state, client_request(r#"{"model":"claude-opus-5-5"}"#)).await;
+        let _ = response_body(response).await;
+        let (fast, class) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(ActivityEvent::RequestFinished {
+                        fast, price_class, ..
+                    }) => return Some((fast, price_class)),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("in time")
+        .expect("finished");
+        assert_eq!(fast, Some(true));
+        assert!(class.us_inference, "{class:?}");
     }
 
     /// Drive `sse::transform_body` with a REAL HTTP response (the scripted

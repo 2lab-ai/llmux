@@ -91,6 +91,12 @@ pub struct ModelPrice {
     /// else the `fast` rates. Additive in config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_long_context: Option<TierRates>,
+    /// The multiplier on every rate the class selects when the request ran
+    /// as US-only inference ([`PriceClass::us_inference`]; Anthropic
+    /// `inference_geo: "us"`, 1.1x on Claude 4.6 and later). `None` = no
+    /// premium. Additive in config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub us_inference: Option<f64>,
     /// Built-in only: the prompt size at which a request is long-context.
     /// Never read from or written to config (thresholds are not settable).
     #[serde(skip)]
@@ -257,9 +263,16 @@ pub struct PriceClass {
     /// rates.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub long_context: bool,
-    /// Codex Fast mode (`service_tier: "priority"`) was in effect.
+    /// The request was served at the Fast tier: codex Fast mode
+    /// (`service_tier: "priority"`) or Claude fast mode (`usage.speed:
+    /// "fast"`) — the served tier when the response reports it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    /// The request ran as US-only inference (Anthropic `usage.inference_geo:
+    /// "us"`, claude group only): every rate times the row's
+    /// [`ModelPrice::us_inference`] multiplier.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub us_inference: bool,
     /// The first day of the dated rate change in force on the request's UTC
     /// day (`None` = the row's original rates, or a row with no change).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,6 +289,7 @@ impl PriceClass {
     pub const STANDARD: Self = Self {
         long_context: false,
         fast: false,
+        us_inference: false,
         rates_from: None,
         unbilled: false,
     };
@@ -284,6 +298,7 @@ impl PriceClass {
     pub const UNBILLED: Self = Self {
         long_context: false,
         fast: false,
+        us_inference: false,
         rates_from: None,
         unbilled: true,
     };
@@ -309,12 +324,16 @@ impl PriceClass {
         fast: bool,
         day: RateDay,
     ) -> Self {
-        if self.unbilled && group.eq_ignore_ascii_case("claude") {
+        let claude = group.eq_ignore_ascii_case("claude");
+        if self.unbilled && claude {
             return Self::UNBILLED;
         }
+        // The proxy's served US-only mark is an Anthropic fact.
+        let us_inference = self.us_inference && claude;
         let Some(row) = price_for(group, model, &HashMap::new()) else {
             return Self {
                 fast,
+                us_inference,
                 ..Self::STANDARD
             };
         };
@@ -325,6 +344,7 @@ impl PriceClass {
                 .long_boundary
                 .is_some_and(|boundary| boundary.is_long(prompt_tokens(tokens))),
             fast,
+            us_inference,
             rates_from: change.map(|c| c.from),
             unbilled: false,
         }
@@ -342,6 +362,9 @@ impl PriceClass {
         }
         if self.fast {
             parts.push("fast".to_string());
+        }
+        if self.us_inference {
+            parts.push("US-only inference".to_string());
         }
         if let Some(day) = self.rates_from {
             parts.push(format!("rates from {day}"));
@@ -408,6 +431,7 @@ impl ModelPrice {
             long_context: None,
             fast: None,
             fast_long_context: None,
+            us_inference: None,
             long_boundary: None,
             rate_changes: &[],
         }
@@ -456,7 +480,15 @@ impl ModelPrice {
             (false, true) => row.fast,
             (true, true) => row.fast_long_context.or(row.long_context).or(row.fast),
         };
-        tier.unwrap_or(row.standard())
+        let rates = tier.unwrap_or(row.standard());
+        // US-only inference multiplies whatever the other facts selected
+        // ("Data residency multipliers apply on top of fast mode pricing";
+        // on Haiku 5.5 "also ... the higher prices for prompts over 100,000
+        // tokens").
+        match (class.us_inference, row.us_inference) {
+            (true, Some(factor)) => rates.times(factor),
+            _ => rates,
+        }
     }
 
     /// The latest built-in rate change in force on `day`, if any.
@@ -494,6 +526,14 @@ impl ModelPrice {
     const fn with_fast_standard_only(self, factor: f64) -> Self {
         Self {
             fast: Some(self.standard().times(factor)),
+            ..self
+        }
+    }
+
+    /// This row with the US-only inference multiplier.
+    const fn with_us_inference(self, factor: f64) -> Self {
+        Self {
+            us_inference: Some(factor),
             ..self
         }
     }
@@ -552,6 +592,27 @@ const HAIKU_5_5_LONG: LongBoundary = LongBoundary::Above(100_000);
 /// https://developers.openai.com/api/docs/pricing, read 2026-11-11.
 const OPENAI_FAST: f64 = 2.0;
 
+/// Claude fast mode is 2x every standard rate on the rows that have it:
+/// "Fast mode is priced at a multiplier on standard rates across the full
+/// context window" — Fable 5.2 and Mythos 5.2 $16 / $80, Opus 5.5 $8 / $40,
+/// Opus 5 and Opus 4.8 $10 / $50 — and "Prompt caching multipliers apply on
+/// top of fast mode pricing", so cache reads and both writes double too
+/// (https://platform.claude.com/docs/en/build-with-claude/fast-mode and the
+/// pricing page's "Fast mode pricing", read 2026-11-12). Classified from the
+/// SERVED `usage.speed`.
+const CLAUDE_FAST: f64 = 2.0;
+/// US-only inference: "Claude 4.6 and later models: US-only inference
+/// (`inference_geo: "us"`) is priced at 1.1x the standard rate across all
+/// token pricing categories (input tokens, output tokens, cache writes, and
+/// cache reads). On Claude Haiku 5.5, the multiplier also applies to the
+/// higher prices for prompts over 100,000 tokens"
+/// (https://platform.claude.com/docs/en/manage-claude/data-residency,
+/// "Pricing", read 2026-11-12). Earlier models reject the parameter. Rows
+/// shared with an earlier model (the Opus tier with Opus 4.5, the Sonnet tier
+/// with Sonnet 4.5) carry it too: those models can never report US-only
+/// inference. Classified from the SERVED `usage.inference_geo`.
+const CLAUDE_US_ONLY: f64 = 1.1;
+
 /// Every Claude row's 1-hour cache-write rate is 2x its input rate: the "1h
 /// cache writes" column of https://platform.claude.com/docs/en/about-claude/pricing,
 /// read 2026-11-11 ("Cache write tokens with a 1-hour TTL are 2 times the base
@@ -560,12 +621,20 @@ const OPENAI_FAST: f64 = 2.0;
 /// Opus-tier rates {input 5.0, output 25.0, cache_read 0.5, cache_creation 6.25,
 /// 1h 10.0} (Opus 5 / 4.8 / 4.7 / 4.6 / 4.5). Also the `group == "claude"`
 /// unknown-model fallback.
-const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25).with_extended(10.0);
+const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25)
+    .with_extended(10.0)
+    .with_us_inference(CLAUDE_US_ONLY);
+/// Opus 5 and Opus 4.8: the Opus tier plus fast mode ([`CLAUDE_FAST`]: $10 /
+/// $50; Opus 5 in research preview, Opus 4.8 deprecated).
+const OPUS_TIER_FAST: ModelPrice = OPUS_TIER.with_fast(CLAUDE_FAST);
 /// Opus 5.5 (Anthropic announcement 2026-09-22): $4 in / $20 out / cache read
 /// 0.20 / cache write 5.0 — 20% below the opus tier, cache reads 60% below, so
 /// it must NOT fall to the `claude-opus-` prefix fallback. 1h writes $8
 /// (pricing page, read 2026-11-11).
-const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0).with_extended(8.0);
+const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0)
+    .with_extended(8.0)
+    .with_fast(CLAUDE_FAST)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Claude Opus 4.1 and Claude Opus 4 (retired on the Claude API, still served
 /// on some cloud platforms): $15 in / $18.75 5m writes / $30 1h writes / $1.50
 /// cache hits / $75 out, https://platform.claude.com/docs/en/about-claude/pricing,
@@ -575,13 +644,19 @@ const OPUS_4_1: ModelPrice = ModelPrice::new(15.0, 75.0, 1.50, 18.75).with_exten
 /// Sonnet-tier rates {3.0, 15.0, 0.3, 3.75, 1h 6.0} — the 4.x generation
 /// (`claude-sonnet-4-6` / `-4-5`) and the `claude-sonnet-` prefix fallback.
 /// 1h writes $6 (pricing page, read 2026-11-11).
-const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75).with_extended(6.0);
+const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75)
+    .with_extended(6.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Sonnet 5 (pricing page, read 2026-10-08): $2 / $10 / $0.20 / $2.50; 1h
 /// writes $4 (read 2026-11-11).
-const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5).with_extended(4.0);
+const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.20, 2.5)
+    .with_extended(4.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Sonnet 5.5 cache reads fell to $0.10 on 2026-10-07. Other rates unchanged.
 /// 1h writes $4 (pricing page, read 2026-11-11).
-const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5).with_extended(4.0);
+const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5)
+    .with_extended(4.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Haiku 4.5 rates; also the unknown Haiku family fallback. Since 2026-10-23
 /// Haiku 4.5 ids are SERVED by Haiku 5.5 (`crate::catalog::SUPERSEDED_CLAUDE_IDS`),
 /// but new requests are recorded under the served `claude-haiku-5-5`, so a
@@ -595,30 +670,45 @@ const HAIKU_TIER: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25).with_extende
 /// (the "for prompts over 100,000 tokens" row, pricing page, read 2026-11-11).
 const HAIKU_5_5: ModelPrice = ModelPrice::new(0.10, 0.50, 0.01, 0.125)
     .with_extended(0.20)
-    .with_long(HAIKU_5_5_LONG, tier(0.50, 2.50, 0.05, 0.625, Some(1.0)));
+    .with_long(HAIKU_5_5_LONG, tier(0.50, 2.50, 0.05, 0.625, Some(1.0)))
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Fable 5 rates; also the unknown Fable family fallback. 1h writes $20
 /// (pricing page, read 2026-11-11).
-const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_extended(20.0);
+const FABLE_TIER: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5)
+    .with_extended(20.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Fable 5.1 cache reads are $0.25 (official pricing, read 2026-10-08). 1h
 /// writes $20 (read 2026-11-11).
-const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5).with_extended(20.0);
+const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5)
+    .with_extended(20.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Fable 5.2 (released 2026-11-09; official pricing, read 2026-11-10): $8 in /
 /// $40 out / $0.20 cache read / $10 cache write (5m); 1h writes $16 (read
 /// 2026-11-11). There is no long-context tier. CHEAPER than Fable 5 / 5.1, so
 /// it must NOT fall to the `claude-fable-` prefix fallback.
-const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0).with_extended(16.0);
+const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0)
+    .with_extended(16.0)
+    .with_fast(CLAUDE_FAST)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Mythos 5.2 (limited availability): $8 in / $40 out / $0.20 cache read /
 /// $10 cache write (5m) / $16 (1h),
 /// https://platform.claude.com/docs/en/about-claude/pricing, read 2026-11-11.
 /// Before this row the id fell to the claude group fallback (opus tier).
-const MYTHOS_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0).with_extended(16.0);
+const MYTHOS_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0)
+    .with_extended(16.0)
+    .with_fast(CLAUDE_FAST)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Mythos 5.1 (limited availability): $10 in / $50 out / $0.25 cache read /
 /// $12.50 cache write (5m) / $20 (1h), same page, read 2026-11-11.
-const MYTHOS_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5).with_extended(20.0);
+const MYTHOS_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5)
+    .with_extended(20.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// Mythos 5 (limited availability): $10 in / $50 out / $1 cache read /
 /// $12.50 cache write (5m) / $20 (1h), same page, read 2026-11-11. Also the
 /// unknown Mythos family fallback.
-const MYTHOS_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_extended(20.0);
+const MYTHOS_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5)
+    .with_extended(20.0)
+    .with_us_inference(CLAUDE_US_ONLY);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 5.0}. The pricing page lists no cache-write rate for
 /// gpt-5.5 (re-read 2026-11-11; later rows do list one), and the prompt-
@@ -812,8 +902,8 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "claude-opus-5-5" => Some(OPUS_5_5),
         // `claude-opus-4-0` is Anthropic's alias of the Opus 4 snapshot.
         "claude-opus-4-1" | "claude-opus-4" | "claude-opus-4-0" => Some(OPUS_4_1),
-        "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6"
-        | "claude-opus-4-5" => Some(OPUS_TIER),
+        "claude-opus-5" | "claude-opus-4-8" => Some(OPUS_TIER_FAST),
+        "claude-opus-4-7" | "claude-opus-4-6" | "claude-opus-4-5" => Some(OPUS_TIER),
         "claude-sonnet-5-5" => Some(SONNET_5_5),
         "claude-sonnet-5" => Some(SONNET_5),
         "claude-sonnet-4-6" | "claude-sonnet-4-5" => Some(SONNET_TIER),
@@ -1951,9 +2041,11 @@ mod tests {
             "fable-5-2",
             "claude-fable-5-2-20261109",
         ] {
+            // Its standard rates (the row also carries its fast-mode and
+            // US-only tiers, pinned by their own tests).
             assert_eq!(
-                price_for("claude", model, &empty()),
-                Some(fable_5_2),
+                price_for("claude", model, &empty()).map(|p| p.standard()),
+                Some(fable_5_2.standard()),
                 "{model}"
             );
         }
@@ -2018,12 +2110,15 @@ mod tests {
                 ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_extended(20.0),
             ),
         ] {
-            assert_eq!(price_for("claude", model, &empty()), Some(want), "{model}");
+            assert_eq!(
+                price_for("claude", model, &empty()).map(|p| p.standard()),
+                Some(want.standard()),
+                "{model}"
+            );
         }
         // Version boundary, as for Fable: `claude-mythos-5-20` is not 5.2.
-        let mythos_5 = Some(ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_extended(20.0));
-        assert_eq!(builtin_price("claude-mythos-5-20"), mythos_5);
-        assert_eq!(builtin_price("claude-mythos-5-2x"), mythos_5);
+        assert_eq!(builtin_price("claude-mythos-5-20"), Some(MYTHOS_5));
+        assert_eq!(builtin_price("claude-mythos-5-2x"), Some(MYTHOS_5));
     }
 
     #[test]
@@ -2859,7 +2954,8 @@ mod tests {
         ] {
             assert_eq!(price_for("claude", model, &empty()), Some(want), "{model}");
         }
-        // The 4.5+ rows and their snapshots keep the Opus tier.
+        // The 4.5+ rows and their snapshots keep the Opus tier (Opus 4.8
+        // with its fast mode).
         for model in [
             "claude-opus-4-5",
             "claude-opus-4-5-20251101",
@@ -2868,8 +2964,8 @@ mod tests {
             "claude-opus-4-1x",
         ] {
             assert_eq!(
-                price_for("claude", model, &empty()),
-                Some(OPUS_TIER),
+                price_for("claude", model, &empty()).map(|p| p.standard()),
+                Some(OPUS_TIER.standard()),
                 "{model}"
             );
         }
@@ -2977,6 +3073,7 @@ mod tests {
             long_context: true,
             fast: true,
             rates_from: Some(RateDay::ymd(2026, 12, 1)),
+            us_inference: false,
             unbilled: false,
         };
         assert_eq!(flat.rates(both), flat.standard());
@@ -3024,6 +3121,7 @@ mod tests {
             long_context: true,
             fast: true,
             rates_from: Some(RateDay::ymd(2026, 12, 1)),
+            us_inference: false,
             unbilled: false,
         };
         let json = serde_json::to_string(&class).expect("ser");
@@ -3157,6 +3255,114 @@ mod tests {
                 &empty(),
             ),
             (120_000.0 * 0.50 + 300.0 * 2.50 + 5_000.0 * 4.0 + 800.0 * 20.0) / 1e6,
+        );
+    }
+
+    /// Claude fast mode (https://platform.claude.com/docs/en/build-with-claude/fast-mode
+    /// and the pricing page's "Fast mode pricing", read 2026-11-12): Fable 5.2
+    /// and Mythos 5.2 $16 / $80, Opus 5.5 $8 / $40, Opus 5 and Opus 4.8 $10 /
+    /// $50, "a multiplier on standard rates across the full context window",
+    /// with "Prompt caching multipliers ... on top": every rate is 2x. No
+    /// other row has a fast price.
+    #[test]
+    fn claude_fast_mode_is_twice_every_standard_rate_where_it_exists() {
+        for (model, input, output) in [
+            ("claude-fable-5-2", 16.0, 80.0),
+            ("claude-mythos-5-2", 16.0, 80.0),
+            ("claude-opus-5-5", 8.0, 40.0),
+            ("claude-opus-5", 10.0, 50.0),
+            ("claude-opus-4-8", 10.0, 50.0),
+        ] {
+            let price = price_for("claude", model, &empty()).expect("priced");
+            let fast_rates = price.rates(fast());
+            assert_eq!(fast_rates, price.standard().times(2.0), "{model}");
+            assert_eq!(
+                (fast_rates.input, fast_rates.output),
+                (input, output),
+                "{model}"
+            );
+        }
+        // Opus 5.5: cache hits 0.05x of $8 = $0.40, 5m writes 1.25x = $10,
+        // 1h writes 2x = $16.
+        assert_eq!(
+            price_for("claude", "claude-opus-5-5", &empty())
+                .expect("priced")
+                .rates(fast()),
+            rates(8.0, 40.0, 0.40, 10.0, Some(16.0))
+        );
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+        ] {
+            let price = price_for("claude", model, &empty()).expect("priced");
+            assert_eq!(price.rates(fast()), price.standard(), "{model}");
+        }
+    }
+
+    /// US-only inference (https://platform.claude.com/docs/en/manage-claude/data-residency,
+    /// "Pricing", read 2026-11-12): "Claude 4.6 and later models: US-only
+    /// inference (`inference_geo: "us"`) is priced at 1.1x the standard rate
+    /// across all token pricing categories ... On Claude Haiku 5.5, the
+    /// multiplier also applies to the higher prices for prompts over 100,000
+    /// tokens", and "Data residency multipliers apply on top of fast mode
+    /// pricing" (fast-mode page).
+    #[test]
+    fn us_only_inference_is_1_1x_every_rate_on_claude_4_6_and_later() {
+        let us = PriceClass {
+            us_inference: true,
+            ..PriceClass::STANDARD
+        };
+        for model in [
+            "claude-fable-5-2",
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-2",
+            "claude-mythos-5-1",
+            "claude-mythos-5",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-5-5",
+        ] {
+            let price = price_for("claude", model, &empty()).expect("priced");
+            assert_eq!(price.rates(us), price.standard().times(1.1), "{model}");
+        }
+        let haiku = price_for("claude", "claude-haiku-5-5", &empty()).expect("priced");
+        let long_us = PriceClass {
+            long_context: true,
+            us_inference: true,
+            ..PriceClass::STANDARD
+        };
+        assert_eq!(haiku.rates(long_us), haiku.rates(long()).times(1.1));
+        let opus = price_for("claude", "claude-opus-5-5", &empty()).expect("priced");
+        let fast_us = PriceClass {
+            fast: true,
+            us_inference: true,
+            ..PriceClass::STANDARD
+        };
+        assert_eq!(opus.rates(fast_us), opus.standard().times(2.0).times(1.1));
+        // Older models do not support it; no premium.
+        for model in ["claude-haiku-4-5", "claude-opus-4-1"] {
+            let price = price_for("claude", model, &empty()).expect("priced");
+            assert_eq!(price.rates(us), price.standard(), "{model}");
+        }
+        // The served mark counts on the claude group only.
+        let t = prompt(10, 0, 0);
+        assert!(
+            us.resolve("claude", "claude-opus-5-5", &t, false, NOV_11)
+                .us_inference
+        );
+        assert!(
+            !us.resolve("codex", "gpt-6.1-sol", &t, false, NOV_11)
+                .us_inference
         );
     }
 }

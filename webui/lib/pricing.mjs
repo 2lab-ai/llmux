@@ -5,8 +5,8 @@
 // `cache_creation`, the short-TTL writes the rest; `d` and `e` are both absolute write rates and `f` is
 // the per-search fee.) Solving those rows by least squares gives the rates the daemon used (overrides
 // included), so history rows that carry tokens but no cost can be priced without copying src/pricing.rs.
-// Price classes (#278): a row's `price_classes` shares (long context, Fast, dated rates, an unbilled
-// refusal) carry their own tokens and cost. The standard remainder (row minus shares) solves under the
+// Price classes (#278): a row's `price_classes` shares (long context, Fast, US-only inference, dated
+// rates, an unbilled refusal) carry their own tokens and cost. The standard remainder (row minus shares) solves under the
 // model's key and each priced share under `model|<class>`; a history row (or sub-usage) is priced with
 // the rates of its own `price_class`, and an unbilled refusal costs nothing.
 
@@ -33,7 +33,7 @@ const COLS = [
 /** Stable key of a price class: '' for the standard class (absent / `{}`). */
 export function classKey(c) {
   if (!c) return '';
-  return [c.long_context && 'long_context', c.fast && 'fast', c.rates_from && `rates_from=${c.rates_from}`, c.unbilled && 'unbilled']
+  return [c.long_context && 'long_context', c.fast && 'fast', c.us_inference && 'us_inference', c.rates_from && `rates_from=${c.rates_from}`, c.unbilled && 'unbilled']
     .filter(Boolean).join(',');
 }
 

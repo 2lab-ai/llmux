@@ -106,8 +106,9 @@ pub(crate) enum CompletedBody {
         group: Option<String>,
         model: Option<String>,
         effort: Option<String>,
-        /// Codex fast mode was in effect (`Some(false)` for claude; `None`
-        /// only for pre-field replayed history — "unknown", never coerced).
+        /// The Fast tier was in effect (codex, or served Claude fast mode;
+        /// `None` only for pre-field replayed history — "unknown", never
+        /// coerced).
         fast: Option<bool>,
         /// Millis to first upstream body chunk / first streamed output delta
         /// (both from the served attempt's upstream dispatch), plus the
@@ -1003,7 +1004,8 @@ pub(crate) struct PersistedRequest {
     pub group: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Codex fast mode was in effect (`Some(false)` for claude). Additive:
+    /// The Fast tier was in effect (codex fast mode, or the served Claude
+    /// fast mode; see `ActivityEvent::RequestFinished::fast`). Additive:
     /// lines persisted before this field existed deserialize to `None` —
     /// "unknown", deliberately NOT `false`, so legacy history can never be
     /// misfiled into the fast=off statistics (perf telemetry v1).

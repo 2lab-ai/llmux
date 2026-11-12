@@ -144,6 +144,22 @@ test('an explicitly free price class stays free on history rows (#278)', () => {
   assert.equal(priceRow(row, rates, new Map()), 0, 'not repriced at the standard $0.30');
 });
 
+test('US-only inference and Claude fast mode are their own classes on history rows (#278)', () => {
+  const a = 1e-6;
+  const rows = [[1e5, 2e5, 3e5], [4e5, 1e5, 2e4], [7e3, 9e4, 5e5]].map(([i, us, fu]) => ({
+    gran: 'hour', model: 'opus', tokens_in: i + us + fu, cost_usd: i * a + us * 1.1 * a + fu * 2.2 * a,
+    price_classes: [
+      { class: { us_inference: true }, tokens: { input: us }, cost_usd: us * 1.1 * a },
+      { class: { fast: true, us_inference: true }, tokens: { input: fu }, cost_usd: fu * 2.2 * a },
+    ],
+  }));
+  const rates = solveRates(rows);
+  const tokens = { input: 1e6 };
+  assert.equal(+priceRow({ model: 'opus', cost_usd: null, tokens, price_class: { us_inference: true } }, rates, new Map()).toFixed(6), 1.1);
+  assert.equal(+priceRow({ model: 'opus', cost_usd: null, tokens, price_class: { fast: true, us_inference: true } }, rates, new Map()).toFixed(6), 2.2);
+  assert.equal(+priceRow({ model: 'opus', cost_usd: null, tokens }, rates, new Map()).toFixed(6), 1);
+});
+
 test('solveRates refuses a fit that is not linear', () => {
   const rows = [1, 2, 3, 4, 5, 6].map(i => ({ gran: 'hour', model: 'x', tokens_in: i * 100, tokens_out: i * i * 10, cache_read: 0, cache_creation: 0, cost_usd: Math.random() * 10 + 1 }));
   assert.equal(solveRates(rows).has('x'), false);

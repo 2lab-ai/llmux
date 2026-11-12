@@ -250,12 +250,14 @@ Rates are USD per million tokens:
 
 | `long_context` | Optional (#278). The rates of a long-context request, as an object with the same five fields (`input`, `output`, `cache_read`, `cache_creation`, optional `cache_creation_extended`). Absent means the entry has no long tier. |
 | `fast` | Optional (#278). The rates of a codex Fast request (same object shape). Absent means no Fast premium. |
+| `us_inference` | Optional (#278). A multiplier on every rate the request's class selects when the response reports US-only inference (`usage.inference_geo: "us"`, claude group); the built-in Claude 4.6+ rows use `1.1`. Absent means no premium. |
 | `fast_long_context` | Optional (#278). The rates of a request that is both long-context and Fast (same object shape); it applies even when the entry has no `long_context`. Absent means the `long_context` rates, else the `fast` rates. |
 
 An entry replaces the whole built-in row, tiers included: an entry without
-`long_context` prices a long request at its own standard rates (flat), and one
-without `fast` prices a Fast request at its standard rates, even when the
-built-in row has those tiers. Which requests are long-context is NOT
+`long_context` prices a long request at its own standard rates (flat), one
+without `fast` prices a Fast request (codex Fast or Claude fast mode) at its
+standard rates, and one without `us_inference` adds no US-only premium, even
+when the built-in row has those tiers. Which requests are long-context is NOT
 configurable: the boundary is built-in data per model (OpenAI `> 272,000`,
 xAI `>= 200,000`, Claude Haiku 5.5 `> 100,000` prompt tokens; see
 [models.md](models.md#per-request-price-classes)), so an entry's

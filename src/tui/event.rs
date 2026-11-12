@@ -233,11 +233,14 @@ pub enum ActivityEvent {
         /// upstream, after the clamp; claude: thinking budget like `"16k"`),
         /// when known.
         effort: Option<String>,
-        /// Whether codex fast mode (`service_tier: "priority"`) was in effect
-        /// for this request. `Some(false)` for claude requests and pre-routing
-        /// failures; `None` ONLY for replayed history persisted before the
-        /// field existed ("unknown" — never coerced to off, so legacy lines
-        /// cannot pollute the fast=off statistics).
+        /// Whether the request was served at the Fast tier: the tier the
+        /// response reported (Claude `usage.speed: "fast"`, OpenAI
+        /// `service_tier: "priority"`) when it reports one, else the
+        /// requested codex fast mode (`service_tier: "priority"`; Claude
+        /// requests without a reported speed record `Some(false)`, as do
+        /// pre-routing failures). `None` ONLY for replayed history persisted
+        /// before the field existed ("unknown" — never coerced to off, so
+        /// legacy lines cannot pollute the fast=off statistics).
         fast: Option<bool>,
         /// Time to first successful upstream body chunk (TTFB), millis from
         /// request start. `None` on non-streaming relays, pre-body failures,

@@ -769,8 +769,9 @@ never on an aggregate's summed tokens.
 Writes a response does not report as 1-hour take the 5-minute rate and those it
 does the 1-hour rate (`usage.cache_creation.ephemeral_1h_input_tokens`, since
 2026-11-11; earlier history has no split and keeps the 5-minute price). Each
-request's server web searches add $10 per 1,000. Claude Fast mode and data
-residency premiums are not applied (llmux records neither). Aggregates keep the
+request's server web searches add $10 per 1,000. Claude fast mode and US-only
+inference are priced from what the response reports (`usage.speed`,
+`usage.inference_geo`). Aggregates keep the
 1-hour write subset, the search count and the tokens of each non-standard
 class, so they price as the sum of their requests. These are API-equivalent
 estimates, never a subscription invoice. Existing config price overrides still
@@ -821,7 +822,8 @@ attempt) is classified on its own prompt and model.
 | Fact | When | Rates |
 | --- | --- | --- |
 | Long context | The prompt (input + cache reads + cache writes) is over 272,000 tokens on a listed GPT row, 200,000 or more on `grok-4.5` / `grok-4.6` / `grok-4.7` (and the grok fallback), over 100,000 on `claude-haiku-5-5`. Built-in data, not configurable. | The whole request at the long rates below. |
-| Fast | Codex Fast mode (`service_tier: "priority"`) was in effect. | The Fast rates below. |
+| Fast | The request was served at the Fast tier: codex Fast mode (the response's `service_tier: "priority"`, or the requested tier when the response does not report one) or Claude fast mode (the response's `usage.speed: "fast"`). | The Fast rates below; Claude fast mode is 2× every standard rate on Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5 and Opus 4.8 ($16 / $80, $16 / $80, $8 / $40, $10 / $50, $10 / $50, cache rates doubled too). Rows with no fast price stay standard. |
+| US-only inference | The response's `usage.inference_geo` is `"us"` (claude group). | 1.1× every rate the other facts select (on top of fast mode, and of Haiku 5.5's long tier), on Claude 4.6 and later rows. |
 | Dated rates | The request's UTC day is on or after a built-in rate change (the pricing page names no time zone, so the change is at 00:00 UTC). | That change's rates. |
 | Unbilled refusal | An Anthropic response with `stop_reason: "refusal"`, no output tokens and a `stop_details.category` that is not `bio`, `frontier_llm` or `reasoning_extraction` (claude group only). | No cost; the tokens stay visible. |
 
@@ -852,6 +854,23 @@ read 2026-11-11): `gemini-4-argon` (and `argon`, `gemini-4-argon-*`) $2.00 /
 $10.00 / $0.10 through 2026-11-30, $4.00 / $20.00 / $0.20 from 2026-12-01;
 Gemini 3.8 Flash (every thinking variant, and the gemini fallback) $0.75 /
 $3.75 / $0.075 through 2026-12-31, $1.50 / $7.50 / $0.15 from 2027-01-01.
+
+Claude fast mode ([fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode),
+read 2026-11-12) "is priced at a multiplier on standard rates across the full
+context window" and "Prompt caching multipliers apply on top of fast mode
+pricing"; US-only inference
+([data residency](https://platform.claude.com/docs/en/manage-claude/data-residency),
+read 2026-11-12) is "1.1x the standard rate across all token pricing
+categories" on Claude 4.6 and later, and "Data residency multipliers apply on
+top of fast mode pricing". Both are classified from the served usage, so a
+request that asked for fast mode but ran at standard speed (`usage.speed:
+"standard"`) prices standard, and a workspace whose default geo is `us`
+prices at 1.1× without the request parameter. Opus 4.5 and Sonnet 4.5 share
+their price rows with Opus 4.6 / 4.7 and Sonnet 4.6; they reject
+`inference_geo`, so they never report US-only inference. llmux does not price
+Claude's Priority Tier, Batch or regional cloud-platform rates. An OpenAI
+`service_tier` other than `priority` (`default`, `flex`, `ultrafast`) prices at
+the Standard rates; llmux never requests flex or Ultrafast.
 
 `gpt-5.6-sol`'s rates are promotional "until November 30, 2026"; OpenAI has not
 published the later price, so the row keeps the current one.

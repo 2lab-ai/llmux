@@ -50,6 +50,13 @@ pub struct StreamUsage {
     /// ([`unbilled_refusal`]). Its tokens are still recorded; the request is
     /// priced at 0 ([`crate::pricing::PriceClass::UNBILLED`]).
     pub unbilled_refusal: bool,
+    /// The tier the response says served the request, when it says so:
+    /// Anthropic `usage.speed` (`"fast"` / `"standard"`), OpenAI
+    /// `response.service_tier` (`"priority"` = Fast). `None` = not reported;
+    /// the requested tier is recorded then.
+    pub served_fast: Option<bool>,
+    /// Anthropic `usage.inference_geo` was `"us"` (US-only inference).
+    pub us_inference: bool,
 }
 
 impl StreamUsage {
@@ -69,7 +76,44 @@ impl StreamUsage {
         self.cache_creation_extended =
             add_opt(self.cache_creation_extended, other.cache_creation_extended);
         self.web_search_requests = add_opt(self.web_search_requests, other.web_search_requests);
+        self.served_fast = other.served_fast.or(self.served_fast);
+        self.us_inference |= other.us_inference;
     }
+}
+
+/// The served Claude speed of one usage object: `usage.speed` `"fast"` →
+/// `Some(true)`, any other reported value (`"standard"`) → `Some(false)`,
+/// absent → `None` ("The response `usage` object includes a `speed` field
+/// that indicates which speed was used", build-with-claude/fast-mode, read
+/// 2026-11-12).
+pub fn served_speed(usage: &serde_json::Value) -> Option<bool> {
+    usage
+        .get("speed")
+        .and_then(serde_json::Value::as_str)
+        .map(|speed| speed == "fast")
+}
+
+/// Whether one usage object reports US-only inference: `usage.inference_geo`
+/// `"us"` ("The response `usage` object includes an `inference_geo` field
+/// indicating where inference ran", manage-claude/data-residency, read
+/// 2026-11-12).
+pub fn us_inference(usage: &serde_json::Value) -> bool {
+    usage
+        .get("inference_geo")
+        .and_then(serde_json::Value::as_str)
+        == Some("us")
+}
+
+/// The OpenAI tier that served a Responses request: `response.service_tier`
+/// `"priority"` (Fast) → `Some(true)`, any other reported tier → `Some(false)`,
+/// absent or null → `None` ("the response body will include the
+/// `service_tier` value based on the processing mode actually used to serve
+/// the request", Responses API reference, read 2026-11-12).
+pub fn served_service_tier(response: &serde_json::Value) -> Option<bool> {
+    response
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+        .map(|tier| tier == "priority")
 }
 
 /// Refusal categories Anthropic bills even when the refusal came before any
@@ -461,6 +505,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: served_speed(usage),
+                us_inference: us_inference(usage),
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -471,7 +517,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
             // 2026-11-11), so fresh input is what is left after both and the
             // writes are cache creation. Same rule as the translate path
             // (`crate::provider::responses`).
-            let usage = value.get("response")?.get("usage")?;
+            let response = value.get("response")?;
+            let usage = response.get("usage")?;
             let input = usage.get("input_tokens")?.as_u64()?;
             let cache = usage
                 .pointer("/input_tokens_details/cached_tokens")
@@ -495,6 +542,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: served_service_tier(response),
+                us_inference: false,
             })
         }
         "message_delta" => {
@@ -510,6 +559,8 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             })
         }
         _ => None,
@@ -583,6 +634,12 @@ impl UsageObserver {
                 }
                 if let Some(n) = web_search_requests(u) {
                     self.usage.web_search_requests = Some(n);
+                }
+                if let Some(fast) = served_speed(u) {
+                    self.usage.served_fast = Some(fast);
+                }
+                if us_inference(u) {
+                    self.usage.us_inference = true;
                 }
                 if u.get("iterations").is_some() {
                     self.iterations = Some(u.clone());
@@ -1323,6 +1380,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             })
         );
     }
@@ -1343,6 +1402,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             })
         );
     }
@@ -1361,6 +1422,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             })
         );
     }
@@ -1399,6 +1462,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             })
         );
         // No write field: unchanged behaviour (creation unavailable).
@@ -1415,6 +1480,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             })
         );
     }
@@ -1432,6 +1499,8 @@ mod tests {
             sub_usage: Vec::new(),
             served_model: None,
             unbilled_refusal: false,
+            served_fast: None,
+            us_inference: false,
         });
         total.add(StreamUsage {
             input_tokens: 0,
@@ -1443,6 +1512,8 @@ mod tests {
             sub_usage: Vec::new(),
             served_model: None,
             unbilled_refusal: false,
+            served_fast: None,
+            us_inference: false,
         });
         assert_eq!(
             total,
@@ -1458,6 +1529,8 @@ mod tests {
                 sub_usage: Vec::new(),
                 served_model: None,
                 unbilled_refusal: false,
+                served_fast: None,
+                us_inference: false,
             }
         );
     }
@@ -2001,5 +2074,60 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
             observer.observe(event);
         }
         assert!(!observer.finish().unbilled_refusal);
+    }
+
+    /// Claude fast mode and US-only inference are read from the SERVED
+    /// usage: "The response `usage` object includes a `speed` field ...
+    /// either "fast" or "standard"" (build-with-claude/fast-mode) and "an
+    /// `inference_geo` field indicating where inference ran"
+    /// (manage-claude/data-residency), both read 2026-11-12.
+    #[test]
+    fn the_served_speed_and_inference_geo_are_read_from_the_usage() {
+        let run = |events: &[&str]| {
+            let mut observer = UsageObserver::default();
+            for event in events {
+                observer.observe(event);
+            }
+            observer.finish()
+        };
+        let usage = run(&[
+            r#"data: {"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":0,"speed":"fast","inference_geo":"us"}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+        ]);
+        assert_eq!((usage.served_fast, usage.us_inference), (Some(true), true));
+        let usage = run(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5,"speed":"standard","inference_geo":"global"}}"#,
+        ]);
+        assert_eq!(
+            (usage.served_fast, usage.us_inference),
+            (Some(false), false)
+        );
+        let usage = run(&[
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+        ]);
+        assert_eq!((usage.served_fast, usage.us_inference), (None, false));
+    }
+
+    /// OpenAI reports the tier that served the request: "the response body
+    /// will include the `service_tier` value based on the processing mode
+    /// actually used to serve the request" — `priority` for Fast (Responses
+    /// API reference, read 2026-11-12). The native passthrough reads it.
+    #[test]
+    fn the_native_responses_passthrough_reads_the_served_service_tier() {
+        let completed = |tier: &str| {
+            format!(
+                r#"data: {{"type":"response.completed","response":{{"service_tier":{tier},"usage":{{"input_tokens":10,"output_tokens":2}}}}}}"#
+            )
+        };
+        for (tier, want) in [
+            (r#""priority""#, Some(true)),
+            (r#""default""#, Some(false)),
+            ("null", None),
+        ] {
+            let mut observer = UsageObserver::default();
+            observer.observe(&completed(tier));
+            assert_eq!(observer.finish().served_fast, want, "{tier}");
+        }
     }
 }
