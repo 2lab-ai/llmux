@@ -54,3 +54,17 @@ Review gate on llmux#288: fable APPROVE (P3 notes), astra REJECT with one P2 (mo
 
 R3 — the shipped preview. G6 partly measured on preview `0803` (new sessions), G9 opened when `/clear` still leaked the title; #290 added the bounded first-main-turn wait; preview `0902` closed both.
 
+## R4 — closed 2026-11-12 20:10 KST
+
+- measured 1✅ · result: llmux's own idle probe runs each provider's small tier by alias on the deployed preview · closed rows: G10 · commit/PR: https://github.com/2lab-ai/llmux/pull/291
+
+### Closed rows
+
+| ID | Source | Universe Item | Observable Acceptance | AS-IS Evidence | Status | Gap | Dispatch | Verification Evidence | Last Measured |
+|---|---|---|---|---|---|---|---|---|---|
+| G10 | spec 27 "llmux's own automatic calls" | Idle probe (quota headers per account) | Claude probe = `haiku` owner + Claude Code identity block + `oauth-2025-04-20` beta, answered 200 with the unified ratelimit headers; Codex probe = `luna` low; both by alias | Claude probe pinned `claude-3-5-haiku-20241022` → 404, no headers; Codex probe = the configured main model | ✅ | — | #291 | live A/B on one real subscription account before merge (in #291): old pin 404 with no `anthropic-ratelimit-unified-*` headers, `claude-haiku-5-5` without the identity block 429 with none, with block + beta 200 with all 11; unit `probes_use_the_small_tier_aliases_not_pinned_or_main_models`, `anthropic_probe_body_is_minimal`, `builds_anthropic_request_with_injected_oauth_bearer`; deployed: the [owner Mac] daemon runs preview `2026-11-12-0929-740bc0c3039b` since 19:16 KST (`llmux status`). The probe writes no raw-io row and no log line, so a per-probe live trace waits on https://github.com/2lab-ai/llmux/issues/292 | 2026-11-12 20:10 |
+
+### Round section (as it was in loop.md)
+
+R4 — llmux's own automatic calls. G10 opened with #291 merged and its preview pending; preview `0929` deployed and G10 closed on the pre-merge live A/B plus the deployed version.
+

@@ -1,5 +1,5 @@
 # 27 — Claude Code harness requests follow the main model's provider
-Status: shipped — harness routing (#288, #290) in preview `2026-11-12-0902-b7615bb47834`, verified live 2026-11-12; the idle probe (#291) is open as loop R4 until its preview is measured
+Status: shipped — harness routing (#288, #290) verified live on preview `2026-11-12-0902-b7615bb47834`; the idle probe (#291) deployed in preview `2026-11-12-0929-740bc0c3039b` (2026-11-12)
 Date: 2026-11-12
 
 Original request and frozen scope: [internal-request-routing/ssot.md](internal-request-routing/ssot.md).
