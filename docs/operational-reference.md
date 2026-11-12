@@ -701,6 +701,22 @@ accounts for every observed completion.
   restart, while a format-2 and a format-3 daemon both run the daily export,
   each regenerates the days the other exported (a new archive generation each
   time) until the old daemon exits.
+- **Price classes.** Each row also stores its price class (`price_class`:
+  compact JSON such as `{"long_context":true}` or `{"fast":true}`, `''` for
+  the standard class), resolved when the request was recorded, and the
+  window query keeps each cell's non-standard classes apart, so a tenant's
+  cost is priced like its requests (#278; see
+  [models.md](models.md#per-request-price-classes)). Schema v4 (2026-11-12)
+  adds the column with default `''` — older rows are the standard class and
+  price exactly as before — in place on open; the daily archive lines carry
+  it (export format 4; `''` for a store that predates it).
+  **Downgrade:** an older (v3) binary still opens a v4 store and writes to it:
+  its inserts leave `price_class` at `''`, so its rows are the standard class;
+  its queries ignore the column and price every cell, the v4 rows' long
+  context and Fast tokens included, at the standard rates (as that binary
+  prices everything); and it rewrites `schema_version` back to `3` (the next
+  current daemon sets it to `4` again). A day it archives in the format-3 line
+  shape is exported again by a current binary.
 - **Coverage caveat.** Rows come from the same best-effort activity-event
   stream the dashboard folds (`try_send`, dropped on a full channel). This is
   faithful metering of observed completions, not an independent billing
