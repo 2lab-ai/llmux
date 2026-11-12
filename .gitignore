@@ -16,7 +16,3 @@ dist/*.backup.app/
 /bridge/node_modules/
 scripts/dbms/pgdata/
 __pycache__/
-
-# vhs output of demo/llmux.tape: published as a release asset, not committed —
-# a recording can show real account names.
-screenshots/llmux-demo.gif
