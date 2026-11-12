@@ -28,6 +28,10 @@ const MONITOR: &str = "You are a security monitor for autonomous AI coding agent
 const TTL: Duration = Duration::from_secs(6 * 3600);
 const CAPACITY: usize = 4096;
 pub const DEADLINE: Duration = Duration::from_secs(60);
+/// How long a session title of an unknown session waits for that session's
+/// first main turn. Live 2026-11-12 (CLI 2.1.322): the title starts 70–350 ms
+/// before the main turn, also after `/clear`, which sends no warmup.
+pub const FIRST_MAIN_WAIT: Duration = Duration::from_secs(3);
 pub const RESPONSE_LIMIT: usize = 1024 * 1024;
 
 /// Per tenant/session: when the entry was written and the provider that serves
@@ -123,6 +127,12 @@ impl Sessions {
             .find(|m| m.id == model || m.aliases.iter().any(|a| a == model))
             .map(|m| BackendGroup::from_kind(m.group))
             .filter(|group| is_routed(*group))
+    }
+
+    /// True when the request names a session (tenant + `metadata.user_id`)
+    /// that no main turn or warmup has recorded yet.
+    pub fn awaiting_first_main(&self, tenant: Option<&str>, body: &Value) -> bool {
+        identity(tenant, body).is_some_and(|key| !self.entries.contains_key(&key))
     }
 
     fn insert(&mut self, key: (String, String), now: Instant, group: BackendGroup) {
@@ -709,6 +719,25 @@ mod tests {
         subagent["system"][0]["text"] = json!("x-anthropic-billing-header: cc_is_subagent=true;");
         other.observe(Some("t"), &subagent, "user", BackendGroup::Codex, now);
         assert!(other.entries.is_empty());
+    }
+    #[test]
+    fn a_session_awaits_its_first_main_turn_until_one_is_recorded() {
+        let now = Instant::now();
+        let mut sessions = Sessions::default();
+        let title = json!({"model":"claude-haiku-5-5","metadata":{"user_id":"session"}});
+        assert!(sessions.awaiting_first_main(Some("t"), &title));
+        assert!(
+            !sessions.awaiting_first_main(None, &title),
+            "no identity: nothing to wait for"
+        );
+        sessions.observe(
+            Some("t"),
+            &main("claude-opus-5-5"),
+            "user",
+            BackendGroup::Claude,
+            now,
+        );
+        assert!(!sessions.awaiting_first_main(Some("t"), &title));
     }
     #[test]
     fn grok_main_session_routes_its_monitor_and_hints_resolve_by_catalog_group() {

@@ -515,8 +515,10 @@ remain authoritative even if their text resembles a title/compaction prompt;
 subagents cannot overwrite that choice. Unknown sessions are unchanged, apart from
 an exact initial `quota`/`max_tokens:1` probe or captured no-tools session-title
 request carrying fresh `llmux run` launch context. A title can arrive before the
-first main turn (live 2026-11-12: 255 ms earlier); the session's own warmup, which
-names the current main model, seeds the session first. E2Es
+first main turn (live 2026-11-12: 70 to 350 ms earlier); the session's own warmup,
+which names the current main model, seeds the session first, and a title in a session
+with no warmup (after `/clear`) waits up to 3 seconds for the first main turn — E2E
+`harness_title_after_clear_waits_for_the_first_main_turn`. E2Es
 `internal_routing_title_before_first_main_uses_fresh_hint_without_seeding_session` and
 `harness_title_before_first_main_follows_the_gpt_warmup` cover that order, configured
 aliases, stale hints and observed Claude priority; `harness_warmup_never_overrides_a_main_turn_and_codex_tiers_avoid_sol`

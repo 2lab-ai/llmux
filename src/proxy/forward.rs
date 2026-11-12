@@ -1514,6 +1514,12 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
             let task = super::internal_requests::task(&value, classified.kind);
+            // A title can start before its session's first main turn, with no
+            // warmup (after `/clear`) and no fresh launch hint: wait, bounded,
+            // for that main turn so the title follows the session's model.
+            if task == Some(super::internal_requests::Task::Title) {
+                wait_for_first_main(state, tenant.as_deref(), &value).await;
+            }
             let hint = if matches!(
                 task,
                 Some(super::internal_requests::Task::Quota | super::internal_requests::Task::Title)
@@ -1705,6 +1711,25 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         super::responses::adapt(response, input, capture).await
     } else {
         response
+    }
+}
+
+/// Poll (25 ms) until the request's session has a recorded main turn or
+/// warmup, at most [`super::auto_classifier::FIRST_MAIN_WAIT`]. Requests with
+/// no session identity and already-known sessions return at once. The lock is
+/// never held across an await.
+async fn wait_for_first_main(state: &AppState, tenant: Option<&str>, body: &serde_json::Value) {
+    let deadline = tokio::time::Instant::now() + super::auto_classifier::FIRST_MAIN_WAIT;
+    loop {
+        let awaiting = state
+            .auto_classifier_sessions
+            .lock()
+            .map(|sessions| sessions.awaiting_first_main(tenant, body))
+            .unwrap_or(false);
+        if !awaiting || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

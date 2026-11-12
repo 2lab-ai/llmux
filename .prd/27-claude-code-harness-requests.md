@@ -70,7 +70,11 @@ tenant and Claude Code session (`metadata.user_id` device and session), in this 
 2. **Warmup** — the Claude Code identity, `max_tokens: 1`, no tools. Claude Code sends it with the
    session's main model when a session starts. It seeds the session only when the session is
    unknown and never overwrites a main turn.
-3. **Launch hint** — `llmux run` headers, at most 120 seconds old, for an exact quota or title
+3. **First main turn, awaited** — a title from a session with no entry waits up to 3 seconds
+   for that session's first main turn. After `/clear` Claude Code sends no warmup and the
+   launch hint is usually past 120 seconds; the title still starts 70–350 ms before the main
+   turn (live 2026-11-12 on the shipped preview).
+4. **Launch hint** — `llmux run` headers, at most 120 seconds old, for an exact quota or title
    request only. Unchanged.
 
 Entries remain bounded (4096), expire after 6 hours and are not persisted.
@@ -108,3 +112,5 @@ Each runs against the mock upstream in `tests/e2e.rs` unless marked live.
   request time.
 - A8 (live). Replaying the captured 2026-11-12 warmup and title from both sessions against the new
   build sends the title to `gpt-6-luna` and to Grok, with no Claude account involved.
+- A9. After `/clear` (no warmup, stale launch hint) the title waits for the first main turn and
+  is served by the main provider; with no main turn it falls back after the bounded wait.
