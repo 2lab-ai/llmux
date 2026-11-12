@@ -266,6 +266,7 @@ pub fn uncounted_iterations(
                     ),
                     web_search_requests: None,
                 },
+                price_class: crate::pricing::PriceClass::STANDARD,
             }
         })
         .filter(|sub| sub.tokens.total() > 0)
@@ -1431,6 +1432,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             vec![SubUsage {
                 model: Some("claude-opus-5-5".into()),
                 tokens: tokens(823, 1612, Some(0), Some(0)),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }]
         );
         assert_eq!(usage.served_model, None, "no fallback served this turn");
@@ -1452,6 +1454,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(vec![SubUsage {
                 model: None,
                 tokens: tokens(180_000, 3_500, None, None),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }])
         );
         // Every response carries `iterations` once the beta is on; without a
@@ -1500,6 +1503,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(vec![SubUsage {
                 model: Some("claude-fable-5".into()),
                 tokens: tokens(535, output, Some(0), Some(0)),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }])
         };
         let pre_output = fallback_usage(0);
@@ -1561,6 +1565,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             vec![SubUsage {
                 model: Some("claude-fable-5".into()),
                 tokens: tokens(535, 120, Some(0), Some(0)),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }]
         );
         // The reported model is the fallback when nothing better names it.
@@ -1659,6 +1664,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             vec![SubUsage {
                 model: Some("claude-fable-5".into()),
                 tokens: tokens(535, 0, Some(40), None),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }],
             "the billed (bio) declined attempt, once"
         );
@@ -1677,6 +1683,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(vec![SubUsage {
                 model: Some("claude-x".into()),
                 tokens: tokens(7, 3, None, None),
+                price_class: crate::pricing::PriceClass::STANDARD,
             }])
         );
     }
@@ -1700,10 +1707,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 SubUsage {
                     model: None,
                     tokens: tokens(100, 10, None, None),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 SubUsage {
                     model: Some("claude-z".into()),
                     tokens: tokens(30, 3, None, None),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
             ],
             "the cumulative array replaces the earlier one, never doubles it"

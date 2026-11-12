@@ -9350,14 +9350,15 @@ fn e2e_tps(tokens: Option<&TokenCounts>, duration: Duration) -> Option<f64> {
 /// A finished request's per-request TOTALS (#278): every token it spent —
 /// its own top-level counters plus its sub-usages (advisor / compaction /
 /// billed fallback attempt) — and its API-equivalent cost with each
-/// sub-usage at its own model's rates, from the built-in rate table (the
-/// render path holds no config overrides). The cost is `None` unless
-/// `(group, model)` is known.
+/// sub-usage at its own model's rates, each in its own price class (#278),
+/// from the built-in rate table (the render path holds no config overrides).
+/// The cost is `None` unless `(group, model)` is known.
 fn request_totals(
     tokens: &TokenCounts,
     sub_usage: &[crate::tui::SubUsage],
     group: Option<&str>,
     model: Option<&str>,
+    class: crate::pricing::PriceClass,
 ) -> (u64, Option<f64>) {
     let total = tokens
         .total()
@@ -9366,7 +9367,7 @@ fn request_totals(
         crate::pricing::request_cost_usd(
             group,
             model,
-            crate::pricing::PriceClass::STANDARD,
+            class,
             tokens,
             sub_usage,
             &std::collections::HashMap::new(),
@@ -9442,6 +9443,7 @@ impl RowMetrics {
                 model,
                 effort,
                 sub_usage,
+                price_class,
                 ..
             } = &entry.body
             else {
@@ -9451,8 +9453,13 @@ impl RowMetrics {
             m.meta_w = m.meta_w.max(cells::width(&meta));
             m.dur_w = m.dur_w.max(format::elapsed_secs(*duration).len());
             if let Some(tokens) = tokens {
-                let (total, cost) =
-                    request_totals(tokens, sub_usage, group.as_deref(), model.as_deref());
+                let (total, cost) = request_totals(
+                    tokens,
+                    sub_usage,
+                    group.as_deref(),
+                    model.as_deref(),
+                    *price_class,
+                );
                 m.tok_w = m
                     .tok_w
                     .max(format!("{}tok", format::human_count(total)).len());
@@ -9925,6 +9932,7 @@ fn completed_line(
             tenant: _,
             client_name,
             sub_usage,
+            price_class,
         } => {
             // Row layout (Z 2026-07-15): every column padded to the frame's
             // max width so rows line up, and the input excerpt LAST, spending
@@ -9958,8 +9966,13 @@ fn completed_line(
                     // Per-request totals: the request's own tokens and cost
                     // plus its sub-usages (#278), built-in rate table.
                     // Priced only when (group, model) is known.
-                    let (total, usd) =
-                        request_totals(tokens, sub_usage, group.as_deref(), model.as_deref());
+                    let (total, usd) = request_totals(
+                        tokens,
+                        sub_usage,
+                        group.as_deref(),
+                        model.as_deref(),
+                        *price_class,
+                    );
                     let tok = format!("{}tok", format::human_count(total));
                     let cost = usd.map(format_cost).unwrap_or_else(|| "—".to_string());
                     (tok, cost, usd)
@@ -10089,6 +10102,7 @@ fn completed_detail_lines(
         tenant,
         client_name,
         sub_usage,
+        price_class,
     } = &entry.body
     else {
         return Vec::new();
@@ -10223,7 +10237,13 @@ fn completed_detail_lines(
         Some(t) => {
             // The request's own columns; `total` adds its sub-usages (#278),
             // each listed below with its own model, tokens and cost.
-            let (total, _) = request_totals(t, sub_usage, group.as_deref(), model.as_deref());
+            let (total, _) = request_totals(
+                t,
+                sub_usage,
+                group.as_deref(),
+                model.as_deref(),
+                *price_class,
+            );
             // The extended-TTL write subset (Anthropic 1h / OpenAI 12h) and
             // the web searches (#278) show only when the upstream reported
             // them.
@@ -10256,7 +10276,11 @@ fn completed_detail_lines(
                 group.as_deref().unwrap_or(""),
                 model.as_deref().unwrap_or(""),
             );
-            let part = |tokens: TokenCounts| crate::pricing::cost_usd(g, m, &tokens, &empty);
+            // Every component at the rates of the request's own price class
+            // (#278), so the parts still add up to the row's cost.
+            let part = |tokens: TokenCounts| {
+                crate::pricing::class_cost(g, m, *price_class, &tokens, &empty).unwrap_or(0.0)
+            };
             let cost_in = part(TokenCounts {
                 input: t.input,
                 ..Default::default()
@@ -10281,7 +10305,9 @@ fn completed_detail_lines(
             let mut cost_sub = 0.0;
             for sub in sub_usage {
                 let sub_model = sub.model.as_deref().unwrap_or(m);
-                let usd = crate::pricing::cost_usd(g, sub_model, &sub.tokens, &empty);
+                let usd =
+                    crate::pricing::class_cost(g, sub_model, sub.price_class, &sub.tokens, &empty)
+                        .unwrap_or(0.0);
                 cost_sub += usd;
                 lines.push(indent(
                     "sub",
@@ -10296,6 +10322,11 @@ fn completed_detail_lines(
                 ));
             }
             let cost_total = cost_in + cost_out + cost_cr + cost_cc + cost_ws + cost_sub;
+            // The rates the request took when they are not the standard ones
+            // (long context, Fast, dated rates, an unbilled refusal).
+            if !price_class.is_standard() {
+                lines.push(indent("rates", price_class.label()));
+            }
             let search_part = if t.web_search_requests.is_some_and(|n| n > 0) {
                 format!("web_search {} · ", format_cost(cost_ws))
             } else {
@@ -10737,7 +10768,8 @@ fn model_total(m: &ModelUsageDoc) -> u64 {
 /// rolling upgrade. The fallback holds no config overrides (empty map = the
 /// built-in default rate table); an unknown/zero-rate `(group, model)` still
 /// yields `None`: no rate is known, and the `$` cell says `—` rather than a
-/// credible `$0`.
+/// credible `$0`. The row's price-class shares (#278) price at their own
+/// rates, so a row of unbilled refusals (#283) stays `$0`.
 fn model_cost(m: &ModelUsageDoc) -> Option<f64> {
     if m.cost_usd > 0.0 {
         return Some(m.cost_usd);
@@ -10745,10 +10777,11 @@ fn model_cost(m: &ModelUsageDoc) -> Option<f64> {
     if m.tokens_in.saturating_add(m.tokens_out) == 0 {
         return Some(0.0);
     }
-    crate::pricing::priced_cost(
+    crate::pricing::aggregate_cost(
         &m.group,
         &m.model,
         &m.token_counts(),
+        &crate::pricing::ClassSplit::from_shares(&m.price_classes),
         &std::collections::HashMap::new(),
     )
 }
@@ -12603,6 +12636,7 @@ mod tests {
             // Old-daemon default: tests exercise the local pricing fallback.
             cost_usd: 0.0,
             sub_cost_usd: 0.0,
+            price_classes: Vec::new(),
         }
     }
 
@@ -12857,6 +12891,7 @@ mod tests {
                         cache_creation_extended: 0,
                         web_search_requests: 0,
                         cost_usd: 1.25,
+                        price_classes: Vec::new(),
                     }],
                 },
                 crate::dashboard::TenantUsageDoc {
@@ -13040,6 +13075,7 @@ mod tests {
                     cache_creation_extended: 0,
                     web_search_requests: 0,
                     cost_usd: 0.0,
+                    price_classes: Vec::new(),
                 }],
             })
             .collect();
@@ -13148,6 +13184,7 @@ mod tests {
             web_search_requests: 0,
             cost_usd: 0.1,
             priced: true,
+            price_classes: Vec::new(),
         };
         let mut view = view_with(Vec::new());
         view.usage_stats = (0..20u64)
@@ -14849,6 +14886,7 @@ mod tests {
             web_search_requests: 0,
             cost_usd,
             priced: true,
+            price_classes: Vec::new(),
         }
     }
 
@@ -17420,6 +17458,7 @@ mod tests {
                 tenant: Some("k-t1".into()),
                 client_name: Some(client_name.into()),
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         }];
         view
@@ -17522,6 +17561,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         };
         let labels = BTreeMap::new();
@@ -17901,6 +17941,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
@@ -17983,6 +18024,41 @@ mod tests {
         assert_eq!(model_cost(&unpriced), None);
     }
 
+    /// #278: the local fallback prices a row's price-class shares at their
+    /// own rates — a row of nothing but unbilled refusals (#283) has a $0
+    /// server cost and tokens, and must stay $0, not be repriced flat.
+    #[test]
+    fn model_cost_fallback_prices_each_class_share() {
+        let mut m = model_row("claude", "claude-haiku-5-5", 200_000, 0);
+        m.cache_read = None;
+        m.cache_creation = None;
+        let all = TokenCounts {
+            input: 200_000,
+            ..Default::default()
+        };
+        m.price_classes = vec![crate::pricing::ClassShare {
+            class: crate::pricing::PriceClass::UNBILLED,
+            tokens: all,
+            cost_usd: 0.0,
+        }];
+        assert_eq!(model_cost(&m), Some(0.0));
+        // Half of it long-context (5x on Haiku 5.5): 100k x $0.10 + 100k x
+        // $0.50.
+        m.price_classes = vec![crate::pricing::ClassShare {
+            class: crate::pricing::PriceClass {
+                long_context: true,
+                ..crate::pricing::PriceClass::STANDARD
+            },
+            tokens: TokenCounts {
+                input: 100_000,
+                ..Default::default()
+            },
+            cost_usd: 0.0,
+        }];
+        let cost = model_cost(&m).expect("priced");
+        assert!((cost - (0.01 + 0.05)).abs() < 1e-12, "got {cost}");
+    }
+
     #[test]
     fn model_total_counts_all_four_token_classes() {
         // Distinct per-class values so a dropped class is caught: the strip's
@@ -18011,6 +18087,7 @@ mod tests {
                 output: 1_600,
                 ..Default::default()
             },
+            price_class: crate::pricing::PriceClass::STANDARD,
         };
         if let CompletedBody::Request { sub_usage, .. } = &mut entry.body {
             *sub_usage = vec![advisor.clone()];
@@ -18109,6 +18186,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         }
     }
@@ -21130,6 +21208,7 @@ mod tests {
             endpoints: Vec::new(),
             cost_usd: 0.0,
             sub_cost_usd: 0.0,
+            price_classes: Vec::new(),
         }]);
         view.email_anonymous = true;
         view.snapshot.accounts = vec![AccountSnapshot {
@@ -21210,6 +21289,7 @@ mod tests {
                     tenant: None,
                     client_name: None,
                     sub_usage: Vec::new(),
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
             },
             Completed {

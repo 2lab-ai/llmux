@@ -350,6 +350,42 @@ impl PriceClass {
     }
 }
 
+/// Resolve the price class of a finished request and of each of its
+/// sub-usages, once, at the instant `at` the dashboard hub records it —
+/// before the request is persisted, metered and folded, so all three carry
+/// the same classes. The request keeps the proxy's unbilled mark
+/// ([`PriceClass::resolve`]); a sub-usage is classified on its own model
+/// (`None` → the request's) and prompt, with the request's Fast flag and
+/// day, never as an unbilled refusal. Every other event is left alone.
+pub fn classify_finished(event: &mut crate::tui::ActivityEvent, at: std::time::SystemTime) {
+    let crate::tui::ActivityEvent::RequestFinished {
+        tokens,
+        group,
+        model,
+        fast,
+        sub_usage,
+        price_class,
+        ..
+    } = event
+    else {
+        return;
+    };
+    let day = RateDay::of(at);
+    let fast = fast.unwrap_or(false);
+    let group = group.as_deref().unwrap_or("");
+    let model = model.as_deref().unwrap_or("");
+    *price_class = price_class.resolve(group, model, &tokens.unwrap_or_default(), fast, day);
+    for sub in sub_usage.iter_mut() {
+        sub.price_class = PriceClass::STANDARD.resolve(
+            group,
+            sub.model.as_deref().unwrap_or(model),
+            &sub.tokens,
+            fast,
+            day,
+        );
+    }
+}
+
 /// The prompt a long-context boundary is measured on: fresh input plus both
 /// cache classes ("A request's prompt length counts all of its input tokens,
 /// including cache reads and cache writes", Anthropic pricing page; OpenAI and
@@ -1022,7 +1058,7 @@ pub fn request_cost_usd(
             sum + class_cost(
                 group,
                 sub.model.as_deref().unwrap_or(model),
-                PriceClass::STANDARD,
+                sub.price_class,
                 &sub.tokens,
                 overrides,
             )

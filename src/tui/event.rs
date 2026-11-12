@@ -112,6 +112,15 @@ pub struct SubUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub tokens: TokenCounts,
+    /// This sub-usage's own price class (#278), resolved from its own
+    /// prompt and model when the request is recorded
+    /// ([`crate::pricing::PriceClass::resolve`]). Absent (standard) on every
+    /// line written before classes, and omitted when standard.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pricing::PriceClass::is_standard"
+    )]
+    pub price_class: crate::pricing::PriceClass,
 }
 
 impl SubUsage {
@@ -283,6 +292,13 @@ pub enum ActivityEvent {
         /// and NONE of them is a request. Empty for every upstream that
         /// reports no `usage.iterations`, and on pre-field history.
         sub_usage: Vec<SubUsage>,
+        /// The request's price class (#278, #283): the proxy marks only an
+        /// unbilled refusal ([`crate::pricing::PriceClass::UNBILLED`]); the
+        /// dashboard hub resolves the rest from the request's own facts when
+        /// it records the request ([`crate::pricing::classify_finished`]),
+        /// so the persisted line, the key-usage row and every aggregate
+        /// carry the same class. Standard on replayed pre-field history.
+        price_class: crate::pricing::PriceClass,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {

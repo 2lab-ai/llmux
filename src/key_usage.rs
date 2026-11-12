@@ -1488,6 +1488,7 @@ pub fn usage_doc(
                     cache_creation: m.cache_creation,
                     cache_creation_extended: m.cache_creation_extended,
                     web_search_requests: m.web_search_requests,
+                    price_classes: Vec::new(),
                 })
                 .collect();
             TenantUsageDoc {
@@ -1661,6 +1662,7 @@ mod tests {
                         cache_creation_extended: None,
                         web_search_requests: None,
                     },
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
                 crate::tui::SubUsage {
                     model: None,
@@ -1672,8 +1674,10 @@ mod tests {
                         cache_creation_extended: None,
                         web_search_requests: None,
                     },
+                    price_class: crate::pricing::PriceClass::STANDARD,
                 },
             ],
+            price_class: crate::pricing::PriceClass::STANDARD,
         }
     }
 
@@ -1940,6 +1944,7 @@ mod tests {
                     cache_creation_extended: Some(1_000_000),
                     ..Default::default()
                 },
+                price_class: crate::pricing::PriceClass::STANDARD,
             }];
         }
         event

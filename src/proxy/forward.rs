@@ -774,6 +774,7 @@ impl ForwardContext {
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
             sub_usage,
+            price_class: crate::pricing::PriceClass::STANDARD,
         });
     }
 
@@ -826,6 +827,7 @@ impl ForwardContext {
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         });
         if self.endpoint_origin == crate::tui::Endpoint::OpenAi {
             return super::responses::error(StatusCode::BAD_REQUEST, &message);
@@ -1429,6 +1431,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 excerpt: None,
                 tenant,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             });
             return error_response(status, error_type, &message);
         }
@@ -1456,6 +1459,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             excerpt: None,
             tenant: tenant.clone(),
             sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
         });
         super::responses::error(status, detail)
     };
@@ -3940,6 +3944,7 @@ async fn relay(
                         excerpt,
                         tenant,
                         sub_usage: usage.sub_usage,
+                        price_class: crate::pricing::PriceClass::STANDARD,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -4533,6 +4538,7 @@ async fn relay_translate(
                         excerpt,
                         tenant,
                         sub_usage: usage.sub_usage,
+                        price_class: crate::pricing::PriceClass::STANDARD,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -4874,6 +4880,7 @@ mod tests {
                     cache_creation_extended: None,
                     web_search_requests: None,
                 },
+                price_class: crate::pricing::PriceClass::STANDARD,
             }]
         );
     }
@@ -4920,6 +4927,7 @@ mod tests {
                     cache_creation_extended: None,
                     web_search_requests: None,
                 },
+                price_class: crate::pricing::PriceClass::STANDARD,
             }]
         );
         // An ordinary response keeps its attribution.

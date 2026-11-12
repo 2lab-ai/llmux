@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readTranscript, messagesToEntries, transcriptMeta, listSubagents, recoverMessages, parseResponse } from './transcript.mjs';
-import { solveRates, avgPerRequest, priceRow, rowTokens, priceCounts } from './pricing.mjs';
+import { solveRates, avgPerRequest, priceRow, rowTokens, priceCounts, classKey, ratesFor } from './pricing.mjs';
 import { parseRawMeta } from './rawmeta.mjs';
 import { cleanPrompt, promptOf } from './overview.mjs';
 export { promptOf };
@@ -186,15 +186,18 @@ export class SessionIndex {
     b.n++; if (r.status >= 400 || r.aborted) b.err++;
     if (r.account) b.accounts.set(r.account, (b.accounts.get(r.account) || 0) + 1);
     const t = r.tokens || {};
-    const mt = b.models.get(r.model) || { n: 0, ...zeroCounts(), cost: 0, priced: 0 };
+    // Keyed by model AND price class (#278): a bucket's unpriced tokens are priced per class.
+    const mk = `${r.model}|${classKey(r.price_class)}`;
+    const mt = b.models.get(mk) || { model: r.model, cls: r.price_class, n: 0, ...zeroCounts(), cost: 0, priced: 0 };
     mt.n++; addCounts(mt, t);
     if (r.cost_usd != null) { mt.cost += r.cost_usd; mt.priced++; }
-    b.models.set(r.model, mt);
+    b.models.set(mk, mt);
     // A history row has no daemon cost: its sub-usages (#278) are priced per model in bucketCost.
     // A daemon row's cost_usd already includes them.
     if (r.cost_usd == null) for (const s of r.sub_usage || []) {
-      const k = s.model || r.model, st = s.tokens || {};
-      const e = b.sub.get(k) || zeroCounts();
+      const model = s.model || r.model, st = s.tokens || {};
+      const k = `${model}|${classKey(s.price_class)}`;
+      const e = b.sub.get(k) || { model, cls: s.price_class, ...zeroCounts() };
       addCounts(e, st);
       b.sub.set(k, e);
     }
@@ -202,16 +205,18 @@ export class SessionIndex {
 
   bucketCost(b) {
     let c = 0;
-    for (const [model, t] of b.models) {
+    for (const t of b.models.values()) {
       const unpriced = t.n - t.priced;
       if (!unpriced) { c += t.cost; continue; }
-      const r = this.rates.get(model);
-      const est = r ? priceCounts(t, r) : (this.avg.get(model) || 0) * t.n;
+      const unbilled = !!(t.cls && t.cls.unbilled);
+      const r = unbilled ? null : ratesFor(this.rates, t.model, t.cls);
+      const est = unbilled ? 0 : r ? priceCounts(t, r) : (this.avg.get(t.model) || 0) * t.n;
       // mixed buckets: daemon-priced part is exact; scale the estimate to the unpriced share
       c += t.priced ? t.cost + est * (unpriced / t.n) : est;
     }
-    for (const [model, t] of b.sub || []) {
-      const r = this.rates.get(model);
+    for (const t of (b.sub || new Map()).values()) {
+      if (t.cls && t.cls.unbilled) continue;
+      const r = ratesFor(this.rates, t.model, t.cls);
       if (r) c += priceCounts(t, r);
     }
     return c;
@@ -236,7 +241,7 @@ export class SessionIndex {
       if (!line.startsWith('{')) continue;
       let o; try { o = JSON.parse(line); } catch { continue; }
       if (!o.ts_ms) continue;
-      this.addRow({ kind: 'request', id: o.id, at_ms: o.ts_ms, method: o.method, path: o.path, endpoint: o.endpoint, account: o.account, status: o.status, duration_ms: o.duration_ms, tokens: o.tokens, group: o.group, model: o.model, effort: o.effort, fast: o.fast, ttfb_ms: o.ttfb_ms, ttft_ms: o.ttft_ms, gen_ms: o.gen_ms, aborted: o.aborted, msg_kind: o.kind, tenant: o.tenant, user_id: o.user_id, excerpt: o.excerpt, sub_usage: o.sub_usage, cost_usd: null, _hist: true });
+      this.addRow({ kind: 'request', id: o.id, at_ms: o.ts_ms, method: o.method, path: o.path, endpoint: o.endpoint, account: o.account, status: o.status, duration_ms: o.duration_ms, tokens: o.tokens, group: o.group, model: o.model, effort: o.effort, fast: o.fast, ttfb_ms: o.ttfb_ms, ttft_ms: o.ttft_ms, gen_ms: o.gen_ms, aborted: o.aborted, msg_kind: o.kind, tenant: o.tenant, user_id: o.user_id, excerpt: o.excerpt, sub_usage: o.sub_usage, price_class: o.price_class, cost_usd: null, _hist: true });
       this.backfill.rows++;
     }
     this.backfill.state = 'done';

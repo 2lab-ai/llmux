@@ -5,6 +5,10 @@
 // `cache_creation`, the short-TTL writes the rest; `d` and `e` are both absolute write rates and `f` is
 // the per-search fee.) Solving those rows by least squares gives the rates the daemon used (overrides
 // included), so history rows that carry tokens but no cost can be priced without copying src/pricing.rs.
+// Price classes (#278): a row's `price_classes` shares (long context, Fast, dated rates, an unbilled
+// refusal) carry their own tokens and cost. The standard remainder (row minus shares) solves under the
+// model's key and each priced share under `model|<class>`; a history row (or sub-usage) is priced with
+// the rates of its own `price_class`, and an unbilled refusal costs nothing.
 
 /** The extended (`ext`) and short (`short`) parts of a row's cache writes — disjoint counts, so a model
  *  whose writes are all one TTL still has independent columns. */
@@ -25,6 +29,34 @@ const COLS = [
   { key: 'ce', get: r => writes(r.cache_creation, r.cache_creation_extended).extended, scale: 1e-6 },
   { key: 'ws', get: r => r.web_search_requests || 0, scale: 1e-3 },
 ];
+
+/** Stable key of a price class: '' for the standard class (absent / `{}`). */
+export function classKey(c) {
+  if (!c) return '';
+  return [c.long_context && 'long_context', c.fast && 'fast', c.rates_from && `rates_from=${c.rates_from}`, c.unbilled && 'unbilled']
+    .filter(Boolean).join(',');
+}
+
+const rateKey = (model, c) => { const k = classKey(c); return k ? `${model}|${k}` : model; };
+
+// A share's `tokens` (activity shape) under the usage-row column names.
+const SHARE_FIELD = { tokens_in: 'input', tokens_out: 'output', cache_read: 'cache_read', cache_creation: 'cache_creation', cache_creation_extended: 'cache_creation_extended', web_search_requests: 'web_search_requests' };
+
+/** One usage row as solver samples (usage-row shape plus a `key`): its standard remainder under the
+ *  model, each priced share under its class. An unbilled share costs 0 and is not solved. */
+function samples(u) {
+  const all = (u.price_classes || []).filter(s => s && s.class);
+  const std = { key: u.model, cost_usd: (u.cost_usd || 0) - all.reduce((a, s) => a + (s.cost_usd || 0), 0) };
+  for (const [f, t] of Object.entries(SHARE_FIELD)) std[f] = (u[f] || 0) - all.reduce((a, s) => a + ((s.tokens || {})[t] || 0), 0);
+  const out = [std];
+  for (const s of all) {
+    if (s.class.unbilled) continue;
+    const x = { key: rateKey(u.model, s.class), cost_usd: s.cost_usd || 0 };
+    for (const [f, t] of Object.entries(SHARE_FIELD)) x[f] = (s.tokens || {})[t] || 0;
+    out.push(x);
+  }
+  return out;
+}
 
 function solve(A, b) {
   const n = b.length;
@@ -52,8 +84,11 @@ export function solveRates(usageStats) {
   const byModel = new Map();
   for (const u of usageStats || []) {
     if (!u || u.priced === false || !(u.cost_usd > 0) || (u.gran !== 'hour' && u.gran !== 'day')) continue;
-    if (!byModel.has(u.model)) byModel.set(u.model, []);
-    byModel.get(u.model).push(u);
+    for (const x of samples(u)) {
+      if (!(x.cost_usd > 0)) continue;
+      if (!byModel.has(x.key)) byModel.set(x.key, []);
+      byModel.get(x.key).push(x);
+    }
   }
   const out = new Map();
   for (const [model, rows] of byModel) {
@@ -106,9 +141,16 @@ export function priceCounts(t, r) {
     + w.extended * (r.ce ?? r.cc) + (t.web_search_requests || 0) * (r.ws || 0);
 }
 
-export function priceTokens(model, t, rates, avg) {
-  if (!t) return 0;
-  const r = rates && rates.get(model);
+/** The solved rates for `model` in price class `cls`: the class's own, else the model's standard
+ *  rates (an estimate below the real class price), else none. */
+export function ratesFor(rates, model, cls) {
+  if (!rates) return null;
+  return rates.get(rateKey(model, cls)) || rates.get(model) || null;
+}
+
+export function priceTokens(model, t, rates, avg, cls) {
+  if (!t || (cls && cls.unbilled)) return 0;
+  const r = ratesFor(rates, model, cls);
   if (r) return priceCounts(t, r);
   return (avg && avg.get(model)) || 0;
 }
@@ -121,8 +163,8 @@ export function priceRow(row, rates, avg) {
   if (row.cost_usd != null) return row.cost_usd;
   return (row.sub_usage || []).reduce((sum, s) => {
     const model = s.model || row.model;
-    return sum + (rates && rates.get(model) ? priceTokens(model, s.tokens, rates, null) : 0);
-  }, priceTokens(row.model, row.tokens, rates, avg));
+    return sum + (ratesFor(rates, model, s.price_class) ? priceTokens(model, s.tokens, rates, null, s.price_class) : 0);
+  }, priceTokens(row.model, row.tokens, rates, avg, row.price_class));
 }
 
 /** One row's token classes with its sub-usages added — what a per-request or per-session TOTAL

@@ -97,6 +97,34 @@ test('the per-request average leaves out sub-usage booked under the model (#278)
   assert.equal(avg.has('advisor-only'), false, 'no requests, no estimate');
 });
 
+test('price classes: the standard part and each class solve on their own, history rows take their class (#278)', () => {
+  // Daemon: the row's standard remainder at a/b, a long-context share at 2a/1.5b (its own cost
+  // carried on the share), an unbilled refusal share at 0.
+  const a = 1e-6, b = 5e-6;
+  const rows = [[1e5, 2e3, 3e5, 1e3, 4e3], [2e4, 9e3, 6e5, 5e2, 0], [7e4, 1e3, 0, 0, 9e3], [3e3, 4e4, 9e5, 2e4, 1e3]].map(([i, o, li, lo, u]) => {
+    const long = li * 2 * a + lo * 1.5 * b;
+    return { gran: 'hour', model: 'm', tokens_in: i + li + u, tokens_out: o + lo, cost_usd: i * a + o * b + long,
+      price_classes: [
+        { class: { long_context: true }, tokens: { input: li, output: lo }, cost_usd: long },
+        { class: { unbilled: true }, tokens: { input: u, output: 0 }, cost_usd: 0 },
+      ] };
+  });
+  const rates = solveRates(rows);
+  const std = rates.get('m');
+  assert.ok(std, 'the standard remainder solves');
+  assert.ok(Math.abs(std.in - a) / a < 1e-6 && Math.abs(std.out - b) / b < 1e-6, JSON.stringify(std));
+  const long = rates.get('m|long_context');
+  assert.ok(long, 'the long-context share solves under its own key');
+  assert.ok(Math.abs(long.in - 2 * a) / a < 1e-6, JSON.stringify(long));
+  const tokens = { input: 1e6, output: 1e4 };
+  assert.equal(+priceRow({ model: 'm', cost_usd: null, tokens }, rates, new Map()).toFixed(6), +(1e6 * a + 1e4 * b).toFixed(6));
+  assert.equal(+priceRow({ model: 'm', cost_usd: null, tokens, price_class: { long_context: true } }, rates, new Map()).toFixed(6), +(2e6 * a + 1.5e4 * b).toFixed(6));
+  assert.equal(priceRow({ model: 'm', cost_usd: null, tokens, price_class: { unbilled: true } }, rates, new Map()), 0, 'an unbilled refusal costs nothing');
+  // A sub-usage takes its own class.
+  const row = { model: 'm', cost_usd: null, tokens: { input: 0, output: 0 }, sub_usage: [{ tokens, price_class: { long_context: true } }] };
+  assert.equal(+priceRow(row, rates, new Map()).toFixed(6), +(2e6 * a + 1.5e4 * b).toFixed(6));
+});
+
 test('solveRates refuses a fit that is not linear', () => {
   const rows = [1, 2, 3, 4, 5, 6].map(i => ({ gran: 'hour', model: 'x', tokens_in: i * 100, tokens_out: i * i * 10, cache_read: 0, cache_creation: 0, cost_usd: Math.random() * 10 + 1 }));
   assert.equal(solveRates(rows).has('x'), false);

@@ -9,7 +9,7 @@ See it: ▶ [llmux film, 48 s](https://github.com/2lab-ai/llmux/releases/downloa
 - `lib/sessions.mjs` — session index (owner = key, origin, side-call folding, Q4 flags, users view).
 - `lib/rawmeta.mjs` — what a raw-io request says about a remote Claude Code session (cwd, branch, version, OS, MCP, prompts).
 - `lib/overview.mjs` — instructions → tools, files, requests, cost.
-- `lib/pricing.mjs` — per-token rates solved from the daemon's `usage_stats`.
+- `lib/pricing.mjs` — per-token rates solved from the daemon's `usage_stats`, per model and price class.
 - `public/app.html`, `app.js`, `app.css` — the page, built from `@2lab.ai/ui` elements served at `/ui/*` from `UI_DIST`
   (default: the host's soma-work install; falls back to jsDelivr `@2lab.ai/ui@0.39.0`). `core.js`/`core.css` keep the
   activity and account renderers. `ccview.js`/`ccview.css` draw the Claude Code screen; `rawview.js` is the raw viewer

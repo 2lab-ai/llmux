@@ -948,6 +948,7 @@ mod tests {
                 tenant: None,
                 client_name: None,
                 sub_usage: Vec::new(),
+                price_class: crate::pricing::PriceClass::STANDARD,
             },
         }
     }
