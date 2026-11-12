@@ -362,7 +362,9 @@ Decision record: [27-claude-code-harness-requests.md](27-claude-code-harness-req
 (`Codex`, `Grok`, or `Claude` for everything else). Recognized main CLI execution
 turns always update it, at request entry; the session's warmup (main identity,
 `max_tokens: 1`, no tools) seeds an entry only when none exists; subagents and
-control turns never touch it. The current JSON-in-string `metadata.user_id`
+control turns never touch it. A title for a session with no entry polls the
+registry (25 ms, lock released between polls) for up to
+`auto_classifier::FIRST_MAIN_WAIT` (3 s) before it is routed. The current JSON-in-string `metadata.user_id`
 is normalized to device/session, excluding account UUID. State is not persisted.
 
 On POST `/v1/messages`, with model routing enabled, a recognized security monitor

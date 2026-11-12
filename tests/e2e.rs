@@ -7933,3 +7933,110 @@ async fn harness_monitor_naming_a_non_tier_model_is_not_rerouted() {
     );
     assert_eq!(mock.seen().len(), 1, "only the warmup reached upstream");
 }
+
+/// Live 2026-11-12 on the deployed preview: after `/clear` Claude Code starts
+/// a new session with NO warmup, the launch hint is past 120 s, and the title
+/// still starts 70–350 ms before the session's first main turn. The title of
+/// an unknown session waits (bounded) for that main turn instead of falling
+/// through to Claude.
+#[tokio::test]
+async fn harness_title_after_clear_waits_for_the_first_main_turn() {
+    let mock = MockUpstream::spawn().await;
+    for text in [r#"{"title":"Fixture folder"}"#, "Working."] {
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(text),
+            256,
+        ));
+    }
+    // Codex only: a title that falls through to Claude answers 404.
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at-codex")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let title = {
+        let (client, url) = (client.clone(), proxy.url("/v1/messages"));
+        tokio::spawn(async move {
+            stale_launch(client.post(url).header("x-api-key", "client-supplied-key"))
+                .json(&harness_title("after-clear", false))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let main = post_messages(
+        &client,
+        &proxy,
+        &harness_main("after-clear", "astra").to_string(),
+    )
+    .await;
+    assert_eq!(main.status(), 200);
+    main.bytes().await.unwrap();
+    let title = title.await.unwrap();
+    assert_eq!(
+        title.status(),
+        200,
+        "title must wait for the main turn, not leak to Claude"
+    );
+    title.bytes().await.unwrap();
+    let models: Vec<String> = mock
+        .seen()
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["model"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(models.contains(&resolved_alias("luna")), "{models:?}");
+
+    // No main turn ever arrives: the wait is bounded and the title keeps
+    // normal routing (Claude → 404 here).
+    let started = std::time::Instant::now();
+    let lone = post_messages(&client, &proxy, &harness_title("lonely", false).to_string()).await;
+    let waited = started.elapsed();
+    assert_eq!(lone.status(), 404);
+    assert!(
+        waited >= std::time::Duration::from_millis(2500)
+            && waited < std::time::Duration::from_secs(8),
+        "bounded wait: {waited:?}"
+    );
+}
+
+/// Review finding on #290 (P2): a launch hint fresh when the title arrives
+/// (117.5 s old: 2.5 s of slack for a loaded test host, yet past 120 s once
+/// the 3 s wait has run) must not expire during the bounded wait for a main
+/// turn.
+#[tokio::test]
+async fn harness_title_launch_hint_is_judged_at_arrival() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse(r#"{"title":"Fixture folder"}"#),
+        256,
+    ));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at-codex")],
+        "error",
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-claude-launch-model", "astra")
+        .header(
+            "x-llmux-claude-launch-time",
+            (epoch_ms_now() - 117_500).to_string(),
+        )
+        .json(&harness_title("hint-at-arrival", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "the hint was fresh on arrival");
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(message["model"], resolved_alias("luna"));
+}
