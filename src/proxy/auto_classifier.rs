@@ -129,10 +129,14 @@ impl Sessions {
             .filter(|group| is_routed(*group))
     }
 
-    /// True when the request names a session (tenant + `metadata.user_id`)
-    /// that no main turn or warmup has recorded yet.
+    /// True when the request names a Claude Code CLI session (tenant +
+    /// `metadata.user_id`, the CLI identity block) that no main turn or warmup
+    /// has recorded yet. Agent SDK hosts never record a main turn (live
+    /// 2026-11-12: 372 of 378 titles carried the SDK identity), so their
+    /// requests never wait for one.
     pub fn awaiting_first_main(&self, tenant: Option<&str>, body: &Value) -> bool {
-        identity(tenant, body).is_some_and(|key| !self.entries.contains_key(&key))
+        is_main_identity(&system_blocks(body))
+            && identity(tenant, body).is_some_and(|key| !self.entries.contains_key(&key))
     }
 
     fn insert(&mut self, key: (String, String), now: Instant, group: BackendGroup) {
@@ -724,12 +728,18 @@ mod tests {
     fn a_session_awaits_its_first_main_turn_until_one_is_recorded() {
         let now = Instant::now();
         let mut sessions = Sessions::default();
-        let title = json!({"model":"claude-haiku-5-5","metadata":{"user_id":"session"}});
+        let title = json!({"model":"claude-haiku-5-5","metadata":{"user_id":"session"},
+            "system":[{"text":"x-anthropic-billing-header: cc_entrypoint=cli;"},{"text":MAIN},
+                {"text":"You are naming a coding session…"}]});
         assert!(sessions.awaiting_first_main(Some("t"), &title));
         assert!(
             !sessions.awaiting_first_main(None, &title),
             "no identity: nothing to wait for"
         );
+        // An Agent SDK host's title: its main turns are never recorded.
+        let mut sdk = title.clone();
+        sdk["system"][1]["text"] = json!(SDK_AGENT);
+        assert!(!sessions.awaiting_first_main(Some("t"), &sdk));
         sessions.observe(
             Some("t"),
             &main("claude-opus-5-5"),

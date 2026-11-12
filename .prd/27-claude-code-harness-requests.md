@@ -70,8 +70,9 @@ tenant and Claude Code session (`metadata.user_id` device and session), in this 
 2. **Warmup** — the Claude Code identity, `max_tokens: 1`, no tools. Claude Code sends it with the
    session's main model when a session starts. It seeds the session only when the session is
    unknown and never overwrites a main turn.
-3. **First main turn, awaited** — a title from a session with no entry waits up to 3 seconds
-   for that session's first main turn. After `/clear` Claude Code sends no warmup and the
+3. **First main turn, awaited** — a title from a CLI session (Claude Code identity) with no entry
+   waits up to 3 seconds for that session's first main turn. Agent SDK host titles (372 of 378
+   titles on 2026-11-12) never record a main turn, so they do not wait. After `/clear` Claude Code sends no warmup and the
    launch hint is usually past 120 seconds; the title still starts 70–350 ms before the main
    turn (live 2026-11-12 on the shipped preview).
 4. **Launch hint** — `llmux run` headers, at most 120 seconds old, for an exact quota or title

@@ -1193,9 +1193,10 @@ Startup quota and session-title calls can occur before the first main request
 Claude Code sends a warmup (`"Hi"`, `max_tokens: 1`, no tools) with the session's
 current main model when a process starts a session; llmux uses it to learn an unknown
 session's provider. It never overrides an observed main turn. After `/clear` there is
-no warmup, so a title from a session llmux has not seen yet waits up to 3 seconds for
+no warmup, so a title from a CLI session llmux has not seen yet waits up to 3 seconds for
 that session's first main turn (measured 70 to 350 ms behind the title) and then
-follows it; titles run in the background, so the wait is not visible. `llmux run` also supplies
+follows it; titles run in the background, so the wait is not visible. Agent SDK hosts
+(their title carries the SDK identity and they never send a CLI main turn) do not wait. `llmux run` also supplies
 `x-llmux-claude-launch-model` only when it can resolve the launch choice: explicit
 `--model`, `ANTHROPIC_MODEL`, or ordinary user/project/local/flag settings model,
 with native alias environment overrides considered. Both `--model=value` and
