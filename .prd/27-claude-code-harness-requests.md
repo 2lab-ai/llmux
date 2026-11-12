@@ -1,9 +1,10 @@
 # 27 — Claude Code harness requests follow the main model's provider
-Status: in-progress
+Status: shipped — harness routing (#288, #290) verified live on preview `2026-11-12-0902-b7615bb47834`; the idle probe (#291) deployed in preview `2026-11-12-0929-740bc0c3039b` (2026-11-12)
 Date: 2026-11-12
 
 Original request and frozen scope: [internal-request-routing/ssot.md](internal-request-routing/ssot.md).
-Round plan and open gaps: [internal-request-routing/loop.md](internal-request-routing/loop.md).
+Round log: [internal-request-routing/loop.md](internal-request-routing/loop.md), closed rounds in [loop.done.md](internal-request-routing/loop.done.md).
+This is the implemented contract of #288, #290 and #291 — not a future target.
 Supersedes the GPT-only exception in [02-architecture.md](02-architecture.md#claude-code-auto-mode-routing-exception-2026-10-07)
 (#187, #191, #194).
 
@@ -79,6 +80,15 @@ tenant and Claude Code session (`metadata.user_id` device and session), in this 
    request only. Unchanged.
 
 Entries remain bounded (4096), expire after 6 hours and are not persisted.
+
+## llmux's own automatic calls
+
+The same rule covers the calls llmux makes by itself. The idle probe (quota headers per account)
+runs on each provider's small tier, by alias, resolved per probe: Claude subscription accounts the
+`haiku` owner with the Claude Code identity block and the `oauth-2025-04-20` beta, Codex accounts
+`luna` at low effort (#291). Soma-work's own side calls (titles, summaries, memory dreaming, dispatch,
+cron `fast`, the auto-mode safety classifier) follow the same table in soma-work
+(`src/agent-runtime/aux-model.ts`, 2lab-ai/soma-work#1224).
 
 ## Non-goals
 

@@ -3,7 +3,7 @@
 SSOT: ./ssot.md (frozen) · Spec: ../27-claude-code-harness-requests.md · Done: ./loop.done.md ·
 Repo: 2lab-ai/llmux · Channel: Slack thread 1794465952.178559 · Started: 2026-11-12 (15:46 KST)
 
-Status: R1 closed (5/5 ✅), R2 review closed (2/2 ✅) — see loop.done.md. R3 open — the shipped preview on the [owner Mac].
+Status: R1–R4 closed — see loop.done.md. No open rows.
 
 ## Build facts (measured)
 
@@ -15,14 +15,11 @@ Status: R1 closed (5/5 ✅), R2 review closed (2/2 ✅) — see loop.done.md. R3
   at a scratch dir, one Codex and one Grok account copied with refresh disabled (dummy refresh
   token and token endpoint), no Claude account; the production daemon on 3456 is not touched.
 
-## R3 — the shipped preview
+## Re-verified
 
-| ID | Gap | Status | Source |
-| --- | --- | --- | --- |
-| G6 | Preview build on the [owner Mac] routes a real GPT and a real Grok session's title, status and security requests (spec A8); live `claude_code.gpt_model_mapping.opus` set to `terra` | 🟡 partly measured: preview `2026-11-12-0803-3c2b27a9a5f5` running, `opus: terra` set; real `astra` and `grok` sessions (tmux, auto mode): quota and title → `gpt-6-luna` / `grok-4.7` low, security → `gpt-6-luna` / `grok-4.7` medium | spec A8 |
-| G9 | After `/clear` the title of the new session still reached `claude-haiku-5-5` in both real sessions (no warmup, launch hint past 120 s; raw-io #121, #126) | 🟡 fix on branch `fix/title-waits-for-first-main-turn`: bounded wait for the first main turn; E2E `harness_title_after_clear_waits_for_the_first_main_turn` (RED on main: 404) | live, spec A9 |
+- G6, G9 re-verified 2026-11-12 20:05 KST on preview `2026-11-12-0929-740bc0c3039b`: `/clear` in the real astra session `2f8d5bb5` and grok session `9b63cf4d`, then a file write; raw-io: title #2412 `claude-haiku-5-5` → `gpt-6-luna` low, title #2413 → `grok-4.7` low, the other 8 requests were the sessions' own main turns (`gpt-6-astra` ×6, `grok-4.7` ×2), 0 requests to a Claude model.
+- soma-work side: 2lab-ai/soma-work#1224 deployed to dev (deploy run 43206305851, all three targets); the deployed `auxModelFor` resolves Claude → `claude-haiku-5-5[1m]`/`claude-sonnet-5-5[1m]`, Codex (astra or sol) → `gpt-6-luna[1m]`/`gpt-6.1-terra[1m]`, Grok → `grok-4.7` low/medium.
 
 ## Next
 
-- Merge G9 fix → preview release → `brew upgrade llmux-preview` → restart → `/clear` in a real `astra`
-  and `grok` session → raw-io shows the new title on the main provider → close G6 and G9, set spec 27 to shipped.
+- None open. Follow-up outside this loop: failed idle probes are silent — https://github.com/2lab-ai/llmux/issues/292.
