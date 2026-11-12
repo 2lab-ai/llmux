@@ -38,3 +38,19 @@ on either provider · WU4 `classify.rs` + `webui/` `status` kind · WU5 `schema.
 ### Round section (as it was in loop.md)
 
 Review gate on llmux#288: fable APPROVE (P3 notes), astra REJECT with one P2 (monitor tier gate), grok pending at close. G7 fixed in code; G8 measured live.
+
+## R3 — closed 2026-11-12 18:55 KST
+
+- measured 2✅ · result: the shipped preview routes a real GPT and a real Grok session's title, security and status requests to the main provider, including the title after `/clear` · closed rows: G6 G9 · commit/PR: https://github.com/2lab-ai/llmux/pull/288, https://github.com/2lab-ai/llmux/pull/290
+
+### Closed rows
+
+| ID | Source | Universe Item | Observable Acceptance | AS-IS Evidence | Status | Gap | Dispatch | Verification Evidence | Last Measured |
+|---|---|---|---|---|---|---|---|---|---|
+| G6 | spec A8 | Preview build on the [owner Mac], real GPT and Grok sessions; live `gpt_model_mapping.opus` = `terra` | title/status → `gpt-6-luna` / Grok low, security → `gpt-6-luna` / Grok medium, no Claude account | before #288: title → `claude-haiku-5-5` (#50916), Grok security 3/3 → `claude-sonnet-5` | ✅ | — | #288 → preview | preview `2026-11-12-0902-b7615bb47834`, raw-io 2026-11-12 after the 18:27 restart: astra session `86996706` title #26 → `gpt-6-luna` low, security #45 → `gpt-6-luna` medium; grok session `7d866f80` title #30 → `grok-4.7` low, security #37 → `grok-4.7` medium; live config `opus: terra` | 2026-11-12 18:28 |
+| G9 | live raw-io #121, #126 | Title after `/clear` (no warmup, launch hint past 120 s) | A9: the title waits for the first main turn and goes to the main provider | title → `claude-haiku-5-5` in both sessions | ✅ | — | #290 bounded wait (3 s, CLI identity only) | E2E `harness_title_after_clear_waits_for_the_first_main_turn` (RED on main: 404); live: astra session `86996706` has no warmup, title #26 (18:27:41.664) precedes the first main turn #28 (18:27:43.315) and went to `gpt-6-luna` low; grok session `7d866f80` title #30 (18:27:45.401) precedes main #32 (18:27:45.541) and went to `grok-4.7` low | 2026-11-12 18:28 |
+
+### Round section (as it was in loop.md)
+
+R3 — the shipped preview. G6 partly measured on preview `0803` (new sessions), G9 opened when `/clear` still leaked the title; #290 added the bounded first-main-turn wait; preview `0902` closed both.
+
