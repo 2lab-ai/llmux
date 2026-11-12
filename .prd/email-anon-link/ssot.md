@@ -43,5 +43,5 @@ ON 모자이크/OFF 원본 오케스트레이터 육안 확정. E5(토글→서�
   잘못 얹힘 → reset --soft로 원상복구(유저 gif·미추적 무손상), 릴리즈는 격리 worktree에서 재실행.
   교훈: 릴리즈도 resolver처럼 항상 worktree — 메인 체크아웃 브랜치를 가정하지 마라.
 - 잔여(분류기 유저-게이트, 각 1커맨드): ① 로컬 데몬 restart(`/opt/homebrew/bin/llmux restart`,
-  false "not ready 5s" 무시하고 poll) ② oudwood-512 `brew upgrade llmux` + restart(활성 llmux run
+  false "not ready 5s" 무시하고 poll) ② devbox-b `brew upgrade llmux` + restart(활성 llmux run
   워크로드 3개 있음 — 한가할 때).

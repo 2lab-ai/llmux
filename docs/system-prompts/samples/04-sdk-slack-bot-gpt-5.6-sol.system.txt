@@ -106,7 +106,7 @@ MEMORY (your personal notes) [96% -- 2121/2200 chars]
 
 ## Your Personal Skills
 You have 6 personal skill(s). Invoke with `$user:skill-name`. Manage with MANAGE_SKILL command (create/update/delete/rename/list/share/get/copy).
-- `$user:dev`: Deploy to dev environment. Creates main→deploy/dev PR, merges, and monitors CI deployment to both targets (mac-mini-dev, oudwood-dev).
+- `$user:dev`: Deploy to dev environment. Creates main→deploy/dev PR, merges, and monitors CI deployment to both targets (devbox-a-dev, devbox-b-dev).
 - `$user:import-skills`: Imports skills from external agent repos. Default sources are NousResearch hermes-agent and openclaw openclaw. Diffs against soma-work src local skills, asks the user which to import via UIAskUserQuestion, and opens a PR. Pass --personal to register them as user skills via MANAGE_SKILL instead of opening a PR. Trigger keyword import-skills.
 - `$user:pr-triage`: Triage every open PR of a GitHub repo into 4 buckets (ready-to-merge / needs-review / close+spec-issue / close-obsolete). Evidence-based, parallel cluster investigation, bold close of rotted PRs, specs preserved as issues. Trigger: pr-triage <org/repo or repo-url> [issue-tracker-base-url].
 - `$user:prod`: Deploy to prod environment. Creates main→deploy/prod PR, merges, and monitors CI deployment to the production target ([REDACTED: host]).

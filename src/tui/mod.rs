@@ -11025,7 +11025,7 @@ mod tests {
         // A daemon on another host has a DIFFERENT activity.jsonl — splicing
         // the local file under its live rows would show wrong data.
         for url in [
-            "http://oudwood-512:3456",
+            "http://devbox-b:3456",
             "http://100.98.240.111:3456",
             "http://[2001:db8::1]:3456",
             "not a url",
@@ -11035,7 +11035,7 @@ mod tests {
         // And the App-level gate wires it up: a cross-host remote never arms.
         let mut app = remote_app();
         if let Backend::Remote(remote) = &mut app.backend {
-            remote.base_url = "http://oudwood-512:3456".into();
+            remote.base_url = "http://devbox-b:3456".into();
         }
         app.request_history();
         assert!(!app.history_loading, "cross-host attach must not hydrate");
