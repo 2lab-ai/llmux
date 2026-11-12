@@ -11026,7 +11026,7 @@ mod tests {
         // the local file under its live rows would show wrong data.
         for url in [
             "http://devbox-b:3456",
-            "http://100.98.240.111:3456",
+            "http://192.0.2.10:3456",
             "http://[2001:db8::1]:3456",
             "not a url",
         ] {
