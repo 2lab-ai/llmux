@@ -250,7 +250,7 @@ Rates are USD per million tokens:
 
 | `long_context` | Optional (#278). The rates of a long-context request, as an object with the same five fields (`input`, `output`, `cache_read`, `cache_creation`, optional `cache_creation_extended`). Absent means the entry has no long tier. |
 | `fast` | Optional (#278). The rates of a codex Fast request (same object shape). Absent means no Fast premium. |
-| `fast_long_context` | Optional (#278). The rates of a request that is both long-context and Fast (same object shape). Absent means the `long_context` rates. |
+| `fast_long_context` | Optional (#278). The rates of a request that is both long-context and Fast (same object shape); it applies even when the entry has no `long_context`. Absent means the `long_context` rates, else the `fast` rates. |
 
 An entry replaces the whole built-in row, tiers included: an entry without
 `long_context` prices a long request at its own standard rates (flat), and one

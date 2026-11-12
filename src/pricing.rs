@@ -87,8 +87,8 @@ pub struct ModelPrice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<TierRates>,
     /// The rates of a request that is both long-context and Fast. `None` =
-    /// the `long_context` rates (no Fast premium published for that tier).
-    /// Additive in config.
+    /// the `long_context` rates (no Fast premium published for that tier),
+    /// else the `fast` rates. Additive in config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_long_context: Option<TierRates>,
     /// Built-in only: the prompt size at which a request is long-context.
@@ -446,17 +446,17 @@ impl ModelPrice {
             .rates_from
             .and_then(|from| self.change_on(from))
             .map_or(*self, |change| change.price);
-        let long = if class.long_context {
-            row.long_context
-        } else {
-            None
+        // The most specific tier the row has for BOTH class flags first, so
+        // an explicit `fast_long_context` applies even without a
+        // `long_context` tier; then the long tier (no Fast premium published
+        // for it), the Fast tier, the standard rates.
+        let tier = match (class.long_context, class.fast) {
+            (false, false) => None,
+            (true, false) => row.long_context,
+            (false, true) => row.fast,
+            (true, true) => row.fast_long_context.or(row.long_context).or(row.fast),
         };
-        match (long, class.fast) {
-            (None, false) => row.standard(),
-            (Some(long), false) => long,
-            (None, true) => row.fast.unwrap_or(row.standard()),
-            (Some(long), true) => row.fast_long_context.unwrap_or(long),
-        }
+        tier.unwrap_or(row.standard())
     }
 
     /// The latest built-in rate change in force on `day`, if any.
@@ -3042,5 +3042,34 @@ mod tests {
         assert!(serde_json::from_str::<PriceClass>(r#"{"rates_from":"2026-02-30"}"#).is_err());
         assert_eq!(RateDay::ymd(1970, 1, 1), RateDay(0));
         assert_eq!(RateDay::ymd(2026, 12, 1).to_string(), "2026-12-01");
+    }
+
+    /// #278 review: an override that sets `fast_long_context` without
+    /// `long_context` applies it to a long Fast request; each class takes
+    /// the most specific tier the row has.
+    #[test]
+    fn an_explicit_fast_long_tier_applies_without_a_long_tier() {
+        let price: ModelPrice = serde_json::from_str(
+            r#"{"input":1.0,"output":2.0,"cache_read":0.1,"cache_creation":1.25,
+                "fast":{"input":2.0,"output":4.0,"cache_read":0.2,"cache_creation":2.5},
+                "fast_long_context":{"input":7.0,"output":8.0,"cache_read":0.7,"cache_creation":8.75}}"#,
+        )
+        .expect("parses");
+        let both = PriceClass {
+            long_context: true,
+            fast: true,
+            ..PriceClass::STANDARD
+        };
+        assert_eq!(price.rates(both), rates(7.0, 8.0, 0.7, 8.75, None));
+        // No long tier: a long, not-Fast request is flat.
+        assert_eq!(price.rates(long()), price.standard());
+        assert_eq!(price.rates(fast()), rates(2.0, 4.0, 0.2, 2.5, None));
+        // Only a Fast tier: a long Fast request takes the Fast rates.
+        let fast_only: ModelPrice = serde_json::from_str(
+            r#"{"input":1.0,"output":2.0,"cache_read":0.1,"cache_creation":1.25,
+                "fast":{"input":2.0,"output":4.0,"cache_read":0.2,"cache_creation":2.5}}"#,
+        )
+        .expect("parses");
+        assert_eq!(fast_only.rates(both), rates(2.0, 4.0, 0.2, 2.5, None));
     }
 }
