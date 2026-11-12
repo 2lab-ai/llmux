@@ -758,8 +758,14 @@ Server web search is $10 per 1,000 searches on top of the tokens; web fetch has
 no extra charge (same pricing page, read 2026-11-11).
 
 **Estimator scope:** `src/pricing.rs` prices each request with the rates of
-its own [price class](#per-request-price-classes): Haiku 5.5's >100K tier is
-applied to a request whose own prompt is over 100,000 tokens, never to a sum.
+its own [price class](#per-request-price-classes). Haiku 5.5's >100K tier
+follows the page's per-request rule: "a request whose prompt is over 100,000
+tokens pays higher prices. A request's prompt length counts all of its input
+tokens, including cache reads and cache writes. Each request is priced on its
+own" ([pricing](https://platform.claude.com/docs/en/about-claude/pricing), read
+2026-11-12). llmux measures that prompt on the request's top-level usage — the
+whole request, every executor iteration of an advisor turn included — and
+never on an aggregate's summed tokens.
 Writes a response does not report as 1-hour take the 5-minute rate and those it
 does the 1-hour rate (`usage.cache_creation.ephemeral_1h_input_tokens`, since
 2026-11-11; earlier history has no split and keeps the 5-minute price). Each

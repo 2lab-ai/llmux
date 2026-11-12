@@ -3072,4 +3072,91 @@ mod tests {
         .expect("parses");
         assert_eq!(fast_only.rates(both), rates(2.0, 4.0, 0.2, 2.5, None));
     }
+
+    /// #278 review: Anthropic prices Haiku 5.5 "by prompt length: a request
+    /// whose prompt is over 100,000 tokens pays higher prices. A request's
+    /// prompt length counts all of its input tokens ... Each request is
+    /// priced on its own" (pricing page, read 2026-11-12). A request whose
+    /// executor ran two 60,000-token iterations (an advisor turn) reports
+    /// 120,000 top-level input tokens, and is classified on that total —
+    /// the whole request long — while its advisor sub-usage is classified
+    /// on its own prompt and model.
+    #[test]
+    fn a_multi_iteration_haiku_request_is_classified_on_its_top_level_prompt() {
+        let stream = [
+            r#"data: {"type":"message_start","message":{"model":"claude-haiku-5-5","usage":{"input_tokens":120000,"output_tokens":0}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":120000,"output_tokens":300,"iterations":[{"type":"message","input_tokens":60000,"output_tokens":100},{"type":"advisor_message","model":"claude-opus-5-5","input_tokens":5000,"output_tokens":800},{"type":"message","input_tokens":60000,"output_tokens":200}]}}"#,
+        ];
+        let mut observer = crate::proxy::sse::UsageObserver::default();
+        for event in stream {
+            observer.observe(event);
+        }
+        let usage = observer.finish();
+        assert_eq!(
+            usage.input_tokens, 120_000,
+            "the top level sums the executor"
+        );
+        let mut event = crate::tui::ActivityEvent::RequestFinished {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: None,
+            status: 200,
+            duration: std::time::Duration::from_millis(1),
+            tokens: Some(TokenCounts {
+                input: usage.input_tokens,
+                output: usage.output_tokens,
+                ..Default::default()
+            }),
+            group: Some("claude".into()),
+            model: Some("claude-haiku-5-5".into()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: None,
+            sub_usage: usage.sub_usage,
+            price_class: PriceClass::STANDARD,
+        };
+        let day = u64::from(NOV_11.0);
+        classify_finished(
+            &mut event,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(day * 86_400),
+        );
+        let crate::tui::ActivityEvent::RequestFinished {
+            price_class,
+            sub_usage,
+            tokens: Some(tokens),
+            ..
+        } = &event
+        else {
+            panic!("finished");
+        };
+        assert!(
+            price_class.long_context,
+            "120,000 > 100,000 for the request"
+        );
+        assert_eq!(sub_usage.len(), 1);
+        assert!(
+            !sub_usage[0].price_class.long_context,
+            "the advisor's own prompt"
+        );
+        approx(
+            request_cost_usd(
+                "claude",
+                "claude-haiku-5-5",
+                *price_class,
+                tokens,
+                sub_usage,
+                &empty(),
+            ),
+            (120_000.0 * 0.50 + 300.0 * 2.50 + 5_000.0 * 4.0 + 800.0 * 20.0) / 1e6,
+        );
+    }
 }
