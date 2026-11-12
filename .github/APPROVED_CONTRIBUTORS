@@ -1,0 +1,7 @@
+# GitHub logins whose pull requests are reviewed by Review of Legends, one per line.
+# Collaborators with write access are approved without a line here.
+# A line *@example.com approves anyone who verified an email at that domain.
+# See https://github.com/2lab-ai/review-of-legends/blob/main/docs/operations.md (Contributor gate).
+*@2lab.ai
+zhuge-liang-bot[bot]
+andrewinalaska
