@@ -58,6 +58,110 @@ pub struct StreamUsage {
     pub served_fast: Option<bool>,
     /// Anthropic `usage.inference_geo` was `"us"` (US-only inference).
     pub us_inference: bool,
+    /// How each of [`Self::sub_usage`]'s speed is known, index for index
+    /// ([`SubSpeed`]); applied by [`Self::mark_sub_speeds`].
+    pub sub_speeds: Vec<SubSpeed>,
+}
+
+/// How the speed (Claude fast mode) of one sub-usage is decided (#278).
+/// "Each [fallback] entry names a `model` and can override ... `speed` for
+/// that attempt only" (build-with-claude/refusals-and-fallback, read
+/// 2026-11-12), so a sub-usage has its own speed:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubSpeed {
+    /// Its `usage.iterations` entry reported `speed` (`true` = fast).
+    Reported(bool),
+    /// A declined fallback attempt that reported none: it ran at the speed
+    /// the request asked for that attempt ([`RequestedSpeed::attempt_fast`]).
+    Declined,
+    /// An advisor call that reported none: standard. The advisor is "a
+    /// separate sub-inference billed at the advisor model's rates"
+    /// (agents-and-tools/tool-use/advisor-tool, read 2026-11-12) and fast
+    /// mode is requested for the request's own model only.
+    Advisor,
+    /// Any other entry (a compaction, an unknown type) that reported none:
+    /// it ran inside the request on the request's model, at the request's
+    /// served speed.
+    Executor,
+}
+
+/// The Claude speed a request asked for (#278): its top-level `speed` and
+/// each `fallbacks[]` entry's override. Read from the request body only when
+/// it mentions `speed` at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestedSpeed {
+    /// `speed: "fast"` on the request.
+    pub fast: bool,
+    /// `(model, fast)` of each fallback entry that overrides `speed`.
+    pub fallbacks: Vec<(String, bool)>,
+}
+
+impl RequestedSpeed {
+    /// Parse the speeds a Messages request body asks for.
+    pub fn from_body(body: &[u8]) -> Self {
+        if !body.windows(7).any(|w| w == b"\"speed\"") {
+            return Self::default();
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Self::default();
+        };
+        fn speed(v: &serde_json::Value) -> Option<&str> {
+            v.get("speed").and_then(serde_json::Value::as_str)
+        }
+        Self {
+            fast: speed(&value) == Some("fast"),
+            fallbacks: value
+                .get("fallbacks")
+                .and_then(serde_json::Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let model = entry.get("model")?.as_str()?;
+                            Some((model.to_string(), speed(entry)? == "fast"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The speed a declined attempt on `model` ran at: its fallback entry's
+    /// override when it has one, else the request's own `speed` (the
+    /// requested model's attempt, or an entry that does not override it).
+    pub fn attempt_fast(&self, model: Option<&str>) -> bool {
+        let same = |a: &str, b: &str| {
+            crate::tui::activity::normalize_model(a)
+                .eq_ignore_ascii_case(&crate::tui::activity::normalize_model(b))
+        };
+        model
+            .and_then(|model| {
+                self.fallbacks
+                    .iter()
+                    .find(|(entry, _)| same(entry, model))
+                    .map(|(_, fast)| *fast)
+            })
+            .unwrap_or(self.fast)
+    }
+}
+
+impl StreamUsage {
+    /// Mark each sub-usage's speed on its price class (the proxy's mark the
+    /// hub resolves, [`crate::pricing::classify_finished`]), per
+    /// [`SubSpeed`]: its own reported speed, else the request's speed for
+    /// that attempt, standard for an advisor call, the served top-level
+    /// speed for anything else.
+    pub fn mark_sub_speeds(&mut self, requested: &RequestedSpeed) {
+        let served = self.served_fast.unwrap_or(requested.fast);
+        for (sub, speed) in self.sub_usage.iter_mut().zip(&self.sub_speeds) {
+            sub.price_class.fast = match speed {
+                SubSpeed::Reported(fast) => *fast,
+                SubSpeed::Declined => requested.attempt_fast(sub.model.as_deref()),
+                SubSpeed::Advisor => false,
+                SubSpeed::Executor => served,
+            };
+        }
+    }
 }
 
 impl StreamUsage {
@@ -239,6 +343,16 @@ pub fn uncounted_iterations(
     usage: &serde_json::Value,
     hops: &[FallbackHop],
 ) -> Option<Vec<SubUsage>> {
+    uncounted_iterations_with_speeds(usage, hops)
+        .map(|subs| subs.into_iter().map(|(sub, _)| sub).collect())
+}
+
+/// [`uncounted_iterations`] with how each sub-usage's speed is decided
+/// ([`SubSpeed`]).
+pub fn uncounted_iterations_with_speeds(
+    usage: &serde_json::Value,
+    hops: &[FallbackHop],
+) -> Option<Vec<(SubUsage, SubSpeed)>> {
     let iterations = usage.get("iterations")?.as_array()?;
     let served: Vec<Option<&str>> = iterations
         .iter()
@@ -310,7 +424,15 @@ pub fn uncounted_iterations(
         .map(|(_, it)| it)
         .map(|it| {
             let count = |key: &str| it.get(key).and_then(serde_json::Value::as_u64);
-            SubUsage {
+            let speed = match served_speed(it) {
+                Some(fast) => SubSpeed::Reported(fast),
+                None => match iteration_kind(it) {
+                    "message" => SubSpeed::Declined,
+                    "advisor_message" => SubSpeed::Advisor,
+                    _ => SubSpeed::Executor,
+                },
+            };
+            let sub = SubUsage {
                 model: iteration_model(it).map(str::to_string),
                 tokens: TokenCounts {
                     input: count("input_tokens").unwrap_or(0),
@@ -327,9 +449,10 @@ pub fn uncounted_iterations(
                     web_search_requests: None,
                 },
                 price_class: crate::pricing::PriceClass::STANDARD,
-            }
+            };
+            (sub, speed)
         })
-        .filter(|sub| sub.tokens.total() > 0)
+        .filter(|(sub, _)| sub.tokens.total() > 0)
         .collect();
     Some(uncounted)
 }
@@ -496,6 +619,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 unbilled_refusal: false,
                 served_fast: served_speed(usage),
                 us_inference: us_inference(usage),
+                sub_speeds: Vec::new(),
             })
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
@@ -536,6 +660,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 // so the requested tier stands.
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         }
         "message_delta" => {
@@ -553,6 +678,7 @@ pub fn extract_usage(event: &str) -> Option<StreamUsage> {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         }
         _ => None,
@@ -710,7 +836,11 @@ impl UsageObserver {
             usage.cache_creation_extended =
                 extended_cache_writes(served, usage.cache_creation_input_tokens);
         }
-        usage.sub_usage = uncounted_iterations(&iterations, &self.hops).unwrap_or_default();
+        (usage.sub_usage, usage.sub_speeds) =
+            uncounted_iterations_with_speeds(&iterations, &self.hops)
+                .unwrap_or_default()
+                .into_iter()
+                .unzip();
         usage.unbilled_refusal = unbilled_refusal(
             self.stop_reason.as_deref(),
             self.refusal_category.as_deref(),
@@ -1374,6 +1504,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1396,6 +1527,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1416,6 +1548,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1456,6 +1589,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
         // No write field: unchanged behaviour (creation unavailable).
@@ -1474,6 +1608,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             })
         );
     }
@@ -1493,6 +1628,7 @@ mod tests {
             unbilled_refusal: false,
             served_fast: None,
             us_inference: false,
+            sub_speeds: Vec::new(),
         });
         total.add(StreamUsage {
             input_tokens: 0,
@@ -1506,6 +1642,7 @@ mod tests {
             unbilled_refusal: false,
             served_fast: None,
             us_inference: false,
+            sub_speeds: Vec::new(),
         });
         assert_eq!(
             total,
@@ -1523,6 +1660,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }

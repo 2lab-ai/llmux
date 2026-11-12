@@ -817,7 +817,16 @@ model row, a usage row, a tenant cell or a key-usage report costs exactly the
 sum of its requests, and history keeps the rates of its own class. A record
 with no class (everything recorded before 2026-11-12) is the standard class
 and prices as before. A sub-usage (advisor, compaction, billed fallback
-attempt) is classified on its own prompt and model.
+attempt) is classified on its own prompt and model, at its own speed and the
+request's geography: US-only inference covers every inference of the request.
+Its speed is the `speed` its `usage.iterations` entry reports; when the entry
+reports none, a declined fallback attempt ran at the speed the request asked
+for that attempt ("Each [fallback] entry ... can override ... `speed` for that
+attempt only", [refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback),
+read 2026-11-12: the entry's override, else the request's `speed`), an advisor
+call at standard speed (a separate sub-inference on another model; fast mode
+is requested for the request's own model), and a compaction at the request's
+served speed.
 
 | Fact | When | Rates |
 | --- | --- | --- |

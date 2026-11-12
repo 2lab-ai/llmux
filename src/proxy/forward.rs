@@ -710,8 +710,9 @@ impl ForwardContext {
         state: &AppState,
         account: Option<&AccountId>,
         status: StatusCode,
-        usage: sse::StreamUsage,
+        mut usage: sse::StreamUsage,
     ) {
+        usage.mark_sub_speeds(&sse::RequestedSpeed::from_body(&self.body));
         self.emit_finished_timed(
             state,
             account,
@@ -3871,12 +3872,16 @@ async fn relay(
         // differs, and that is the half worth keeping.
         let raw_io_upstream_meta = upstream_meta;
         let raw_io_upstream_res_headers = upstream_response_headers.clone();
+        // The speed the request asked for each attempt, for the sub-usages a
+        // fallback turn or an advisor call reports (#278).
+        let requested_speed = sse::RequestedSpeed::from_body(&ctx.body);
         sse::passthrough_body(
             response,
             BODY_LOG_LIMIT,
             raw_io_max_body,
             std::time::Duration::from_secs(state.config.proxy.forward_idle_timeout_secs),
-            move |usage, captured, raw_captured, error, timing: sse::StreamTiming| {
+            move |mut usage, captured, raw_captured, error, timing: sse::StreamTiming| {
+                usage.mark_sub_speeds(&requested_speed);
                 // Provider failure = transport break OR a protocol-level SSE
                 // `error` event (arrives under a clean HTTP 200).
                 let upstream_error = provider_failure(
@@ -4785,6 +4790,13 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
     let written = usage
         .get("cache_creation_input_tokens")
         .and_then(serde_json::Value::as_u64);
+    // Sub-inferences the counters below leave out, with how each one's speed
+    // is decided.
+    let (sub_usage, sub_speeds): (Vec<_>, Vec<_>) =
+        sse::uncounted_iterations_with_speeds(usage, &hops)
+            .unwrap_or_default()
+            .into_iter()
+            .unzip();
     sse::StreamUsage {
         input_tokens: usage
             .get("input_tokens")
@@ -4804,7 +4816,7 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
         web_search_requests: sse::web_search_requests(usage),
         // Sub-inferences the counters above leave out (advisor, compaction,
         // billed declined fallback attempts), billed under their own model.
-        sub_usage: sse::uncounted_iterations(usage, &hops).unwrap_or_default(),
+        sub_usage,
         served_model: sse::fallback_served_model(
             usage,
             &hops,
@@ -4825,6 +4837,7 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
         // Claude fast mode and US-only inference, as served.
         served_fast: sse::served_speed(usage),
         us_inference: sse::us_inference(usage),
+        sub_speeds,
     }
 }
 
@@ -4836,10 +4849,10 @@ fn usage_from_json_body(body: &[u8]) -> sse::StreamUsage {
 /// the rest (long context, Fast, dated rates); both marks only count on the
 /// claude group ([`crate::pricing::PriceClass::resolve`]).
 fn served_class(unbilled_refusal: bool, us_inference: bool) -> crate::pricing::PriceClass {
-    if unbilled_refusal {
-        return crate::pricing::PriceClass::UNBILLED;
-    }
+    // Both marks ride along: the hub prices the request itself at 0 when it
+    // is unbilled, and still carries the geography into its sub-usages.
     crate::pricing::PriceClass {
+        unbilled: unbilled_refusal,
         us_inference,
         ..crate::pricing::PriceClass::STANDARD
     }
@@ -7679,6 +7692,152 @@ mod tests {
         .expect("finished");
         assert_eq!(fast, Some(true));
         assert!(class.us_inference, "{class:?}");
+    }
+
+    /// Drive one JSON request through the proxy and return its finished
+    /// event, classified as the dashboard hub records it.
+    async fn finished_through_proxy(response: &'static str, request: &str) -> ActivityEvent {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::Ok { body: response });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+        let reply = forward(&state, client_request(request)).await;
+        let _ = response_body(reply).await;
+        let mut event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(event @ ActivityEvent::RequestFinished { .. }) => return Some(event),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("in time")
+        .expect("finished");
+        crate::pricing::classify_finished(&mut event, SystemTime::now());
+        event
+    }
+
+    /// #278 review: US-only inference covers every inference of the request
+    /// ("1.1x the standard rate across all token pricing categories",
+    /// manage-claude/data-residency, read 2026-11-12) — its advisor call
+    /// too. A US-only Opus 5.5 request whose Fable 5.2 advisor read 100k and
+    /// wrote 1k tokens prices the advisor at 1.1x: $0.924, not $0.84.
+    #[tokio::test]
+    async fn a_us_only_request_carries_its_geography_into_its_sub_usage() {
+        const BODY: &str = r#"{"id":"msg_1","type":"message","model":"claude-opus-5-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":100,"inference_geo":"us","iterations":[{"type":"message","input_tokens":1000,"output_tokens":100},{"type":"advisor_message","model":"claude-fable-5-2","input_tokens":100000,"output_tokens":1000}]}}"#;
+        let event = finished_through_proxy(BODY, r#"{"model":"claude-opus-5-5"}"#).await;
+        let ActivityEvent::RequestFinished {
+            sub_usage,
+            price_class,
+            tokens: Some(tokens),
+            ..
+        } = &event
+        else {
+            panic!("finished");
+        };
+        assert!(price_class.us_inference);
+        assert_eq!(sub_usage.len(), 1);
+        assert!(sub_usage[0].price_class.us_inference, "{:?}", sub_usage[0]);
+        let none = std::collections::HashMap::new();
+        let advisor = crate::pricing::class_cost(
+            "claude",
+            "claude-fable-5-2",
+            sub_usage[0].price_class,
+            &sub_usage[0].tokens,
+            &none,
+        )
+        .expect("priced");
+        assert!((advisor - 0.924).abs() < 1e-9, "advisor {advisor}");
+        let request = crate::pricing::request_cost_usd(
+            "claude",
+            "claude-opus-5-5",
+            *price_class,
+            tokens,
+            sub_usage,
+            &none,
+        );
+        let executor = (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6 * 1.1;
+        assert!(
+            (request - (executor + 0.924)).abs() < 1e-9,
+            "request {request}"
+        );
+        // Through every aggregate of the hub: the model rows add up to it.
+        let hub = crate::dashboard::DashboardHub::default();
+        hub.apply_event(event.clone(), SystemTime::now());
+        let view = hub.view(SystemTime::now());
+        let rows: f64 = view
+            .model_usage
+            .iter()
+            .map(|m| {
+                crate::pricing::aggregate_cost_usd(
+                    &m.group,
+                    &m.model,
+                    &m.token_counts(),
+                    &m.classes,
+                    &none,
+                )
+            })
+            .sum();
+        assert!((rows - request).abs() < 1e-9, "rows {rows} != {request}");
+    }
+
+    /// #278 review: each fallback attempt runs at its own speed — "Each
+    /// entry names a `model` and can override ... `speed` for that attempt
+    /// only" (build-with-claude/refusals-and-fallback, read 2026-11-12). The
+    /// declined attempt of the requested model ran at the request's `speed`;
+    /// the top-level `usage.speed` is the served attempt's.
+    #[tokio::test]
+    async fn each_fallback_attempt_is_priced_at_its_own_speed() {
+        // Standard declined + fast served: the fallback entry asks for fast.
+        const STANDARD_THEN_FAST: &str = r#"{"id":"msg_1","type":"message","model":"claude-opus-5-5","content":[{"type":"fallback","from":{"model":"claude-fable-5-2"},"to":{"model":"claude-opus-5-5"},"trigger":{"type":"refusal","category":"cyber"}}],"stop_reason":"end_turn","usage":{"input_tokens":500,"output_tokens":50,"speed":"fast","iterations":[{"type":"message","model":"claude-fable-5-2","input_tokens":500,"output_tokens":7},{"type":"fallback_message","model":"claude-opus-5-5","input_tokens":500,"output_tokens":50}]}}"#;
+        let event = finished_through_proxy(
+            STANDARD_THEN_FAST,
+            r#"{"model":"claude-fable-5-2","fallbacks":[{"model":"claude-opus-5-5","speed":"fast"}]}"#,
+        )
+        .await;
+        let ActivityEvent::RequestFinished {
+            fast, sub_usage, ..
+        } = &event
+        else {
+            panic!("finished");
+        };
+        assert_eq!(*fast, Some(true), "the served attempt ran fast");
+        assert_eq!(sub_usage.len(), 1, "the declined attempt streamed output");
+        assert!(!sub_usage[0].price_class.fast, "it ran at standard speed");
+        // Fast declined + standard served: the request asks for fast, the
+        // fallback entry overrides it to standard.
+        const FAST_THEN_STANDARD: &str = r#"{"id":"msg_2","type":"message","model":"claude-opus-5-5","content":[{"type":"fallback","from":{"model":"claude-fable-5-2"},"to":{"model":"claude-opus-5-5"},"trigger":{"type":"refusal","category":"cyber"}}],"stop_reason":"end_turn","usage":{"input_tokens":500,"output_tokens":50,"speed":"standard","iterations":[{"type":"message","model":"claude-fable-5-2","input_tokens":500,"output_tokens":7},{"type":"fallback_message","model":"claude-opus-5-5","input_tokens":500,"output_tokens":50}]}}"#;
+        let event = finished_through_proxy(
+            FAST_THEN_STANDARD,
+            r#"{"model":"claude-fable-5-2","speed":"fast","fallbacks":[{"model":"claude-opus-5-5","speed":"standard"}]}"#,
+        )
+        .await;
+        let ActivityEvent::RequestFinished {
+            fast, sub_usage, ..
+        } = &event
+        else {
+            panic!("finished");
+        };
+        assert_eq!(*fast, Some(false), "the served attempt ran standard");
+        assert!(
+            sub_usage[0].price_class.fast,
+            "the declined attempt ran fast"
+        );
+        // An iteration entry that reports its own speed wins.
+        const REPORTED: &str = r#"{"id":"msg_3","type":"message","model":"claude-opus-5-5","content":[],"stop_reason":"end_turn","usage":{"input_tokens":500,"output_tokens":50,"speed":"standard","iterations":[{"type":"message","model":"claude-fable-5-2","input_tokens":500,"output_tokens":7,"speed":"fast"},{"type":"fallback_message","model":"claude-opus-5-5","input_tokens":500,"output_tokens":50}]}}"#;
+        let event = finished_through_proxy(REPORTED, r#"{"model":"claude-fable-5-2"}"#).await;
+        let ActivityEvent::RequestFinished { sub_usage, .. } = &event else {
+            panic!("finished");
+        };
+        assert!(sub_usage[0].price_class.fast, "the entry's own speed");
     }
 
     /// Drive `sse::transform_body` with a REAL HTTP response (the scripted

@@ -3898,7 +3898,12 @@ mod tests {
                     input: 1_000,
                     ..Default::default()
                 },
-                price_class: crate::pricing::PriceClass::STANDARD,
+                // The proxy's mark: this sub-usage ran at the Fast tier
+                // (`StreamUsage::mark_sub_speeds`).
+                price_class: crate::pricing::PriceClass {
+                    fast: true,
+                    ..crate::pricing::PriceClass::STANDARD
+                },
             });
         }
         crate::pricing::classify_finished(&mut event, now);
@@ -3914,7 +3919,8 @@ mod tests {
             price_class.long_context && price_class.fast,
             "{price_class:?}"
         );
-        // The sub-usage is classified on its own (short) prompt.
+        // The sub-usage is classified on its own (short) prompt and keeps
+        // its own speed.
         assert!(!sub_usage[0].price_class.long_context);
         assert!(sub_usage[0].price_class.fast);
         let line =

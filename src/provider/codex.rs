@@ -1819,6 +1819,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -1865,6 +1866,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -1911,6 +1913,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -1973,6 +1976,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -2011,6 +2015,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -2045,6 +2050,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }
@@ -2447,6 +2453,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             }
         );
     }

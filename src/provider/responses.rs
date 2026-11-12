@@ -949,6 +949,7 @@ impl ResponsesSseConverter {
             // stands (see `the_translate_path_ignores_the_codex_service_tier`).
             served_fast: None,
             us_inference: false,
+            sub_speeds: Vec::new(),
         };
     }
 
@@ -1834,6 +1835,7 @@ mod tests {
                 unbilled_refusal: false,
                 served_fast: None,
                 us_inference: false,
+                sub_speeds: Vec::new(),
             },
             "a capped turn still bills the tokens it really burned"
         );
@@ -1862,6 +1864,7 @@ mod tests {
             unbilled_refusal: false,
             served_fast: None,
             us_inference: false,
+            sub_speeds: Vec::new(),
         };
         let failed = json!({"type": "response.failed", "response": {
             "error": {"message": "boom"}, "usage": usage_fixture()}});

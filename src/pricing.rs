@@ -376,10 +376,11 @@ impl PriceClass {
 /// Resolve the price class of a finished request and of each of its
 /// sub-usages, once, at the instant `at` the dashboard hub records it —
 /// before the request is persisted, metered and folded, so all three carry
-/// the same classes. The request keeps the proxy's unbilled mark
-/// ([`PriceClass::resolve`]); a sub-usage is classified on its own model
-/// (`None` → the request's) and prompt, with the request's Fast flag and
-/// day, never as an unbilled refusal. Every other event is left alone.
+/// the same classes. The request keeps the proxy's unbilled and US-only
+/// marks ([`PriceClass::resolve`]); a sub-usage is classified on its own
+/// model (`None` → the request's) and prompt, its own speed (the proxy's
+/// mark on it) and the request's day and geography, never as an unbilled
+/// refusal. Every other event is left alone.
 pub fn classify_finished(event: &mut crate::tui::ActivityEvent, at: std::time::SystemTime) {
     let crate::tui::ActivityEvent::RequestFinished {
         tokens,
@@ -397,13 +398,26 @@ pub fn classify_finished(event: &mut crate::tui::ActivityEvent, at: std::time::S
     let fast = fast.unwrap_or(false);
     let group = group.as_deref().unwrap_or("");
     let model = model.as_deref().unwrap_or("");
+    // The request's geography covers every inference it ran (US-only
+    // inference is "1.1x the standard rate across all token pricing
+    // categories" of the request, manage-claude/data-residency, read
+    // 2026-11-12); its unbilled mark is its own.
+    let geography = PriceClass {
+        us_inference: price_class.us_inference,
+        ..PriceClass::STANDARD
+    };
     *price_class = price_class.resolve(group, model, &tokens.unwrap_or_default(), fast, day);
     for sub in sub_usage.iter_mut() {
-        sub.price_class = PriceClass::STANDARD.resolve(
+        // The proxy marked each sub-usage's own speed
+        // (`crate::proxy::sse::StreamUsage::mark_sub_speeds`): a fallback
+        // attempt, an advisor call or a compaction runs at its own speed,
+        // not the served attempt's.
+        let sub_fast = sub.price_class.fast;
+        sub.price_class = geography.resolve(
             group,
             sub.model.as_deref().unwrap_or(model),
             &sub.tokens,
-            fast,
+            sub_fast,
             day,
         );
     }
