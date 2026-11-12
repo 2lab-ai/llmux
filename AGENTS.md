@@ -88,7 +88,7 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
   secret, which 2lab-ai/soma-work holds with the same value; `scripts/sanitize-scan.sh` is a
   byte-identical copy of soma-work's. Write "a shared host" or "the owner's Mac" instead of a
   machine name, and commit with a configured `user.email` (git's default `user@hostname` puts
-  the host name in the author line). Commits published before the gate are listed in
-  `scripts/sanitize-known-leaks.txt`.
+  the host name in the author line). The history was rewritten on 2026-11-12, so nothing
+  is exempt: a hit is fixed by rewriting the commit, never by listing it.
 - The `/api/oauth/usage` endpoint returns **percentages (0–100)**, not fractions — each
   evidence source has a fixed scale (see `src/scheduler/usage.rs`).
