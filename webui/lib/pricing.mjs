@@ -83,9 +83,13 @@ function solve(A, b) {
 export function solveRates(usageStats) {
   const byModel = new Map();
   for (const u of usageStats || []) {
-    if (!u || u.priced === false || !(u.cost_usd > 0) || (u.gran !== 'hour' && u.gran !== 'day')) continue;
+    if (!u || u.priced === false || (u.gran !== 'hour' && u.gran !== 'day')) continue;
+    // A row with price classes comes from a daemon that prices every row, so its 0 is a real price
+    // (an explicitly free class); an older row's 0 may mean "not priced", so it is not solved.
+    const classed = (u.price_classes || []).length > 0;
+    if (!classed && !(u.cost_usd > 0)) continue;
     for (const x of samples(u)) {
-      if (!(x.cost_usd > 0)) continue;
+      if (classed ? !(x.cost_usd >= 0) || !COLS.some(c => c.get(x) > 0) : !(x.cost_usd > 0)) continue;
       if (!byModel.has(x.key)) byModel.set(x.key, []);
       byModel.get(x.key).push(x);
     }
@@ -110,7 +114,8 @@ export function solveRates(usageStats) {
       const est = live.reduce((a, c, i) => a + c.get(r) * c.scale * sol[i], 0);
       err += Math.abs(est - r.cost_usd); tot += r.cost_usd;
     }
-    if (tot <= 0 || err / tot > 0.02) continue;
+    // A key whose every sample cost 0 is free (all its rates 0), not unsolvable.
+    if (tot <= 0 ? err > 1e-12 : err / tot > 0.02) continue;
     const rate = { in: 0, out: 0, cr: 0, cc: 0, ce: 0, ws: 0 };
     live.forEach((c, i) => { rate[c.key] = Math.max(0, sol[i]) * c.scale; });
     const seen = key => live.some(c => c.key === key);

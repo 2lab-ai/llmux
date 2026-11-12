@@ -125,6 +125,25 @@ test('price classes: the standard part and each class solve on their own, histor
   assert.equal(+priceRow(row, rates, new Map()).toFixed(6), +(2e6 * a + 1.5e4 * b).toFixed(6));
 });
 
+test('an explicitly free price class stays free on history rows (#278)', () => {
+  // Standard input $1/M; the long-context class is free (an override can set that). The rows carry
+  // the free long share with its daemon cost of 0, one row nothing else.
+  const rows = [
+    { gran: 'hour', model: 'm', tokens_in: 1e6, cost_usd: 1 },
+    { gran: 'hour', model: 'm', tokens_in: 2e6 + 3e5, cost_usd: 2,
+      price_classes: [{ class: { long_context: true }, tokens: { input: 3e5 }, cost_usd: 0 }] },
+    { gran: 'hour', model: 'm', tokens_in: 4e5, cost_usd: 0,
+      price_classes: [{ class: { long_context: true }, tokens: { input: 4e5 }, cost_usd: 0 }] },
+  ];
+  const rates = solveRates(rows);
+  assert.ok(Math.abs(rates.get('m').in - 1e-6) < 1e-12, JSON.stringify(rates.get('m')));
+  const free = rates.get('m|long_context');
+  assert.ok(free, 'the free class is solved, not dropped');
+  assert.equal(free.in, 0);
+  const row = { model: 'm', cost_usd: null, tokens: { input: 3e5 }, price_class: { long_context: true } };
+  assert.equal(priceRow(row, rates, new Map()), 0, 'not repriced at the standard $0.30');
+});
+
 test('solveRates refuses a fit that is not linear', () => {
   const rows = [1, 2, 3, 4, 5, 6].map(i => ({ gran: 'hour', model: 'x', tokens_in: i * 100, tokens_out: i * i * 10, cache_read: 0, cache_creation: 0, cost_usd: Math.random() * 10 + 1 }));
   assert.equal(solveRates(rows).has('x'), false);
