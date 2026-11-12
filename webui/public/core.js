@@ -98,7 +98,7 @@
   };
 
   /* ---------- work log (per-request) ---------- */
-  const KIND_ICON = { sdk: '◆', user: '›', other: '◆', subagent: '⑂', count: '#', title: 'T', suggest: '?', compact: '⇣', security: '⛨', summary: 'Σ', quota: '%', recap: '↺', audit: '✓' };
+  const KIND_ICON = { sdk: '◆', user: '›', other: '◆', subagent: '⑂', count: '#', title: 'T', status: '◔', suggest: '?', compact: '⇣', security: '⛨', summary: 'Σ', quota: '%', recap: '↺', audit: '✓' };
   X.renderWorklog = function (rows, opt = {}) {
     const list = rows.slice().sort((a, b) => b.at_ms - a.at_ms).slice(0, opt.limit || 400);
     if (opt.compact) return `<div class="x-wl x-wl-c x-wl-h"><span>time</span><span>kind</span><span>model · account</span><span>st</span><span>dur</span><span>out</span></div>` + list.map(r => {

@@ -353,16 +353,24 @@ separate from the backend group. See [feature contract](21-codex-frontend.md) an
 [vertical traces](codex-frontend/trace.md). The shipped contract and verified
 preview release are recorded in [the convergence loop](codex-frontend/loop.md).
 
-## Claude Code auto-mode routing exception (2026-10-07)
+## Claude Code auto-mode routing exception (2026-10-07, generalized 2026-11-12)
+
+Decision record: [27-claude-code-harness-requests.md](27-claude-code-harness-requests.md).
 
 `AppState.auto_classifier_sessions` holds at most 4096 tenant/session entries with a
-6-hour TTL. Only recognized main CLI execution turns update it, at request entry;
-subagents and control turns do not. The current JSON-in-string `metadata.user_id`
+6-hour TTL; each entry stores the provider serving the session's main model
+(`Codex`, `Grok`, or `Claude` for everything else). Recognized main CLI execution
+turns always update it, at request entry; the session's warmup (main identity,
+`max_tokens: 1`, no tools) seeds an entry only when none exists; subagents and
+control turns never touch it. The current JSON-in-string `metadata.user_id`
 is normalized to device/session, excluding account UUID. State is not persisted.
 
 On POST `/v1/messages`, with model routing enabled, a recognized security monitor
-for a known GPT main session receives a request-owned Codex shape (`claude_code.auto_classifier_model`, default `luna`, medium,
-no priority override). Original client bytes remain available for raw-io capture;
+for a known Codex main session receives a request-owned Codex shape
+(`claude_code.auto_classifier_model`, default `luna`, medium, no priority override);
+for a Grok main session, a request-owned Grok shape (the configured pin through the
+bare `grok` alias, medium). `auto_classifier::Route` carries a `Target` (Codex or Grok
+shape) and `forward.rs` builds, meters and converts it on that provider. Original client bytes remain available for raw-io capture;
 provider input and activity metadata use the effective shape. An empty/exhausted
 Codex group never falls back to Claude for this exception.
 
@@ -375,8 +383,12 @@ remain unchanged. Details and regression receipts are in
 
 ### Internal model mapping and bootstrap context
 
-`internal_requests` recognizes quota, title and helper/subagent wire signatures.
-The same bounded session registry selects `claude_code.gpt_model_mapping` targets;
+`internal_requests` recognizes quota, title, notification-status and helper/subagent
+wire signatures, reads the Claude tier from the request model, and maps it per main
+provider: Codex → `claude_code.gpt_model_mapping` (default `terra`/`terra`/`luna`);
+Grok → the pin with effort low for utilities and the client's effort capped at
+low/medium/high for Haiku/Sonnet/Opus helpers. The same bounded session registry
+selects the provider;
 real main execution wins over display-kind heuristics and explicit Claude switches
 clear GPT context. Utility routes own their provider shape/response model too, but
 only monitors use verdict buffering and the special deadline/size limit. The title

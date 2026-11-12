@@ -1057,14 +1057,18 @@ Image validation requires `source.type: "base64"`, nonempty valid base64, a deco
 
 Send `X-Llmux-Compatibility: strict` to reject any such issue with HTTP 400 **before upstream traffic or credential refresh**. Other header values and invalid/nonpositive/noninteger limits also return 400. Since normal Messages clients send `max_tokens`, strict mode will reject those Codex/Grok requests rather than pretend to enforce an equivalent budget.
 
-**Claude Code auto-mode monitors.** With routing enabled, llmux remembers the main
-CLI model for each tenant/device/session (at most 4096 entries, six hours, cleared
-on daemon restart). After a GPT main turn, its auto-mode security monitor uses
-`claude_code.auto_classifier_model` (default alias `luna`) with **medium** effort, independent of the main
-model's effort/fast settings. Main model changes update this context; subagents,
-quota/count probes, compact/summary and other control calls do not. Unknown
-sessions, other endpoints, routing-disabled traffic and Claude main sessions keep
-normal routing. The monitor does not fall back to Claude when Codex is unavailable.
+**Claude Code auto-mode monitors.** With routing enabled, llmux remembers the
+provider of the main CLI model for each tenant/device/session (at most 4096 entries,
+six hours, cleared on daemon restart). In a Codex main session the auto-mode
+security monitor uses `claude_code.auto_classifier_model` (default alias `luna`);
+in a Grok main session it uses the Grok pin (the `grok` alias). Both run at
+**medium** effort, independent of the main model's effort/fast settings and of the
+global `grok.reasoning_effort`. Main model changes update this context; the
+session's startup warmup (`max_tokens: 1`, no tools) seeds an unknown session;
+subagents, quota/count probes, compact/summary and other control calls do not.
+Unknown sessions, other endpoints, routing-disabled traffic and Claude main
+sessions keep normal routing. The monitor does not fall back to Claude when the
+main provider is unavailable.
 
 The adapter recognizes the monitor system contract, supports Stage 1 severity and
 Stage 2 thinking/severity/category, and retains historical block verdict support.
@@ -1078,7 +1082,7 @@ deadline is 60 seconds; a successful upstream stream over 1 MiB is refused.
 
 Original requested Sonnet model/stop remain in raw-io; the upstream half and
 activity model show the effective configured model/medium. The route trace includes
-`reason=gpt_main_session_internal_request`. `classifier_local_stop` appears in
+`reason=non_claude_main_session_harness_request` with the target group and effort. `classifier_local_stop` appears in
 compatibility warnings when the local adapter is used. **Strict mode still rejects
 unsupported original controls**, and ordinary stop requests still return 400.
 This local output boundary is not a generation or billing cap; Codex still omits
@@ -1160,14 +1164,35 @@ Contributor conventions are in [`../AGENTS.md`](../AGENTS.md).
 
 ## Claude Code internal model routing
 
-In a GPT main session, llmux maps implicit Opus/Sonnet/Haiku requests to
-`sol`/`terra`/`luna`. Configure `claude_code.gpt_model_mapping` and the separate
-`claude_code.auto_classifier_model` in [configuration](configuration.md#claude-code-internal-models-claude_code).
-Titles are labeled `title`; activity records the actual effective model.
-Explicit main Claude choices remain authoritative, including a switch after launch.
+Claude Code sends requests of its own beside the user's turns — session title,
+quota probe, notification status check, security monitor, recap, suggestion,
+helper and subagent turns — and names a Claude model for each one. When the
+session's main model is served by Codex or Grok, every recognised harness request
+that names a Claude tier (`opus`, `sonnet`, `haiku`) is served by the main
+provider's model for that tier ([design](../.prd/27-claude-code-harness-requests.md)):
 
-Startup quota and session-title calls can occur before the first main request.
-`llmux run` supplies
+| Harness request | Codex main | Grok main |
+| --- | --- | --- |
+| title, quota, status (Haiku) | `luna`, low | `grok`, low |
+| security monitor (Sonnet) | `auto_classifier_model` (`luna`), medium | `grok`, medium |
+| helper / subagent / recap / suggest naming Haiku, Sonnet, Opus | `luna` / `terra` / `terra`, client effort | `grok`, client effort capped at low / medium / high |
+
+Codex uses the smaller models through `claude_code.gpt_model_mapping` and
+`claude_code.auto_classifier_model` ([configuration](configuration.md#claude-code-internal-models-claude_code)).
+Grok has one model line, so it keeps the `grok` alias (the configured pin) and lowers
+effort; the request-owned effort wins over the global `grok.reasoning_effort`. Every
+target is an alias resolved on each request, so a model update moves these requests
+with no config change. Requests that name the main model itself (warmup, compact)
+or a non-tier model (`fable`, an explicit GPT/Grok id) are not rewritten.
+Titles are labeled `title`, the status check `status`; activity records the actual
+effective model. Explicit main Claude choices remain authoritative, including a
+switch after launch.
+
+Startup quota and session-title calls can occur before the first main request
+(Claude Code 2.1.322 starts the title about 255 ms before the first main turn).
+Claude Code sends a warmup (`"Hi"`, `max_tokens: 1`, no tools) with the session's
+current main model first; llmux uses it to learn an unknown session's provider. It
+never overrides an observed main turn. `llmux run` also supplies
 `x-llmux-claude-launch-model` only when it can resolve the launch choice: explicit
 `--model`, `ANTHROPIC_MODEL`, or ordinary user/project/local/flag settings model,
 with native alias environment overrides considered. Both `--model=value` and
@@ -1191,7 +1216,7 @@ settings or native selection overrides not visible at launch cannot be inferred;
 the first genuine main request supplies authoritative context. Direct `claude`
 launches without `llmux run` also rely on that observed context.
 
-For GPT sessions the quota call checks Codex availability. Actual Codex quota
+For Codex sessions the quota call checks Codex availability. Actual Codex quota
 headers remain available, but native Claude UI does not interpret them as Claude
 usage percentages. llmux does not manufacture Claude limits/reset times. The
 Codex gateway's existing output-cap omission also applies to this probe. See the

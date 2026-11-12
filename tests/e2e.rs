@@ -7580,3 +7580,324 @@ async fn haiku_4_5_float_reaches_upstream_and_activity_consistently() {
         vec!["claude-haiku-4-5-20251001", "claude-haiku-5-5"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Claude Code harness requests follow the main provider (.prd/27, 2026-11-12)
+// ---------------------------------------------------------------------------
+
+// Sanitized wire shapes from Claude Code 2.1.322 (raw-io 2026-11-12, warmup
+// #50915/#50903, title #50916/#50904, status classifier #48932). Session
+// identity is the current JSON-in-string `metadata.user_id`.
+fn harness_session(session: &str) -> String {
+    serde_json::json!({"device_id":"dev-fixture","account_uuid":"acct-fixture","session_id":session})
+        .to_string()
+}
+fn harness_billing() -> serde_json::Value {
+    serde_json::json!({"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.322; cc_entrypoint=cli;"})
+}
+fn harness_warmup(session: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({"model":model,"max_tokens":1,"metadata":{"user_id":harness_session(session)},
+        "system":[harness_billing(),{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],
+        "messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]})
+}
+fn harness_title(session: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({"model":"claude-haiku-5-5","max_tokens":128000,"stream":stream,"tools":[],
+        "metadata":{"user_id":harness_session(session)},
+        "system":[harness_billing(),{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions. Return JSON with a single \"title\" field."}],
+        "messages":[{"role":"user","content":[{"type":"text","text":"<session>Inspect the fixture folder</session>"}]}],
+        "output_config":{"effort":"medium","format":{"type":"json_schema","schema":llmux::proxy::internal_requests::title_schema()}}})
+}
+fn harness_status(session: &str) -> serde_json::Value {
+    serde_json::json!({"model":"claude-haiku-5-5","max_tokens":3072,"metadata":{"user_id":harness_session(session)},
+        "system":[harness_billing(),{"type":"text","text":"A user kicked off a Claude Code agent to do a coding task and walked away. Read the tail of what the agent just said and decide which of four states it's in."}],
+        "messages":[{"role":"user","content":"Current state: working (for 3m)\nTool calls so far: Read×1\nUser's most recent ask: \"inspect the fixture\"\n\nAssistant message tail (last 0 chars):\n"}]})
+}
+fn harness_main(session: &str, model: &str) -> serde_json::Value {
+    let mut body = auto_main_request("unused", model);
+    body["metadata"]["user_id"] = serde_json::json!(harness_session(session));
+    body
+}
+fn harness_monitor(session: &str) -> serde_json::Value {
+    let mut body = auto_classifier_request("unused", false);
+    body["metadata"]["user_id"] = serde_json::json!(harness_session(session));
+    body
+}
+fn harness_subagent(session: &str, model: &str, effort: &str) -> serde_json::Value {
+    serde_json::json!({"model":model,"metadata":{"user_id":harness_session(session)},
+        "output_config":{"effort":effort},
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.322; cc_entrypoint=cli; cc_is_subagent=true;"},
+            {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."}],
+        "tools":[{"name":"Read","description":"Read a fixture","input_schema":{"type":"object"}}],
+        "messages":[{"role":"user","content":"Explore the fixture"}]})
+}
+fn grok_routing_account(mock: &MockUpstream) -> AccountConfig {
+    AccountConfig {
+        name: "grok:fixture".into(),
+        credential: AccountCredential::Grok {
+            subject: "sub-fixture".into(),
+            access_token: "at-grok".into(),
+            refresh_token: "rt-grok".into(),
+            expires_at_ms: far_future_ms(),
+            token_endpoint: format!("{}/v1/oauth/token", mock.base_url()),
+            last_refresh_ms: None,
+        },
+    }
+}
+/// Launch-hint headers as an older `llmux run` wrote them: a Claude model,
+/// hours before the session's `/model` switch (live #50916: 4.5 hours).
+fn stale_launch(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
+        .header("x-llmux-claude-launch-model", "claude-opus-5-5[1m]")
+        .header(
+            "x-llmux-claude-launch-time",
+            (epoch_ms_now() - 16_000_000).to_string(),
+        )
+}
+fn upstream_body(mock: &MockUpstream, index: usize) -> serde_json::Value {
+    serde_json::from_slice(&mock.seen()[index].body).unwrap()
+}
+
+/// Spec A1 (live #50915 → #50916): the title starts before the first main
+/// turn and the launch hint is stale. The session's own warmup names the main
+/// model, so the title still reaches the Codex haiku-tier alias (`luna`).
+#[tokio::test]
+async fn harness_title_before_first_main_follows_the_gpt_warmup() {
+    for stream in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        for text in ["Hi", r#"{"title":"Fixture folder"}"#] {
+            mock.push(ScriptedResponse::sse_plain(
+                &classifier_response_sse(text),
+                256,
+            ));
+        }
+        // No Claude account: a leak to Claude would answer 404.
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at-codex")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let session = format!("a1-{stream}");
+        let send = |body: serde_json::Value| {
+            stale_launch(
+                client
+                    .post(proxy.url("/v1/messages"))
+                    .header("x-api-key", "client-supplied-key"),
+            )
+            .json(&body)
+            .send()
+        };
+        let warmup = send(harness_warmup(&session, "astra")).await.unwrap();
+        assert_eq!(warmup.status(), 200);
+        warmup.bytes().await.unwrap();
+        let title = send(harness_title(&session, stream)).await.unwrap();
+        assert_eq!(title.status(), 200, "title must not leak to Claude");
+        let text = title.text().await.unwrap();
+        assert!(text.contains(&resolved_alias("luna")), "{text}");
+        let sent = upstream_body(&mock, 1);
+        assert_eq!(sent["model"], resolved_alias("luna"));
+        assert_eq!(sent["reasoning"]["effort"], "low");
+        assert_eq!(
+            sent["text"]["format"]["schema"],
+            llmux::proxy::internal_requests::title_schema()
+        );
+        assert_eq!(mock.seen().len(), 2);
+    }
+}
+
+/// Spec A2–A4 (live #50903/#50904/#50909): in a Grok main session every
+/// harness request stays on Grok — the configured pin (the `grok` alias) —
+/// at a lowered, request-owned effort that wins over the global `xhigh`.
+#[tokio::test]
+async fn harness_requests_in_a_grok_session_use_the_grok_pin_at_lower_effort() {
+    let mock = MockUpstream::spawn().await;
+    for text in [
+        "Hi",
+        r#"{"title":"Fixture folder"}"#,
+        "Working.",
+        "<severity>5</severity>",
+        r#"{"state":"working"}"#,
+        "Explored.",
+        "Explored.",
+    ] {
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(text),
+            256,
+        ));
+    }
+    let mut config = routing_config(&mock, vec![grok_routing_account(&mock)], "error");
+    config.grok.upstream = mock.base_url();
+    config.grok.reasoning_effort = Some("xhigh".into());
+    let pin = config.grok.default_model.clone();
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let post = |body: serde_json::Value| {
+        let (client, proxy) = (&client, &proxy);
+        async move { post_messages(client, proxy, &body.to_string()).await }
+    };
+    let s = "grok-session";
+
+    assert_eq!(post(harness_warmup(s, "grok")).await.status(), 200);
+    let title = post(harness_title(s, false)).await;
+    assert_eq!(title.status(), 200, "title must stay on Grok");
+    let title: serde_json::Value = title.json().await.unwrap();
+    assert_eq!(title["content"][0]["text"], r#"{"title":"Fixture folder"}"#);
+    let sent = upstream_body(&mock, 1);
+    assert_eq!(sent["model"], pin.as_str());
+    assert_eq!(sent["reasoning"]["effort"], "low");
+    assert_eq!(
+        sent["text"]["format"]["schema"],
+        llmux::proxy::internal_requests::title_schema()
+    );
+
+    let main = post(harness_main(s, "grok")).await;
+    assert_eq!(main.status(), 200);
+    main.bytes().await.unwrap();
+    assert_eq!(
+        upstream_body(&mock, 2)["reasoning"]["effort"],
+        "xhigh",
+        "the main turn keeps the global effort"
+    );
+
+    let monitor = post(harness_monitor(s)).await;
+    let status = monitor.status();
+    let verdict: serde_json::Value = monitor.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "monitor must work with no Claude account: {verdict}"
+    );
+    assert_eq!(verdict["content"][0]["text"], "<severity>5");
+    assert_eq!(verdict["stop_reason"], "stop_sequence");
+    let sent = upstream_body(&mock, 3);
+    assert_eq!(sent["model"], pin.as_str());
+    assert_eq!(sent["reasoning"]["effort"], "medium");
+
+    let status = post(harness_status(s)).await;
+    assert_eq!(status.status(), 200, "status classifier must stay on Grok");
+    status.bytes().await.unwrap();
+    assert_eq!(upstream_body(&mock, 4)["reasoning"]["effort"], "low");
+
+    // Helper turns keep the client's effort, capped by the tier they name.
+    for (index, model, effort, expected) in [
+        (5, "claude-haiku-5-5", "high", "low"),
+        (6, "claude-opus-5-5", "max", "high"),
+    ] {
+        let helper = post(harness_subagent(s, model, effort)).await;
+        assert_eq!(helper.status(), 200, "{model}");
+        helper.bytes().await.unwrap();
+        let sent = upstream_body(&mock, index);
+        assert_eq!(sent["model"], pin.as_str(), "{model}");
+        assert_eq!(sent["reasoning"]["effort"], expected, "{model}");
+    }
+    assert_eq!(mock.seen().len(), 7);
+}
+
+/// Spec A4 (live #48932): the notification status classifier is a harness
+/// request — classified `status`, served by `luna` at low effort in a GPT
+/// main session.
+#[tokio::test]
+async fn harness_status_classifier_in_a_gpt_session_routes_to_luna() {
+    let request = harness_status("status-s");
+    assert_eq!(
+        llmux::proxy::classify::classify("/v1/messages", request.to_string().as_bytes()).kind,
+        "status"
+    );
+    let mock = MockUpstream::spawn().await;
+    for text in ["Working.", r#"{"state":"done"}"#] {
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(text),
+            256,
+        ));
+    }
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at-codex")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let main = post_messages(
+        &client,
+        &proxy,
+        &harness_main("status-s", "astra").to_string(),
+    )
+    .await;
+    assert_eq!(main.status(), 200);
+    main.bytes().await.unwrap();
+    let response = post_messages(&client, &proxy, &request.to_string()).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "status classifier must not leak to Claude"
+    );
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(message["model"], resolved_alias("luna"));
+    let sent = upstream_body(&mock, 1);
+    assert_eq!(sent["model"], resolved_alias("luna"));
+    assert_eq!(sent["reasoning"]["effort"], "low");
+}
+
+/// Spec A6/A7: a warmup naming Claude after a GPT main turn does not clear
+/// GPT context (only a main turn does), and the default Codex tiers are
+/// `terra`/`terra`/`luna` — never `sol`.
+#[tokio::test]
+async fn harness_warmup_never_overrides_a_main_turn_and_codex_tiers_avoid_sol() {
+    let mock = MockUpstream::spawn().await;
+    // One FIFO serves every upstream: main (codex), warmup (claude), then
+    // title and two helpers (codex).
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        256,
+    ));
+    mock.push(ScriptedResponse::ok(
+        r#"{"id":"msg_w","type":"message","content":[],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+    ));
+    for _ in 0..3 {
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(r#"{"title":"Fixture"}"#),
+            256,
+        ));
+    }
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![
+            oauth_account("claude-acct", "at-claude"),
+            codex_account("cx", "at-codex"),
+        ],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let post = |body: serde_json::Value| {
+        let (client, proxy) = (&client, &proxy);
+        async move { post_messages(client, proxy, &body.to_string()).await }
+    };
+    let s = "a6";
+    let main = post(harness_main(s, "astra")).await;
+    assert_eq!(main.status(), 200);
+    main.bytes().await.unwrap();
+    let warmup = post(harness_warmup(s, "claude-opus-5-5")).await;
+    assert_eq!(warmup.status(), 200);
+    warmup.bytes().await.unwrap();
+    assert_eq!(
+        mock.seen()[1].authorization.as_deref(),
+        Some("Bearer at-claude")
+    );
+    let title = post(harness_title(s, false)).await;
+    assert_eq!(title.status(), 200);
+    title.bytes().await.unwrap();
+    assert_eq!(upstream_body(&mock, 2)["model"], resolved_alias("luna"));
+    for (index, model, alias) in [
+        (3, "claude-opus-5-5", "terra"),
+        (4, "claude-sonnet-5-5", "terra"),
+    ] {
+        let helper = post(harness_subagent(s, model, "high")).await;
+        assert_eq!(helper.status(), 200, "{model}");
+        helper.bytes().await.unwrap();
+        let sent = upstream_body(&mock, index);
+        assert_eq!(sent["model"], resolved_alias(alias), "{model}");
+        assert_ne!(sent["model"], resolved_alias("sol"), "{model}");
+    }
+}

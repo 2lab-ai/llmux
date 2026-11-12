@@ -1,7 +1,10 @@
-//! Narrow wire signatures for implicit Claude Code tasks. Display KIND is not
+//! Narrow wire signatures for implicit Claude Code tasks (harness requests)
+//! and the per-provider tier policy that serves them in a Codex or Grok main
+//! session (`.prd/27-claude-code-harness-requests.md`). Display KIND is not
 //! sufficient: a human can ask for a title inside a normal main-agent turn.
-use super::auto_classifier::{system_blocks, Route, MAIN};
+use super::auto_classifier::{system_blocks, Route, Target, MAIN};
 use crate::config::schema::ClaudeCodeConfig;
+use crate::routing::BackendGroup;
 use serde_json::{json, Value};
 
 pub const LAUNCH_MODEL_HEADER: &str = "x-llmux-claude-launch-model";
@@ -18,11 +21,34 @@ pub fn fresh_launch(value: Option<&str>, now_ms: u64) -> bool {
 pub const TITLE_SYSTEM: &str =
     "You are naming a coding session so the user can pick it out of a long list of sessions.";
 
+/// Claude Code's notification status classifier (captured 2026-11-12, CLI
+/// 2.1.322): decides whether a walked-away agent is done, working or blocked.
+pub const STATUS_SYSTEM: &str =
+    "A user kicked off a Claude Code agent to do a coding task and walked away.";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Task {
     Quota,
     Title,
+    /// The notification status classifier.
+    Status,
     Helper,
+}
+
+impl Task {
+    /// Fixed short-output tasks: they always run at low effort.
+    fn is_utility(self) -> bool {
+        !matches!(self, Self::Helper)
+    }
+}
+
+/// The Claude tier a harness request names. Only these three family names are
+/// generic tiers; `fable` and concrete non-Claude ids are explicit choices.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tier {
+    Opus,
+    Sonnet,
+    Haiku,
 }
 
 fn no_tools(body: &Value) -> bool {
@@ -44,6 +70,9 @@ pub fn task(body: &Value, kind: &str) -> Option<Task> {
     }
     if no_tools(body) && system.iter().any(|s| s.starts_with(TITLE_SYSTEM)) {
         return Some(Task::Title);
+    }
+    if no_tools(body) && system.iter().any(|s| s.starts_with(STATUS_SYSTEM)) {
+        return Some(Task::Status);
     }
     // Genuine main execution (including a user quoting a control prompt) wins.
     if !no_tools(body)
@@ -71,19 +100,101 @@ pub fn task(body: &Value, kind: &str) -> Option<Task> {
     None
 }
 
-pub fn target<'a>(body: &Value, config: &'a ClaudeCodeConfig) -> Option<&'a str> {
+/// The tier named by the request's `model` (`claude-haiku-5-5`, `sonnet`,
+/// `claude-opus-5-5[1m]`, …).
+pub fn tier(body: &Value) -> Option<Tier> {
     let model = body.get("model")?.as_str()?.trim().to_ascii_lowercase();
     let model = model.strip_suffix("[1m]").unwrap_or(&model);
     let family = model.strip_prefix("claude-").unwrap_or(model);
-    let mapping = &config.gpt_model_mapping;
-    if family == "opus" || family.starts_with("opus-") {
-        Some(&mapping.opus)
-    } else if family == "sonnet" || family.starts_with("sonnet-") {
-        Some(&mapping.sonnet)
-    } else if family == "haiku" || family.starts_with("haiku-") {
-        Some(&mapping.haiku)
+    let is = |name: &str| family == name || family.starts_with(&format!("{name}-"));
+    if is("opus") {
+        Some(Tier::Opus)
+    } else if is("sonnet") {
+        Some(Tier::Sonnet)
+    } else if is("haiku") {
+        Some(Tier::Haiku)
     } else {
         None
+    }
+}
+
+/// Effort ladder used to cap a Grok helper turn (lowest first).
+const EFFORTS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+fn grok_cap(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Opus => "high",
+        Tier::Sonnet => "medium",
+        Tier::Haiku => "low",
+    }
+}
+
+/// The client's effort, lowered to `cap` (the cap when the client sent none).
+fn capped(body: &Value, cap: &'static str) -> String {
+    let rank = |e: &str| EFFORTS.iter().position(|x| *x == e);
+    let requested = body
+        .get("output_config")
+        .and_then(|c| c.get("effort"))
+        .and_then(Value::as_str)
+        .map(|e| e.trim().to_ascii_lowercase());
+    match requested {
+        Some(e) if rank(&e).is_some_and(|r| Some(r) < rank(cap)) => e,
+        _ => cap.to_string(),
+    }
+}
+
+/// Where a harness request goes in a session whose main model is served by
+/// `main`. Codex uses its smaller models (`gpt_model_mapping`, default
+/// `terra`/`terra`/`luna`); Grok has one line, so it keeps the `grok` pin and
+/// lowers effort. `None` = not routed (a non-tier model, or a Claude main).
+pub fn target(
+    body: &Value,
+    task: Task,
+    main: BackendGroup,
+    config: &ClaudeCodeConfig,
+    grok_pin: &str,
+) -> Option<Target> {
+    let tier = tier(body)?;
+    match main {
+        BackendGroup::Codex => {
+            let mapping = &config.gpt_model_mapping;
+            let model = match tier {
+                Tier::Opus => &mapping.opus,
+                Tier::Sonnet => &mapping.sonnet,
+                Tier::Haiku => &mapping.haiku,
+            };
+            // Worker/subagent effort preserves the client's explicit request.
+            Some(Target::codex(
+                model,
+                task.is_utility().then(|| "low".to_string()),
+            ))
+        }
+        BackendGroup::Grok => {
+            let effort = if task.is_utility() {
+                "low".to_string()
+            } else {
+                capped(body, grok_cap(tier))
+            };
+            Some(Target::grok(grok_pin, Some(effort)))
+        }
+        _ => None,
+    }
+}
+
+/// The security monitor's target in a `main` session: Codex uses
+/// `auto_classifier_model` (default `luna`), Grok its pin; both at medium.
+pub fn monitor_target(
+    main: BackendGroup,
+    config: &ClaudeCodeConfig,
+    grok_pin: &str,
+) -> Option<Target> {
+    let effort = Some("medium".to_string());
+    match main {
+        BackendGroup::Codex => Some(Target::codex(&config.auto_classifier_model, effort)),
+        BackendGroup::Grok => Some(Target::grok(grok_pin, effort)),
+        _ => None,
     }
 }
 
@@ -91,9 +202,8 @@ pub fn title_schema() -> Value {
     json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})
 }
 
-pub fn route(original: &Value, task: Task, model: &str) -> Result<Route, &'static str> {
+pub fn route(original: &Value, task: Task, target: Target) -> Result<Route, &'static str> {
     let mut body = original.clone();
-    body["model"] = json!(model);
     let mut omitted_temperature = false;
     let mut format = None;
     if task == Task::Title {
@@ -118,25 +228,121 @@ pub fn route(original: &Value, task: Task, model: &str) -> Result<Route, &'stati
             );
         }
     }
-    // Utility effort is independent of a main agent's global ultra setting.
-    // Worker/subagent effort preserves the client's explicit request.
-    let effort = if task == Task::Helper {
-        None
-    } else {
-        Some("low".into())
-    };
-    Ok(Route::utility(
-        body,
-        model,
-        effort,
-        format,
-        omitted_temperature,
-    ))
+    // Utility effort is independent of a main agent's global ultra setting;
+    // the target carries it (see `target`).
+    Ok(Route::utility(body, target, format, omitted_temperature))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grok_effort(target: &Target) -> Option<&str> {
+        match target {
+            Target::Grok(shape) => shape.effort.as_deref(),
+            Target::Codex(_) => None,
+        }
+    }
+
+    #[test]
+    fn status_classifier_is_a_utility_task() {
+        let body = json!({"model":"claude-haiku-5-5","system":[
+            {"text":"x-anthropic-billing-header: cc_version=2.1.322;"},
+            {"text":format!("{STATUS_SYSTEM} Read the tail…")}],
+            "messages":[{"role":"user","content":"Current state: working"}]});
+        assert_eq!(task(&body, "status"), Some(Task::Status));
+        let mut tooled = body.clone();
+        tooled["tools"] = json!([{"name":"Bash"}]);
+        assert_eq!(task(&tooled, "user"), None);
+    }
+
+    #[test]
+    fn tiers_come_from_claude_family_names_only() {
+        for (model, tier_) in [
+            ("claude-haiku-5-5", Some(Tier::Haiku)),
+            ("haiku", Some(Tier::Haiku)),
+            ("claude-sonnet-5[1m]", Some(Tier::Sonnet)),
+            ("claude-opus-5-5", Some(Tier::Opus)),
+            ("claude-fable-5-2", None),
+            ("astra", None),
+            ("grok", None),
+            ("opusplan-x", None),
+        ] {
+            assert_eq!(tier(&json!({ "model": model })), tier_, "{model}");
+        }
+    }
+
+    #[test]
+    fn codex_uses_terra_and_luna_aliases_by_default() {
+        let config = ClaudeCodeConfig::default();
+        for (model, task_, alias, effort) in [
+            ("claude-haiku-5-5", Task::Title, "luna", Some("low")),
+            ("claude-haiku-5-5", Task::Status, "luna", Some("low")),
+            ("claude-sonnet-5-5", Task::Helper, "terra", None),
+            ("claude-opus-5-5", Task::Helper, "terra", None),
+        ] {
+            let body = json!({ "model": model, "output_config": {"effort": "max"} });
+            let Some(Target::Codex(shape)) =
+                target(&body, task_, BackendGroup::Codex, &config, "grok-4.7")
+            else {
+                panic!("{model} must route to codex");
+            };
+            assert_eq!(shape.model, alias, "{model}");
+            assert_eq!(shape.effort.as_deref(), effort, "{model}");
+        }
+        let Some(Target::Codex(shape)) = monitor_target(BackendGroup::Codex, &config, "grok-4.7")
+        else {
+            panic!("codex monitor");
+        };
+        assert_eq!(
+            (shape.model.as_str(), shape.effort.as_deref()),
+            ("luna", Some("medium"))
+        );
+    }
+
+    #[test]
+    fn grok_keeps_its_pin_and_lowers_effort_by_tier() {
+        let config = ClaudeCodeConfig::default();
+        for (model, task_, client, expected) in [
+            ("claude-haiku-5-5", Task::Title, Some("medium"), "low"),
+            ("claude-haiku-5-5", Task::Quota, None, "low"),
+            ("claude-haiku-5-5", Task::Helper, Some("xhigh"), "low"),
+            ("claude-sonnet-5-5", Task::Helper, Some("max"), "medium"),
+            ("claude-sonnet-5-5", Task::Helper, Some("low"), "low"),
+            ("claude-opus-5-5", Task::Helper, Some("ultra"), "high"),
+            ("claude-opus-5-5", Task::Helper, Some("medium"), "medium"),
+            ("claude-opus-5-5", Task::Helper, None, "high"),
+            ("claude-opus-5-5", Task::Helper, Some("bogus"), "high"),
+        ] {
+            let mut body = json!({ "model": model });
+            if let Some(client) = client {
+                body["output_config"] = json!({ "effort": client });
+            }
+            let routed =
+                target(&body, task_, BackendGroup::Grok, &config, "grok-4.7").expect("grok route");
+            assert_eq!(routed.group(), BackendGroup::Grok);
+            assert_eq!(routed.body_model(), "grok");
+            assert_eq!(grok_effort(&routed), Some(expected), "{model} {client:?}");
+        }
+        let monitor = monitor_target(BackendGroup::Grok, &config, "grok-4.7").unwrap();
+        assert_eq!(grok_effort(&monitor), Some("medium"));
+        for main in [
+            BackendGroup::Claude,
+            BackendGroup::Gemini,
+            BackendGroup::OpenRouter,
+        ] {
+            assert!(target(&json!({"model":"haiku"}), Task::Title, main, &config, "g").is_none());
+            assert!(monitor_target(main, &config, "g").is_none());
+        }
+        assert!(target(
+            &json!({"model":"claude-fable-5-2"}),
+            Task::Helper,
+            BackendGroup::Grok,
+            &config,
+            "g"
+        )
+        .is_none());
+    }
     #[test]
     fn launch_timestamp_requires_fresh_nonfuture_value() {
         assert!(fresh_launch(Some("1000000"), 1_120_000));

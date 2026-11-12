@@ -220,10 +220,13 @@ pub struct GptModelMapping {
     pub sonnet: String,
     pub haiku: String,
 }
+/// Codex harness requests use the smaller models only (`terra`, `luna`):
+/// an Opus-named helper in a GPT main session is still a helper, not the
+/// main agent (`.prd/27-claude-code-harness-requests.md`, 2026-11-12).
 impl Default for GptModelMapping {
     fn default() -> Self {
         Self {
-            opus: "sol".into(),
+            opus: "terra".into(),
             sonnet: "terra".into(),
             haiku: "luna".into(),
         }
@@ -1609,7 +1612,7 @@ mod claude_code_tests {
         let value: Config =
             serde_json::from_str(r#"{"claude_code":{"gpt_model_mapping":{"sonnet":"luna"}}}"#)
                 .unwrap();
-        assert_eq!(value.claude_code.gpt_model_mapping.opus, "sol");
+        assert_eq!(value.claude_code.gpt_model_mapping.opus, "terra");
         assert_eq!(value.claude_code.gpt_model_mapping.sonnet, "luna");
         assert_eq!(value.claude_code.gpt_model_mapping.haiku, "luna");
         assert_eq!(value.claude_code.auto_classifier_model, "luna");
