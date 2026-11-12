@@ -2879,9 +2879,16 @@ mod tests {
     fn an_aggregate_prices_as_the_sum_of_its_requests_per_class() {
         // Requests of one model in five classes; the aggregate keeps the
         // total plus the non-standard split.
+        // Long requests with a 1h / 12h write subset and web searches: the
+        // extended split and the per-search fee stay per class too.
+        let with_split = |t: TokenCounts| TokenCounts {
+            cache_creation_extended: Some(3_000),
+            web_search_requests: Some(2),
+            ..t
+        };
         let requests = [
             (PriceClass::STANDARD, prompt(100_000, 50_000, 10_000)),
-            (long(), prompt(250_000, 30_000, 5_000)),
+            (long(), with_split(prompt(250_000, 30_000, 5_000))),
             (fast(), prompt(1_000, 0, 0)),
             (
                 PriceClass {
@@ -2891,7 +2898,7 @@ mod tests {
                 },
                 prompt(300_000, 0, 0),
             ),
-            (PriceClass::UNBILLED, prompt(400, 0, 0)),
+            (PriceClass::UNBILLED, with_split(prompt(400, 0, 4_000))),
         ];
         for (group, model) in [
             ("codex", "gpt-6.1-terra"),
