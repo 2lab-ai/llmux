@@ -210,8 +210,16 @@ impl DashboardHub {
     }
 
     /// Fold one proxy/scheduler event: last-switch + poller-health pane
-    /// state, then the activity log itself.
-    pub fn apply_event(&self, event: ActivityEvent, now: SystemTime) {
+    /// state, then the activity log itself. A finished request's price class
+    /// is resolved here first ([`crate::pricing::classify_finished`]).
+    pub fn apply_event(&self, mut event: ActivityEvent, now: SystemTime) {
+        crate::pricing::classify_finished(&mut event, now);
+        self.apply_classified(event, now);
+    }
+
+    /// [`Self::apply_event`] for an event whose price class is already
+    /// resolved at `now` (the fold resolves it once, before its trace line).
+    fn apply_classified(&self, event: ActivityEvent, now: SystemTime) {
         let mut state = self.lock();
         match &event {
             ActivityEvent::AccountSwitched { from, to, reason } => {
@@ -253,11 +261,9 @@ impl DashboardHub {
             }
             _ => {}
         }
-        // Resolve the request's price class once, at the instant it is
-        // recorded (#278): the persisted line, the key-usage rows and the
-        // fold below all carry the same classes.
-        let mut event = event;
-        crate::pricing::classify_finished(&mut event, now);
+        // The request's price class was resolved once, at the instant it is
+        // recorded (#278): the trace line, the persisted line, the key-usage
+        // rows and the fold below all carry the same classes.
         // Persist finished requests before folding (req-persist A/C). Borrow,
         // not move: `apply` still consumes the event below. The append target
         // is `None` until the daemon armed persistence in `load_from_state_dir`,
@@ -380,12 +386,7 @@ pub async fn fold(
         tokio::select! {
             event = events.recv() => {
                 match event {
-                    Some(event) => {
-                        if trace_events {
-                            trace_event(&event);
-                        }
-                        hub.apply_event(event, SystemTime::now());
-                    }
+                    Some(event) => fold_event(&hub, event, SystemTime::now(), trace_events),
                     None => return, // every sender gone — server is down
                 }
             }
@@ -402,6 +403,17 @@ pub async fn fold(
             }
         }
     }
+}
+
+/// Fold one activity event at `now`: resolve a finished request's price
+/// class ONCE (#278), then its tracing line (daemon mode) and the hub, so the
+/// logged cost is the cost the request is recorded and aggregated at.
+fn fold_event(hub: &DashboardHub, mut event: ActivityEvent, now: SystemTime, trace_events: bool) {
+    crate::pricing::classify_finished(&mut event, now);
+    if trace_events {
+        trace_event(&event);
+    }
+    hub.apply_classified(event, now);
 }
 
 /// Resolve a tenant attribution id to its display name: the key's name for
@@ -4030,6 +4042,72 @@ mod tests {
             .find(|t| t.tenant == "k-refusal")
             .expect("tenant");
         assert!((tenant.cost_usd - 0.75).abs() < 1e-9, "{}", tenant.cost_usd);
+    }
+
+    /// #278 review: the daemon's `request finished` line prices the request
+    /// in the class the hub records it in — a Fast gpt-6.1-sol request with
+    /// 100k fresh input logs $0.40 (Fast), the cost its activity row and model
+    /// row carry, not the $0.20 Standard price.
+    #[test]
+    fn the_request_finished_line_logs_the_recorded_class_cost() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let hub = DashboardHub::default();
+        let event = ActivityEvent::RequestFinished {
+            id: 51,
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+            endpoint: crate::tui::Endpoint::OpenAi,
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens: Some(TokenCounts {
+                input: 100_000,
+                ..Default::default()
+            }),
+            group: Some("codex".into()),
+            model: Some("gpt-6.1-sol".into()),
+            effort: None,
+            fast: Some(true),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: None,
+            sub_usage: Vec::new(),
+            price_class: crate::pricing::PriceClass::STANDARD,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let subscriber = tracing_subscriber::registry().with(crate::logging::ChannelLayer::new(tx));
+        tracing::subscriber::with_default(subscriber, || {
+            fold_event(&hub, event, now(), true);
+        });
+        let line = rx.try_recv().expect("request finished line");
+        assert!(line.text.contains("request finished"), "{}", line.text);
+        assert!(line.text.contains(" cost=0.4000"), "{}", line.text);
+        let doc = seeded_free_doc(&hub);
+        let row = doc
+            .model_usage
+            .iter()
+            .find(|m| m.model == "gpt-6.1-sol")
+            .expect("row");
+        assert!((row.cost_usd - 0.4).abs() < 1e-9, "{}", row.cost_usd);
+    }
+
+    /// The document of `hub` at [`now`], with no other traffic seeded.
+    fn seeded_free_doc(hub: &DashboardHub) -> DashboardDoc {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.evaluate(None, &params(), now());
+        dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        )
     }
 
     #[test]
