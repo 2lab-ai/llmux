@@ -2676,6 +2676,9 @@ pub fn status_json(
                     // ms; null for apikey accounts / unknown expiry / never
                     // refreshed.
                     "token_expires_at_ms": account.token_expires_at_ms,
+                    // When the login itself ends (additive; null until the
+                    // token endpoint has said, Claude OAuth only).
+                    "login_expires_at_ms": account.login_expires_at_ms,
                     "last_refresh_ms": account.last_refresh_ms,
                     "totals": {
                         "requests": lifetime.requests,
@@ -4398,6 +4401,7 @@ mod tests {
                 expires_at_ms: 0,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         }
     }
@@ -5924,6 +5928,7 @@ mod tests {
                 expires_at_ms: 1_700_000_000_000,
                 tier: Some("max".into()),
                 last_refresh_ms: Some(1_699_990_000_000),
+                login_expires_at_ms: None,
             },
         }
     }
@@ -6700,6 +6705,94 @@ mod tests {
         let result = run_login(&state, crate::proxy::login::LoginProvider::Gemini, "st-1").await;
 
         assert_eq!(result.err().as_deref(), Some(GEMINI_NO_CLIENT));
+    }
+
+    /// A successful background refresh records when the sign-in ends (the
+    /// token endpoint's `refresh_token_expires_in`) on the live credential,
+    /// and the status document reports it.
+    #[tokio::test]
+    async fn background_refresh_records_the_login_end() {
+        // First answer reports the sign-in's end with a short-lived token (so
+        // the next pass refreshes again); the second omits the end.
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/oauth/token",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    let body = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":60,"refresh_token_expires_in":172800}"#
+                    } else {
+                        r#"{"access_token":"at-newer","refresh_token":"rt-newer","expires_in":28800}"#
+                    };
+                    ([(header::CONTENT_TYPE, "application/json")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let upstream = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut claude = oauth_account("a");
+        if let AccountCredential::Oauth { expires_at_ms, .. } = &mut claude.credential {
+            *expires_at_ms = 1;
+        }
+        let config = Config {
+            upstream,
+            accounts: vec![claude],
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool.clone(), None, None).expect("state");
+        state.config_path = None;
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        background_refresh_pass(&state).await;
+
+        let snapshot = pool.snapshot();
+        let ends = snapshot.accounts[0].login_expires_at_ms.expect("login end");
+        assert!(ends >= before + 172_800_000, "{ends}");
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 0,
+            port: 0,
+            email_anonymous: false,
+            usage_controls: Default::default(),
+            plans: Default::default(),
+        };
+        let doc = status_json(
+            &snapshot,
+            &UsageTotals::default(),
+            &params(),
+            SystemTime::now(),
+            &meta,
+        );
+        assert_eq!(doc["accounts"][0]["login_expires_at_ms"], ends);
+
+        // A later refresh that omits the end keeps the exact learned one.
+        background_refresh_pass(&state).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "refreshed again");
+        let snapshot = pool.snapshot();
+        assert!(matches!(
+            pool.credential(&AccountId("a".into())),
+            Some(AccountCredential::Oauth { access_token, .. }) if access_token == "at-newer"
+        ));
+        assert_eq!(snapshot.accounts[0].login_expires_at_ms, Some(ends));
+        let doc = status_json(
+            &snapshot,
+            &UsageTotals::default(),
+            &params(),
+            SystemTime::now(),
+            &meta,
+        );
+        assert_eq!(doc["accounts"][0]["login_expires_at_ms"], ends);
     }
 
     /// The 2026-11-13 failure end to end: the token endpoint answers

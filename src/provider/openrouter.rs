@@ -689,6 +689,7 @@ mod tests {
                 expires_at_ms: 0,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
             AccountCredential::Apikey {
                 api_key: "sk-ant-api03-k".into(),

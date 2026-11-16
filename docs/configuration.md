@@ -403,6 +403,8 @@ Like `tui_effects`, the resolved settings ride the dashboard document, so `llmux
 
 Every browser-login type in that table — `oauth`, `codex`, `grok`, `openrouter`, `gemini` — can also be added without leaving the dashboard: `n` opens the provider picker, the flow runs in the client, and the credential is injected into the running daemon (see [operational-reference.md](operational-reference.md#commands)). `apikey` accounts still come from `a` (paste) or `llmux login --api`. `gemini` accounts can also come from `llmux import` or the Islands sign-in menu.
 
+A Claude `oauth` account also stores `login_expires_at_ms` (epoch ms) once the token endpoint has reported it: when the sign-in itself ends. It comes from the `refresh_token_expires_in` field of a login or refresh response, and a refresh never moves it — a Claude sign-in lasts about 29 days, and only a new login starts a new one (see [Login expiry](operational-reference.md#login-expiry)). Absent until the account's first refresh on a version that records it.
+
 Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; Gemini accounts dedupe by email; API keys and OpenRouter accounts dedupe by name (an OpenRouter label is not unique per key, so it is used for the name only).
 
 ### Gemini accounts

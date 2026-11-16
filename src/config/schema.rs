@@ -1121,6 +1121,13 @@ pub enum AccountCredential {
         /// until the first refresh after upgrade.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_refresh_ms: Option<u64>,
+        /// When this login ends, epoch ms: the token endpoint's
+        /// `refresh_token_expires_in` (seconds left on the sign-in) read at
+        /// the last login or refresh. A refresh never extends it — only a new
+        /// sign-in does (measured 2026-11-16: Claude sign-ins last ~29 days).
+        /// `None` until the first refresh after upgrade.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login_expires_at_ms: Option<u64>,
     },
     /// Plain Anthropic API key.
     Apikey { api_key: String },
@@ -1228,6 +1235,18 @@ impl AccountCredential {
     /// Epoch ms of the last successful token refresh. `None` for apikey
     /// accounts (nothing to refresh) and for oauth-style accounts that have
     /// not been refreshed since the field was introduced.
+    /// When the login behind this credential ends (Claude OAuth only; see
+    /// the `Oauth::login_expires_at_ms` field).
+    pub fn login_expires_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::Oauth {
+                login_expires_at_ms,
+                ..
+            } => *login_expires_at_ms,
+            _ => None,
+        }
+    }
+
     pub fn last_refresh_ms(&self) -> Option<u64> {
         match self {
             Self::Oauth {
@@ -1358,6 +1377,7 @@ impl Config {
             refresh_token,
             expires_at_ms,
             refreshed_at_ms,
+            None,
         )
     }
 
@@ -1378,6 +1398,7 @@ impl Config {
         refresh_token: Option<&str>,
         expires_at_ms: u64,
         refreshed_at_ms: u64,
+        login_expires_at_ms: Option<u64>,
     ) -> bool {
         let idx = self
             .accounts
@@ -1389,6 +1410,13 @@ impl Config {
         };
         if !still_matches(&self.accounts[idx].credential) {
             return false;
+        }
+        if let AccountCredential::Oauth {
+            login_expires_at_ms: login,
+            ..
+        } = &mut self.accounts[idx].credential
+        {
+            *login = crate::auth::oauth::earliest_login_end(*login, login_expires_at_ms);
         }
         match &mut self.accounts[idx].credential {
             AccountCredential::Oauth {

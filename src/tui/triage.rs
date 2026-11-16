@@ -198,6 +198,25 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
         });
     }
 
+    // 3b. Logins that end soon: a refresh cannot extend a sign-in, so the
+    //     operator re-signs these before they die (soonest first).
+    let expiring: Vec<(&AccountSnapshot, Duration)> = snapshot
+        .accounts
+        .iter()
+        .filter_map(|a| select::login_expiring(a, now).map(|left| (a, left)))
+        .collect();
+    if let Some(&(first, left)) = expiring.iter().min_by_key(|(_, left)| *left) {
+        conditions.push(Condition {
+            level: VerdictLevel::Warn,
+            text: format!(
+                "LOGIN EXPIRING ×{} in {}",
+                expiring.len(),
+                select::compact_duration(left)
+            ),
+            account: Some(first.id.0.clone()),
+        });
+    }
+
     // 4. No health telemetry (attach to an old daemon): the verdict CANNOT
     //    say healthy — absence of data is never evidence of health. Lowest
     //    dominance: any real condition above still headlines, but a
@@ -533,6 +552,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: Some(window(0.10)),
@@ -998,6 +1018,33 @@ mod tests {
         unknown.healthy = false;
         assert_eq!(auth_broken_text(&[&unknown]), "AUTH BROKEN");
         assert_eq!(auth_broken_text(&[&unknown, &unknown]), "AUTH BROKEN +1");
+    }
+
+    /// A healthy login ending within the window is a WARN naming the
+    /// soonest account; a benched one is left to the auth condition.
+    #[test]
+    fn login_expiring_is_a_warning_with_the_soonest_account() {
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut soon = account("soon");
+        soon.login_expires_at_ms = Some(ms(now() + Duration::from_secs(36 * 3_600)));
+        let mut later = account("later");
+        later.login_expires_at_ms = Some(ms(now() + Duration::from_secs(4 * 86_400)));
+        let mut far = account("far");
+        far.login_expires_at_ms = Some(ms(now() + Duration::from_secs(20 * 86_400)));
+        let verdict = health_verdict(
+            &view_with(
+                pool(vec![later, far, soon]),
+                HealthCounts {
+                    requests: 10,
+                    ..Default::default()
+                },
+            ),
+            now(),
+        );
+        assert_eq!(verdict.level(), VerdictLevel::Warn);
+        let head = verdict.headline().expect("condition");
+        assert_eq!(head.text, "LOGIN EXPIRING ×2 in 1d12h");
+        assert_eq!(head.account.as_deref(), Some("soon"));
     }
 
     #[test]

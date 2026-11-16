@@ -107,6 +107,10 @@ pub struct OAuthTokens {
     /// Expiry in epoch milliseconds, already normalized via
     /// [`normalize_expires_at_ms`].
     pub expires_at_ms: u64,
+    /// When the sign-in behind these tokens ends (epoch ms), from the
+    /// response's `refresh_token_expires_in`; `None` when the provider did
+    /// not say (every provider but Anthropic, so far).
+    pub login_expires_at_ms: Option<u64>,
 }
 
 /// Build the browser authorize URL (PKCE S256, `state` echo check,
@@ -544,6 +548,38 @@ struct TokenResponse {
     expires_at: Option<u64>,
     #[serde(default)]
     expires_in: Option<u64>,
+    /// Seconds left on the sign-in itself (Anthropic; not extended by a
+    /// refresh). Advisory: an unsupported representation reads as `None`
+    /// rather than rejecting the rotated tokens next to it.
+    #[serde(default, deserialize_with = "lenient_seconds")]
+    refresh_token_expires_in: Option<u64>,
+}
+
+/// `refresh_token_expires_in` decoder: whole or fractional non-negative
+/// seconds; anything else is `None` (never an error — the tokens beside it
+/// may already have rotated the old refresh token out).
+fn lenient_seconds<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|secs| secs.is_finite() && *secs >= 0.0)
+                .map(|secs| secs as u64)
+        })
+    }))
+}
+
+/// Merge a known login end with one a refresh just reported: a refresh
+/// cannot extend a sign-in, so two known ends keep the earlier (a slow
+/// response computes a slightly later one); an omitted end keeps the known.
+pub fn earliest_login_end(known: Option<u64>, reported: Option<u64>) -> Option<u64> {
+    match (known, reported) {
+        (Some(known), Some(reported)) => Some(known.min(reported)),
+        (known, reported) => known.or(reported),
+    }
 }
 
 impl TokenResponse {
@@ -557,6 +593,9 @@ impl TokenResponse {
             access_token: self.access_token,
             refresh_token: self.refresh_token,
             expires_at_ms,
+            login_expires_at_ms: self
+                .refresh_token_expires_in
+                .map(|secs| now_ms().saturating_add(secs.saturating_mul(1000))),
         }
     }
 }
@@ -946,6 +985,60 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "401 must not be retried");
         assert!(matches!(err, AuthError::RefreshPermanent { status, .. }
             if status == StatusCode::UNAUTHORIZED));
+    }
+
+    /// The token endpoint reports how long the sign-in itself has left
+    /// (`refresh_token_expires_in`, seconds); it becomes the login's end.
+    #[tokio::test]
+    async fn refresh_reads_the_sign_in_end() {
+        let (url, _) = spawn_token_mock(
+            vec![(
+                StatusCode::OK,
+                r#"{"access_token":"at2","refresh_token":"rt2","expires_in":28800,"refresh_token_expires_in":180000}"#
+                    .into(),
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let before = now_ms();
+        let tokens = refresh_at(&reqwest::Client::new(), &url, "rt-old")
+            .await
+            .expect("refresh");
+        let ends = tokens.login_expires_at_ms.expect("login end");
+        assert!(ends >= before + 180_000_000 && ends <= now_ms() + 180_000_000);
+        let (url, _) = spawn_token_mock(
+            vec![(
+                StatusCode::OK,
+                r#"{"access_token":"at3","expires_in":600}"#.into(),
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let tokens = refresh_at(&reqwest::Client::new(), &url, "rt-old")
+            .await
+            .expect("refresh");
+        assert_eq!(tokens.login_expires_at_ms, None, "not reported → unknown");
+    }
+
+    /// A malformed advisory field never costs the rotated tokens beside it.
+    #[test]
+    fn sign_in_end_is_parsed_leniently_and_merged_earliest() {
+        let parse = |body: &str| serde_json::from_str::<TokenResponse>(body).expect("parse");
+        let with = |v: &str| {
+            parse(&format!(
+                r#"{{"access_token":"a","expires_in":60,"refresh_token_expires_in":{v}}}"#
+            ))
+            .refresh_token_expires_in
+        };
+        assert_eq!(with("172800"), Some(172_800));
+        assert_eq!(with("172800.0"), Some(172_800));
+        assert_eq!(with(r#""soon""#), None);
+        assert_eq!(with("-5"), None);
+        assert_eq!(with("null"), None);
+        assert_eq!(earliest_login_end(Some(10), Some(12)), Some(10));
+        assert_eq!(earliest_login_end(Some(10), Some(8)), Some(8));
+        assert_eq!(earliest_login_end(Some(10), None), Some(10));
+        assert_eq!(earliest_login_end(None, Some(12)), Some(12));
     }
 
     #[tokio::test]

@@ -66,6 +66,7 @@ fn oauth_account(name: &str, access_token: &str) -> AccountConfig {
             expires_at_ms: far_future_ms(),
             tier: None,
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         },
     }
 }
@@ -237,10 +238,19 @@ fn a_stale_refresh_is_refused_by_the_config_row_it_would_overwrite() {
     };
     let retired = config.accounts[0].credential.clone();
 
-    // The re-login wins the race to disk.
-    config.upsert_account(oauth_account("a", "at-a-relogin"));
+    // The re-login wins the race to disk, with its own login end.
+    let mut relogin = oauth_account("a", "at-a-relogin");
+    if let AccountCredential::Oauth {
+        login_expires_at_ms,
+        ..
+    } = &mut relogin.credential
+    {
+        *login_expires_at_ms = Some(2_000);
+    }
+    config.upsert_account(relogin);
 
-    // The refresh that started from `retired` lands afterwards.
+    // The refresh that started from `retired` lands afterwards, carrying the
+    // retired login's (earlier) end.
     let applied = config.update_oauth_tokens_if(
         "uuid-a",
         |stored| {
@@ -251,12 +261,22 @@ fn a_stale_refresh_is_refused_by_the_config_row_it_would_overwrite() {
         Some("rt-from-retired-refresh"),
         42,
         41,
+        Some(1_000),
     );
 
     assert!(!applied, "the stale refresh is refused");
     match &config.accounts[0].credential {
-        AccountCredential::Oauth { access_token, .. } => {
-            assert_eq!(access_token, "at-a-relogin", "the re-login row survives")
+        AccountCredential::Oauth {
+            access_token,
+            login_expires_at_ms,
+            ..
+        } => {
+            assert_eq!(access_token, "at-a-relogin", "the re-login row survives");
+            assert_eq!(
+                *login_expires_at_ms,
+                Some(2_000),
+                "the stale refresh does not touch the new login's end"
+            );
         }
         other => panic!("unexpected credential {other:?}"),
     }
@@ -282,6 +302,7 @@ fn an_unraced_refresh_still_persists() {
         None,
         42,
         41,
+        None,
     );
 
     assert!(applied);

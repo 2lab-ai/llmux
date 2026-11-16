@@ -489,6 +489,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 |---|---|---|---|
 | Authentication/usage history, re-login poll recovery, transient refresh handling | no | no | yes |
 | Classified auth-failure cause (`! 400 login expired`, `needs action:` block in `status`, `auth_failure` object, cause-first dashboard verdict); benched accounts not usage-polled | no | no | yes |
+| Login expiry forecast (`login_expires_at_ms`, `· login 12d` in `status`, `LOGIN EXPIRING` dashboard warning 5 days ahead) | no | no | yes |
 | Day-partitioned raw-io store (`store/raw-io/`, verified day archives, no retention deletion, `llmux raw-io`, `GET /llmux/raw-io/status`) | no | no | yes |
 | `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
 | Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | yes (source `7fe64d1`) | yes | yes |
@@ -1254,6 +1255,22 @@ Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
 Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
 clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
 restart inside that short window can reuse launch context until a main turn is observed.
+
+### Login expiry
+
+In short: a Claude login lasts about 29 days, a token refresh cannot extend it, and llmux now says how long each login has left and warns 5 days before it ends — sign in again (`llmux login`, or `n` in the dashboard) before then.
+
+The token endpoint reports, on every login and refresh, how long the sign-in itself has left (`refresh_token_expires_in`). llmux stores the resulting end time on the account (`login_expires_at_ms`, see [configuration](configuration.md#account-types)). A refresh rotates the tokens but never moves that end: measured on 2026-11-16, a refresh that asked for a one-year access token received the usual 8 hours, and the sign-in's remaining 2.09 days were unchanged; four logins on a shared host died 28.7–29.9 days after the login that minted them. Claude Code itself does the same — it keeps the earliest reported end and warns 3 days ahead. llmux warns 5 days ahead, since a pool of many accounts needs time to re-sign each one.
+
+Where it shows:
+
+- **`llmux status`**: every Claude token line ends with `· login 12d` (or `· login ended`); a healthy account whose login ends within 5 days is listed under `needs action:` as `login expiring ×N`, with its time left and the login command.
+- **Dashboard header**: `[WARN] LOGIN EXPIRING ×N in 1d12h <soonest account>` (below any failure condition).
+- **Accounts table**: a ready account inside the window reads `ready · login 2d4h` in yellow; the active one `active · login 2d4h`.
+- **Account modal**: a `login` row in the token section, `ends 2d4h (11-18 14:50)`, or `end unknown until the next token refresh`.
+- **Documents**: `/llmux/status` and `/llmux/dashboard` add a nullable `login_expires_at_ms` per account.
+
+The end is unknown for an account until its first refresh on this version (refreshes run every few hours). Like Claude Code, llmux keeps the earliest end it has been told for a login (a slow response computes a slightly later one); a new login replaces it. A benched account shows its auth failure instead (see below).
 
 ### Account authentication failure status
 

@@ -4402,6 +4402,16 @@ fn account_modal_lines(
         "token",
         token_detail_spans(account, view.refresh_ahead, now, ctx.tz_offset),
     ));
+    if account.credential_kind == "oauth" {
+        // The sign-in's own end — no refresh moves it.
+        rows.push(ModalRow::field(
+            "login",
+            account.login_expires_at_ms.map_or_else(
+                || "end unknown until the next token refresh".to_string(),
+                |ms| format!("ends {}", until(UNIX_EPOCH + Duration::from_millis(ms))),
+            ),
+        ));
+    }
     rows.push(ModalRow::field(
         "stamps",
         format!(
@@ -7147,7 +7157,12 @@ fn status_span(
     let Some(reason) = gate else {
         // Eligible. The current account is "active" — a braille working
         // spinner while it has in-flight traffic, otherwise a calm bar
-        // heartbeat. Other eligible accounts get a faint "ready" drift.
+        // heartbeat. Other eligible accounts get a faint "ready" drift. A
+        // login that ends within the warning window says so ("· login 2d4h",
+        // a ready row turns yellow): a refresh cannot extend it.
+        let login = select::login_expiring(account, now)
+            .map(|left| format!(" · login {}", select::compact_duration(left)))
+            .unwrap_or_default();
         return if is_current {
             let glyph = if account.in_flight > 0 {
                 SpinnerKind::Braille.glyph(frame)
@@ -7155,11 +7170,16 @@ fn status_span(
                 SpinnerKind::Pulse.glyph(frame)
             };
             Span::styled(
-                format!("{glyph} active"),
+                format!("{glyph} active{login}"),
                 Style::new().fg(THEME.ok).add_modifier(Modifier::BOLD),
             )
-        } else {
+        } else if login.is_empty() {
             Span::styled(format!("{} ready", SpinnerKind::Drift.glyph(frame)), dim())
+        } else {
+            Span::styled(
+                format!("{} ready{login}", SpinnerKind::Drift.glyph(frame)),
+                Style::new().fg(THEME.wait),
+            )
         };
     };
     // Cooldowns render TIME-ONLY (`⡇ 45m 34s`, yellow): the rotating-timer
@@ -7890,6 +7910,7 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
             let synthetic = AccountSnapshot {
                 auth_failure_status: Some(599),
                 auth_failure: None,
+                login_expires_at_ms: None,
                 paused: true,
                 cooldown_until: Some(now + span),
                 seven_day: Some(window),
@@ -12700,6 +12721,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: kind,
             group,
             seven_day: None,
@@ -13572,6 +13594,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: kind,
             group,
             seven_day: None,
@@ -18538,6 +18561,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: Some(QuotaWindow {
@@ -18765,6 +18789,7 @@ mod tests {
                 healthy: true,
                 auth_failure_status: None,
                 auth_failure: None,
+                login_expires_at_ms: None,
                 credential_kind: kind,
                 group,
                 seven_day: seven,
@@ -18872,6 +18897,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: kind,
             group,
             seven_day: None,
@@ -19683,6 +19709,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "gemini",
             group: BackendGroup::Gemini,
             seven_day: None,
@@ -19727,6 +19754,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -19781,6 +19809,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -20471,6 +20500,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -20715,6 +20745,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: kind,
             group,
             seven_day: Some(window(0.20)),
@@ -21058,6 +21089,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             // 7d populated, so the only cold cell in the row is the
@@ -21115,6 +21147,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -21183,6 +21216,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -21278,6 +21312,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -21711,6 +21746,7 @@ mod tests {
                     healthy: true,
                     auth_failure_status: None,
                     auth_failure: None,
+                    login_expires_at_ms: None,
                     credential_kind: kind,
                     group,
                     // Instants sit 30 s inside their rendered unit (2h56m,
@@ -24997,6 +25033,7 @@ mod tests {
                     healthy: true,
                     auth_failure_status: None,
                     auth_failure: None,
+                    login_expires_at_ms: None,
                     credential_kind: kind,
                     group,
                     seven_day: window(if spent { 1.0 } else { 0.31 }),
@@ -25692,6 +25729,31 @@ mod tests {
         );
         assert!(body.contains("HTTP 400"), "{body}");
         println!("{body}");
+    }
+
+    /// A healthy login ending within the warning window says so on its row
+    /// and in the modal's token section.
+    #[test]
+    fn login_end_shows_on_the_row_and_in_the_modal() {
+        let (mut view, name) = rich_account_view();
+        // Eligible (no cooldown), so the row shows its ready/active state.
+        view.snapshot.accounts[0].cooldown_until = None;
+        view.snapshot.accounts[0].cooldown_source = None;
+        view.snapshot.accounts[0].scoped_cooldowns.clear();
+        let ends = SystemTime::now() + Duration::from_secs(2 * 86_400 + 3_600);
+        view.snapshot.accounts[0].login_expires_at_ms = Some(
+            ends.duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
+        let body = render_rows(&view, &chrome_overlay(Overlay::None), 240, 40).join("\n");
+        assert!(body.contains("LOGIN EXPIRING ×1 in 2d"), "{body}");
+        assert!(body.contains("active · login 2d"), "{body}");
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal::new(name));
+        let modal = render_rows(&view, &chrome, 200, 60).join("\n");
+        assert!(modal.contains("login:"), "{modal}");
+        assert!(modal.contains("ends 2d"), "{modal}");
     }
 
     /// A benched codex account whose CURRENT cause is a dead login, with an

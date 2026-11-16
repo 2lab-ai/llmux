@@ -156,10 +156,10 @@
     client_rejected: ['OAuth client rejected', 'update llmux'],
     token_rejected: ['Token rejected', 'sign in again'],
     key_rejected: ['Key rejected', 'add a valid key'],
-    account_rejected: ['Account rejected', 'check the account'],
+    account_rejected: ['Account rejected', 'check the account, then sign in again'],
     access_suspended: ['Access suspended', 'resolve with the provider, then sign in again'],
     usage_forbidden: ['Usage forbidden', 'sign in again'],
-    provider_error: ['Provider error', 'check the daemon log'],
+    provider_error: ['Provider error', 'check the daemon log, then sign in again'],
   };
 
   /* ---------- Accounts view (with management actions) ---------- */

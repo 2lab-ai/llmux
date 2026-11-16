@@ -231,6 +231,7 @@ fn account_from_value(value: &Value) -> Result<AccountConfig, String> {
                 // Imported tokens are of unknown age — "never (refreshed)"
                 // until the proxy's first refresh stamps it.
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         })
     } else {
@@ -327,7 +328,9 @@ mod tests {
                 expires_at_ms,
                 tier,
                 last_refresh_ms,
+                login_expires_at_ms,
             } => {
+                assert_eq!(*login_expires_at_ms, None);
                 assert_eq!(account_uuid, "uuid-primary");
                 assert_eq!(access_token, "sk-ant-oat01-AAA");
                 assert_eq!(refresh_token, "sk-ant-ort01-AAA");

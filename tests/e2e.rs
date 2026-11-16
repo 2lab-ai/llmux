@@ -77,6 +77,7 @@ fn oauth_account_expiring(name: &str, token: &str, expires_at_ms: u64) -> Accoun
             expires_at_ms,
             tier: None,
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         },
     }
 }

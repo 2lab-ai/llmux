@@ -342,6 +342,7 @@ fn parse_grok_token_response(value: &Value) -> Result<GrokTokenBundle, AuthError
             access_token,
             refresh_token,
             expires_at_ms,
+            login_expires_at_ms: None,
         },
         id_token,
     })
@@ -770,6 +771,7 @@ mod tests {
                 access_token: "at".into(),
                 refresh_token: None,
                 expires_at_ms: 1,
+                login_expires_at_ms: None,
             },
             id_token: None,
         };
@@ -779,6 +781,7 @@ mod tests {
                 access_token: "at".into(),
                 refresh_token: Some("rt".into()),
                 expires_at_ms: 1,
+                login_expires_at_ms: None,
             },
             id_token: None,
         };

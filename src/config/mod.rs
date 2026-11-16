@@ -807,6 +807,7 @@ mod tests {
                 expires_at_ms: 1_750_000_000_000,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         }
     }
@@ -1329,6 +1330,27 @@ mod tests {
         // Match by name too; unknown identity is reported.
         assert!(config.update_oauth_tokens("a@x.com", "at-2", Some("rt-2"), 43, 42));
         assert!(!config.update_oauth_tokens("nobody", "at", None, 0, 0));
+    }
+
+    /// A refresh that reports the sign-in's end stores it; one that does not
+    /// keeps the known end (a refresh never moves it).
+    #[test]
+    fn rotated_tokens_carry_the_login_end() {
+        let mut config = Config::default();
+        config.accounts.push(oauth_account("a@x.com", "uuid-a"));
+        let login_end = |c: &Config| c.accounts[0].credential.login_expires_at_ms();
+        assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-1", None, 1, 1, Some(500)));
+        assert_eq!(login_end(&config), Some(500));
+        assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-2", None, 2, 2, None));
+        assert_eq!(login_end(&config), Some(500), "an unreported end is kept");
+        assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-3", None, 3, 3, Some(510)));
+        assert_eq!(
+            login_end(&config),
+            Some(500),
+            "a later computed end never moves it out"
+        );
+        assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-4", None, 4, 4, Some(490)));
+        assert_eq!(login_end(&config), Some(490));
     }
 
     #[test]
