@@ -6712,13 +6712,22 @@ mod tests {
     /// and the status document reports it.
     #[tokio::test]
     async fn background_refresh_records_the_login_end() {
+        // First answer reports the sign-in's end with a short-lived token (so
+        // the next pass refreshes again); the second omits the end.
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = hits.clone();
         let app = Router::new().route(
             "/v1/oauth/token",
-            post(|| async {
-                (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800,"refresh_token_expires_in":172800}"#,
-                )
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    let body = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":60,"refresh_token_expires_in":172800}"#
+                    } else {
+                        r#"{"access_token":"at-newer","refresh_token":"rt-newer","expires_in":28800}"#
+                    };
+                    ([(header::CONTENT_TYPE, "application/json")], body)
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -6758,6 +6767,24 @@ mod tests {
             usage_controls: Default::default(),
             plans: Default::default(),
         };
+        let doc = status_json(
+            &snapshot,
+            &UsageTotals::default(),
+            &params(),
+            SystemTime::now(),
+            &meta,
+        );
+        assert_eq!(doc["accounts"][0]["login_expires_at_ms"], ends);
+
+        // A later refresh that omits the end keeps the exact learned one.
+        background_refresh_pass(&state).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "refreshed again");
+        let snapshot = pool.snapshot();
+        assert!(matches!(
+            pool.credential(&AccountId("a".into())),
+            Some(AccountCredential::Oauth { access_token, .. }) if access_token == "at-newer"
+        ));
+        assert_eq!(snapshot.accounts[0].login_expires_at_ms, Some(ends));
         let doc = status_json(
             &snapshot,
             &UsageTotals::default(),

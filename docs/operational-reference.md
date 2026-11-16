@@ -1270,7 +1270,7 @@ Where it shows:
 - **Account modal**: a `login` row in the token section, `ends 2d4h (11-18 14:50)`, or `end unknown until the next token refresh`.
 - **Documents**: `/llmux/status` and `/llmux/dashboard` add a nullable `login_expires_at_ms` per account.
 
-The end is unknown for an account until its first refresh on this version (refreshes run every few hours). A benched account shows its auth failure instead (see below).
+The end is unknown for an account until its first refresh on this version (refreshes run every few hours). Like Claude Code, llmux keeps the earliest end it has been told for a login (a slow response computes a slightly later one); a new login replaces it. A benched account shows its auth failure instead (see below).
 
 ### Account authentication failure status
 

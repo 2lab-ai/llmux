@@ -1411,15 +1411,12 @@ impl Config {
         if !still_matches(&self.accounts[idx].credential) {
             return false;
         }
-        if let (
-            AccountCredential::Oauth {
-                login_expires_at_ms: login,
-                ..
-            },
-            Some(at),
-        ) = (&mut self.accounts[idx].credential, login_expires_at_ms)
+        if let AccountCredential::Oauth {
+            login_expires_at_ms: login,
+            ..
+        } = &mut self.accounts[idx].credential
         {
-            *login = Some(at);
+            *login = crate::auth::oauth::earliest_login_end(*login, login_expires_at_ms);
         }
         match &mut self.accounts[idx].credential {
             AccountCredential::Oauth {

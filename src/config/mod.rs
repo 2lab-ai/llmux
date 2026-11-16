@@ -1343,6 +1343,14 @@ mod tests {
         assert_eq!(login_end(&config), Some(500));
         assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-2", None, 2, 2, None));
         assert_eq!(login_end(&config), Some(500), "an unreported end is kept");
+        assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-3", None, 3, 3, Some(510)));
+        assert_eq!(
+            login_end(&config),
+            Some(500),
+            "a later computed end never moves it out"
+        );
+        assert!(config.update_oauth_tokens_if("uuid-a", |_| true, "at-4", None, 4, 4, Some(490)));
+        assert_eq!(login_end(&config), Some(490));
     }
 
     #[test]

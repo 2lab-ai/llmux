@@ -549,9 +549,37 @@ struct TokenResponse {
     #[serde(default)]
     expires_in: Option<u64>,
     /// Seconds left on the sign-in itself (Anthropic; not extended by a
-    /// refresh).
-    #[serde(default)]
+    /// refresh). Advisory: an unsupported representation reads as `None`
+    /// rather than rejecting the rotated tokens next to it.
+    #[serde(default, deserialize_with = "lenient_seconds")]
     refresh_token_expires_in: Option<u64>,
+}
+
+/// `refresh_token_expires_in` decoder: whole or fractional non-negative
+/// seconds; anything else is `None` (never an error — the tokens beside it
+/// may already have rotated the old refresh token out).
+fn lenient_seconds<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|secs| secs.is_finite() && *secs >= 0.0)
+                .map(|secs| secs as u64)
+        })
+    }))
+}
+
+/// Merge a known login end with one a refresh just reported: a refresh
+/// cannot extend a sign-in, so two known ends keep the earlier (a slow
+/// response computes a slightly later one); an omitted end keeps the known.
+pub fn earliest_login_end(known: Option<u64>, reported: Option<u64>) -> Option<u64> {
+    match (known, reported) {
+        (Some(known), Some(reported)) => Some(known.min(reported)),
+        (known, reported) => known.or(reported),
+    }
 }
 
 impl TokenResponse {
@@ -990,6 +1018,27 @@ mod tests {
             .await
             .expect("refresh");
         assert_eq!(tokens.login_expires_at_ms, None, "not reported → unknown");
+    }
+
+    /// A malformed advisory field never costs the rotated tokens beside it.
+    #[test]
+    fn sign_in_end_is_parsed_leniently_and_merged_earliest() {
+        let parse = |body: &str| serde_json::from_str::<TokenResponse>(body).expect("parse");
+        let with = |v: &str| {
+            parse(&format!(
+                r#"{{"access_token":"a","expires_in":60,"refresh_token_expires_in":{v}}}"#
+            ))
+            .refresh_token_expires_in
+        };
+        assert_eq!(with("172800"), Some(172_800));
+        assert_eq!(with("172800.0"), Some(172_800));
+        assert_eq!(with(r#""soon""#), None);
+        assert_eq!(with("-5"), None);
+        assert_eq!(with("null"), None);
+        assert_eq!(earliest_login_end(Some(10), Some(12)), Some(10));
+        assert_eq!(earliest_login_end(Some(10), Some(8)), Some(8));
+        assert_eq!(earliest_login_end(Some(10), None), Some(10));
+        assert_eq!(earliest_login_end(None, Some(12)), Some(12));
     }
 
     #[tokio::test]

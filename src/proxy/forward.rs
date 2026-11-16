@@ -3506,9 +3506,14 @@ pub(crate) async fn refresh_credential(
                         expires_at_ms: tokens.expires_at_ms,
                         tier: tier.clone(),
                         last_refresh_ms: Some(refreshed_at_ms),
-                        // A refresh reports the same sign-in's end; keep the
-                        // known one when a response omits it.
-                        login_expires_at_ms: tokens.login_expires_at_ms.or(*login_expires_at_ms),
+                        // A refresh reports the same sign-in's end and can
+                        // never extend it: keep the earliest known end (a slow
+                        // response computes a slightly later one), and keep
+                        // the known one when a response omits it.
+                        login_expires_at_ms: crate::auth::oauth::earliest_login_end(
+                            *login_expires_at_ms,
+                            tokens.login_expires_at_ms,
+                        ),
                     },
                     non_empty_or(account_uuid, &account.0),
                 ),
