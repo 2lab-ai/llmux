@@ -33,9 +33,11 @@ pub enum AuthCause {
     RefreshRejected,
     /// `invalid_client`: the provider refused llmux's OAuth client.
     ClientRejected,
-    /// The provider rejected the access token (or API key) again after the
-    /// refresh that should have fixed it.
+    /// The provider rejected the OAuth access token — again after the
+    /// refresh that should have fixed it, for the kinds llmux refreshes.
     TokenRejected,
+    /// The provider rejected an API key (nothing to refresh).
+    KeyRejected,
     /// The provider refused the account itself on a request (persistent
     /// account rejection, not a token problem).
     AccountRejected,
@@ -58,13 +60,14 @@ pub struct AuthFailure {
 
 impl AuthCause {
     /// Every cause, for exhaustive tests and docs.
-    pub const ALL: [AuthCause; 10] = [
+    pub const ALL: [AuthCause; 11] = [
         AuthCause::LoginExpired,
         AuthCause::LoginRotated,
         AuthCause::LoginRevoked,
         AuthCause::RefreshRejected,
         AuthCause::ClientRejected,
         AuthCause::TokenRejected,
+        AuthCause::KeyRejected,
         AuthCause::AccountRejected,
         AuthCause::AccessSuspended,
         AuthCause::UsageForbidden,
@@ -95,22 +98,6 @@ impl AuthCause {
         }
     }
 
-    /// Stable machine id, as serialized (`login_expired`, …).
-    pub fn id(self) -> &'static str {
-        match self {
-            AuthCause::LoginExpired => "login_expired",
-            AuthCause::LoginRotated => "login_rotated",
-            AuthCause::LoginRevoked => "login_revoked",
-            AuthCause::RefreshRejected => "refresh_rejected",
-            AuthCause::ClientRejected => "client_rejected",
-            AuthCause::TokenRejected => "token_rejected",
-            AuthCause::AccountRejected => "account_rejected",
-            AuthCause::AccessSuspended => "access_suspended",
-            AuthCause::UsageForbidden => "usage_forbidden",
-            AuthCause::ProviderError => "provider_error",
-        }
-    }
-
     /// Short label for the status column (`! 400 login expired`). At most 16
     /// characters so `! NNN <label>` fits the 20-column status cell.
     pub fn label(self) -> &'static str {
@@ -121,6 +108,7 @@ impl AuthCause {
             AuthCause::RefreshRejected => "refresh rejected",
             AuthCause::ClientRejected => "client rejected",
             AuthCause::TokenRejected => "token rejected",
+            AuthCause::KeyRejected => "key rejected",
             AuthCause::AccountRejected => "account rejected",
             AuthCause::AccessSuspended => "access suspended",
             AuthCause::UsageForbidden => "usage forbidden",
@@ -147,8 +135,9 @@ impl AuthCause {
                 "the provider refused llmux's OAuth client, not this account"
             }
             AuthCause::TokenRejected => {
-                "the provider rejected this account's token again right after a refresh"
+                "the provider rejected this account's access token, even after a refresh where one was possible"
             }
+            AuthCause::KeyRejected => "the provider rejected this account's API key",
             AuthCause::AccountRejected => {
                 "the provider refused this account on a request (billing, organization or plan problem)"
             }
@@ -188,6 +177,7 @@ impl AuthCause {
                 "resolve the suspension with the provider, or remove the account (`llmux remove <name>`)"
                     .to_string()
             }
+            AuthCause::KeyRejected => format!("add a valid key: `{login}`"),
             AuthCause::ProviderError => format!(
                 "check the provider's status and the daemon log; sign in again to retry: `{login}`"
             ),
@@ -244,13 +234,31 @@ mod tests {
     }
 
     #[test]
-    fn labels_fit_the_status_cell_and_ids_match_serde() {
+    fn labels_fit_the_status_cell_and_round_trip_as_snake_case() {
         for cause in AuthCause::ALL {
             assert!(cause.label().len() <= 16, "{}", cause.label());
-            let json = serde_json::to_value(cause).expect("serialize");
-            assert_eq!(json, serde_json::Value::from(cause.id()));
             assert!(!cause.why().is_empty());
+            let json = serde_json::to_value(cause).expect("serialize");
+            assert_eq!(
+                json,
+                serde_json::Value::from(cause.label().replace(' ', "_"))
+            );
+            assert_eq!(
+                serde_json::from_value::<AuthCause>(json).expect("deserialize"),
+                cause
+            );
         }
+    }
+
+    /// An API key was never refreshed: its rejection must not be explained
+    /// as a failed refresh, and its fix is a new key.
+    #[test]
+    fn api_key_rejection_is_its_own_cause() {
+        assert!(!AuthCause::KeyRejected.why().contains("refresh"));
+        assert_eq!(
+            AuthCause::KeyRejected.fix("apikey"),
+            "add a valid key: `llmux login --api`"
+        );
     }
 
     #[test]

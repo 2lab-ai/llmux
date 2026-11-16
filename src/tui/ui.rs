@@ -25694,6 +25694,61 @@ mod tests {
         println!("{body}");
     }
 
+    /// A benched codex account whose CURRENT cause is a dead login, with an
+    /// older, contradictory receipt in its history: the detail pane and the
+    /// modal show the current cause and the codex login command, not the
+    /// historical failure.
+    #[test]
+    fn classified_failure_overrides_history_in_detail_pane_and_modal() {
+        use crate::auth_cause::{AuthCause, AuthFailure};
+        let (mut view, name) = rich_account_view();
+        {
+            let account = &mut view.snapshot.accounts[0];
+            account.credential_kind = "codex";
+            account.healthy = false;
+            account.auth_failure_status = Some(400);
+            account.auth_failure = Some(AuthFailure {
+                cause: AuthCause::LoginExpired,
+                at_ms: 1_793_130_000_000,
+            });
+        }
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "request_401_refresh",
+                "permanent_failure",
+                Some(401),
+                "invalid_client: OAuth client rejected",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1_790_000_000),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.middle = Some(11);
+        let width = band_bound(&view, &chrome).max(240);
+        let body = render_rows(&view, &chrome, width, 60).join("\n");
+        assert!(body.contains("login expired since"), "{body}");
+        assert!(
+            body.contains("fix: sign in again on the daemon's host: `llmux login --codex`"),
+            "{body}"
+        );
+        assert!(!body.contains("last failure"), "{body}");
+        assert!(!body.contains("OAuth client rejected"), "{body}");
+
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal::new(name));
+        let modal = render_rows(&view, &chrome, 200, 60).join("\n");
+        assert!(modal.contains("cause:"), "{modal}");
+        assert!(
+            modal.contains("login expired — the provider ended this login"),
+            "{modal}"
+        );
+        assert!(modal.contains("since:"), "{modal}");
+        assert!(modal.contains("`llmux login --codex`"), "{modal}");
+        assert!(modal.contains("press `n` (new login)"), "{modal}");
+    }
+
     #[test]
     fn account_history_is_visible_in_scrollable_real_render() {
         let (mut view, name) = rich_account_view();

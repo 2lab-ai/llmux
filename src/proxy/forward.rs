@@ -2941,9 +2941,6 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
             UpstreamSignal::AuthRejected => {
                 let mut auth_status = response.status();
-                // The token was rejected; a dead refresh below replaces this
-                // with the refresh's own, more specific cause.
-                let mut auth_cause = crate::auth_cause::AuthCause::TokenRejected;
                 ctx.log("=== RESPONSE 401 ===".to_string());
                 drop(response);
                 // Gemini too: Google access tokens live ~1h, and without one
@@ -2955,6 +2952,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         | AccountCredential::Codex { .. }
                         | AccountCredential::Gemini { .. }
                 );
+                // A key was rejected outright (nothing to refresh); a token
+                // was rejected, and a dead refresh below replaces this with
+                // the refresh's own, more specific cause.
+                let mut auth_cause = if matches!(
+                    credential,
+                    AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. }
+                ) {
+                    crate::auth_cause::AuthCause::KeyRejected
+                } else {
+                    crate::auth_cause::AuthCause::TokenRejected
+                };
                 if oauth && !force_refreshed.contains(&account) {
                     force_refreshed.insert(account.clone());
                     // `Superseded` retries for the same reason `Refreshed`
@@ -6724,6 +6732,59 @@ mod tests {
             "! 401 token rejected"
         );
         assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
+    }
+
+    /// An API key is never refreshed: its 401 benches it as `key rejected`,
+    /// not as a token the provider refused "after a refresh".
+    #[tokio::test]
+    async fn api_key_401_is_benched_as_key_rejected() {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::RequireBearer {
+                accept: &["at-b"],
+                body: r#"{"ok":1}"#,
+            });
+        let upstream = spawn_mock(shared.clone()).await;
+        // The key is the only account, so the request must try it.
+        let key = AccountConfig {
+            name: "k".into(),
+            credential: AccountCredential::Apikey {
+                api_key: "sk-ant-api03-test".into(),
+            },
+        };
+        let state = test_state(&upstream, vec![key]);
+
+        let response = forward(&state, client_request("{}")).await;
+        assert_ne!(response.status(), StatusCode::OK);
+        assert_eq!(
+            shared.seen.lock().expect("lock").len(),
+            1,
+            "one try, no refresh"
+        );
+
+        let snapshot = state.pool.snapshot();
+        let k = snapshot
+            .accounts
+            .iter()
+            .find(|acct| acct.id.0 == "k")
+            .expect("k");
+        assert!(!k.healthy);
+        assert_eq!(
+            k.auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::KeyRejected)
+        );
+        assert_eq!(
+            crate::scheduler::select::blocking_reason(
+                k,
+                crate::scheduler::select::IneligibleReason::AuthUnhealthy,
+                &state.select_params(),
+                SystemTime::now(),
+            ),
+            "! 401 key rejected"
+        );
     }
 
     /// Exercise the real OAuth HTTP parser and both request-time refresh paths.

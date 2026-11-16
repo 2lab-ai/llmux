@@ -197,12 +197,9 @@ fn action_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
         fix: String,
         members: Vec<String>,
     }
-    let accounts = doc["accounts"].as_array().cloned().unwrap_or_default();
+    let accounts = doc["accounts"].as_array().into_iter().flatten();
     let mut groups: Vec<Group> = Vec::new();
-    for account in accounts
-        .iter()
-        .filter(|a| a["status"].as_str() == Some("auth_failed"))
-    {
+    for account in accounts.filter(|a| a["status"].as_str() == Some("auth_failed")) {
         let name = account["name"].as_str().unwrap_or("?");
         let failure = &account["auth_failure"];
         let (label, why, fix) = match failure["label"].as_str() {

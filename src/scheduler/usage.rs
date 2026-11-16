@@ -1430,6 +1430,44 @@ mod tests {
         assert!(pool.snapshot().accounts[0].healthy);
     }
 
+    /// The healthy → benched transition: a scheduled account whose usage
+    /// read answers 403 is benched as `usage_forbidden`, and from then on it
+    /// takes no poll slot — not even after its retry deadline — until a
+    /// re-login.
+    #[tokio::test]
+    async fn usage_403_benches_a_scheduled_account_and_stops_its_polls() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = MockFetcher::new(vec![Err(status_err(403)), Ok(snapshot_with(0.2))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        assert_eq!(fetcher.call_count(), 1);
+        let account = &pool.snapshot().accounts[0];
+        assert!(!account.healthy);
+        assert_eq!(
+            account.auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::UsageForbidden)
+        );
+        for step in 1..=6u32 {
+            poller.tick(now() + Duration::from_secs(900) * step).await;
+        }
+        assert_eq!(fetcher.call_count(), 1, "no polls past the retry deadline");
+        assert!(!poller.schedule.contains_key(&id("a")));
+
+        let mut fresh = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut fresh.credential {
+            *access_token = "at-relogin".into();
+        }
+        pool.reload_accounts(&[fresh]);
+        poller.tick(now() + Duration::from_secs(900) * 7).await;
+        assert_eq!(fetcher.call_count(), 2, "the re-login is polled at once");
+    }
+
     #[tokio::test]
     async fn relogin_retries_usage_without_inheriting_backoff() {
         let pool = AccountPool::new(&[oauth_account("a")]);

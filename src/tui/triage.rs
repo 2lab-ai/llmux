@@ -969,6 +969,29 @@ mod tests {
             verdict.conditions
         );
 
+        // A HEALTHY account's stale poll is still its own condition — and the
+        // auth cause keeps the headline over it.
+        view.poll_health.insert(
+            "ok".to_string(),
+            crate::tui::PollHealth {
+                last_ok: Some(now() - Duration::from_secs(3_600)),
+                consecutive_failures: 4,
+                next_at: now(),
+            },
+        );
+        let verdict = health_verdict(&view, now());
+        assert_eq!(
+            verdict.headline().expect("condition").text,
+            "AUTH BROKEN: login expired ×2 · re-login"
+        );
+        let stale: Vec<&Condition> = verdict
+            .conditions
+            .iter()
+            .filter(|c| c.text.starts_with("POLLER STALE"))
+            .collect();
+        assert_eq!(stale.len(), 1, "{:?}", verdict.conditions);
+        assert_eq!(stale[0].account.as_deref(), Some("ok"));
+
         let mixed = [
             &dead("a", AuthCause::LoginExpired),
             &dead("b", AuthCause::ClientRejected),

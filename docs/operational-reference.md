@@ -1277,7 +1277,8 @@ only the display, not scheduling priority or retry policy.
 | `login revoked` | `invalid_grant` / "… revoked": revoked in the provider's settings, or rotated elsewhere | sign in again |
 | `refresh rejected` | any other refresh rejection (a bare `invalid_grant`, a 401 from the token endpoint) | sign in again |
 | `client rejected` | `invalid_client`: the provider refused llmux's OAuth client, not the account | `llmux update`, then sign in again if it persists |
-| `token rejected` | the provider refused the token (or API key) again right after a refresh | sign in again |
+| `token rejected` | the provider refused the access token, even after a refresh where one was possible | sign in again |
+| `key rejected` | the provider refused an API key (nothing to refresh) | add a valid key (`llmux login --api`) |
 | `account rejected` | the provider refused the account itself on a request | check the account's standing, then sign in again |
 | `access suspended` | the provider suspended the account (Google ToS on gemini) | resolve it with the provider, or `llmux remove` |
 | `usage forbidden` | the Claude usage endpoint answered 403 | sign in again |
@@ -1306,7 +1307,8 @@ Where it shows:
   label, and add a nullable `auth_failure` object — `/llmux/status` carries
   `{cause, label, why, fix, needs_relogin, since_ms}` (`cause` is a stable id
   such as `login_expired`); the dashboard document carries `{cause, at_ms}` and
-  the attached dashboard renders the rest itself.
+  the attached dashboard renders the rest itself. A cause the attached
+  dashboard does not know (a newer daemon) reads as unclassified.
 
 A benched account's usage is not polled: its login is dead, so every poll would
 fail (401, then 429 once the endpoint rate-limits the dead token) and take a
