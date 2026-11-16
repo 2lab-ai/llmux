@@ -72,6 +72,9 @@ sessions.
 
 **활동 (activity)** and **계정 (accounts)** show the same data as the TUI. Account and key changes are made
 in the TUI or with `llmux keys`; the web page is read-only.
+On 계정 a benched account names its cause and fix (`Login expired 400 · sign in again`), and an account whose
+Claude login ends within 5 days says so (`Ready · login ends in 7h 59m · sign in again`) — the same verdicts as
+`llmux status` ([operational reference](operational-reference.md#login-expiry)).
 
 ## Numbers
 

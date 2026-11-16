@@ -1266,8 +1266,9 @@ Where it shows:
 
 - **`llmux status`**: every Claude token line ends with `· login 12d` (or `· login ended`); a healthy account whose login ends within 5 days is listed under `needs action:` as `login expiring ×N`, with its time left and the login command.
 - **Dashboard header**: `[WARN] LOGIN EXPIRING ×N in 1d12h <soonest account>` (below any failure condition).
-- **Accounts table**: a ready account inside the window reads `ready · login 2d4h` in yellow; the active one `active · login 2d4h`.
+- **Accounts table**: a ready account inside the window reads `ready · login 2d` in yellow; the active one `active · login 2d`. The row shows one unit, rounded down (`4d`, `7h`, `12m`, then `now`), so it fits the status column; the modal and `llmux status` give the exact time.
 - **Account modal**: a `login` row in the token section, `ends 2d4h (11-18 14:50)`, or `end unknown until the next token refresh`.
+- **Web dashboard (계정)**: the state pill of an account inside the window reads `Ready · login ends in 2d 4h · sign in again` (or `Serving · …`, `login ended`) in yellow; a benched account keeps its cause label.
 - **Documents**: `/llmux/status` and `/llmux/dashboard` add a nullable `login_expires_at_ms` per account.
 
 The end is unknown for an account until its first refresh on this version (refreshes run every few hours). Like Claude Code, llmux keeps the earliest end it has been told for a login (a slow response computes a slightly later one); a new login replaces it. A benched account shows its auth failure instead (see below).

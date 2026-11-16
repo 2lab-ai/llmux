@@ -7142,6 +7142,22 @@ fn draw_fold(
     (hits, drawn.hidden)
 }
 
+/// Time left on a login, in ONE unit, for the status column: `4d`, `7h`,
+/// `12m`, then `now`. The column is at most STATUS_COL_MAX (20) wide, and
+/// `⠴ active · login 7h56m` (22) was cut to `login 7h5`, which reads as
+/// seven hours five. One unit keeps the longest form, `⠴ active · login 23h`,
+/// at 20. It rounds down, so the row never promises more time than is left;
+/// the modal and `llmux status` give the exact time.
+fn login_left_short(left: Duration) -> String {
+    let secs = left.as_secs();
+    match (secs / 86_400, secs / 3_600, secs / 60) {
+        (days @ 1.., _, _) => format!("{days}d"),
+        (_, hours @ 1.., _) => format!("{hours}h"),
+        (_, _, mins @ 1..) => format!("{mins}m"),
+        _ => "now".to_string(),
+    }
+}
+
 /// Status column: active (green) / ready (default) / the concrete blocking
 /// reason from the scheduler's own gate ("cooldown 3m12s", "7d 99.4% > 99%",
 /// "usage stale 14m", "! 404 auth X") so the TUI never disagrees with the
@@ -7158,10 +7174,10 @@ fn status_span(
         // Eligible. The current account is "active" — a braille working
         // spinner while it has in-flight traffic, otherwise a calm bar
         // heartbeat. Other eligible accounts get a faint "ready" drift. A
-        // login that ends within the warning window says so ("· login 2d4h",
+        // login that ends within the warning window says so ("· login 2d",
         // a ready row turns yellow): a refresh cannot extend it.
         let login = select::login_expiring(account, now)
-            .map(|left| format!(" · login {}", select::compact_duration(left)))
+            .map(|left| format!(" · login {}", login_left_short(left)))
             .unwrap_or_default();
         return if is_current {
             let glyph = if account.in_flight > 0 {
@@ -25754,6 +25770,40 @@ mod tests {
         let modal = render_rows(&view, &chrome, 200, 60).join("\n");
         assert!(modal.contains("login:"), "{modal}");
         assert!(modal.contains("ends 2d"), "{modal}");
+    }
+
+    /// The row's login time fits the status column whole. Seen live on
+    /// 2026-11-16: `active · login 7h56m` was cut to `active · login 7h5`.
+    #[test]
+    fn login_end_under_a_day_fits_the_status_column() {
+        let (mut view, _) = rich_account_view();
+        view.snapshot.accounts[0].cooldown_until = None;
+        view.snapshot.accounts[0].cooldown_source = None;
+        view.snapshot.accounts[0].scoped_cooldowns.clear();
+        let ends = SystemTime::now() + Duration::from_secs(7 * 3_600 + 56 * 60);
+        view.snapshot.accounts[0].login_expires_at_ms = Some(
+            ends.duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
+        let body = render_rows(&view, &chrome_overlay(Overlay::None), 230, 40).join("\n");
+        let row = body
+            .lines()
+            .find(|line| line.contains("· login"))
+            .unwrap_or_else(|| panic!("no login suffix: {body}"));
+        assert!(row.contains("active · login 7h "), "{row}");
+    }
+
+    #[test]
+    fn login_left_short_uses_one_unit_and_rounds_down() {
+        let short = |secs| login_left_short(Duration::from_secs(secs));
+        assert_eq!(short(4 * 86_400 + 23 * 3_600), "4d");
+        assert_eq!(short(86_400), "1d");
+        assert_eq!(short(23 * 3_600 + 59 * 60), "23h");
+        assert_eq!(short(7 * 3_600 + 56 * 60), "7h");
+        assert_eq!(short(59 * 60 + 59), "59m");
+        assert_eq!(short(59), "now");
+        assert_eq!(short(0), "now");
     }
 
     /// A benched codex account whose CURRENT cause is a dead login, with an

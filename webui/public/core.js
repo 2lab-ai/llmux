@@ -163,7 +163,19 @@
   };
 
   /* ---------- Accounts view (with management actions) ---------- */
+  // The window in which `llmux status` lists a login as expiring
+  // (LOGIN_EXPIRY_WARN in src/scheduler/select.rs). A refresh cannot extend the
+  // sign-in, so the fix is a new login before it ends.
+  X.LOGIN_EXPIRY_WARN_S = 5 * 86400;
   X.accountState = function (a, p) {
+    const s = baseState(a, p);
+    if (s[0] === 'error' || !a.login_expires_at_ms) return s;
+    const loginLeft = a.login_expires_at_ms / 1000 - Date.now() / 1000;
+    if (loginLeft > X.LOGIN_EXPIRY_WARN_S) return s;
+    const ends = loginLeft > 0 ? 'login ends in ' + X.dur(loginLeft) : 'login ended';
+    return [s[0], s[1] + ' · ' + ends + ' · sign in again', 'warn'];
+  };
+  function baseState(a, p) {
     const now = Date.now() / 1000;
     const w7 = a.seven_day && a.seven_day.resets_at > now ? a.seven_day.utilization : a.seven_day ? 0 : null;
     if (a.paused) return ['paused', 'Paused', 'mute'];
@@ -179,7 +191,7 @@
     if (w7 != null && w7 >= p.seven_day_max) return ['spent', '7d used up', 'warn'];
     if (a.status === 'active') return ['active', 'Serving', 'good'];
     return ['ok', 'Ready', 'ok'];
-  };
+  }
   const left = (w) => { if (!w) return null; const now = Date.now() / 1000; return w.resets_at <= now ? 1 : Math.max(0, 1 - w.utilization); };
   X.renderAccounts = function (doc) {
     const groups = ['claude', 'codex', 'grok', 'openrouter', 'gemini'];
