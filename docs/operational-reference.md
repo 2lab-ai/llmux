@@ -448,10 +448,12 @@ scrolls with `↑↓`/`j k`, `PgUp`/`PgDn` and `Home`/`End` (or the mouse wheel)
 right shows where you are, and the bottom border says which rows are in view (`1-14 of 53`).
 Quota windows read as a bar with what is left and when it resets.
 
-`! 400 auth X` means the scheduler recorded HTTP 400 when it excluded that
-account; the history distinguishes an OAuth `invalid_grant` from other failures.
-`! auth X` means no HTTP status was available — it does not prove credentials
-were deleted. Usage HTTP 429 means a rate-limited gauge read and does not revoke
+`! 400 login expired` means the scheduler recorded HTTP 400 when it excluded
+that account and classified why (see
+[Account authentication failure status](#account-authentication-failure-status));
+the history keeps the safe OAuth reason behind it. `! 400 auth X` is a failure
+whose cause was not classified, and `! auth X` means no HTTP status was
+available — it does not prove credentials were deleted. Usage HTTP 429 means a rate-limited gauge read and does not revoke
 authentication. A Claude usage 403 is recorded as an exclusion only when the
 credential guard applied it; Grok and Gemini usage reads remain informational.
 Responses discarded after token rotation change neither poll health nor backoff.
@@ -486,6 +488,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 | Feature | Stable 0.2.25 (2026-10-08) | Stable 0.2.26 (2026-10-26) | Preview |
 |---|---|---|---|
 | Authentication/usage history, re-login poll recovery, transient refresh handling | no | no | yes |
+| Classified auth-failure cause (`! 400 login expired`, `needs action:` block in `status`, `auth_failure` object, cause-first dashboard verdict); benched accounts not usage-polled | no | no | yes |
 | Day-partitioned raw-io store (`store/raw-io/`, verified day archives, no retention deletion, `llmux raw-io`, `GET /llmux/raw-io/status`) | no | no | yes |
 | `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
 | Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | yes (source `7fe64d1`) | yes | yes |
@@ -1254,17 +1257,61 @@ restart inside that short window can reuse launch context until a main turn is o
 
 ### Account authentication failure status
 
-Accounts blocked by authentication or a persistent account error show the HTTP
-status actually observed, for example `! 401 auth X`, `! 404 auth X`, or
-`! 503 auth X`. A paused account shows `paused`; when authentication also fails,
-the same line shows `paused + 404 auth X` (using its observed code). The same
-reason appears in `llmux status`, the local/attached
-dashboard, and Islands account details. `/llmux/status` and `/llmux/dashboard`
-retain `status: "auth_failed"` and add nullable `auth_failure_status`; `blocked`
-contains the readable reason. Failures without an HTTP response
-show `! auth X`, or `paused + auth X` when also paused, without an invented status.
-Pause and authentication health remain independent; this combined label changes
+In short: a benched account's row names **why** it is benched and every
+surface says **what to do** — `! 400 login expired` means the login reached its
+lifetime and you sign in again (`llmux login`, or `n` in the dashboard).
+
+The row shows the HTTP status actually observed and the classified cause, for
+example `! 400 login expired`, `! 400 login rotated`, `! 401 token rejected`.
+A paused account shows `paused`; when authentication also fails, the same line
+shows `paused + 400 login expired`. A failure whose cause the daemon did not
+classify (an older daemon) keeps the generic `! 404 auth X`, and one without an
+HTTP response shows `! auth X` / `paused + auth X`, without an invented status
+or cause. Pause and authentication health remain independent; the label changes
 only the display, not scheduling priority or retry policy.
+
+| Label | What happened | Fix |
+|---|---|---|
+| `login expired` | the token endpoint answered `invalid_grant` / "refresh token expired": the login reached its lifetime (Claude sign-ins measured on a shared host died 28.7–29.9 days after the login that minted them) | sign in again on the daemon's host |
+| `login rotated` | `invalid_grant` / "not found or invalid": another holder of the same login (a second daemon, a copied config) refreshed first | sign in again; keep each login on one daemon |
+| `login revoked` | `invalid_grant` / "… revoked": revoked in the provider's settings, or rotated elsewhere | sign in again |
+| `refresh rejected` | any other refresh rejection (a bare `invalid_grant`, a 401 from the token endpoint) | sign in again |
+| `client rejected` | `invalid_client`: the provider refused llmux's OAuth client, not the account | `llmux update`, then sign in again if it persists |
+| `token rejected` | the provider refused the token (or API key) again right after a refresh | sign in again |
+| `account rejected` | the provider refused the account itself on a request | check the account's standing, then sign in again |
+| `access suspended` | the provider suspended the account (Google ToS on gemini) | resolve it with the provider, or `llmux remove` |
+| `usage forbidden` | the Claude usage endpoint answered 403 | sign in again |
+| `provider error` | a persistent non-auth provider error benched the account | check the provider and the daemon log; sign in again to retry |
+
+Where it shows:
+
+- **`llmux status`** prints a `needs action:` block after the account list:
+  benched accounts grouped by cause, each group with the why, every member with
+  how long ago it was benched, and the fix (`llmux login --codex` etc. for the
+  account's kind). An auth-failed account with no recorded cause still appears,
+  as `auth failed`.
+- **Dashboard header** (local and attached): the verdict leads with the auth
+  condition and names the cause, e.g. `[FAIL] AUTH BROKEN: login expired ×4 ·
+  re-login <first account> +1` (`+N other` when the benched accounts carry
+  different causes). A benched account's failing usage poll is not reported as
+  a separate `POLLER STALE`: the dead login is the cause, the stale poll its
+  symptom. With no recorded cause the verdict stays `AUTH BROKEN` / `AUTH
+  BROKEN +N`.
+- **Account modal** (click a row): `cause` (label and why), `since` and `fix`,
+  including "press `n` (new login) here and sign in as this account".
+- **Detail pane extras** (a band dragged taller): the cause, when, the status
+  and the fix, in place of the last history receipt.
+- **Documents:** `/llmux/status` and `/llmux/dashboard` keep
+  `status: "auth_failed"`, the nullable `auth_failure_status` and the `blocked`
+  label, and add a nullable `auth_failure` object — `/llmux/status` carries
+  `{cause, label, why, fix, needs_relogin, since_ms}` (`cause` is a stable id
+  such as `login_expired`); the dashboard document carries `{cause, at_ms}` and
+  the attached dashboard renders the rest itself.
+
+A benched account's usage is not polled: its login is dead, so every poll would
+fail (401, then 429 once the endpoint rate-limits the dead token) and take a
+slot of the shared one-poll-per-10-seconds budget the live accounts need. The
+re-login that heals it is scheduled for a fresh poll at once.
 
 A permanent refresh rejection uses the refresh endpoint's status. A second
 upstream 401 after a successful forced refresh records 401. In the current
@@ -1273,6 +1320,7 @@ permanently excluding the account; its observed status/reason appears in the
 history above. Ordinary inference 404 responses still relay and ordinary 503
 responses remain transient.
 A successful credential refresh or changed credentials on re-login clear the
-stored failure code; late failures from replaced credentials cannot restore it.
+stored failure code and cause; late failures from replaced credentials cannot
+restore them.
 The numeric status and safe structured lifecycle receipts are included in account
 documents; provider bodies and credentials are omitted.

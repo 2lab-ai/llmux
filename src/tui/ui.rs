@@ -4340,6 +4340,23 @@ fn account_modal_lines(
             select::blocking_reason(account, reason, params, now),
         ));
     }
+    if let Some(failure) = account.auth_failure.filter(|_| !account.healthy) {
+        // Why it is benched and what the operator does about it — the two
+        // facts a `! 400 auth X` row never said (2026-11-13).
+        rows.push(ModalRow::field(
+            "cause",
+            format!("{} — {}", failure.cause.label(), failure.cause.why()),
+        ));
+        rows.push(ModalRow::field(
+            "since",
+            ago(UNIX_EPOCH + Duration::from_millis(failure.at_ms)),
+        ));
+        let mut fix = failure.cause.fix(account.credential_kind);
+        if failure.cause.needs_relogin() {
+            fix.push_str(" — or press `n` (new login) here and sign in as this account");
+        }
+        rows.push(ModalRow::field("fix", fix));
+    }
     if heuristic_degraded {
         // Why a heuristic-parked account above still reads `ready`: the whole
         // group is heuristic-locked, so the selector drops that cooldown gate.
@@ -7872,6 +7889,7 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
             };
             let synthetic = AccountSnapshot {
                 auth_failure_status: Some(599),
+                auth_failure: None,
                 paused: true,
                 cooldown_until: Some(now + span),
                 seven_day: Some(window),
@@ -8549,15 +8567,16 @@ fn summary_codex_line(model: &str, fast: bool, effort: &str) -> Line<'static> {
     ])
 }
 
-/// One-line usage-poller health: polled-account count (oauth, grok and
-/// gemini — [`is_polled_kind`]), last-success age spread, backing-off
-/// accounts, soonest next poll.
+/// One-line usage-poller health: polled-account count (healthy oauth, grok
+/// and gemini — [`is_polled_kind`]), last-success age spread, backing-off
+/// accounts, soonest next poll. A benched account is not polled (its login
+/// is dead; the auth verdict reports it), so it is not counted here either.
 fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
     let polled: Vec<&AccountSnapshot> = view
         .snapshot
         .accounts
         .iter()
-        .filter(|a| is_polled_kind(a.credential_kind))
+        .filter(|a| a.healthy && is_polled_kind(a.credential_kind))
         .collect();
     if polled.is_empty() {
         return "no polled accounts (header-driven only)".into();
@@ -8583,13 +8602,13 @@ fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
     poller_text(polled.len(), ok, next_in, &poller_backoff(view))
 }
 
-/// The `{name}×{failures}` entries of every polled account whose usage poll
-/// is currently failing.
+/// The `{name}×{failures}` entries of every polled (healthy) account whose
+/// usage poll is currently failing.
 fn poller_backoff(view: &DashboardView) -> Vec<String> {
     view.snapshot
         .accounts
         .iter()
-        .filter(|a| is_polled_kind(a.credential_kind))
+        .filter(|a| a.healthy && is_polled_kind(a.credential_kind))
         .filter_map(|account| {
             let health = view.poll_health(&account.id.0)?;
             (health.consecutive_failures > 0).then(|| {
@@ -8777,38 +8796,67 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
         life,
         poll,
         reset,
-        auth: view
-            .auth_history
-            .get(&account.id.0)
-            .and_then(|events| {
-                events
-                    .iter()
-                    .find(|e| e.outcome == "permanent_failure")
-                    .or_else(|| events.iter().find(|e| e.outcome == "excluded"))
-                    .or_else(|| {
-                        events
-                            .iter()
-                            .find(|e| matches!(e.outcome.as_str(), "transient_failure" | "failed"))
-                    })
-            })
-            .map(|event| {
-                vec![
-                    Line::from(format!(
-                        " last failure {} · {} · {}",
-                        format::month_day_hm(
-                            UNIX_EPOCH + Duration::from_millis(event.at_ms),
-                            ctx.tz_offset
-                        ),
-                        event.source,
-                        event
-                            .http_status
-                            .map_or_else(|| "HTTP unavailable".into(), |s| format!("HTTP {s}"))
-                    )),
-                    Line::from(format!("   {} → {}", event.reason, event.effect)),
-                ]
-            })
+        auth: classified_failure_lines(account, ctx.tz_offset)
+            .or_else(|| history_failure_lines(view, account, ctx.tz_offset))
             .unwrap_or_default(),
     })
+}
+
+/// The detail pane's failure extras for a benched account whose cause the
+/// daemon classified: cause + since + status, then the fix. `None` while
+/// healthy or when the cause is unknown (the history fallback runs then).
+fn classified_failure_lines(account: &AccountSnapshot, offset: i64) -> Option<Vec<Line<'static>>> {
+    let failure = account.auth_failure.filter(|_| !account.healthy)?;
+    let http = account
+        .auth_failure_status
+        .map_or_else(|| "HTTP unavailable".into(), |s| format!("HTTP {s}"));
+    Some(vec![
+        Line::from(format!(
+            " {} since {} · {http} · {}",
+            failure.cause.label(),
+            format::month_day_hm(UNIX_EPOCH + Duration::from_millis(failure.at_ms), offset),
+            failure.cause.why()
+        )),
+        Line::from(format!(
+            "   fix: {}",
+            failure.cause.fix(account.credential_kind)
+        )),
+    ])
+}
+
+/// The newest decisive event in the account's history as two detail lines
+/// (the pre-classification view, still used for unclassified failures).
+fn history_failure_lines(
+    view: &DashboardView,
+    account: &AccountSnapshot,
+    offset: i64,
+) -> Option<Vec<Line<'static>>> {
+    view.auth_history
+        .get(&account.id.0)
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|e| e.outcome == "permanent_failure")
+                .or_else(|| events.iter().find(|e| e.outcome == "excluded"))
+                .or_else(|| {
+                    events
+                        .iter()
+                        .find(|e| matches!(e.outcome.as_str(), "transient_failure" | "failed"))
+                })
+        })
+        .map(|event| {
+            vec![
+                Line::from(format!(
+                    " last failure {} · {} · {}",
+                    format::month_day_hm(UNIX_EPOCH + Duration::from_millis(event.at_ms), offset),
+                    event.source,
+                    event
+                        .http_status
+                        .map_or_else(|| "HTTP unavailable".into(), |s| format!("HTTP {s}"))
+                )),
+                Line::from(format!("   {} → {}", event.reason, event.effect)),
+            ]
+        })
 }
 
 /// ` {id}` bold + ` · {kind}` dim, then ` · {plan}` when the daemon knows the
@@ -12651,6 +12699,7 @@ mod tests {
             id: crate::scheduler::AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: kind,
             group,
             seven_day: None,
@@ -13522,6 +13571,7 @@ mod tests {
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: kind,
             group,
             seven_day: None,
@@ -18487,6 +18537,7 @@ mod tests {
             id: AccountId(name.clone()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: Some(QuotaWindow {
@@ -18713,6 +18764,7 @@ mod tests {
                 id: AccountId(name.into()),
                 healthy: true,
                 auth_failure_status: None,
+                auth_failure: None,
                 credential_kind: kind,
                 group,
                 seven_day: seven,
@@ -18819,6 +18871,7 @@ mod tests {
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: kind,
             group,
             seven_day: None,
@@ -19560,10 +19613,10 @@ mod tests {
 
     /// Catalog `status_bar` (plan batch 3): the header keeps its verdict
     /// and drops identity segments whole by importance. At 80 columns it
-    /// read `… +2  llmux 0.2.25 (p` (cut mid-segment); now it ends with the
-    /// whole version. At 120 the least important went (the build tag, the
-    /// account count, cfg, then pid) while the attach marker, port and
-    /// uptime stayed. At every width the row is the verdict followed by
+    /// read `… +2  llmux 0.2.25 (p` (cut mid-segment); now it ends with
+    /// whole segments (the version, then the attach marker). At 120 the least important went (the build tag, the
+    /// account count and cfg) while pid, the attach marker, port and uptime
+    /// stayed. At every width the row is the verdict followed by
     /// whole segments only.
     #[test]
     fn header_drops_whole_segments_by_importance_and_keeps_the_verdict() {
@@ -19583,12 +19636,13 @@ mod tests {
             let (verdict_part, rest) = rows[0].split_at(verdict.len());
             (digits(verdict_part), rest.to_string())
         };
+        // The headline is the auth condition (it leads the poller since
+        // 2026-11-16), shorter than the old `POLLER STALE last ok …` one, so
+        // at 80 the attach marker fits beside the version.
+        let (kept, rest) = row0(80);
         assert_eq!(
-            row0(80),
-            (
-                verdict.clone(),
-                "  llmux 0.2.25".to_string() + &" ".repeat(80 - verdict.len() - 14)
-            ),
+            (kept, rest.trim_end()),
+            (verdict.clone(), "  llmux 0.2.25 attached → pid 1695"),
             "verdict whole, then the version whole"
         );
         let whole = [
@@ -19604,7 +19658,7 @@ mod tests {
         ];
         assert_eq!(
             row0(120).1.trim_end(),
-            "  llmux 0.2.25 :3456 up 4d 13h attached → pid 1695",
+            "  llmux 0.2.25 :3456 pid 1695 up 4d 13h attached → pid 1695",
         );
         for w in (verdict.len() as u16..=179).rev().step_by(3) {
             let (kept, rest) = row0(w);
@@ -19628,6 +19682,7 @@ mod tests {
             id: AccountId("gemini:g@x.com".into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "gemini",
             group: BackendGroup::Gemini,
             seven_day: None,
@@ -19671,6 +19726,7 @@ mod tests {
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -19724,6 +19780,7 @@ mod tests {
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -20413,6 +20470,7 @@ mod tests {
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -20656,6 +20714,7 @@ mod tests {
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: kind,
             group,
             seven_day: Some(window(0.20)),
@@ -20998,6 +21057,7 @@ mod tests {
             id: AccountId("claude:cold@example.com".into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             // 7d populated, so the only cold cell in the row is the
@@ -21054,6 +21114,7 @@ mod tests {
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -21121,6 +21182,7 @@ mod tests {
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -21215,6 +21277,7 @@ mod tests {
             id: AccountId(LEAK.into()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -21647,6 +21710,7 @@ mod tests {
                     id: AccountId(id.clone()),
                     healthy: true,
                     auth_failure_status: None,
+                    auth_failure: None,
                     credential_kind: kind,
                     group,
                     // Instants sit 30 s inside their rendered unit (2h56m,
@@ -23593,7 +23657,16 @@ mod tests {
     /// so the band title reads `poller 17 polled` (was `poller 14 oauth`).
     /// Only that line changes, text and style (previous digest
     /// 8_580_461_030_093_644_723).
-    const FOLD_OFF_179X43_DIGEST: u64 = 4_993_104_869_699_455_335;
+    /// Re-pinned 2026-11-16 (auth cause): the header verdict leads with the
+    /// auth condition instead of the poller one — four expired logins had
+    /// headlined `POLLER STALE` on one of them, the symptom rather than the
+    /// fix. The header row's headline changes (`AUTH BROKEN <account> +3`,
+    /// the same `+3`), and the band title counts only polled accounts —
+    /// a benched account is no longer polled — so it reads `poller 16
+    /// polled` (was 17, the fixture's auth-broken #4 included); every other
+    /// row, text and style, unchanged (previous digest
+    /// 4_993_104_869_699_455_335).
+    const FOLD_OFF_179X43_DIGEST: u64 = 14_970_205_558_617_183_116;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -24923,6 +24996,7 @@ mod tests {
                     id: AccountId(format!("{}:{letter}{i}", group.as_str())),
                     healthy: true,
                     auth_failure_status: None,
+                    auth_failure: None,
                     credential_kind: kind,
                     group,
                     seven_day: window(if spent { 1.0 } else { 0.31 }),

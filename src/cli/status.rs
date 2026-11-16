@@ -89,6 +89,9 @@ fn render(
     for line in account_lines(doc, now) {
         let _ = writeln!(out, "{line}");
     }
+    for line in action_lines(doc, now) {
+        let _ = writeln!(out, "{line}");
+    }
     let _ = writeln!(
         out,
         "  current: {}",
@@ -181,6 +184,79 @@ fn account_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
         .collect()
 }
 
+/// The `needs action:` block: every auth-failed account grouped by its
+/// classified cause, each group with the why and the fix, so the operator
+/// reads what to do without opening the daemon log. Empty (no block) when
+/// nothing is benched. An auth-failed account without an `auth_failure`
+/// object (an older daemon, an unclassified path) still gets a group — the
+/// count must never hide an account — but no guessed cause.
+fn action_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
+    struct Group {
+        label: String,
+        why: String,
+        fix: String,
+        members: Vec<String>,
+    }
+    let accounts = doc["accounts"].as_array().cloned().unwrap_or_default();
+    let mut groups: Vec<Group> = Vec::new();
+    for account in accounts
+        .iter()
+        .filter(|a| a["status"].as_str() == Some("auth_failed"))
+    {
+        let name = account["name"].as_str().unwrap_or("?");
+        let failure = &account["auth_failure"];
+        let (label, why, fix) = match failure["label"].as_str() {
+            Some(label) => (
+                label.to_string(),
+                failure["why"].as_str().unwrap_or_default().to_string(),
+                failure["fix"].as_str().unwrap_or_default().to_string(),
+            ),
+            None => (
+                "auth failed".to_string(),
+                "no cause recorded (older daemon or unclassified failure)".to_string(),
+                "check the daemon log, then sign in again on the daemon's host: `llmux login`"
+                    .to_string(),
+            ),
+        };
+        let since = failure["since_ms"]
+            .as_u64()
+            .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+            .and_then(|at| now.duration_since(at).ok())
+            .map(|age| {
+                format!(
+                    "  since {} ago",
+                    crate::scheduler::select::compact_duration(age)
+                )
+            })
+            .unwrap_or_default();
+        let member = format!("{name}{since}");
+        match groups.iter_mut().find(|g| g.label == label && g.fix == fix) {
+            Some(group) => group.members.push(member),
+            None => groups.push(Group {
+                label,
+                why,
+                fix,
+                members: vec![member],
+            }),
+        }
+    }
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  needs action:".to_string()];
+    for group in groups {
+        lines.push(format!(
+            "    {} ×{} — {}",
+            group.label,
+            group.members.len(),
+            group.why
+        ));
+        lines.extend(group.members.iter().map(|m| format!("      {m}")));
+        lines.push(format!("      fix: {}", group.fix));
+    }
+    lines
+}
+
 /// "max20 · 7d 66% left" — the account's subscription plan beside its
 /// remaining weekly quota (`.prd/25`). Either half alone when only one is
 /// known; `None` when neither is (older daemons, api-key accounts).
@@ -247,6 +323,43 @@ mod tests {
         assert!(lines[1].contains("! 503 auth X"));
         assert!(lines[2].contains("paused"));
         assert!(lines[3].contains("paused + 503 auth X"));
+    }
+
+    /// What the operator saw on 2026-11-13: four `! 400 auth X` rows and no
+    /// way to tell why without the daemon log. The block now groups them by
+    /// cause with the why and the fix, and still counts an account whose
+    /// daemon recorded no cause.
+    #[test]
+    fn needs_action_block_groups_auth_failures_by_cause() {
+        let expired = serde_json::json!({
+            "cause": "login_expired", "label": "login expired",
+            "why": "the provider ended this login",
+            "fix": "sign in again on the daemon's host: `llmux login`",
+            "needs_relogin": true,
+            "since_ms": 1_781_308_800_000u64 - 3 * 86_400_000,
+        });
+        let doc = serde_json::json!({"accounts":[
+            {"name":"ok@x", "status":"active", "blocked":null},
+            {"name":"a@x", "status":"auth_failed", "blocked":"! 400 login expired", "auth_failure": expired},
+            {"name":"b@x", "status":"auth_failed", "blocked":"! 400 login expired", "auth_failure": expired},
+            {"name":"c@x", "status":"auth_failed", "blocked":"! 401 auth X", "auth_failure": null},
+        ]});
+        let lines = action_lines(&doc, test_now());
+        assert_eq!(
+            lines,
+            vec![
+                "  needs action:",
+                "    login expired ×2 — the provider ended this login",
+                "      a@x  since 3d0h ago",
+                "      b@x  since 3d0h ago",
+                "      fix: sign in again on the daemon's host: `llmux login`",
+                "    auth failed ×1 — no cause recorded (older daemon or unclassified failure)",
+                "      c@x",
+                "      fix: check the daemon log, then sign in again on the daemon's host: `llmux login`",
+            ]
+        );
+        let healthy = serde_json::json!({"accounts":[{"name":"ok@x","status":"ok"}]});
+        assert!(action_lines(&healthy, test_now()).is_empty());
     }
 
     /// Fixed test clock: 2026-06-13 00:00:00 UTC.

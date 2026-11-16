@@ -4,6 +4,7 @@
 
 pub mod account_history;
 pub mod auth;
+pub mod auth_cause;
 pub mod build_info;
 pub mod catalog;
 pub mod cli;

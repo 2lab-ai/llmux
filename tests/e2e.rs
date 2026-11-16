@@ -7074,7 +7074,10 @@ async fn responses_sdk_account_rejections_fail_over_without_refresh() {
                 .find(|a| a["name"] == "a-rejected")
                 .unwrap();
             assert_eq!(rejected["auth_failure_status"], status);
-            assert_eq!(rejected["blocked"], format!("! {status} auth X"));
+            // The provider refused the account, not its token: the label and
+            // the cause say so (and the fix is not a token rotation).
+            assert_eq!(rejected["blocked"], format!("! {status} account rejected"));
+            assert_eq!(rejected["auth_failure"]["cause"], "account_rejected");
         }
         assert!(
             !accounts[0].healthy,

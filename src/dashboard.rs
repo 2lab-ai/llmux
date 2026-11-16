@@ -1045,6 +1045,10 @@ pub struct AccountDoc {
     /// Optional for documents from older daemons.
     #[serde(default)]
     pub auth_failure_status: Option<u16>,
+    /// Classified cause + time of the auth failure (additive; absent on
+    /// older daemons and while healthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_failure: Option<crate::auth_cause::AuthFailure>,
     pub seven_day: Option<WindowDoc>,
     /// The "Fable" model-scoped weekly window surfaced for convenient reads;
     /// `null` when this account carries no Fable scope. Additive — absent in
@@ -1988,6 +1992,7 @@ pub(crate) fn dashboard_doc(
                 blocked,
                 healthy: account.healthy,
                 auth_failure_status: account.auth_failure_status,
+                auth_failure: account.auth_failure,
                 seven_day: window_doc(&account.seven_day, now),
                 fable_weekly: account
                     .fable_weekly()

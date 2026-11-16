@@ -166,6 +166,9 @@ pub struct AccountState {
     pub health: AccountHealth,
     /// HTTP status observed when this credential was marked unhealthy.
     pub auth_failure_status: Option<u16>,
+    /// Why and when this credential was benched (`None` while healthy, or
+    /// when the failing path predates classification).
+    pub auth_failure: Option<crate::auth_cause::AuthFailure>,
     pub seven_day: Option<QuotaWindow>,
     /// Model-scoped weekly limits from the usage poll's `limits[]` (e.g. the
     /// "Fable" weekly gauge) — generic, keyed by scope label; empty until a
@@ -209,6 +212,7 @@ impl AccountState {
             generation: next_generation(),
             health: AccountHealth::Healthy,
             auth_failure_status: None,
+            auth_failure: None,
             seven_day: None,
             scoped_limits: Vec::new(),
             scoped_cooldowns: Vec::new(),
@@ -705,10 +709,23 @@ impl PoolState {
     /// failed refresh). Marks the account `AuthFailed` until re-login. An
     /// auth failure on a manually pinned account ends the pin (issue #122).
     pub fn record_auth_failure(&mut self, account: &AccountId, status: Option<http::StatusCode>) {
+        self.record_auth_failure_with(account, status, None);
+    }
+
+    /// [`Self::record_auth_failure`] that also records WHY (the classified
+    /// cause and when), so every surface can name the fix instead of a bare
+    /// status code. `None` keeps the cause unknown.
+    pub fn record_auth_failure_with(
+        &mut self,
+        account: &AccountId,
+        status: Option<http::StatusCode>,
+        failure: Option<crate::auth_cause::AuthFailure>,
+    ) {
         self.clear_manual_pin_for(account);
         if let Some(acct) = self.account_mut(account) {
             acct.health = AccountHealth::AuthFailed;
             acct.auth_failure_status = status.map(|code| code.as_u16());
+            acct.auth_failure = failure;
         }
     }
 
@@ -720,6 +737,7 @@ impl PoolState {
             if acct.health == AccountHealth::AuthFailed {
                 acct.health = AccountHealth::Healthy;
                 acct.auth_failure_status = None;
+                acct.auth_failure = None;
             }
         }
     }
@@ -827,6 +845,7 @@ impl PoolState {
                     id: a.id.clone(),
                     healthy: a.health == AccountHealth::Healthy,
                     auth_failure_status: a.auth_failure_status,
+                    auth_failure: a.auth_failure,
                     credential_kind: a.credential.kind(),
                     group: BackendGroup::from_kind(a.credential.kind()),
                     seven_day: a.seven_day,
@@ -932,6 +951,9 @@ pub struct AccountSnapshot {
     pub id: AccountId,
     pub healthy: bool,
     pub auth_failure_status: Option<u16>,
+    /// Classified cause + time of the auth failure; `None` while healthy or
+    /// when unknown (an older daemon, an unclassified path).
+    pub auth_failure: Option<crate::auth_cause::AuthFailure>,
     pub credential_kind: &'static str,
     /// Backend group this account belongs to, derived from `credential_kind`
     /// (codex credential → Codex, oauth/apikey → Claude). The selector's
@@ -1430,12 +1452,17 @@ impl AccountPool {
         account: &AccountId,
         expected: &AccountFingerprint,
         status: Option<http::StatusCode>,
+        cause: crate::auth_cause::AuthCause,
     ) -> bool {
+        let failure = crate::auth_cause::AuthFailure {
+            cause,
+            at_ms: crate::account_history::epoch_ms(SystemTime::now()),
+        };
         let mut state = self.write();
         if !state.matches_fingerprint(account, expected) {
             return false;
         }
-        state.record_auth_failure(account, status);
+        state.record_auth_failure_with(account, status, Some(failure));
         true
     }
 
@@ -1529,6 +1556,7 @@ impl AccountPool {
                             if kept.health == AccountHealth::AuthFailed {
                                 kept.health = AccountHealth::Healthy;
                                 kept.auth_failure_status = None;
+                                kept.auth_failure = None;
                                 // Usage read under the RETIRED credential is
                                 // evidence about a dead login. Re-enter COLD
                                 // (cold is eligible, stale is not) or the
@@ -2926,7 +2954,12 @@ mod tests {
         pool.reload_accounts(&[oauth_account_with_token("a", "at-a-relogin")]);
 
         assert!(
-            !pool.record_auth_failure_if(&id("a"), &stale, None),
+            !pool.record_auth_failure_if(
+                &id("a"),
+                &stale,
+                None,
+                crate::auth_cause::AuthCause::TokenRejected
+            ),
             "the guard reports the stale result was discarded"
         );
         assert!(
@@ -2942,7 +2975,12 @@ mod tests {
         let pool = AccountPool::new(&[oauth_account("a")]);
         let live = pool.fingerprint(&id("a")).expect("fingerprint");
 
-        assert!(pool.record_auth_failure_if(&id("a"), &live, None));
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &live,
+            None,
+            crate::auth_cause::AuthCause::TokenRejected
+        ));
         assert!(!pool.snapshot().accounts[0].healthy);
     }
 
@@ -2951,7 +2989,16 @@ mod tests {
         let account = oauth_account("a");
         let pool = AccountPool::new(std::slice::from_ref(&account));
         let old = pool.fingerprint(&id("a")).expect("fingerprint");
-        assert!(pool.record_auth_failure_if(&id("a"), &old, Some(http::StatusCode::NOT_FOUND)));
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &old,
+            Some(http::StatusCode::NOT_FOUND),
+            crate::auth_cause::AuthCause::LoginExpired,
+        ));
+        assert_eq!(
+            pool.snapshot().accounts[0].auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::LoginExpired)
+        );
         assert_eq!(pool.snapshot().accounts[0].auth_failure_status, Some(404));
         // Unrelated reload retains the known status; changed credentials clear it.
         pool.reload_accounts(&[account]);
@@ -2959,17 +3006,24 @@ mod tests {
         pool.reload_accounts(&[oauth_account_with_token("a", "new-token")]);
         assert!(pool.snapshot().accounts[0].healthy);
         assert_eq!(pool.snapshot().accounts[0].auth_failure_status, None);
+        assert_eq!(
+            pool.snapshot().accounts[0].auth_failure,
+            None,
+            "the re-login that heals the account clears its cause"
+        );
         assert!(!pool.record_auth_failure_if(
             &id("a"),
             &old,
-            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+            Some(http::StatusCode::SERVICE_UNAVAILABLE),
+            crate::auth_cause::AuthCause::TokenRejected,
         ));
         assert_eq!(pool.snapshot().accounts[0].auth_failure_status, None);
         let current = pool.fingerprint(&id("a")).expect("fingerprint");
         assert!(pool.record_auth_failure_if(
             &id("a"),
             &current,
-            Some(http::StatusCode::UNAUTHORIZED)
+            Some(http::StatusCode::UNAUTHORIZED),
+            crate::auth_cause::AuthCause::TokenRejected,
         ));
         pool.update_credential(
             &id("a"),
@@ -2977,6 +3031,7 @@ mod tests {
         );
         assert!(pool.snapshot().accounts[0].healthy);
         assert_eq!(pool.snapshot().accounts[0].auth_failure_status, None);
+        assert_eq!(pool.snapshot().accounts[0].auth_failure, None);
         pool.record_auth_failure(&id("a"), Some(http::StatusCode::FORBIDDEN));
         pool.record_auth_failure(&id("a"), None);
         assert_eq!(
@@ -3058,7 +3113,12 @@ mod tests {
             other => panic!("unexpected credential {other:?}"),
         }
         assert!(
-            !pool.record_auth_failure_if(&id("a"), lease.fingerprint(), None),
+            !pool.record_auth_failure_if(
+                &id("a"),
+                lease.fingerprint(),
+                None,
+                crate::auth_cause::AuthCause::TokenRejected
+            ),
             "a result from this lease can no longer bench the account"
         );
     }
