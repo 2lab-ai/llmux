@@ -99,9 +99,21 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
     let params = &view.select_params;
     let headers_only = select::headers_only_mode(snapshot, params, None, now);
 
-    // 1. Poller stale / auth broken — the proxy is BLIND, worse than a storm.
+    // 1. Auth broken / poller stale — the proxy is BLIND, worse than a storm.
+    //    Auth comes first and names its cause: a benched login also fails
+    //    every usage poll, and on 2026-11-13 the header read "POLLER STALE
+    //    ai30" for four dead logins — the symptom, not the fix. A benched
+    //    account's poll staleness is therefore never its own condition.
+    let broken: Vec<&AccountSnapshot> = snapshot.accounts.iter().filter(|a| !a.healthy).collect();
+    if let Some(first) = broken.first() {
+        conditions.push(Condition {
+            level: VerdictLevel::Fail,
+            text: auth_broken_text(&broken),
+            account: Some(first.id.0.clone()),
+        });
+    }
     let mut stale_poll: Option<(String, Duration)> = None;
-    for account in &snapshot.accounts {
+    for account in snapshot.accounts.iter().filter(|a| a.healthy) {
         if let Some(health) = view.poll_health(&account.id.0) {
             let aged = health
                 .last_ok
@@ -126,20 +138,6 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
             level: VerdictLevel::Fail,
             text: format!("POLLER STALE{since}"),
             account: Some(account),
-        });
-    }
-    let broken: Vec<&AccountSnapshot> = snapshot.accounts.iter().filter(|a| !a.healthy).collect();
-    if let Some(first) = broken.first() {
-        let extra = broken.len() - 1;
-        let suffix = if extra > 0 {
-            format!(" +{extra}")
-        } else {
-            String::new()
-        };
-        conditions.push(Condition {
-            level: VerdictLevel::Fail,
-            text: format!("AUTH BROKEN{suffix}"),
-            account: Some(first.id.0.clone()),
         });
     }
 
@@ -213,6 +211,31 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
     }
 
     Verdict { conditions }
+}
+
+/// "AUTH BROKEN: login expired ×4 · re-login": the first benched account's
+/// classified cause, how many share it, how many carry another cause, and
+/// "re-login" when signing in again fixes every one of them. When the first
+/// account's cause is unknown (an older daemon) the text stays the plain
+/// "AUTH BROKEN" / "AUTH BROKEN +N" — no guessed cause.
+fn auth_broken_text(broken: &[&AccountSnapshot]) -> String {
+    let mut causes = broken.iter().map(|a| a.auth_failure.map(|f| f.cause));
+    let Some(Some(cause)) = causes.clone().next() else {
+        return match broken.len().saturating_sub(1) {
+            0 => "AUTH BROKEN".to_string(),
+            extra => format!("AUTH BROKEN +{extra}"),
+        };
+    };
+    let same = causes.clone().filter(|c| *c == Some(cause)).count();
+    let mut text = format!("AUTH BROKEN: {} ×{same}", cause.label());
+    let other = broken.len() - same;
+    if other > 0 {
+        text.push_str(&format!(" +{other} other"));
+    }
+    if causes.all(|c| c.is_some_and(crate::auth_cause::AuthCause::needs_relogin)) {
+        text.push_str(" · re-login");
+    }
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +532,7 @@ mod tests {
             id: AccountId(id.to_string()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: Some(window(0.10)),
@@ -891,6 +915,89 @@ mod tests {
         let head = verdict.headline().expect("condition");
         assert!(head.text.contains("AUTH BROKEN"), "got {}", head.text);
         assert_eq!(verdict.more(), 1, "storm stays visible as +1");
+    }
+
+    /// 2026-11-13: four logins expired and the header headlined "POLLER
+    /// STALE" on one of them. The auth condition now leads, names the cause
+    /// and the fix, and a benched account's failing poll is not a second
+    /// condition.
+    #[test]
+    fn auth_broken_names_the_cause_and_hides_its_poll_symptom() {
+        use crate::auth_cause::{AuthCause, AuthFailure};
+        let dead = |name: &str, cause: AuthCause| {
+            let mut a = account(name);
+            a.healthy = false;
+            a.auth_failure_status = Some(400);
+            a.auth_failure = Some(AuthFailure { cause, at_ms: 1 });
+            a
+        };
+        let mut view = view_with(
+            pool(vec![
+                dead("ai30", AuthCause::LoginExpired),
+                dead("ai41", AuthCause::LoginExpired),
+                account("ok"),
+            ]),
+            HealthCounts {
+                requests: 10,
+                ..Default::default()
+            },
+        );
+        view.poll_health.insert(
+            "ai30".to_string(),
+            crate::tui::PollHealth {
+                last_ok: Some(now() - Duration::from_secs(3 * 86_400)),
+                consecutive_failures: 250,
+                next_at: now(),
+            },
+        );
+        let verdict = health_verdict(&view, now());
+        let head = verdict.headline().expect("condition");
+        assert_eq!(head.text, "AUTH BROKEN: login expired ×2 · re-login");
+        assert_eq!(head.account.as_deref(), Some("ai30"));
+        assert!(
+            verdict
+                .conditions
+                .iter()
+                .all(|c| !c.text.contains("POLLER STALE")),
+            "a dead login's failing poll is a symptom: {:?}",
+            verdict.conditions
+        );
+
+        // A HEALTHY account's stale poll is still its own condition — and the
+        // auth cause keeps the headline over it.
+        view.poll_health.insert(
+            "ok".to_string(),
+            crate::tui::PollHealth {
+                last_ok: Some(now() - Duration::from_secs(3_600)),
+                consecutive_failures: 4,
+                next_at: now(),
+            },
+        );
+        let verdict = health_verdict(&view, now());
+        assert_eq!(
+            verdict.headline().expect("condition").text,
+            "AUTH BROKEN: login expired ×2 · re-login"
+        );
+        let stale: Vec<&Condition> = verdict
+            .conditions
+            .iter()
+            .filter(|c| c.text.starts_with("POLLER STALE"))
+            .collect();
+        assert_eq!(stale.len(), 1, "{:?}", verdict.conditions);
+        assert_eq!(stale[0].account.as_deref(), Some("ok"));
+
+        let mixed = [
+            &dead("a", AuthCause::LoginExpired),
+            &dead("b", AuthCause::ClientRejected),
+        ];
+        assert_eq!(
+            auth_broken_text(&mixed),
+            "AUTH BROKEN: login expired ×1 +1 other"
+        );
+        let mut unknown = account("u");
+        unknown.healthy = false;
+        assert_eq!(auth_broken_text(&[&unknown]), "AUTH BROKEN");
+        assert_eq!(auth_broken_text(&[&unknown, &unknown]), "AUTH BROKEN +1");
     }
 
     #[test]

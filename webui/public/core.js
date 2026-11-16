@@ -147,12 +147,34 @@
   };
   X.stub = (what) => X.toast(`시안입니다 — "${what}"는 2차에서 llmux 쓰기 API(/llmux/*)에 연결합니다`);
 
+  /* Labels for the daemon's `auth_failure.cause` ids (src/auth_cause.rs). */
+  X.AUTH_CAUSE = {
+    login_expired: ['Login expired', 'sign in again'],
+    login_rotated: ['Login rotated', 'sign in again'],
+    login_revoked: ['Login revoked', 'sign in again'],
+    refresh_rejected: ['Refresh rejected', 'sign in again'],
+    client_rejected: ['OAuth client rejected', 'update llmux'],
+    token_rejected: ['Token rejected', 'sign in again'],
+    key_rejected: ['Key rejected', 'add a valid key'],
+    account_rejected: ['Account rejected', 'check the account'],
+    access_suspended: ['Access suspended', 'resolve with the provider, then sign in again'],
+    usage_forbidden: ['Usage forbidden', 'sign in again'],
+    provider_error: ['Provider error', 'check the daemon log'],
+  };
+
   /* ---------- Accounts view (with management actions) ---------- */
   X.accountState = function (a, p) {
     const now = Date.now() / 1000;
     const w7 = a.seven_day && a.seven_day.resets_at > now ? a.seven_day.utilization : a.seven_day ? 0 : null;
     if (a.paused) return ['paused', 'Paused', 'mute'];
-    if (!a.healthy) return ['error', a.auth_failure_status ? 'Sign-in failed ' + a.auth_failure_status : 'Unhealthy', 'bad'];
+    if (!a.healthy) {
+      // The daemon's classified cause (`auth_failure.cause`) names the fix;
+      // older daemons send none and keep the generic label.
+      const cause = a.auth_failure && X.AUTH_CAUSE[a.auth_failure.cause];
+      const code = a.auth_failure_status ? ' ' + a.auth_failure_status : '';
+      if (cause) return ['error', cause[0] + code + ' · ' + cause[1], 'bad'];
+      return ['error', a.auth_failure_status ? 'Sign-in failed' + code : 'Unhealthy', 'bad'];
+    }
     if (a.cooldown_until && a.cooldown_until > now) return ['cool', 'Cooling ' + X.dur(a.cooldown_until - now), 'warn'];
     if (w7 != null && w7 >= p.seven_day_max) return ['spent', '7d used up', 'warn'];
     if (a.status === 'active') return ['active', 'Serving', 'good'];

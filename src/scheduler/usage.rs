@@ -603,15 +603,23 @@ impl<F: UsageFetcher> UsagePoller<F> {
     }
 
     /// Re-read the POLLABLE roster (the credential kinds that have an active
-    /// usage source), drop schedules for removed accounts, and give every
-    /// current account a schedule entry (new accounts due immediately).
+    /// usage source, on HEALTHY accounts), drop schedules for removed or
+    /// benched accounts, and give every current account a schedule entry (new
+    /// accounts due immediately).
+    ///
+    /// A benched account is not polled: its login is dead, so every poll
+    /// fails (401, then 429 once the endpoint rate-limits the dead token) and
+    /// takes a slot of the one-poll-per-gap budget the live accounts need.
+    /// On a shared host four expired logins ran 250 failed polls each over
+    /// three days (2026-11-13..16). The re-login that heals the account is a
+    /// new generation, so it is scheduled immediately as a fresh login.
     fn refresh_schedule(&mut self, now: SystemTime) -> Vec<AccountId> {
         let pollable: Vec<AccountId> = self
             .pool
             .snapshot()
             .accounts
             .iter()
-            .filter(|a| is_polled_kind(a.credential_kind))
+            .filter(|a| a.healthy && is_polled_kind(a.credential_kind))
             .map(|a| a.id.clone())
             .collect();
         self.schedule.retain(|id, _| pollable.contains(id));
@@ -914,6 +922,7 @@ impl<F: UsageFetcher> UsagePoller<F> {
                         account,
                         &fingerprint,
                         Some(http::StatusCode::FORBIDDEN),
+                        crate::auth_cause::AuthCause::UsageForbidden,
                     ) {
                         PollEffect::AuthExcluded
                     } else {
@@ -1390,6 +1399,117 @@ mod tests {
     }
 
     // ---- poll loop behavior (mock fetcher, no network, no sleeps) ----
+
+    /// A benched (auth-failed) account's usage is not polled — the dead login
+    /// would only fail and spend the global poll budget — and its re-login
+    /// is polled at once as a fresh login.
+    #[tokio::test]
+    async fn benched_account_is_not_polled_until_relogin() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        pool.record_auth_failure(&id("a"), Some(http::StatusCode::BAD_REQUEST));
+        let fetcher = MockFetcher::new(vec![Ok(snapshot_with(0.42))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        poller.tick(now() + MIN_POLL_GAP).await;
+        assert_eq!(fetcher.call_count(), 0, "a dead login is never polled");
+        assert!(!poller.schedule.contains_key(&id("a")));
+
+        let mut fresh = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut fresh.credential {
+            *access_token = "at-relogin".into();
+        }
+        pool.reload_accounts(&[fresh]);
+        poller.tick(now() + MIN_POLL_GAP * 2).await;
+        assert_eq!(fetcher.call_count(), 1, "the re-login is polled at once");
+        assert!(pool.snapshot().accounts[0].healthy);
+    }
+
+    /// Skipping a benched account must not spend the shared poll slot or
+    /// stall the roster: with `a` and `b` both due at the same instant,
+    /// benching `a` leaves the very next budget-eligible tick to `b`, and `a`
+    /// is never fetched afterwards.
+    #[tokio::test]
+    async fn benched_account_does_not_starve_the_healthy_roster() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        let fetcher = MockFetcher::new(Vec::new());
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.prime(now()).await;
+        assert_eq!(fetcher.call_count(), 2, "both scheduled and primed");
+        // Both due at the same controlled instant; `a` sorts first, so a slot
+        // spent on it would show as no fetch on this tick.
+        let due = now() + Duration::from_secs(600);
+        for entry in poller.schedule.values_mut() {
+            entry.next_at = due;
+        }
+        pool.record_auth_failure(&id("a"), Some(http::StatusCode::BAD_REQUEST));
+        poller.tick(due).await;
+        assert_eq!(
+            fetcher.calls.lock().unwrap()[2..].to_vec(),
+            vec!["at-b".to_string()],
+            "the very next slot goes to the healthy account"
+        );
+        let mut t = due + MIN_POLL_GAP;
+        while t <= due + Duration::from_secs(1_800) {
+            poller.tick(t).await;
+            t += MIN_POLL_GAP;
+        }
+        assert!(
+            fetcher.calls.lock().unwrap()[2..]
+                .iter()
+                .all(|token| token == "at-b"),
+            "the benched account is never fetched"
+        );
+    }
+
+    /// The healthy → benched transition: a scheduled account whose usage
+    /// read answers 403 is benched as `usage_forbidden`, and from then on it
+    /// takes no poll slot — not even after its retry deadline — until a
+    /// re-login.
+    #[tokio::test]
+    async fn usage_403_benches_a_scheduled_account_and_stops_its_polls() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fetcher = MockFetcher::new(vec![Err(status_err(403)), Ok(snapshot_with(0.2))]);
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.tick(now()).await;
+        assert_eq!(fetcher.call_count(), 1);
+        let account = &pool.snapshot().accounts[0];
+        assert!(!account.healthy);
+        assert_eq!(
+            account.auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::UsageForbidden)
+        );
+        for step in 1..=6u32 {
+            poller.tick(now() + Duration::from_secs(900) * step).await;
+        }
+        assert_eq!(fetcher.call_count(), 1, "no polls past the retry deadline");
+        assert!(!poller.schedule.contains_key(&id("a")));
+
+        let mut fresh = oauth_account("a");
+        if let AccountCredential::Oauth { access_token, .. } = &mut fresh.credential {
+            *access_token = "at-relogin".into();
+        }
+        pool.reload_accounts(&[fresh]);
+        poller.tick(now() + Duration::from_secs(900) * 7).await;
+        assert_eq!(fetcher.call_count(), 2, "the re-login is polled at once");
+    }
 
     #[tokio::test]
     async fn relogin_retries_usage_without_inheriting_backoff() {

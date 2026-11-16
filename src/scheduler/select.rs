@@ -1068,9 +1068,14 @@ pub fn blocking_reason(
         IneligibleReason::AuthUnhealthy => {
             // Pause and failed auth coexist; compose their display without changing
             // which eligibility gate wins or whether the scheduler selects the account.
+            // The classified cause names the fix ("login expired" → sign in
+            // again); an unclassified failure keeps the generic "auth X".
+            let what = account
+                .auth_failure
+                .map_or("auth X", |failure| failure.cause.label());
             let auth = account
                 .auth_failure_status
-                .map_or_else(|| "auth X".to_string(), |status| format!("{status} auth X"));
+                .map_or_else(|| what.to_string(), |status| format!("{status} {what}"));
             if account.paused {
                 format!("paused + {auth}")
             } else {
@@ -1317,6 +1322,7 @@ mod tests {
             id: AccountId(id.to_string()),
             healthy: true,
             auth_failure_status: None,
+            auth_failure: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -2481,6 +2487,35 @@ mod tests {
         assert_eq!(
             blocking_reason(&dead, IneligibleReason::AuthUnhealthy, &params(), now()),
             "! auth X"
+        );
+    }
+
+    /// The four accounts a shared host lost on 2026-11-12..13 all read
+    /// `! 400 auth X`; with the classified cause the row names what happened
+    /// (and so what to do), keeping the status code for the log trail.
+    #[test]
+    fn auth_failure_label_names_the_classified_cause() {
+        use crate::auth_cause::{AuthCause, AuthFailure};
+        let mut dead = account("e");
+        dead.healthy = false;
+        dead.auth_failure_status = Some(400);
+        dead.auth_failure = Some(AuthFailure {
+            cause: AuthCause::LoginExpired,
+            at_ms: 1,
+        });
+        assert_eq!(
+            blocking_reason(&dead, IneligibleReason::AuthUnhealthy, &params(), now()),
+            "! 400 login expired"
+        );
+        dead.paused = true;
+        dead.auth_failure_status = None;
+        dead.auth_failure = Some(AuthFailure {
+            cause: AuthCause::LoginRotated,
+            at_ms: 1,
+        });
+        assert_eq!(
+            blocking_reason(&dead, IneligibleReason::AuthUnhealthy, &params(), now()),
+            "paused + login rotated"
         );
     }
 

@@ -1045,6 +1045,16 @@ pub struct AccountDoc {
     /// Optional for documents from older daemons.
     #[serde(default)]
     pub auth_failure_status: Option<u16>,
+    /// Classified cause + time of the auth failure (additive; absent on
+    /// older daemons and while healthy). Decoded leniently: a cause this
+    /// client does not know (a newer daemon) reads as unclassified instead of
+    /// rejecting the whole document.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_auth_failure"
+    )]
+    pub auth_failure: Option<crate::auth_cause::AuthFailure>,
     pub seven_day: Option<WindowDoc>,
     /// The "Fable" model-scoped weekly window surfaced for convenient reads;
     /// `null` when this account carries no Fable scope. Additive — absent in
@@ -1089,6 +1099,18 @@ pub struct AccountDoc {
     /// Newest-first, bounded, safe lifecycle receipts; absent on older daemons.
     #[serde(default)]
     pub auth_history: Vec<crate::account_history::AccountEvent>,
+}
+
+/// `AccountDoc::auth_failure` decoder: any value that is not a known
+/// [`crate::auth_cause::AuthFailure`] becomes `None` (unclassified).
+fn lenient_auth_failure<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::auth_cause::AuthFailure>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1988,6 +2010,7 @@ pub(crate) fn dashboard_doc(
                 blocked,
                 healthy: account.healthy,
                 auth_failure_status: account.auth_failure_status,
+                auth_failure: account.auth_failure,
                 seven_day: window_doc(&account.seven_day, now),
                 fable_weekly: account
                     .fable_weekly()
@@ -2831,6 +2854,36 @@ mod tests {
                 serde_json::json!(code.map(|c| c.as_u16()))
             );
         }
+    }
+
+    /// A daemon newer than this client may report a cause it does not know.
+    /// The account reads as unclassified; the rest of the document decodes.
+    #[test]
+    fn unknown_auth_cause_decodes_as_unclassified() {
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &seeded_hub().view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        let mut json = serde_json::to_value(&doc).expect("serialize");
+        json["accounts"][0]["auth_failure"] =
+            serde_json::json!({"cause": "a_cause_from_the_future", "at_ms": 1});
+        let decoded: DashboardDoc = serde_json::from_value(json.clone()).expect("decode");
+        assert_eq!(decoded.accounts[0].auth_failure, None);
+        json["accounts"][0]["auth_failure"] =
+            serde_json::json!({"cause": "login_expired", "at_ms": 7});
+        let decoded: DashboardDoc = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded.accounts[0].auth_failure,
+            Some(crate::auth_cause::AuthFailure {
+                cause: crate::auth_cause::AuthCause::LoginExpired,
+                at_ms: 7
+            })
+        );
     }
 
     /// Multi-tenant #22: the doc's tenant rows join hub aggregates with key

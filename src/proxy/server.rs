@@ -691,8 +691,11 @@ impl AppState {
         expected: &crate::scheduler::AccountFingerprint,
         status: Option<http::StatusCode>,
         reason: &str,
+        cause: crate::auth_cause::AuthCause,
     ) -> bool {
-        let applied = self.pool.record_auth_failure_if(account, expected, status);
+        let applied = self
+            .pool
+            .record_auth_failure_if(account, expected, status, cause);
         self.hub
             .account_history
             .record(crate::account_history::AccountEvent::new(
@@ -1994,7 +1997,11 @@ pub async fn background_refresh_pass(state: &AppState) {
                 );
             }
         }
-        forward::RefreshOutcome::Permanent { detail, status } => {
+        forward::RefreshOutcome::Permanent {
+            detail,
+            status,
+            cause,
+        } => {
             // Only bench if the dead refresh token is STILL this account's
             // credential: a re-login that landed during the refresh has
             // already healed it (relogin-trace B1/B5).
@@ -2003,6 +2010,7 @@ pub async fn background_refresh_pass(state: &AppState) {
                 &fingerprint,
                 Some(status),
                 "background refresh permanently rejected",
+                cause,
             ) {
                 state.emit(ActivityEvent::Error {
                     context: Some("refresh".into()),
@@ -2557,6 +2565,24 @@ pub struct ServerMeta {
     pub plans: HashMap<String, crate::proxy::plans::AccountPlan>,
 }
 
+/// The `auth_failure` object of one status-document account: the classified
+/// cause, its plain-words explanation and the fix for this credential kind.
+/// `None` while healthy, and for an unclassified failure (an older code path):
+/// a guessed cause would send the operator to the wrong fix.
+pub fn auth_failure_json(account: &crate::scheduler::AccountSnapshot) -> serde_json::Value {
+    match account.auth_failure.filter(|_| !account.healthy) {
+        Some(failure) => serde_json::json!({
+            "cause": failure.cause,
+            "label": failure.cause.label(),
+            "why": failure.cause.why(),
+            "fix": failure.cause.fix(account.credential_kind),
+            "needs_relogin": failure.cause.needs_relogin(),
+            "since_ms": failure.at_ms,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Serializable `/llmux/status` document — pure function of a pool
 /// snapshot + totals + select params + server meta so the shape is
 /// unit-testable without a socket. Fields are additive only (the CLI parses
@@ -2618,6 +2644,10 @@ pub fn status_json(
                     "order": order + 1,
                     "blocked": blocked,
                     "auth_failure_status": account.auth_failure_status,
+                    // Why the account is benched and the operator's next step
+                    // (additive; null while healthy or when the cause is
+                    // unknown). `blocked` keeps the short label.
+                    "auth_failure": auth_failure_json(account),
                     "seven_day": window(&account.seven_day),
                     // Model-scoped weekly windows (additive; null / empty when
                     // none seen). `fable_weekly` is the "Fable" entry surfaced
@@ -6670,6 +6700,87 @@ mod tests {
         let result = run_login(&state, crate::proxy::login::LoginProvider::Gemini, "st-1").await;
 
         assert_eq!(result.err().as_deref(), Some(GEMINI_NO_CLIENT));
+    }
+
+    /// The 2026-11-13 failure end to end: the token endpoint answers
+    /// `invalid_grant` / "Refresh token expired" to the background refresh.
+    /// The account is benched as `login_expired`, and the status document
+    /// names the cause, the why and the fix (the `llmux status` block and
+    /// the TUI read these) instead of a bare `! 400 auth X`.
+    #[tokio::test]
+    async fn expired_refresh_token_is_benched_as_login_expired_with_its_fix() {
+        let app = Router::new().route(
+            "/v1/oauth/token",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":"invalid_grant","error_description":"Refresh token expired"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let upstream = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut claude = oauth_account("a");
+        if let AccountCredential::Oauth { expires_at_ms, .. } = &mut claude.credential {
+            *expires_at_ms = 1;
+        }
+        let config = Config {
+            upstream,
+            accounts: vec![claude],
+            ..Default::default()
+        };
+        let pool = AccountPool::new(&config.accounts);
+        let mut state = AppState::new(config, pool.clone(), None, None).expect("state");
+        state.config_path = None;
+
+        background_refresh_pass(&state).await;
+
+        let snapshot = pool.snapshot();
+        let account = &snapshot.accounts[0];
+        assert!(!account.healthy);
+        assert_eq!(account.auth_failure_status, Some(400));
+        assert_eq!(
+            account.auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::LoginExpired)
+        );
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 0,
+            port: 0,
+            email_anonymous: false,
+            usage_controls: Default::default(),
+            plans: Default::default(),
+        };
+        let doc = status_json(
+            &snapshot,
+            &UsageTotals::default(),
+            &params(),
+            SystemTime::now(),
+            &meta,
+        );
+        let row = &doc["accounts"][0];
+        assert_eq!(row["status"], "auth_failed");
+        assert_eq!(row["blocked"], "! 400 login expired");
+        assert_eq!(row["auth_failure"]["cause"], "login_expired");
+        assert_eq!(row["auth_failure"]["needs_relogin"], true);
+        assert_eq!(
+            row["auth_failure"]["fix"],
+            "sign in again on the daemon's host: `llmux login`"
+        );
+        assert!(row["auth_failure"]["since_ms"].as_u64().is_some());
+        let history = state.hub.account_history.snapshot();
+        assert!(
+            history["a"]
+                .iter()
+                .any(|e| e.reason == "invalid_grant: refresh token expired"),
+            "{history:?}"
+        );
     }
 
     /// Without the OAuth client an expired gemini token can never be

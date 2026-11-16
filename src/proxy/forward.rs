@@ -2210,7 +2210,11 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             );
                         }
                     }
-                    RefreshOutcome::Permanent { detail, status } => {
+                    RefreshOutcome::Permanent {
+                        detail,
+                        status,
+                        cause,
+                    } => {
                         // Only bench if the dead refresh token is still the
                         // account's live credential (relogin-trace B1).
                         state.record_auth_failure(
@@ -2218,6 +2222,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             lease.fingerprint(),
                             Some(status),
                             "proactive refresh permanently rejected",
+                            cause,
                         );
                         state.emit(ActivityEvent::Error {
                             context: Some("refresh".into()),
@@ -2632,6 +2637,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         lease.fingerprint(),
                         err.status(),
                         "persistent provider send error; HTTP status may be unavailable",
+                        crate::auth_cause::AuthCause::ProviderError,
                     );
                     drop(lease);
                     switches += 1;
@@ -2946,6 +2952,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         | AccountCredential::Codex { .. }
                         | AccountCredential::Gemini { .. }
                 );
+                // A key was rejected outright (nothing to refresh); a token
+                // was rejected, and a dead refresh below replaces this with
+                // the refresh's own, more specific cause.
+                let mut auth_cause = if matches!(
+                    credential,
+                    AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. }
+                ) {
+                    crate::auth_cause::AuthCause::KeyRejected
+                } else {
+                    crate::auth_cause::AuthCause::TokenRejected
+                };
                 if oauth && !force_refreshed.contains(&account) {
                     force_refreshed.insert(account.clone());
                     // `Superseded` retries for the same reason `Refreshed`
@@ -2964,7 +2981,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                             drop(lease);
                             continue;
                         }
-                        RefreshOutcome::Permanent { status, .. } => auth_status = status,
+                        RefreshOutcome::Permanent { status, cause, .. } => {
+                            auth_status = status;
+                            auth_cause = cause;
+                        }
                         RefreshOutcome::Failed { status } => {
                             ctx.flush_log(state);
                             ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
@@ -3003,6 +3023,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     lease.fingerprint(),
                     Some(auth_status),
                     "request authentication rejected after refresh attempt",
+                    auth_cause,
                 );
                 drop(lease);
                 switches += 1;
@@ -3049,6 +3070,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     lease.fingerprint(),
                     Some(status),
                     "persistent provider account rejection",
+                    crate::auth_cause::AuthCause::AccountRejected,
                 );
                 drop(lease);
                 switches += 1;
@@ -3257,7 +3279,13 @@ pub(crate) enum RefreshOutcome {
     /// without it the operator-visible message said only "refresh token dead",
     /// which hid the one distinction that matters — expired (just re-login)
     /// vs. rotated-out-from-under-us by a second daemon (shared host, 2026-09-10..21).
-    Permanent { detail: String, status: StatusCode },
+    Permanent {
+        detail: String,
+        status: StatusCode,
+        /// The classified reason (expired / rotated / revoked / …) the
+        /// account is benched under — what every status surface shows.
+        cause: crate::auth_cause::AuthCause,
+    },
     /// Transient refresh failure — old token may still work.
     Failed { status: Option<StatusCode> },
     /// No refresh was attempted: the provider's OAuth client is not
@@ -3611,6 +3639,7 @@ pub(crate) async fn refresh_credential(
             tracing::warn!(account = %account, %status, reason, "refresh token rejected");
             RefreshOutcome::Permanent {
                 status,
+                cause: crate::auth_cause::AuthCause::from_refresh_rejection(&body),
                 detail: refresh_death_detail(&status, &body),
             }
         }
@@ -4337,6 +4366,7 @@ async fn relay_translate(
                 lease.fingerprint(),
                 Some(status),
                 "provider access suspended",
+                crate::auth_cause::AuthCause::AccessSuspended,
             );
             state.emit(ActivityEvent::Error {
                 context: Some("upstream".into()),
@@ -6686,6 +6716,12 @@ mod tests {
             .find(|acct| acct.id.0 == "a")
             .expect("a");
         assert!(!a.healthy, "a marked AuthFailed after the second 401");
+        // The refresh worked and the provider still refused the new token:
+        // the row names that, not a bare status.
+        assert_eq!(
+            a.auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::TokenRejected)
+        );
         assert_eq!(
             crate::scheduler::select::blocking_reason(
                 a,
@@ -6693,9 +6729,62 @@ mod tests {
                 &state.select_params(),
                 SystemTime::now(),
             ),
-            "! 401 auth X"
+            "! 401 token rejected"
         );
         assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
+    }
+
+    /// An API key is never refreshed: its 401 benches it as `key rejected`,
+    /// not as a token the provider refused "after a refresh".
+    #[tokio::test]
+    async fn api_key_401_is_benched_as_key_rejected() {
+        let shared = MockShared::default();
+        shared
+            .script
+            .lock()
+            .expect("lock")
+            .push_back(Scripted::RequireBearer {
+                accept: &["at-b"],
+                body: r#"{"ok":1}"#,
+            });
+        let upstream = spawn_mock(shared.clone()).await;
+        // The key is the only account, so the request must try it.
+        let key = AccountConfig {
+            name: "k".into(),
+            credential: AccountCredential::Apikey {
+                api_key: "sk-ant-api03-test".into(),
+            },
+        };
+        let state = test_state(&upstream, vec![key]);
+
+        let response = forward(&state, client_request("{}")).await;
+        assert_ne!(response.status(), StatusCode::OK);
+        assert_eq!(
+            shared.seen.lock().expect("lock").len(),
+            1,
+            "one try, no refresh"
+        );
+
+        let snapshot = state.pool.snapshot();
+        let k = snapshot
+            .accounts
+            .iter()
+            .find(|acct| acct.id.0 == "k")
+            .expect("k");
+        assert!(!k.healthy);
+        assert_eq!(
+            k.auth_failure.map(|f| f.cause),
+            Some(crate::auth_cause::AuthCause::KeyRejected)
+        );
+        assert_eq!(
+            crate::scheduler::select::blocking_reason(
+                k,
+                crate::scheduler::select::IneligibleReason::AuthUnhealthy,
+                &state.select_params(),
+                SystemTime::now(),
+            ),
+            "! 401 key rejected"
+        );
     }
 
     /// Exercise the real OAuth HTTP parser and both request-time refresh paths.
@@ -6752,6 +6841,12 @@ mod tests {
                 let a = snapshot.accounts.iter().find(|a| a.id.0 == "a").expect("a");
                 assert!(!a.healthy);
                 assert_eq!(a.auth_failure_status, Some(status.as_u16()));
+                // A bare `invalid_grant` gives no reason: classified as a
+                // rejected refresh, never guessed as an expiry.
+                assert_eq!(
+                    a.auth_failure.map(|f| f.cause),
+                    Some(crate::auth_cause::AuthCause::RefreshRejected)
+                );
                 assert_eq!(
                     crate::scheduler::select::blocking_reason(
                         a,
@@ -6759,7 +6854,7 @@ mod tests {
                         &state.select_params(),
                         SystemTime::now(),
                     ),
-                    format!("! {} auth X", status.as_u16())
+                    format!("! {} refresh rejected", status.as_u16())
                 );
                 assert_eq!(
                     classify(status, &HeaderMap::new()),
