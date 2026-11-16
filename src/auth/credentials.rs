@@ -38,6 +38,7 @@ impl ClaudeCredentials {
             // The credentials file carries no refresh timestamp — shows
             // "never (refreshed)" until the proxy's first refresh.
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         }
     }
 }
@@ -163,6 +164,7 @@ mod tests {
                 expires_at_ms: 42,
                 tier: Some("max".into()),
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             }
         );
     }

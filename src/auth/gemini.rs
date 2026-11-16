@@ -293,6 +293,7 @@ fn parse_token_response(text: &str) -> Result<OAuthTokens, AuthError> {
         access_token,
         refresh_token,
         expires_at_ms: now_ms().saturating_add(expires_in.saturating_mul(1000)),
+        login_expires_at_ms: None,
     })
 }
 
@@ -1425,6 +1426,7 @@ mod tests {
             access_token: "at".into(),
             refresh_token: None,
             expires_at_ms: 1,
+            login_expires_at_ms: None,
         };
         assert!(login_refresh_token(&tokens).is_err());
         tokens.refresh_token = Some(String::new());

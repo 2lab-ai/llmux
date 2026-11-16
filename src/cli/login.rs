@@ -140,6 +140,8 @@ pub async fn oauth_login_to_account(
             // Login mints a brand-new token — that IS a refresh for the
             // dashboard's "refreshed ago" display.
             last_refresh_ms: Some(super::now_ms()),
+            // The sign-in's own end, when the token endpoint says it.
+            login_expires_at_ms: tokens.login_expires_at_ms,
         },
     })
 }

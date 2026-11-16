@@ -107,6 +107,10 @@ pub struct OAuthTokens {
     /// Expiry in epoch milliseconds, already normalized via
     /// [`normalize_expires_at_ms`].
     pub expires_at_ms: u64,
+    /// When the sign-in behind these tokens ends (epoch ms), from the
+    /// response's `refresh_token_expires_in`; `None` when the provider did
+    /// not say (every provider but Anthropic, so far).
+    pub login_expires_at_ms: Option<u64>,
 }
 
 /// Build the browser authorize URL (PKCE S256, `state` echo check,
@@ -544,6 +548,10 @@ struct TokenResponse {
     expires_at: Option<u64>,
     #[serde(default)]
     expires_in: Option<u64>,
+    /// Seconds left on the sign-in itself (Anthropic; not extended by a
+    /// refresh).
+    #[serde(default)]
+    refresh_token_expires_in: Option<u64>,
 }
 
 impl TokenResponse {
@@ -557,6 +565,9 @@ impl TokenResponse {
             access_token: self.access_token,
             refresh_token: self.refresh_token,
             expires_at_ms,
+            login_expires_at_ms: self
+                .refresh_token_expires_in
+                .map(|secs| now_ms().saturating_add(secs.saturating_mul(1000))),
         }
     }
 }
@@ -946,6 +957,39 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "401 must not be retried");
         assert!(matches!(err, AuthError::RefreshPermanent { status, .. }
             if status == StatusCode::UNAUTHORIZED));
+    }
+
+    /// The token endpoint reports how long the sign-in itself has left
+    /// (`refresh_token_expires_in`, seconds); it becomes the login's end.
+    #[tokio::test]
+    async fn refresh_reads_the_sign_in_end() {
+        let (url, _) = spawn_token_mock(
+            vec![(
+                StatusCode::OK,
+                r#"{"access_token":"at2","refresh_token":"rt2","expires_in":28800,"refresh_token_expires_in":180000}"#
+                    .into(),
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let before = now_ms();
+        let tokens = refresh_at(&reqwest::Client::new(), &url, "rt-old")
+            .await
+            .expect("refresh");
+        let ends = tokens.login_expires_at_ms.expect("login end");
+        assert!(ends >= before + 180_000_000 && ends <= now_ms() + 180_000_000);
+        let (url, _) = spawn_token_mock(
+            vec![(
+                StatusCode::OK,
+                r#"{"access_token":"at3","expires_in":600}"#.into(),
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let tokens = refresh_at(&reqwest::Client::new(), &url, "rt-old")
+            .await
+            .expect("refresh");
+        assert_eq!(tokens.login_expires_at_ms, None, "not reported → unknown");
     }
 
     #[tokio::test]

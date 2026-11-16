@@ -47,6 +47,7 @@ fn oauth(name: &str) -> AccountConfig {
             expires_at_ms: u64::MAX / 2,
             tier: None,
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         },
     }
 }

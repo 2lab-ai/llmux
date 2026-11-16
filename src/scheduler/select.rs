@@ -5,7 +5,7 @@
 //! impure half (snapshotting, CAS commit) lives in `scheduler::AccountPool`.
 
 use std::cmp::Ordering;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{AccountId, AccountSnapshot, CooldownSource, PoolSnapshot};
 use crate::config::SchedulerConfig;
@@ -1135,6 +1135,25 @@ pub fn blocking_reason(
 
 /// Compact no-space duration: "2d4h", "6h52m", "3m12s", "42s". Used in
 /// blocking reasons and the dashboard's countdown cells.
+/// How far ahead a login's end is announced. Claude Code warns 3 days ahead;
+/// a pool of many accounts needs time to re-sign each one, so llmux starts
+/// two days earlier.
+pub const LOGIN_EXPIRY_WARN: Duration = Duration::from_secs(5 * 86_400);
+
+/// Time left on a HEALTHY account's login when it ends within
+/// [`LOGIN_EXPIRY_WARN`] (`Duration::ZERO` once it has passed and the next
+/// refresh has not benched it yet). `None` when healthy accounts are far
+/// from it, when the end is unknown, or when the account is already benched
+/// (its auth failure says more).
+pub fn login_expiring(account: &AccountSnapshot, now: SystemTime) -> Option<Duration> {
+    if !account.healthy {
+        return None;
+    }
+    let ends = UNIX_EPOCH + Duration::from_millis(account.login_expires_at_ms?);
+    let left = ends.duration_since(now).unwrap_or(Duration::ZERO);
+    (left <= LOGIN_EXPIRY_WARN).then_some(left)
+}
+
 pub fn compact_duration(d: Duration) -> String {
     let total = d.as_secs();
     let (days, hours, mins, secs) = (
@@ -1323,6 +1342,7 @@ mod tests {
             healthy: true,
             auth_failure_status: None,
             auth_failure: None,
+            login_expires_at_ms: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             seven_day: None,
@@ -2487,6 +2507,28 @@ mod tests {
         assert_eq!(
             blocking_reason(&dead, IneligibleReason::AuthUnhealthy, &params(), now()),
             "! auth X"
+        );
+    }
+
+    #[test]
+    fn login_expiring_flags_healthy_logins_inside_the_window() {
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut a = account("a");
+        assert_eq!(login_expiring(&a, now()), None, "unknown end");
+        a.login_expires_at_ms = Some(ms(now() + Duration::from_secs(6 * 86_400)));
+        assert_eq!(login_expiring(&a, now()), None, "outside the window");
+        a.login_expires_at_ms = Some(ms(now() + Duration::from_secs(2 * 86_400)));
+        assert_eq!(
+            login_expiring(&a, now()),
+            Some(Duration::from_secs(2 * 86_400))
+        );
+        a.login_expires_at_ms = Some(ms(now() - Duration::from_secs(60)));
+        assert_eq!(login_expiring(&a, now()), Some(Duration::ZERO), "passed");
+        a.healthy = false;
+        assert_eq!(
+            login_expiring(&a, now()),
+            None,
+            "benched: the cause says more"
         );
     }
 

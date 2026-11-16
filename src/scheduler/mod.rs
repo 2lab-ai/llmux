@@ -859,6 +859,7 @@ impl PoolState {
                     healthy: a.health == AccountHealth::Healthy,
                     auth_failure_status: a.auth_failure_status,
                     auth_failure: a.auth_failure,
+                    login_expires_at_ms: a.credential.login_expires_at_ms(),
                     credential_kind: a.credential.kind(),
                     group: BackendGroup::from_kind(a.credential.kind()),
                     seven_day: a.seven_day,
@@ -967,6 +968,9 @@ pub struct AccountSnapshot {
     /// Classified cause + time of the auth failure; `None` while healthy or
     /// when unknown (an older daemon, an unclassified path).
     pub auth_failure: Option<crate::auth_cause::AuthFailure>,
+    /// When the login behind this credential ends (epoch ms; Claude OAuth,
+    /// from the token endpoint). `None` = not known yet.
+    pub login_expires_at_ms: Option<u64>,
     pub credential_kind: &'static str,
     /// Backend group this account belongs to, derived from `credential_kind`
     /// (codex credential → Codex, oauth/apikey → Claude). The selector's
@@ -1740,6 +1744,7 @@ mod tests {
                 expires_at_ms: 0,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         }
     }
@@ -2487,6 +2492,7 @@ mod tests {
                 expires_at_ms: 9_999,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         );
         assert_eq!(state.accounts[0].health, AccountHealth::Healthy);
@@ -2723,6 +2729,7 @@ mod tests {
                 expires_at_ms: 1,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         );
         pool.record_429(&id("a"), Some(Duration::from_secs(60)), now());

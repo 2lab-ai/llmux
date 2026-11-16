@@ -247,6 +247,49 @@ fn action_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
             }),
         }
     }
+    // Healthy accounts whose login ends within the warning window: a
+    // refresh cannot extend a sign-in, so the fix is a new one before then.
+    let warn = crate::scheduler::select::LOGIN_EXPIRY_WARN;
+    let mut expiring: Vec<(Duration, String, String)> = doc["accounts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["status"].as_str() != Some("auth_failed"))
+        .filter_map(|a| {
+            let ends =
+                SystemTime::UNIX_EPOCH + Duration::from_millis(a["login_expires_at_ms"].as_u64()?);
+            let left = ends.duration_since(now).unwrap_or(Duration::ZERO);
+            (left <= warn).then(|| {
+                let kind = a["type"].as_str().unwrap_or("oauth");
+                (
+                    left,
+                    a["name"].as_str().unwrap_or("?").to_string(),
+                    crate::auth_cause::login_command(kind).to_string(),
+                )
+            })
+        })
+        .collect();
+    expiring.sort();
+    for (left, name, login) in expiring {
+        let fix = format!("sign in again on the daemon's host before then: `{login}`");
+        let member = format!(
+            "{name}  ends in {}",
+            crate::scheduler::select::compact_duration(left)
+        );
+        let label = "login expiring".to_string();
+        match groups.iter_mut().find(|g| g.label == label && g.fix == fix) {
+            Some(group) => group.members.push(member),
+            None => groups.push(Group {
+                label,
+                why: format!(
+                    "the sign-in ends within {} days and a refresh cannot extend it",
+                    warn.as_secs() / 86_400
+                ),
+                fix,
+                members: vec![member],
+            }),
+        }
+    }
     if groups.is_empty() {
         return Vec::new();
     }
@@ -294,10 +337,23 @@ fn token_summary(account: &serde_json::Value, now: SystemTime) -> Option<String>
         Ok(left) => crate::scheduler::select::compact_duration(left),
         Err(_) => "expired".to_string(),
     };
-    match crate::tui::format::refreshed_marker(account["last_refresh_ms"].as_u64(), now) {
-        Some(marker) => Some(format!("tok {expiry} {marker}")),
-        None => Some(format!("tok {expiry}")),
+    let mut out =
+        match crate::tui::format::refreshed_marker(account["last_refresh_ms"].as_u64(), now) {
+            Some(marker) => format!("tok {expiry} {marker}"),
+            None => format!("tok {expiry}"),
+        };
+    // The login's own end, which no refresh moves: "login 12d", "login ended".
+    if let Some(ends_ms) = account["login_expires_at_ms"].as_u64() {
+        let ends = SystemTime::UNIX_EPOCH + Duration::from_millis(ends_ms);
+        match ends.duration_since(now) {
+            Ok(left) => {
+                out.push_str(" · login ");
+                out.push_str(&crate::scheduler::select::compact_duration(left));
+            }
+            Err(_) => out.push_str(" · login ended"),
+        }
     }
+    Some(out)
 }
 
 /// "2h 13m" style uptime.
@@ -371,6 +427,32 @@ mod tests {
         );
         let healthy = serde_json::json!({"accounts":[{"name":"ok@x","status":"ok"}]});
         assert!(action_lines(&healthy, test_now()).is_empty());
+    }
+
+    /// A login's end shows on every token line, and a healthy account whose
+    /// login ends within the warning window is announced before it dies.
+    #[test]
+    fn login_end_is_shown_and_announced_inside_the_window() {
+        let day = 86_400_000u64;
+        let now_ms = 1_781_308_800_000u64;
+        let doc = serde_json::json!({"accounts":[
+            {"name":"soon@x", "type":"oauth", "status":"ok",
+             "token_expires_at_ms": now_ms + 3_600_000, "login_expires_at_ms": now_ms + 2 * day},
+            {"name":"later@x", "type":"oauth", "status":"active",
+             "token_expires_at_ms": now_ms + 3_600_000, "login_expires_at_ms": now_ms + 20 * day},
+        ]});
+        let lines = account_lines(&doc, test_now());
+        assert!(lines[0].contains("· login 2d0h"), "{lines:?}");
+        assert!(lines[1].contains("· login 20d0h"), "{lines:?}");
+        assert_eq!(
+            action_lines(&doc, test_now()),
+            vec![
+                "  needs action:",
+                "    login expiring ×1 — the sign-in ends within 5 days and a refresh cannot extend it",
+                "      soon@x  ends in 2d0h",
+                "      fix: sign in again on the daemon's host before then: `llmux login`",
+            ]
+        );
     }
 
     /// Fixed test clock: 2026-06-13 00:00:00 UTC.

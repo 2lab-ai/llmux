@@ -66,6 +66,7 @@ fn oauth_account(name: &str, access_token: &str) -> AccountConfig {
             expires_at_ms: far_future_ms(),
             tier: None,
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         },
     }
 }
@@ -251,6 +252,7 @@ fn a_stale_refresh_is_refused_by_the_config_row_it_would_overwrite() {
         Some("rt-from-retired-refresh"),
         42,
         41,
+        None,
     );
 
     assert!(!applied, "the stale refresh is refused");
@@ -282,6 +284,7 @@ fn an_unraced_refresh_still_persists() {
         None,
         42,
         41,
+        None,
     );
 
     assert!(applied);

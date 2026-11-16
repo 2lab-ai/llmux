@@ -198,6 +198,7 @@ impl DashboardView {
                 healthy: a.healthy,
                 auth_failure_status: a.auth_failure_status,
                 auth_failure: a.auth_failure,
+                login_expires_at_ms: a.login_expires_at_ms,
                 credential_kind: kind_static(&a.kind),
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 seven_day: window_from_doc(&a.seven_day),

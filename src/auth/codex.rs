@@ -243,6 +243,7 @@ fn parse_codex_token_response(text: &str) -> Result<OAuthTokens, AuthError> {
         access_token,
         refresh_token,
         expires_at_ms,
+        login_expires_at_ms: None,
     })
 }
 
@@ -502,6 +503,7 @@ mod tests {
                 access_token: "at-fresh".into(),
                 refresh_token: Some("rt-fresh".into()),
                 expires_at_ms: 1_900_000_000_000,
+                login_expires_at_ms: None,
             },
             id_token: Some(id_token),
         };
@@ -533,6 +535,7 @@ mod tests {
                 access_token: "at".into(),
                 refresh_token: Some("rt".into()),
                 expires_at_ms: 0,
+                login_expires_at_ms: None,
             },
             id_token: None,
         };
@@ -547,6 +550,7 @@ mod tests {
                 access_token: "at".into(),
                 refresh_token: Some("rt".into()),
                 expires_at_ms: 0,
+                login_expires_at_ms: None,
             },
             id_token: Some(id_token),
         };

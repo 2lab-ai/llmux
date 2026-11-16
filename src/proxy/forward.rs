@@ -3493,6 +3493,7 @@ pub(crate) async fn refresh_credential(
                     account_uuid,
                     refresh_token,
                     tier,
+                    login_expires_at_ms,
                     ..
                 } => (
                     AccountCredential::Oauth {
@@ -3505,6 +3506,9 @@ pub(crate) async fn refresh_credential(
                         expires_at_ms: tokens.expires_at_ms,
                         tier: tier.clone(),
                         last_refresh_ms: Some(refreshed_at_ms),
+                        // A refresh reports the same sign-in's end; keep the
+                        // known one when a response omits it.
+                        login_expires_at_ms: tokens.login_expires_at_ms.or(*login_expires_at_ms),
                     },
                     non_empty_or(account_uuid, &account.0),
                 ),
@@ -3702,6 +3706,7 @@ async fn persist_tokens(
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
     let expires = tokens.expires_at_ms;
+    let login_expires = tokens.login_expires_at_ms;
     let expected_digest = expected.digest.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut refused = false;
@@ -3713,6 +3718,7 @@ async fn persist_tokens(
                 refresh.as_deref(),
                 expires,
                 refreshed_at_ms,
+                login_expires,
             );
         });
         (merged, refused)
@@ -5714,6 +5720,7 @@ mod tests {
             expires_at_ms: far_future_ms(),
             tier: None,
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         }
     }
 
@@ -6148,6 +6155,7 @@ mod tests {
                 expires_at_ms: far_future_ms(),
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         }
     }

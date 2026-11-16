@@ -450,6 +450,7 @@ fn oauth_account(name: &str) -> AccountConfig {
             expires_at_ms: far_future_ms(),
             tier: Some("max".into()),
             last_refresh_ms: None,
+            login_expires_at_ms: None,
         },
     }
 }

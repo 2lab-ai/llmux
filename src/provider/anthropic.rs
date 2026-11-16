@@ -1007,6 +1007,7 @@ mod tests {
                 expires_at_ms: 0,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         )
         .await

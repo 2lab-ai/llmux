@@ -1055,6 +1055,10 @@ pub struct AccountDoc {
         deserialize_with = "lenient_auth_failure"
     )]
     pub auth_failure: Option<crate::auth_cause::AuthFailure>,
+    /// When the account's login ends (epoch ms; additive, absent when not
+    /// known or on older daemons).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_expires_at_ms: Option<u64>,
     pub seven_day: Option<WindowDoc>,
     /// The "Fable" model-scoped weekly window surfaced for convenient reads;
     /// `null` when this account carries no Fable scope. Additive — absent in
@@ -2011,6 +2015,7 @@ pub(crate) fn dashboard_doc(
                 healthy: account.healthy,
                 auth_failure_status: account.auth_failure_status,
                 auth_failure: account.auth_failure,
+                login_expires_at_ms: account.login_expires_at_ms,
                 seven_day: window_doc(&account.seven_day, now),
                 fable_weekly: account
                     .fable_weekly()
@@ -2634,6 +2639,7 @@ mod tests {
                 expires_at_ms: 0,
                 tier: None,
                 last_refresh_ms: None,
+                login_expires_at_ms: None,
             },
         }
     }
