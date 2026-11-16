@@ -307,11 +307,14 @@ fn action_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
     lines
 }
 
-/// "max20 · 7d 66% left" — the account's subscription plan beside its
-/// remaining weekly quota (`.prd/25`). Either half alone when only one is
-/// known; `None` when neither is (older daemons, api-key accounts).
+/// "max20 personal · 7d 66% left" — the account's subscription plan and
+/// whether it is a personal subscription or a team seat (`.prd/25`, amended
+/// 2026-11-16), beside its remaining weekly quota. Either half alone when only
+/// one is known; `None` when neither is (older daemons, api-key accounts).
 fn quota_summary(account: &serde_json::Value) -> Option<String> {
-    let plan = account["plan"].as_str().filter(|p| !p.is_empty());
+    let label = account["plan"].as_str().filter(|p| !p.is_empty());
+    let kind = account["account_type"].as_str().filter(|k| !k.is_empty());
+    let plan = crate::auth::plan::plan_summary(label, kind);
     let left = account["seven_day"]["utilization"].as_f64().map(|used| {
         format!(
             "7d {}% left",
@@ -320,7 +323,7 @@ fn quota_summary(account: &serde_json::Value) -> Option<String> {
     });
     match (plan, left) {
         (Some(plan), Some(left)) => Some(format!("{plan} · {left}")),
-        (Some(plan), None) => Some(plan.to_string()),
+        (Some(plan), None) => Some(plan),
         (None, Some(left)) => Some(left),
         (None, None) => None,
     }
@@ -614,6 +617,32 @@ server:
         assert_eq!(lines[1], "    2. codex:b   ready  promax");
         assert_eq!(lines[2], "    3. codex:c   ready  7d 0% left");
         assert_eq!(lines[3], "    4. grok:d    ready");
+    }
+
+    /// `.prd/25` amendment 2026-11-16: the line says whether the plan is a
+    /// personal subscription or a team seat — a team seat with a Max x5 tier
+    /// no longer reads like a personal Max x5.
+    #[test]
+    fn account_lines_say_personal_or_team_beside_the_plan() {
+        let doc = serde_json::json!({
+            "accounts": [
+                { "name": "claude:a", "status": "ok", "order": 1, "plan": "max5",
+                  "account_type": "personal",
+                  "seven_day": { "utilization": 0.34, "resets_at": 0, "resets_in_secs": 0 } },
+                { "name": "claude:b", "status": "ok", "order": 2, "plan": "max5",
+                  "account_type": "team",
+                  "seven_day": { "utilization": 0.34, "resets_at": 0, "resets_in_secs": 0 } },
+                { "name": "codex:c", "status": "ok", "order": 3, "plan": "team",
+                  "account_type": "team", "seven_day": null },
+            ],
+        });
+        let lines = account_lines(&doc, test_now());
+        assert_eq!(
+            lines[0],
+            "    1. claude:a  ready  max5 personal · 7d 66% left"
+        );
+        assert_eq!(lines[1], "    2. claude:b  ready  max5 team · 7d 66% left");
+        assert_eq!(lines[2], "    3. codex:c   ready  team");
     }
 
     #[test]

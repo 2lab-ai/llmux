@@ -89,3 +89,39 @@ test('the web view warns in the same window as llmux status', () => {
   assert.equal(tone(warn - 60), 'warn', 'just inside the window');
   assert.equal(tone(warn + 60), 'ok', 'just outside the window');
 });
+
+// `.prd/25` amendment 2026-11-16: the Accounts view names each account's plan
+// and whether it is a personal subscription or a team seat, from the daemon's
+// `plan` object (src/proxy/plans.rs AccountPlan).
+test('the plan and personal / team come from the daemon plan object', () => {
+  const X = loadCore();
+  const seat = { type: 'oauth', plan: { label: 'max5', rate_limit_tier: 'default_claude_max_5x',
+    account_type: 'team', organization_type: 'claude_team', seat_tier: 'premium', plan_name: 'Team' } };
+  assert.deepEqual([...X.accountPlan(seat)], ['max5', 'team',
+    'org claude_team · tier default_claude_max_5x · seat premium · named "Team"']);
+  assert.deepEqual([...X.accountPlan({ type: 'codex', plan: { label: 'promax', plan_type: 'promax', account_type: 'personal' } })],
+    ['promax', 'personal', 'plan_type promax']);
+  assert.deepEqual([...X.accountPlan({ type: 'oauth' })], ['?', '?', ''], 'not read yet');
+  assert.deepEqual([...X.accountPlan({ type: 'oauth', plan: { label: 'max20' } })], ['max20', '?', ''], 'older daemon');
+  assert.deepEqual([...X.accountPlan({ type: 'grok' })], ['-', '-', ''], 'no plans on this provider');
+});
+
+test('the accounts table has plan and type columns and marks a team seat', () => {
+  const X = loadCore();
+  const now = Date.now() / 1000;
+  const account = (name, type, plan) => ({ name, type, plan, healthy: true, status: 'ok', paused: false,
+    seven_day: { utilization: 0.5, resets_at: now + 3600 }, session: { requests: 1, errors: 0 }, in_flight: 0 });
+  const html = X.renderAccounts({
+    select_params: { mode: 'drain', seven_day_max: 0.99 },
+    current_by_group: {},
+    accounts: [
+      account('claude:seat@x.com', 'oauth', { label: 'max5', account_type: 'team', organization_type: 'claude_team' }),
+      account('claude:me@x.com', 'oauth', { label: 'max20', account_type: 'personal', organization_type: 'claude_max' }),
+      account('grok:me@x.com', 'grok', null),
+    ],
+  });
+  assert.match(html, /<th>account<\/th><th>plan<\/th><th>type<\/th><th>state<\/th>/);
+  assert.match(html, />max5<\/td>\s*<td><span class="x-pill team">Team<\/span>/);
+  assert.match(html, />max20<\/td>\s*<td><span class="x-pill mute">Personal<\/span>/);
+  assert.match(html, /colspan="10"/);
+});

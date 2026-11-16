@@ -26,6 +26,17 @@ pub struct Profile {
     /// `organization.rate_limit_tier` — the exact plan (`default_claude_max_20x`,
     /// `default_claude_max_5x`, …); `None` when not reported. `.prd/25`.
     pub rate_limit_tier: Option<String>,
+    /// `organization.organization_type` — what kind of organization the login
+    /// signed into: `claude_max` / `claude_pro` (a personal subscription) or
+    /// `claude_team` / `claude_enterprise` (a seat in a team). `None` when not
+    /// reported. `.prd/25` amendment 2026-11-16.
+    pub organization_type: Option<String>,
+    /// `organization.plan_display_name` — Anthropic's own name for the plan
+    /// (`Ultra` for a Max x20 subscription, measured 2026-11-16). Display only.
+    pub plan_display_name: Option<String>,
+    /// `organization.seat_tier` — the seat a team member holds; `None` for a
+    /// personal subscription and when not reported. Display only.
+    pub seat_tier: Option<String>,
 }
 
 /// Fetch the profile for one oauth account (Bearer auth against the
@@ -77,6 +88,19 @@ struct ProfileOrganization {
     uuid: Option<String>,
     #[serde(default)]
     rate_limit_tier: Option<String>,
+    #[serde(default)]
+    organization_type: Option<String>,
+    #[serde(default)]
+    plan_display_name: Option<String>,
+    #[serde(default)]
+    seat_tier: Option<String>,
+}
+
+/// A reported string, trimmed; `None` when absent or blank.
+fn present(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Pure parse of the profile JSON body (test seam).
@@ -91,6 +115,7 @@ fn parse_profile(body: &str) -> Result<Profile, AuthError> {
         .email
         .filter(|email| !email.is_empty())
         .ok_or(AuthError::ProfileIncomplete("account.email"))?;
+    let organization = parsed.organization;
     let tier = match (account.has_claude_max, account.has_claude_pro) {
         (Some(true), _) => Some("max".to_string()),
         (_, Some(true)) => Some("pro".to_string()),
@@ -101,14 +126,16 @@ fn parse_profile(body: &str) -> Result<Profile, AuthError> {
         email,
         tier,
         display_name: account.display_name,
-        org_name: parsed.organization.name,
-        org_uuid: parsed.organization.uuid.filter(|u| !u.is_empty()),
+        org_name: organization.name,
+        org_uuid: organization.uuid.filter(|u| !u.is_empty()),
         has_claude_max: account.has_claude_max,
         has_claude_pro: account.has_claude_pro,
-        rate_limit_tier: parsed
-            .organization
+        rate_limit_tier: organization
             .rate_limit_tier
             .filter(|t| !t.trim().is_empty()),
+        organization_type: present(organization.organization_type),
+        plan_display_name: present(organization.plan_display_name),
+        seat_tier: present(organization.seat_tier),
     })
 }
 
@@ -155,6 +182,42 @@ mod tests {
         let blank =
             r#"{"account":{"uuid":"u","email":"e"},"organization":{"rate_limit_tier":" "}}"#;
         assert_eq!(parse_profile(blank).unwrap().rate_limit_tier, None);
+    }
+
+    /// `.prd/25` amendment 2026-11-16: whether the login is a personal
+    /// subscription or a team seat rides on `organization.organization_type`
+    /// (live shape measured 2026-11-16 on Max x20 accounts: `claude_max`,
+    /// `plan_display_name` `Ultra`, `seat_tier` null). A team seat carries
+    /// `claude_team` and its seat tier.
+    #[test]
+    fn parse_profile_reads_the_organization_type_display_name_and_seat() {
+        let personal = r#"{
+            "account": { "uuid": "u-4", "email": "d@x.com" },
+            "organization": {
+                "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x",
+                "plan_display_name": "Ultra", "seat_tier": null
+            }
+        }"#;
+        let profile = parse_profile(personal).unwrap();
+        assert_eq!(profile.organization_type.as_deref(), Some("claude_max"));
+        assert_eq!(profile.plan_display_name.as_deref(), Some("Ultra"));
+        assert_eq!(profile.seat_tier, None);
+
+        let team = r#"{
+            "account": { "uuid": "u-5", "email": "e@x.com" },
+            "organization": {
+                "organization_type": "claude_team", "rate_limit_tier": "default_claude_max_5x",
+                "seat_tier": " team_premium "
+            }
+        }"#;
+        let profile = parse_profile(team).unwrap();
+        assert_eq!(profile.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(profile.seat_tier.as_deref(), Some("team_premium"));
+        assert_eq!(profile.plan_display_name, None);
+
+        let blank =
+            r#"{"account":{"uuid":"u","email":"e"},"organization":{"organization_type":"  "}}"#;
+        assert_eq!(parse_profile(blank).unwrap().organization_type, None);
     }
 
     #[test]

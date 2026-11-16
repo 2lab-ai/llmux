@@ -69,6 +69,14 @@ const NAME_COL_MAX: u16 = 20;
 /// the row (the full id is in the detail pane), while a table ratatui shaves
 /// column-by-column reads `gr`/`CO`.
 const NAME_COL_MIN: u16 = 7;
+/// Max width of the `plan` column (`.prd/25` amendment 2026-11-16): the
+/// widest label llmux writes (`enterprise`). The column is as wide as the
+/// widest label on screen, never narrower than its header word.
+const PLAN_COL_MAX: u16 = 10;
+/// Floor of the `plan` column: the header word `plan`.
+const PLAN_COL_MIN: u16 = 4;
+/// Width of the `type` column: `personal` (the widest cell; `team`, `?`, `-`).
+const TYPE_COL_WIDTH: u16 = 8;
 /// Width of the reset-inventory column (.prd/16): 3 columns hold the header
 /// (`rst`) and every realistic cell — `?`, `—`, `3`, `3*`, `12` — so the
 /// column survives the narrow layout, where the width budget is tight.
@@ -4308,6 +4316,22 @@ fn account_modal_lines(
             yes_no(triage::urgent(account, gate)),
         ),
     ));
+    // Plan (`.prd/25`, amended 2026-11-16): the label and personal / team,
+    // then the upstream values they are read from.
+    if super::view::has_plan(account.credential_kind) {
+        let plan = view.plans.get(&account.id.0);
+        let summary = plan.and_then(super::view::plan_summary);
+        let source = plan.and_then(super::view::plan_source_detail);
+        rows.push(ModalRow::field(
+            "plan",
+            match (summary, source) {
+                (Some(summary), Some(source)) => format!("{summary} · {source}"),
+                (Some(summary), None) => summary,
+                (None, Some(source)) => source,
+                (None, None) => "unknown — the daemon reads it from the provider".to_string(),
+            },
+        ));
+    }
     rows.push(ModalRow::field(
         "order",
         match pos {
@@ -5994,6 +6018,11 @@ struct TableLayout {
     show_resets: bool,
     /// The wide column set (`req` / `tok`).
     wide: bool,
+    /// The `plan` column and its width (`.prd/25` amendment 2026-11-16).
+    show_plan: bool,
+    plan_width: u16,
+    /// The `type` column (personal / team).
+    show_type: bool,
     name_width: u16,
     status_width: u16,
     /// Each stretchy gauge's bar width, and its whole cell's width.
@@ -6030,6 +6059,28 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
         .unwrap_or(0)
         .max("account".len()) as u16)
         .min(NAME_COL_MAX);
+    // `plan` / `type` (`.prd/25` amendment 2026-11-16): shown only when the
+    // daemon reports a plan label or type for some account (an older daemon's
+    // table is unchanged; a record of upstream values alone does not count),
+    // `type` only when some plan says personal or team. The plan
+    // column is as wide as the widest label on screen.
+    let plan_wanted = view
+        .plans
+        .values()
+        .any(|p| p.label.is_some() || p.account_type.is_some());
+    let type_wanted = view.plans.values().any(|p| p.account_type.is_some());
+    let plan_width = (ctx
+        .order
+        .iter()
+        .map(|&idx| {
+            let account = &snapshot.accounts[idx];
+            super::view::plan_cell(view.plans.get(&account.id.0), account.credential_kind)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0) as u16)
+        .clamp(PLAN_COL_MIN, PLAN_COL_MAX);
     // Minimum width of the whole row (.prd/18): every column at its floor —
     // the stretchy gauges at QUOTA_CELL_WIDTH, `status` and `account` at
     // whatever width is being tried — plus the one-column gap between each
@@ -6046,7 +6097,13 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
     // never gives way (.prd/18 rule 3 — the old compact `F 22h!` marker and
     // its narrow drop are gone).
     let n_gauges = 1 + show_fable as usize;
-    let row_min = |wide: bool, status_w: usize, name_w: usize| -> usize {
+    // `plan` / `type` widths when shown, each with its inter-column gap.
+    let plan_cols = |plan: bool, kind: bool| -> usize {
+        let plan = if plan { plan_width as usize + 1 } else { 0 };
+        let kind = if kind { TYPE_COL_WIDTH as usize + 1 } else { 0 };
+        plan + kind
+    };
+    let row_min_with = |wide: bool, status_w: usize, name_w: usize, plan: bool, kind: bool| {
         let (fixed, base_cols) = if wide { (27, 8) } else { (14, 6) };
         let width = fixed
             + status_w
@@ -6058,7 +6115,7 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
                 0
             };
         let ncols = base_cols + n_gauges + show_resets as usize;
-        width + (ncols - 1)
+        width + (ncols - 1) + plan_cols(plan, kind)
     };
     let avail = width as usize;
     // The wide column set is used whenever it actually FITS (Z 2026-07-13:
@@ -6068,14 +6125,36 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
     // at the width its content wants — so the set flips only when req/tok
     // genuinely have no room, and the wide set never buys itself room by
     // clipping names. WIDE_TABLE_AT now governs only the models table.
-    let wide = row_min(true, STATUS_COL_MIN, name_wanted as usize) <= avail;
+    //
+    // `plan` / `type` count toward that fit: the operator asked for them
+    // (2026-11-16), so they outrank `req` / `tok`.
+    let wide = row_min_with(
+        true,
+        STATUS_COL_MIN,
+        name_wanted as usize,
+        plan_wanted,
+        type_wanted,
+    ) <= avail;
+    // Then, in the chosen set, `type` gives way before `plan`, and both
+    // before the `account` column shrinks: each is kept only while the row
+    // fits with `status` at its floor and the name at its full width.
+    let show_plan = plan_wanted
+        && row_min_with(wide, STATUS_COL_MIN, name_wanted as usize, true, false) <= avail;
+    let show_type = type_wanted
+        && show_plan
+        && row_min_with(wide, STATUS_COL_MIN, name_wanted as usize, true, true) <= avail;
+    let row_min = |wide: bool, status_w: usize, name_w: usize| {
+        row_min_with(wide, status_w, name_w, show_plan, show_type)
+    };
     // Give-way order (.prd/18 rule 4, owner 2026-09-18 "status 창부터 줄여줘
     // (최소칸 8칸)"; the `5h` stub that dropped second is gone, owner
-    // 2026-11-04), each step taken only when the one before it was not enough:
+    // 2026-11-04; `type` / `plan` added 2026-11-16), each step taken only when
+    // the one before it was not enough:
     //   1. `status` shrinks 20 → 8,
-    //   2. the `account` column shrinks to NAME_COL_MIN (names clip; the full
+    //   2. `type` drops, then `plan` drops (the detail pane keeps both),
+    //   3. the `account` column shrinks to NAME_COL_MIN (names clip; the full
     //      id stays in the detail pane),
-    //   3. below that the table clips as it always did — ratatui shaves the
+    //   4. below that the table clips as it always did — ratatui shaves the
     //      columns. Narrow minimum with Fbl + `rst` on = 74 cols (14 + 8 + 7 +
     //      2×17 + 3 + 8 spaces), 70 without `rst`.
     // The gauges never give way: `7d` and `7d Fbl` keep QUOTA_CELL_WIDTH at
@@ -6103,6 +6182,9 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
         show_fable,
         show_resets,
         wide,
+        show_plan,
+        plan_width,
+        show_type,
         name_width,
         status_width,
         bar_width,
@@ -6232,7 +6314,7 @@ fn draw_accounts_with(
     };
     let n_gauges = 1 + layout.show_fable as usize;
     let (header, constraints): (Vec<Cell<'static>>, Vec<Constraint>) = {
-        let mut header: Vec<Cell<'static>> = ["", "group", "#", "account", "status"]
+        let mut header: Vec<Cell<'static>> = ["", "group", "#", "account"]
             .into_iter()
             .map(Cell::from)
             .collect();
@@ -6241,8 +6323,19 @@ fn draw_accounts_with(
             Constraint::Length(7),
             Constraint::Length(2),
             Constraint::Length(layout.name_width),
-            Constraint::Length(layout.status_width),
         ];
+        // `plan` / `type` sit beside the account they describe (`.prd/25`
+        // amendment 2026-11-16).
+        if layout.show_plan {
+            header.push(Cell::from("plan"));
+            constraints.push(Constraint::Length(layout.plan_width));
+        }
+        if layout.show_type {
+            header.push(Cell::from("type"));
+            constraints.push(Constraint::Length(TYPE_COL_WIDTH));
+        }
+        header.push(Cell::from("status"));
+        constraints.push(Constraint::Length(layout.status_width));
         for title in ["7d RESET", "7d Fbl RESET"].into_iter().take(n_gauges) {
             header.push(Cell::from(format!(
                 "{title:<width$}{quota_label}",
@@ -6649,6 +6742,10 @@ struct RowParts {
     group: Span<'static>,
     number: Span<'static>,
     name: Span<'static>,
+    /// Present when the `plan` column is shown.
+    plan: Option<Span<'static>>,
+    /// Present when the `type` column is shown.
+    kind: Option<Span<'static>>,
     status: Span<'static>,
     seven: GaugeParts,
     /// Present when the `7d Fbl` column is on.
@@ -6774,6 +6871,28 @@ fn account_row_parts(
         };
         Span::styled(label, style)
     });
+    // Plan / type (`.prd/25` amendment 2026-11-16), in the slots the
+    // header/constraints reserve. A team seat is colored so it stands out from
+    // personal subscriptions; unknown (`?`) and n/a (`-`) are dimmed.
+    let plan_entry = view.plans.get(&account.id.0);
+    let plan = layout.show_plan.then(|| {
+        let label = super::view::plan_cell(plan_entry, account.credential_kind);
+        let style = if matches!(label.as_str(), "?" | "-") {
+            dim()
+        } else {
+            Style::new()
+        };
+        Span::styled(label, style)
+    });
+    let kind = layout.show_type.then(|| {
+        let label = super::view::type_cell(plan_entry, account.credential_kind);
+        let style = match label {
+            "team" => Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
+            "personal" => Style::new(),
+            _ => dim(),
+        };
+        Span::styled(label, style)
+    });
     RowParts {
         marker,
         group: Span::styled(
@@ -6782,6 +6901,8 @@ fn account_row_parts(
         ),
         number: Span::styled(format!("{}", pos + 1), dim()),
         name,
+        plan,
+        kind,
         status: status_span(account, gate, is_current, params, now, ctx.frame),
         seven,
         fable,
@@ -6804,8 +6925,10 @@ fn account_row(parts: RowParts, bar_width: usize) -> Row<'static> {
         Cell::from(parts.group),
         Cell::from(parts.number),
         Cell::from(parts.name),
-        Cell::from(parts.status),
     ];
+    cells.extend(parts.plan.map(Cell::from));
+    cells.extend(parts.kind.map(Cell::from));
+    cells.push(Cell::from(parts.status));
     cells.push(parts.seven.cell(bar_width));
     cells.extend(parts.fable.map(|fable| fable.cell(bar_width)));
     cells.extend(parts.resets.map(Cell::from));
@@ -6968,7 +7091,9 @@ impl FoldBounds {
 /// An account's fold entry: its table cells as fields, in column order —
 /// each gauge becomes its reset text and its percent label (marks and
 /// colors kept, only the fill bar goes), and the status field is left out
-/// when the label column shows the status every member shares.
+/// when the label column shows the status every member shares. The `plan` /
+/// `type` cells stay out: the fold packs spent accounts by their windows, and
+/// the detail pane names the plan of whichever one is selected.
 fn fold_fields(parts: RowParts, with_status: bool, bounds: &FoldBounds) -> Vec<FoldField> {
     let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| {
         let field = packed_grid::Field::new(spans);
@@ -7951,7 +8076,10 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
             let mut spans = detail_name_spans(
                 masked_name(&a.id.0, mask),
                 a.credential_kind,
-                view.plans.get(&a.id.0).map(String::as_str),
+                view.plans
+                    .get(&a.id.0)
+                    .and_then(super::view::plan_summary)
+                    .as_deref(),
             );
             spans.push(Span::raw(order.clone()));
             Line::from(spans).width() + status
@@ -8796,7 +8924,10 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
     let name = detail_name_spans(
         masked_name(&account.id.0, ctx.mask),
         account.credential_kind,
-        view.plans.get(&account.id.0).map(String::as_str),
+        view.plans
+            .get(&account.id.0)
+            .and_then(super::view::plan_summary)
+            .as_deref(),
     );
     let status = status_span(account, gate, is_current, params, now, ctx.frame);
     let token = detail_token_line(account, view.refresh_ahead, now, ctx.tz_offset);
@@ -8897,7 +9028,8 @@ fn history_failure_lines(
 }
 
 /// ` {id}` bold + ` · {kind}` dim, then ` · {plan}` when the daemon knows the
-/// account's subscription plan (`.prd/25`) — the detail pane's first line.
+/// account's subscription plan (`.prd/25`; `max20 personal`, `max5 team` —
+/// [`super::view::plan_summary`]) — the detail pane's first line.
 fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
@@ -13801,9 +13933,224 @@ mod tests {
         chrome.mode = Mode::Select { idx: codex_pos };
         let before = render_rows(&view, &chrome, 160, 30).join("\n");
         assert!(!before.contains("· promax"), "{before}");
-        view.plans.insert(codex_name, "promax".to_string());
+        view.plans.insert(
+            codex_name,
+            crate::proxy::plans::AccountPlan::codex("promax"),
+        );
         let after = render_rows(&view, &chrome, 160, 30).join("\n");
-        assert!(after.contains("· codex · promax"), "{after}");
+        assert!(after.contains("· codex · promax personal"), "{after}");
+    }
+
+    /// A Claude Team seat with a Max x5 tier (`.prd/25` amendment 2026-11-16).
+    fn team_seat_plan() -> crate::proxy::plans::AccountPlan {
+        crate::proxy::plans::AccountPlan {
+            label: Some("max5".into()),
+            rate_limit_tier: Some("default_claude_max_5x".into()),
+            plan_type: None,
+            account_type: Some(crate::auth::plan::AccountType::Team),
+            organization_type: Some("claude_team".into()),
+            plan_name: Some("Team".into()),
+            seat_tier: Some("premium".into()),
+        }
+    }
+
+    /// `usage_control_view` with a plan on every plan-capable account: the
+    /// first Claude account a team seat (any further one personal Max x20),
+    /// Codex personal promax.
+    fn plan_view() -> DashboardView {
+        let mut view = usage_control_view();
+        let mut seat_given = false;
+        for account in &view.snapshot.accounts {
+            let plan = match account.credential_kind {
+                "oauth" if !seat_given => {
+                    seat_given = true;
+                    team_seat_plan()
+                }
+                "oauth" => crate::proxy::plans::AccountPlan {
+                    account_type: Some(crate::auth::plan::AccountType::Personal),
+                    organization_type: Some("claude_max".into()),
+                    ..crate::proxy::plans::AccountPlan::claude("default_claude_max_20x")
+                },
+                "codex" => crate::proxy::plans::AccountPlan::codex("promax"),
+                _ => continue,
+            };
+            view.plans.insert(account.id.0.clone(), plan);
+        }
+        assert!(seat_given, "the fixture has a Claude oauth account");
+        view
+    }
+
+    /// `.prd/25` amendment 2026-11-16 (owner: "tui랑 대시보드에 플랜 구분하고
+    /// 필드 추가해줘. 그리고 팀인지 개인인지도 표시해줘야함"): the accounts
+    /// table carries a `plan` and a `type` column beside the account name; a
+    /// team seat reads `team`, a personal subscription `personal`, a provider
+    /// without plans `-`.
+    #[test]
+    fn accounts_table_shows_the_plan_and_whether_it_is_a_team_seat() {
+        let view = plan_view();
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 30);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .expect("header row");
+        let col = |word: &str| {
+            header
+                .find(word)
+                .unwrap_or_else(|| panic!("{word}: {header}"))
+        };
+        assert!(col("account") < col("plan"), "{header}");
+        assert!(col("plan") < col("type"), "{header}");
+        assert!(col("type") < col("status"), "{header}");
+        // the team seat: max5 + team, in the plan / type columns
+        let seat = rows
+            .iter()
+            .find(|r| r.contains(" max5 ") && r.contains(" team "))
+            .unwrap_or_else(|| panic!("team seat row:\n{frame}"));
+        assert_eq!(
+            seat.find(" max5 ").map(|i| i + 1),
+            Some(col("plan")),
+            "{seat}\n{header}"
+        );
+        assert_eq!(
+            seat.find(" team ").map(|i| i + 1),
+            Some(col("type")),
+            "{seat}\n{header}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(" promax ") && r.contains(" personal ")),
+            "{frame}"
+        );
+    }
+
+    /// No plan reported at all (an older daemon): the table is the one it was
+    /// before — no `plan` / `type` columns.
+    #[test]
+    fn accounts_table_without_plans_has_no_plan_columns() {
+        let view = usage_control_view();
+        assert!(view.plans.is_empty());
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 30);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .expect("header row");
+        assert!(!header.contains("plan"), "{header}");
+        assert!(!header.contains("type"), "{header}");
+    }
+
+    /// Give-way (`.prd/18` amended 2026-11-16): as the pane narrows, `status`
+    /// shrinks first, then `type` drops, then `plan`, and only then does the
+    /// `account` column clip.
+    #[test]
+    fn plan_columns_give_way_after_status_and_before_the_account_name() {
+        let view = plan_view();
+        let ctx = frame_ctx(&view, &chrome_overlay(Overlay::Accounts));
+        let layout_at = |w: u16| table_layout(&view, &ctx, w);
+        // wide enough: everything, status at full width
+        let full = layout_at(220);
+        assert!(full.show_plan && full.show_type, "220");
+        assert_eq!(usize::from(full.status_width), STATUS_COL_MAX);
+        // walk down one column at a time and check the order of the steps
+        let mut saw_type_drop_at = None;
+        let mut saw_plan_drop_at = None;
+        let mut prev = full;
+        for w in (60..220).rev() {
+            let now = layout_at(w);
+            if prev.show_type && !now.show_type {
+                // type drops only once status is at its floor
+                assert_eq!(
+                    usize::from(prev.status_width),
+                    STATUS_COL_MIN,
+                    "type dropped at {w} before status hit its floor"
+                );
+                assert!(now.show_plan || !prev.show_plan, "{w}");
+                saw_type_drop_at.get_or_insert(w);
+            }
+            if prev.show_plan && !now.show_plan {
+                assert!(
+                    !prev.show_type,
+                    "plan dropped at {w} while type was still shown"
+                );
+                saw_plan_drop_at.get_or_insert(w);
+            }
+            if now.name_width < prev.name_width {
+                assert!(
+                    !now.show_plan && !now.show_type,
+                    "account shrank at {w} while plan/type still shown"
+                );
+            }
+            prev = now;
+        }
+        let (t, p) = (
+            saw_type_drop_at.expect("type drops"),
+            saw_plan_drop_at.expect("plan drops"),
+        );
+        assert!(t > p, "type ({t}) gives way before plan ({p})");
+    }
+
+    /// Review P2: a plan the daemon knows only by its upstream values (a tier
+    /// that names no plan) shows those values in the modal, not "unknown",
+    /// and does not by itself open the table's plan columns.
+    #[test]
+    fn account_modal_shows_upstream_values_of_an_unlabelled_plan() {
+        let mut view = usage_control_view();
+        let account = view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.credential_kind == "oauth")
+            .expect("oauth account")
+            .clone();
+        view.plans.insert(
+            account.id.0.clone(),
+            crate::proxy::plans::AccountPlan::claude("default_raven"),
+        );
+        let chrome = chrome_overlay(Overlay::Accounts);
+        let ctx = frame_ctx(&view, &chrome);
+        let text: String = account_modal_lines(&view, &ctx, &chrome, &account, 120)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(text.contains("plan:       tier default_raven"), "{text}");
+        let layout = table_layout(&view, &ctx, 220);
+        assert!(!layout.show_plan && !layout.show_type);
+    }
+
+    /// The account modal names the plan, personal / team and the upstream
+    /// values behind them.
+    #[test]
+    fn account_modal_names_the_plan_and_the_team_seat() {
+        let view = plan_view();
+        let seat = view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| view.plans.get(&a.id.0) == Some(&team_seat_plan()))
+            .expect("seat account")
+            .clone();
+        let chrome = chrome_overlay(Overlay::Accounts);
+        let ctx = frame_ctx(&view, &chrome);
+        let text: String = account_modal_lines(&view, &ctx, &chrome, &seat, 120)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            text.contains("max5 team · org claude_team · tier default_claude_max_5x · seat premium · named \"Team\""),
+            "{text}"
+        );
     }
 
     /// The accounts keybar advertises the two new affordances — and keeps

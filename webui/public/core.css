@@ -92,6 +92,8 @@
 .x-pill.warn{background:color-mix(in srgb,var(--x-warn) 15%,transparent);color:var(--x-warn)}
 .x-pill.bad{background:color-mix(in srgb,var(--x-bad) 13%,transparent);color:var(--x-bad)}
 .x-pill.mute{color:var(--x-ink3)}
+.x-pill.team{background:color-mix(in srgb,var(--x-accent) 15%,transparent);color:var(--x-accent)}
+.x-plan{font-family:var(--x-mono);font-size:12px}
 
 #x-toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,12px);opacity:0;z-index:999;background:#111;color:#fff;padding:10px 16px;border-radius:10px;font:500 13px/1.4 var(--x-sans);box-shadow:0 12px 30px rgba(0,0,0,.25);transition:opacity .18s ease-out,transform .18s cubic-bezier(.2,.8,.2,1);pointer-events:none}
 #x-toast.on{opacity:1;transform:translate(-50%,0)}

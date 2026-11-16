@@ -75,6 +75,11 @@ in the TUI or with `llmux keys`; the web page is read-only.
 On 계정 a benched account names its cause and fix (`Login expired 400 · sign in again`), and an account whose
 Claude login ends within 5 days says so (`Ready · login ends in 7h 59m · sign in again`) — the same verdicts as
 `llmux status` ([operational reference](operational-reference.md#login-expiry)).
+Its `plan` and `type` columns name each account's plan (`max20`, `max5`, `pro`, `team`, `promax`, …) and whether it is a
+personal subscription (`Personal`) or a seat in a team (`Team`, in the accent color); hovering the plan shows the
+upstream values it was read from (`org claude_team · tier default_claude_max_5x · …`). `?` means the daemon has not
+read the plan yet, `-` a provider without plans. The data is the daemon's own (`plan` on `/llmux/dashboard`), so an
+older daemon shows `?` under `type` ([operational reference](operational-reference.md#usage-controls-refresh--resets)).
 
 **On a phone.** Every control is a 44px target and every field is 16px text, so iOS does not zoom in when you
 type. The search takes its own line. The 계정 table and the 활동 log scroll sideways inside their panel; the page
