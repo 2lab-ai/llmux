@@ -3078,6 +3078,47 @@ mod tests {
         );
     }
 
+    /// An equally strong later verdict replaces the recorded one — cause,
+    /// status and time together (`AuthCause::rank`).
+    #[test]
+    fn an_equal_rank_verdict_replaces_the_recorded_one() {
+        use crate::auth_cause::{AuthCause, AuthFailure};
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let first = AuthFailure {
+            cause: AuthCause::AccountRejected,
+            at_ms: 1_000,
+        };
+        let second = AuthFailure {
+            cause: AuthCause::AccessSuspended,
+            at_ms: 2_000,
+        };
+        pool.write().record_auth_failure_with(
+            &id("a"),
+            Some(http::StatusCode::PAYMENT_REQUIRED),
+            Some(first),
+        );
+        pool.write().record_auth_failure_with(
+            &id("a"),
+            Some(http::StatusCode::FORBIDDEN),
+            Some(second),
+        );
+        let account = &pool.snapshot().accounts[0];
+        assert_eq!(account.auth_failure, Some(second));
+        assert_eq!(account.auth_failure_status, Some(403));
+        // …while a weaker one (same credential) leaves it untouched.
+        pool.write().record_auth_failure_with(
+            &id("a"),
+            Some(http::StatusCode::BAD_REQUEST),
+            Some(AuthFailure {
+                cause: AuthCause::LoginExpired,
+                at_ms: 3_000,
+            }),
+        );
+        let account = &pool.snapshot().accounts[0];
+        assert_eq!(account.auth_failure, Some(second));
+        assert_eq!(account.auth_failure_status, Some(403));
+    }
+
     #[test]
     fn auth_failure_status_is_credential_scoped_and_cleared_on_healing() {
         let account = oauth_account("a");

@@ -281,14 +281,19 @@ mod tests {
     }
 
     /// The web dashboard's Accounts view maps every cause id the daemon can
-    /// emit; a cause missing there falls back to "Sign-in failed".
+    /// emit; a cause missing there falls back to "Sign-in failed". Checked
+    /// inside the `X.AUTH_CAUSE = { … };` literal only, so a mention
+    /// elsewhere in the file (a comment) does not count. (The node test
+    /// `webui/test/core-auth.test.mjs` runs the loaded map itself.)
     #[test]
     fn web_dashboard_maps_every_cause_id() {
         let web = include_str!("../webui/public/core.js");
+        let start = web.find("X.AUTH_CAUSE = {").expect("AUTH_CAUSE map");
+        let map = &web[start..start + web[start..].find("};").expect("map end")];
         for cause in AuthCause::ALL {
             let id = serde_json::to_value(cause).expect("serialize");
             let key = format!("{}: [", id.as_str().expect("string id"));
-            assert!(web.contains(&key), "webui/public/core.js lacks {key}");
+            assert!(map.contains(&key), "X.AUTH_CAUSE lacks {key}");
         }
     }
 
