@@ -80,5 +80,12 @@ test('a login inside the warning window says when it ends', () => {
 });
 
 test('the web view warns in the same window as llmux status', () => {
-  assert.equal(loadCore().LOGIN_EXPIRY_WARN_S, daemonLoginWarnSecs());
+  const X = loadCore();
+  const warn = daemonLoginWarnSecs();
+  assert.equal(X.LOGIN_EXPIRY_WARN_S, warn);
+  // The cutoff itself: a minute inside the window warns, a minute outside does not.
+  const p = { seven_day_max: 0.99 };
+  const tone = (secs) => X.accountState({ healthy: true, login_expires_at_ms: Date.now() + secs * 1000 }, p)[2];
+  assert.equal(tone(warn - 60), 'warn', 'just inside the window');
+  assert.equal(tone(warn + 60), 'ok', 'just outside the window');
 });
