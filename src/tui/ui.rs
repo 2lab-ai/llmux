@@ -14110,13 +14110,7 @@ mod tests {
         let ctx = frame_ctx(&view, &chrome);
         let text: String = account_modal_lines(&view, &ctx, &chrome, &account, 120)
             .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-                    + "\n"
-            })
+            .map(|line| format!("{line}\n"))
             .collect();
         assert!(text.contains("plan:       tier default_raven"), "{text}");
         let layout = table_layout(&view, &ctx, 220);
@@ -14139,13 +14133,7 @@ mod tests {
         let ctx = frame_ctx(&view, &chrome);
         let text: String = account_modal_lines(&view, &ctx, &chrome, &seat, 120)
             .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-                    + "\n"
-            })
+            .map(|line| format!("{line}\n"))
             .collect();
         assert!(
             text.contains("max5 team · org claude_team · tier default_claude_max_5x · seat premium · named \"Team\""),
