@@ -1323,6 +1323,10 @@ history above. Ordinary inference 404 responses still relay and ordinary 503
 responses remain transient.
 A successful credential refresh or changed credentials on re-login clear the
 stored failure code and cause; late failures from replaced credentials cannot
-restore them.
+restore them. Once the token endpoint has given its verdict on a login
+(`login expired` / `rotated` / `revoked`, `refresh rejected`, `client
+rejected`), a later generic exclusion of the same credential — a usage read
+already in flight answering 403 — does not replace that cause, its status or
+its time.
 The numeric status and safe structured lifecycle receipts are included in account
 documents; provider bodies and credentials are omitted.

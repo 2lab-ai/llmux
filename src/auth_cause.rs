@@ -151,6 +151,21 @@ impl AuthCause {
         }
     }
 
+    /// Whether the token endpoint itself gave this verdict on the login (as
+    /// opposed to a request or usage read failing afterwards). Such a verdict
+    /// is the root cause; a later generic exclusion of the same credential
+    /// does not replace it.
+    pub fn is_refresh_verdict(self) -> bool {
+        matches!(
+            self,
+            AuthCause::LoginExpired
+                | AuthCause::LoginRotated
+                | AuthCause::LoginRevoked
+                | AuthCause::RefreshRejected
+                | AuthCause::ClientRejected
+        )
+    }
+
     /// Whether signing in again is the fix (it is for every login-side cause).
     pub fn needs_relogin(self) -> bool {
         !matches!(

@@ -723,9 +723,21 @@ impl PoolState {
     ) {
         self.clear_manual_pin_for(account);
         if let Some(acct) = self.account_mut(account) {
+            // A token-endpoint verdict (the login expired / rotated / was
+            // revoked) is the root cause; a later, more generic exclusion of
+            // the SAME credential — a usage poll that was already in flight
+            // answering 403 — is its symptom and must not replace it (or its
+            // status and time). A re-login clears the verdict first.
+            let keeps_root_cause = acct.health == AccountHealth::AuthFailed
+                && acct
+                    .auth_failure
+                    .is_some_and(|known| known.cause.is_refresh_verdict())
+                && !failure.is_some_and(|new| new.cause.is_refresh_verdict());
             acct.health = AccountHealth::AuthFailed;
-            acct.auth_failure_status = status.map(|code| code.as_u16());
-            acct.auth_failure = failure;
+            if !keeps_root_cause {
+                acct.auth_failure_status = status.map(|code| code.as_u16());
+                acct.auth_failure = failure;
+            }
         }
     }
 
@@ -2982,6 +2994,45 @@ mod tests {
             crate::auth_cause::AuthCause::TokenRejected
         ));
         assert!(!pool.snapshot().accounts[0].healthy);
+    }
+
+    /// A usage poll already in flight when the background refresh benched
+    /// the login as expired completes with a 403 for the same credential: the
+    /// expiry stays the reported cause (status and time too) — the 403 is
+    /// its symptom.
+    #[test]
+    fn late_usage_403_keeps_the_refresh_verdict() {
+        use crate::auth_cause::AuthCause;
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let fp = pool.fingerprint(&id("a")).expect("fingerprint");
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &fp,
+            Some(http::StatusCode::BAD_REQUEST),
+            AuthCause::LoginExpired,
+        ));
+        let first = pool.snapshot().accounts[0].auth_failure.expect("cause");
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &fp,
+            Some(http::StatusCode::FORBIDDEN),
+            AuthCause::UsageForbidden,
+        ));
+        let account = &pool.snapshot().accounts[0];
+        assert!(!account.healthy);
+        assert_eq!(account.auth_failure, Some(first));
+        assert_eq!(account.auth_failure_status, Some(400));
+        // A later token-endpoint verdict is new evidence and does replace it.
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &fp,
+            Some(http::StatusCode::BAD_REQUEST),
+            AuthCause::LoginRevoked,
+        ));
+        assert_eq!(
+            pool.snapshot().accounts[0].auth_failure.map(|f| f.cause),
+            Some(AuthCause::LoginRevoked)
+        );
     }
 
     #[test]

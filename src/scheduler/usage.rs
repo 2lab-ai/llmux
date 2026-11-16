@@ -1430,6 +1430,40 @@ mod tests {
         assert!(pool.snapshot().accounts[0].healthy);
     }
 
+    /// Skipping a benched account must not spend the shared poll slot or
+    /// stall the roster: with `a` and `b` scheduled, benching `a` between
+    /// ticks leaves the next slot to `b`, and `a` is not fetched even after
+    /// its old deadline.
+    #[tokio::test]
+    async fn benched_account_does_not_starve_the_healthy_roster() {
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        let fetcher = MockFetcher::new(Vec::new());
+        let mut poller = UsagePoller::with_fetcher(
+            pool.clone(),
+            &fetcher,
+            "http://x".into(),
+            GROK_UPSTREAM.into(),
+            config(),
+        );
+        poller.prime(now()).await;
+        assert_eq!(fetcher.call_count(), 2, "both scheduled and primed");
+        let a_deadline = poller.schedule[&id("a")].next_at;
+        pool.record_auth_failure(&id("a"), Some(http::StatusCode::BAD_REQUEST));
+        let calls_before = fetcher.calls.lock().unwrap().len();
+        let mut t = now() + MIN_POLL_GAP;
+        let end = a_deadline.max(poller.schedule[&id("b")].next_at) + Duration::from_secs(1_800);
+        while t <= end {
+            poller.tick(t).await;
+            t += MIN_POLL_GAP;
+        }
+        let tokens: Vec<String> = fetcher.calls.lock().unwrap()[calls_before..].to_vec();
+        assert!(!tokens.is_empty(), "b keeps being polled");
+        assert!(
+            tokens.iter().all(|token| token == "at-b"),
+            "only the healthy account is fetched: {tokens:?}"
+        );
+    }
+
     /// The healthy → benched transition: a scheduled account whose usage
     /// read answers 403 is benched as `usage_forbidden`, and from then on it
     /// takes no poll slot — not even after its retry deadline — until a
