@@ -157,7 +157,7 @@
     token_rejected: ['Token rejected', 'sign in again'],
     key_rejected: ['Key rejected', 'add a valid key'],
     account_rejected: ['Account rejected', 'check the account'],
-    access_suspended: ['Access suspended', 'contact the provider'],
+    access_suspended: ['Access suspended', 'resolve with the provider, then sign in again'],
     usage_forbidden: ['Usage forbidden', 'sign in again'],
     provider_error: ['Provider error', 'check the daemon log'],
   };

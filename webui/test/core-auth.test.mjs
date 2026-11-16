@@ -27,6 +27,8 @@ test('a classified auth failure names its cause and fix', () => {
     'Login expired 400 · sign in again');
   assert.equal(state({ auth_failure_status: 401, auth_failure: { cause: 'key_rejected', at_ms: 1 } }),
     'Key rejected 401 · add a valid key');
+  assert.equal(state({ auth_failure_status: 403, auth_failure: { cause: 'access_suspended', at_ms: 1 } }),
+    'Access suspended 403 · resolve with the provider, then sign in again');
   assert.equal(state({ auth_failure_status: 401 }), 'Sign-in failed 401', 'older daemon: no cause');
   assert.equal(state({ auth_failure: { cause: 'from_the_future', at_ms: 1 } }), 'Unhealthy', 'unknown cause');
 });
