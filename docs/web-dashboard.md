@@ -76,6 +76,10 @@ On 계정 a benched account names its cause and fix (`Login expired 400 · sign 
 Claude login ends within 5 days says so (`Ready · login ends in 7h 59m · sign in again`) — the same verdicts as
 `llmux status` ([operational reference](operational-reference.md#login-expiry)).
 
+**On a phone.** Every control is a 44px target and every field is 16px text, so iOS does not zoom in when you
+type. The search takes its own line. The 계정 table and the 활동 log scroll sideways inside their panel; the page
+itself does not. Status words (`Serving`, `Ready · login ends in …`, errors) meet 4.5:1 contrast in both themes.
+
 ## Numbers
 
 - Window usage on 사용자 comes from the daemon and is exact.

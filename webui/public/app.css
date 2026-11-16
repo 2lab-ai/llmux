@@ -6,7 +6,7 @@ main { padding: 8px 20px 48px; transition: margin-right var(--ui-dur-move, .32s)
 .offline { margin: 8px 20px 0; padding: 8px 12px; border-radius: 10px; background: color-mix(in srgb, var(--ui-st-fail) 12%, var(--ui-surface)); color: var(--ui-text); font-size: 13px; }
 .hint { color: var(--ui-text-tertiary); font-size: 12.5px; }
 .bad { color: var(--ui-st-fail-text, var(--ui-red)); font-weight: 600; }
-.warn { color: var(--ui-st-wait); font-weight: 600; }
+.warn { color: color-mix(in srgb, var(--ui-st-wait) 70%, var(--ui-text)); font-weight: 600; }
 
 /* toolbar */
 .tb { display: flex; flex-direction: column; gap: 10px; margin: 6px 0 14px; }
@@ -16,10 +16,15 @@ main { padding: 8px 20px 48px; transition: margin-right var(--ui-dur-move, .32s)
 .crumb small { font-weight: 500; font-size: 13px; color: var(--ui-text-tertiary); margin-left: 6px; }
 .search { width: 240px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.uchip { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 11px; border-radius: 999px; border: 1px solid var(--ui-ib-card-border); background: var(--ui-surface); cursor: pointer; font-size: 13px; transition: background var(--ui-dur-press, .16s); }
+.uchip { --uchip-h: 30px; display: inline-flex; align-items: center; gap: 6px; height: var(--uchip-h); padding: 0 11px; border-radius: 999px; border: 1px solid var(--ui-ib-card-border); background: var(--ui-surface); cursor: pointer; font-size: 13px; transition: background var(--ui-dur-press, .16s); }
 .uchip:hover { background: var(--ui-surface-raised); }
 .uchip.on { background: var(--ui-text); color: var(--ui-bg); border-color: var(--ui-text); }
-.uchip b { font: 600 11.5px/1 var(--ui-mono); padding: 3px 6px; border-radius: 6px; background: color-mix(in srgb, var(--ui-st-run) 16%, transparent); color: var(--ui-st-run); }
+.uchip b { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; font: 600 11.5px/1 var(--ui-mono); border-radius: 999px; background: color-mix(in srgb, var(--ui-st-run) 16%, transparent); color: color-mix(in srgb, var(--ui-st-run) 70%, var(--ui-text)); }
+/* The count ends the pill: it sits as far from the right edge as from the top (Haz: even margins), and its pill is
+   concentric with the chip's. Inner height = the chip less its 1px borders. */
+.uchip:has(> b) { padding-right: calc((var(--uchip-h) - 2px - 18px) / 2); }
+/* The same at the start: a chip that opens with its 8px colour dot keeps it as far from the left edge as from the top. */
+.uchip:has(> .dot:first-child) { padding-left: calc((var(--uchip-h) - 2px - 8px) / 2); }
 .uchip.on b { background: color-mix(in srgb, var(--ui-bg) 25%, transparent); color: inherit; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ui-text-tertiary); flex: none; }
 .dot[data-hue="0"], .av[data-hue="0"] { --hue: var(--ui-accent); } .dot[data-hue="1"], .av[data-hue="1"] { --hue: var(--ui-yellow); }
@@ -27,13 +32,13 @@ main { padding: 8px 20px 48px; transition: margin-right var(--ui-dur-move, .32s)
 .dot[data-hue="4"], .av[data-hue="4"] { --hue: var(--ui-purple); } .dot[data-hue="5"], .av[data-hue="5"] { --hue: var(--ui-orange); }
 .dot[data-hue="6"], .av[data-hue="6"] { --hue: color-mix(in srgb, var(--ui-green) 50%, var(--ui-accent)); } .dot[data-hue="7"], .av[data-hue="7"] { --hue: var(--ui-text-tertiary); }
 .dot[data-hue] { background: var(--hue); }
-.attn { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 10px; border-radius: 12px; background: color-mix(in srgb, var(--ui-st-wait) 10%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-st-wait) 30%, var(--ui-ib-card-border)); }
+.attn { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px; border-radius: 16px; background: color-mix(in srgb, var(--ui-st-wait) 10%, var(--ui-surface)); border: 1px solid color-mix(in srgb, var(--ui-st-wait) 30%, var(--ui-ib-card-border)); }
 .attn[hidden] { display: none; }
-.attn-h { font-weight: 650; font-size: 13px; margin-right: 4px; }
+.attn-h { font-weight: 650; font-size: 13px; margin-right: 2px; }
 .attn-i { border: 0; background: var(--ui-surface); border-radius: 8px; padding: 5px 9px; font-size: 12.5px; cursor: pointer; max-width: 460px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-shadow: var(--ui-ib-shadow); }
 .attn-i .bad, .attn-i .warn { margin-left: 4px; }
-.auxline { display: flex; gap: 10px; align-items: baseline; font-size: 12.5px; }
-.linkish { border: 0; background: none; padding: 0; color: var(--ui-accent); cursor: pointer; font-size: 12.5px; }
+.auxline { display: flex; flex-wrap: wrap; gap: 0 10px; align-items: center; font-size: 12.5px; }
+.linkish { display: inline-flex; align-items: center; min-height: 24px; border: 0; background: none; padding: 0; color: var(--ui-accent); cursor: pointer; font-size: 12.5px; white-space: nowrap; }
 ui-agent-inbox { display: block; }
 
 /* drawer content */
@@ -98,7 +103,12 @@ ui-agent-inbox { display: block; }
 #ubody ui-bar-chart, #ubody ui-stat-strip { display: block; }
 
 /* activity / accounts (core.js) on the ui tokens */
-#v-activity, #v-accounts { --x-bg: var(--ui-surface); --x-panel: var(--ui-surface-raised); --x-line: var(--ui-border); --x-ink: var(--ui-text); --x-ink2: var(--ui-text-secondary); --x-ink3: var(--ui-text-tertiary); --x-sans: var(--ui-font); --x-mono: var(--ui-mono); }
+#v-activity, #v-accounts { --x-bg: var(--ui-surface); --x-panel: var(--ui-surface-raised); --x-line: var(--ui-border); --x-ink: var(--ui-text); --x-ink2: var(--ui-text-secondary); --x-ink3: var(--ui-text-tertiary); --x-sans: var(--ui-font); --x-mono: var(--ui-mono);
+  /* Status words in both themes: the status tone 70% toward the ink (≥ 4.5:1, the kit's toned-chip rule); the primary
+     button is the kit's ink primary. The drafts' raw #1f9d55 / #c27c0e / #e5484d / #d97757 read 2.7–3.9:1 here. The
+     wait tone goes 60%: on its own 15% tint a 70% mix read 4.4:1. */
+  --x-good: color-mix(in srgb, var(--ui-st-done) 70%, var(--ui-text)); --x-warn: color-mix(in srgb, var(--ui-st-wait) 60%, var(--ui-text));
+  --x-bad: var(--ui-st-fail-text, var(--ui-red)); --x-run: color-mix(in srgb, var(--ui-st-run) 70%, var(--ui-text)); --x-accent: var(--ui-text); }
 .x-panel { background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 14px; margin-bottom: 14px; }
 #raw-body .x-raw { padding: 4px 0; }
 
@@ -154,3 +164,20 @@ details.rv-hd > summary { cursor: pointer; }
 .rruns > ui-task-runs + ui-task-runs { margin-top: 2px; }
 .rmore { display: flex; gap: 10px; align-items: center; justify-content: center; flex-wrap: wrap; min-height: 44px; margin: 6px 0 10px; }
 .rmore .ui-btn { padding: 4px 12px; font-size: 12.5px; }
+
+/* ── polishing-ui pass (2026-11-16): measured on desktop 1440×900 and a 390×844 touch phone ── */
+/* A phone: the search takes its own full line under Board | List's origin switch (it was a 240px field on a 366px row),
+   and a wide table or log scrolls inside its panel instead of pushing the page sideways (accounts 1181px, activity
+   679px on a 390px screen). */
+@media (max-width: 639px) {
+  .search { flex: 1 1 100%; width: auto; }
+  #accounts, #acts, #act-raw { overflow-x: auto; }
+}
+/* Touch: every control is a 44px target (HIG iOS default control); fields are 16px so iOS does not zoom into them. */
+@media (pointer: coarse) {
+  .uchip { --uchip-h: 44px; padding-left: 14px; }
+  .attn-i { min-height: 44px; } /* a button centres its line itself; flex would drop the space after the name and the ellipsis */
+  .linkish { min-height: 44px; }
+  .x-toolbar button, .x-acts button, .x-filter { min-height: 44px; }
+  .x-filter { font-size: 16px; }
+}
