@@ -71,6 +71,20 @@ pub fn codex_account_type(plan_type: &str) -> Option<AccountType> {
         .then_some(AccountType::Personal)
 }
 
+/// One-phrase plan summary: `max20 personal`, `max5 team`, `team` (a label
+/// that already says the type is not repeated); either half alone when only
+/// one is known; `None` when neither is. The one formatter behind the
+/// `llmux status` line, the TUI detail pane and the account modal.
+pub fn plan_summary(label: Option<&str>, kind: Option<&str>) -> Option<String> {
+    match (label, kind) {
+        (Some(label), Some(kind)) if label == kind => Some(label.to_string()),
+        (Some(label), Some(kind)) => Some(format!("{label} {kind}")),
+        (Some(label), None) => Some(label.to_string()),
+        (None, Some(kind)) => Some(kind.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Short display label of a Claude login: the `rate_limit_tier` label when it
 /// names a plan ([`claude_label`]), else the plan word of the
 /// `organization_type` — `team`, `enterprise`, `pro`, `max` — so a team seat
@@ -238,6 +252,24 @@ mod tests {
         }
         assert_eq!(codex_account_type("unknown"), None);
         assert_eq!(codex_account_type(""), None);
+    }
+
+    #[test]
+    fn plan_summary_joins_label_and_type_without_repeating() {
+        assert_eq!(
+            plan_summary(Some("max5"), Some("team")).as_deref(),
+            Some("max5 team")
+        );
+        assert_eq!(
+            plan_summary(Some("team"), Some("team")).as_deref(),
+            Some("team")
+        );
+        assert_eq!(plan_summary(Some("max20"), None).as_deref(), Some("max20"));
+        assert_eq!(
+            plan_summary(None, Some("personal")).as_deref(),
+            Some("personal")
+        );
+        assert_eq!(plan_summary(None, None), None);
     }
 
     #[test]

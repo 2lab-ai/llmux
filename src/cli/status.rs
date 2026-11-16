@@ -314,14 +314,7 @@ fn action_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
 fn quota_summary(account: &serde_json::Value) -> Option<String> {
     let label = account["plan"].as_str().filter(|p| !p.is_empty());
     let kind = account["account_type"].as_str().filter(|k| !k.is_empty());
-    let plan = match (label, kind) {
-        // A plan word that already says it (`team`) is not repeated.
-        (Some(label), Some(kind)) if label == kind => Some(label.to_string()),
-        (Some(label), Some(kind)) => Some(format!("{label} {kind}")),
-        (Some(label), None) => Some(label.to_string()),
-        (None, Some(kind)) => Some(kind.to_string()),
-        (None, None) => None,
-    };
+    let plan = crate::auth::plan::plan_summary(label, kind);
     let left = account["seven_day"]["utilization"].as_f64().map(|used| {
         format!(
             "7d {}% left",
@@ -330,7 +323,7 @@ fn quota_summary(account: &serde_json::Value) -> Option<String> {
     });
     match (plan, left) {
         (Some(plan), Some(left)) => Some(format!("{plan} · {left}")),
-        (Some(plan), None) => Some(plan.to_string()),
+        (Some(plan), None) => Some(plan),
         (None, Some(left)) => Some(left),
         (None, None) => None,
     }

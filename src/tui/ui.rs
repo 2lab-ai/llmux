@@ -6060,10 +6060,14 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
         .max("account".len()) as u16)
         .min(NAME_COL_MAX);
     // `plan` / `type` (`.prd/25` amendment 2026-11-16): shown only when the
-    // daemon reports a plan for some account (an older daemon's table is
-    // unchanged), `type` only when some plan says personal or team. The plan
+    // daemon reports a plan label or type for some account (an older daemon's
+    // table is unchanged; a record of upstream values alone does not count),
+    // `type` only when some plan says personal or team. The plan
     // column is as wide as the widest label on screen.
-    let plan_wanted = !view.plans.is_empty();
+    let plan_wanted = view
+        .plans
+        .values()
+        .any(|p| p.label.is_some() || p.account_type.is_some());
     let type_wanted = view.plans.values().any(|p| p.account_type.is_some());
     let plan_width = (ctx
         .order
@@ -14083,6 +14087,40 @@ mod tests {
             saw_plan_drop_at.expect("plan drops"),
         );
         assert!(t > p, "type ({t}) gives way before plan ({p})");
+    }
+
+    /// Review P2: a plan the daemon knows only by its upstream values (a tier
+    /// that names no plan) shows those values in the modal, not "unknown",
+    /// and does not by itself open the table's plan columns.
+    #[test]
+    fn account_modal_shows_upstream_values_of_an_unlabelled_plan() {
+        let mut view = usage_control_view();
+        let account = view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.credential_kind == "oauth")
+            .expect("oauth account")
+            .clone();
+        view.plans.insert(
+            account.id.0.clone(),
+            crate::proxy::plans::AccountPlan::claude("default_raven"),
+        );
+        let chrome = chrome_overlay(Overlay::Accounts);
+        let ctx = frame_ctx(&view, &chrome);
+        let text: String = account_modal_lines(&view, &ctx, &chrome, &account, 120)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(text.contains("plan:       tier default_raven"), "{text}");
+        let layout = table_layout(&view, &ctx, 220);
+        assert!(!layout.show_plan && !layout.show_type);
     }
 
     /// The account modal names the plan, personal / team and the upstream

@@ -397,6 +397,17 @@ mod tests {
         assert_eq!(bare.label.as_deref(), Some("max20"));
         assert_eq!(bare.account_type, None);
 
+        // organization type only (no tier): still a plan, labelled by the
+        // organization's plan word (review P2)
+        let org_only =
+            AccountPlan::from_claude_profile(&profile(None, Some("claude_team"))).unwrap();
+        assert_eq!(org_only.label.as_deref(), Some("team"));
+        assert_eq!(
+            org_only.account_type,
+            Some(crate::auth::plan::AccountType::Team)
+        );
+        assert_eq!(org_only.rate_limit_tier, None);
+
         assert_eq!(AccountPlan::from_claude_profile(&profile(None, None)), None);
     }
 

@@ -137,7 +137,8 @@ pub(crate) struct DashboardView {
     /// Subscription plan per account name (`.prd/25`): its label, whether it
     /// is a personal subscription or a team seat (amended 2026-11-16) and the
     /// upstream values they come from, carried on the document. An account
-    /// with no entry has no known plan.
+    /// with no entry has no known plan; an entry may carry upstream values
+    /// only (no label, no type).
     pub plans: std::collections::BTreeMap<String, crate::proxy::plans::AccountPlan>,
     pub auth_history: std::collections::BTreeMap<String, Vec<crate::account_history::AccountEvent>>,
     /// Rolling 5-minute status-class counts for the header health verdict
@@ -492,15 +493,14 @@ impl DashboardView {
                 .iter()
                 .map(|a| (a.name.clone(), a.auth_history.clone()))
                 .collect(),
+            // Every plan record the daemon sent, even one with only upstream
+            // values (no label, no type): the account modal still shows those.
+            // Whether the table's columns appear is decided from the labels
+            // and types (`ui::table_layout`), not from the record count.
             plans: doc
                 .accounts
                 .iter()
-                .filter_map(|a| {
-                    a.plan
-                        .as_ref()
-                        .filter(|p| p.label.is_some() || p.account_type.is_some())
-                        .map(|plan| (a.name.clone(), plan.clone()))
-                })
+                .filter_map(|a| a.plan.as_ref().map(|plan| (a.name.clone(), plan.clone())))
                 .collect(),
             health: doc.health.as_ref().map(|h| super::activity::HealthCounts {
                 requests: h.requests,
@@ -641,16 +641,11 @@ pub(crate) fn type_cell(
 /// personal`, `max5 team`, `team` (a plan word that already says team is not
 /// repeated); `None` when neither half is known.
 pub(crate) fn plan_summary(plan: &crate::proxy::plans::AccountPlan) -> Option<String> {
-    let kind = plan
-        .account_type
-        .map(crate::auth::plan::AccountType::as_str);
-    match (plan.label.as_deref(), kind) {
-        (Some(label), Some(kind)) if label == kind => Some(label.to_string()),
-        (Some(label), Some(kind)) => Some(format!("{label} {kind}")),
-        (Some(label), None) => Some(label.to_string()),
-        (None, Some(kind)) => Some(kind.to_string()),
-        (None, None) => None,
-    }
+    crate::auth::plan::plan_summary(
+        plan.label.as_deref(),
+        plan.account_type
+            .map(crate::auth::plan::AccountType::as_str),
+    )
 }
 
 /// The upstream values behind a plan, for the account modal: `org
@@ -1681,6 +1676,24 @@ mod tests {
         );
         let bare = crate::proxy::plans::AccountPlan::claude("default_claude_max_20x");
         assert_eq!(plan_summary(&bare).as_deref(), Some("max20"));
+    }
+
+    /// Review P2: a plan with upstream values only (a tier that names no
+    /// plan, no organization type) still reaches the view, so the modal can
+    /// show the raw tier instead of "unknown".
+    #[test]
+    fn a_plan_with_upstream_values_only_reaches_the_view() {
+        let mut wire = doc_json();
+        wire["accounts"][0]["plan"] = serde_json::json!({ "rate_limit_tier": "default_raven" });
+        let doc: crate::dashboard::DashboardDoc = serde_json::from_value(wire).unwrap();
+        let view = DashboardView::from_doc(&doc);
+        let plan = &view.plans["a"];
+        assert_eq!(plan.label, None);
+        assert_eq!(plan_summary(plan), None);
+        assert_eq!(
+            plan_source_detail(plan).as_deref(),
+            Some("tier default_raven")
+        );
     }
 
     /// The document carries the account type to the TUI (local and attach).
