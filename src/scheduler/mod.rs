@@ -723,16 +723,18 @@ impl PoolState {
     ) {
         self.clear_manual_pin_for(account);
         if let Some(acct) = self.account_mut(account) {
-            // A token-endpoint verdict (the login expired / rotated / was
-            // revoked) is the root cause; a later, more generic exclusion of
-            // the SAME credential — a usage poll that was already in flight
-            // answering 403 — is its symptom and must not replace it (or its
-            // status and time). A re-login clears the verdict first.
+            // A verdict on the login or the account (it expired, was
+            // rotated or revoked, the provider suspended it) is the root
+            // cause; a later symptom on the SAME credential — a usage poll
+            // already in flight answering 403, a request 401 — must not
+            // replace it (or its status and time). A newer verdict does: an
+            // explicit suspension outranks a bare refresh rejection. A
+            // re-login clears the verdict first.
             let keeps_root_cause = acct.health == AccountHealth::AuthFailed
                 && acct
                     .auth_failure
-                    .is_some_and(|known| known.cause.is_refresh_verdict())
-                && !failure.is_some_and(|new| new.cause.is_refresh_verdict());
+                    .is_some_and(|known| !known.cause.is_symptom())
+                && failure.is_none_or(|new| new.cause.is_symptom());
             acct.health = AccountHealth::AuthFailed;
             if !keeps_root_cause {
                 acct.auth_failure_status = status.map(|code| code.as_u16());
@@ -3022,17 +3024,26 @@ mod tests {
         assert!(!account.healthy);
         assert_eq!(account.auth_failure, Some(first));
         assert_eq!(account.auth_failure_status, Some(400));
-        // A later token-endpoint verdict is new evidence and does replace it.
+        // A later verdict is new evidence and does replace it: a bare
+        // refresh rejection, then an explicit suspension of the account.
         assert!(pool.record_auth_failure_if(
             &id("a"),
             &fp,
             Some(http::StatusCode::BAD_REQUEST),
-            AuthCause::LoginRevoked,
+            AuthCause::RefreshRejected,
         ));
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &fp,
+            Some(http::StatusCode::FORBIDDEN),
+            AuthCause::AccessSuspended,
+        ));
+        let account = &pool.snapshot().accounts[0];
         assert_eq!(
-            pool.snapshot().accounts[0].auth_failure.map(|f| f.cause),
-            Some(AuthCause::LoginRevoked)
+            account.auth_failure.map(|f| f.cause),
+            Some(AuthCause::AccessSuspended)
         );
+        assert_eq!(account.auth_failure_status, Some(403));
     }
 
     #[test]

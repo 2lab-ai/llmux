@@ -1431,9 +1431,9 @@ mod tests {
     }
 
     /// Skipping a benched account must not spend the shared poll slot or
-    /// stall the roster: with `a` and `b` scheduled, benching `a` between
-    /// ticks leaves the next slot to `b`, and `a` is not fetched even after
-    /// its old deadline.
+    /// stall the roster: with `a` and `b` both due at the same instant,
+    /// benching `a` leaves the very next budget-eligible tick to `b`, and `a`
+    /// is never fetched afterwards.
     #[tokio::test]
     async fn benched_account_does_not_starve_the_healthy_roster() {
         let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
@@ -1447,20 +1447,29 @@ mod tests {
         );
         poller.prime(now()).await;
         assert_eq!(fetcher.call_count(), 2, "both scheduled and primed");
-        let a_deadline = poller.schedule[&id("a")].next_at;
+        // Both due at the same controlled instant; `a` sorts first, so a slot
+        // spent on it would show as no fetch on this tick.
+        let due = now() + Duration::from_secs(600);
+        for entry in poller.schedule.values_mut() {
+            entry.next_at = due;
+        }
         pool.record_auth_failure(&id("a"), Some(http::StatusCode::BAD_REQUEST));
-        let calls_before = fetcher.calls.lock().unwrap().len();
-        let mut t = now() + MIN_POLL_GAP;
-        let end = a_deadline.max(poller.schedule[&id("b")].next_at) + Duration::from_secs(1_800);
-        while t <= end {
+        poller.tick(due).await;
+        assert_eq!(
+            fetcher.calls.lock().unwrap()[2..].to_vec(),
+            vec!["at-b".to_string()],
+            "the very next slot goes to the healthy account"
+        );
+        let mut t = due + MIN_POLL_GAP;
+        while t <= due + Duration::from_secs(1_800) {
             poller.tick(t).await;
             t += MIN_POLL_GAP;
         }
-        let tokens: Vec<String> = fetcher.calls.lock().unwrap()[calls_before..].to_vec();
-        assert!(!tokens.is_empty(), "b keeps being polled");
         assert!(
-            tokens.iter().all(|token| token == "at-b"),
-            "only the healthy account is fetched: {tokens:?}"
+            fetcher.calls.lock().unwrap()[2..]
+                .iter()
+                .all(|token| token == "at-b"),
+            "the benched account is never fetched"
         );
     }
 

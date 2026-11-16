@@ -87,13 +87,18 @@ impl AuthCause {
                 .map(str::to_ascii_lowercase)
         };
         let description = field("error_description").unwrap_or_default();
+        // "Token has been expired or revoked." (Google) names both: the
+        // provider did not say which, so neither is claimed.
+        let expired = description.contains("expired");
+        let revoked = description.contains("revoked");
         match field("error").as_deref() {
             Some("invalid_client") => AuthCause::ClientRejected,
-            Some("invalid_grant") if description.contains("expired") => AuthCause::LoginExpired,
+            Some("invalid_grant") if expired && revoked => AuthCause::RefreshRejected,
+            Some("invalid_grant") if expired => AuthCause::LoginExpired,
             Some("invalid_grant") if description.contains("not found or invalid") => {
                 AuthCause::LoginRotated
             }
-            Some("invalid_grant") if description.contains("revoked") => AuthCause::LoginRevoked,
+            Some("invalid_grant") if revoked => AuthCause::LoginRevoked,
             _ => AuthCause::RefreshRejected,
         }
     }
@@ -151,18 +156,17 @@ impl AuthCause {
         }
     }
 
-    /// Whether the token endpoint itself gave this verdict on the login (as
-    /// opposed to a request or usage read failing afterwards). Such a verdict
-    /// is the root cause; a later generic exclusion of the same credential
-    /// does not replace it.
-    pub fn is_refresh_verdict(self) -> bool {
+    /// Whether this cause is a downstream symptom of a dead or refused
+    /// credential (a request or usage read failing) rather than a verdict on
+    /// the login or the account. A symptom never replaces a verdict already
+    /// recorded for the same credential.
+    pub fn is_symptom(self) -> bool {
         matches!(
             self,
-            AuthCause::LoginExpired
-                | AuthCause::LoginRotated
-                | AuthCause::LoginRevoked
-                | AuthCause::RefreshRejected
-                | AuthCause::ClientRejected
+            AuthCause::TokenRejected
+                | AuthCause::KeyRejected
+                | AuthCause::UsageForbidden
+                | AuthCause::ProviderError
         )
     }
 
@@ -237,6 +241,10 @@ mod tests {
             (
                 r#"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#,
                 AuthCause::LoginRevoked,
+            ),
+            (
+                r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#,
+                AuthCause::RefreshRejected,
             ),
             (r#"{"error":"invalid_grant"}"#, AuthCause::RefreshRejected),
             (r#"{"error":"invalid_client"}"#, AuthCause::ClientRejected),
