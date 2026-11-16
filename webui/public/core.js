@@ -193,18 +193,40 @@
     return ['ok', 'Ready', 'ok'];
   }
   const left = (w) => { if (!w) return null; const now = Date.now() / 1000; return w.resets_at <= now ? 1 : Math.max(0, 1 - w.utilization); };
+  /* Plan and personal / team per account (`.prd/25`, amended 2026-11-16),
+     from the daemon's `plan` object. Only Claude OAuth and Codex carry plans
+     (`has_plan` in src/tui/view.rs): `-` elsewhere, `?` until the daemon has
+     read it. Returns [plan, type, hover detail]. */
+  X.PLAN_KINDS = ['oauth', 'codex'];
+  X.accountPlan = function (a) {
+    if (!X.PLAN_KINDS.includes(a.type)) return ['-', '-', ''];
+    const p = a.plan || {};
+    const detail = [
+      p.organization_type && 'org ' + p.organization_type,
+      p.rate_limit_tier && 'tier ' + p.rate_limit_tier,
+      p.seat_tier && 'seat ' + p.seat_tier,
+      p.plan_type && 'plan_type ' + p.plan_type,
+      p.plan_name && 'named "' + p.plan_name + '"',
+    ].filter(Boolean).join(' · ');
+    return [p.label || '?', p.account_type || '?', detail];
+  };
+  const TYPE_PILL = { team: ['Team', 'team'], personal: ['Personal', 'mute'] };
   X.renderAccounts = function (doc) {
     const groups = ['claude', 'codex', 'grok', 'openrouter', 'gemini'];
     const p = doc.select_params;
     const rows = groups.map(g => {
       const list = doc.accounts.filter(a => X.group(a.name) === g);
       if (!list.length) return '';
-      return `<tbody><tr class="x-grp"><td colspan="8">${g} <span class="x-dim">${list.length}</span></td></tr>${list.map(a => {
+      return `<tbody><tr class="x-grp"><td colspan="10">${g} <span class="x-dim">${list.length}</span></td></tr>${list.map(a => {
         const [k, label, tone] = X.accountState(a, p);
+        const [plan, type, planDetail] = X.accountPlan(a);
+        const pill = TYPE_PILL[type];
         const l7 = left(a.seven_day);
         const bar = (v) => v == null ? '<span class="x-dim">—</span>' : `<span class="x-bar"><i style="width:${v * 100}%" class="${v < .15 ? 'lo' : v < .4 ? 'mid' : ''}"></i></span> ${Math.round(v * 100)}%`;
         const cur = Object.values(doc.current_by_group || {}).includes(a.name);
-        return `<tr data-acct="${X.esc(a.name)}"><td>${cur ? '<b class="x-cur">●</b>' : ''}</td><td><b>${X.esc(X.short(a.name))}</b> <span class="x-dim">${X.esc(a.plan ? a.plan.label || a.plan.plan_type || '' : a.type)}</span></td>
+        return `<tr data-acct="${X.esc(a.name)}"><td>${cur ? '<b class="x-cur">●</b>' : ''}</td><td><b>${X.esc(X.short(a.name))}</b> <span class="x-dim">${X.esc(a.type)}</span></td>
+          <td class="x-plan" title="${X.esc(planDetail)}">${plan === '?' || plan === '-' ? `<span class="x-dim">${plan}</span>` : X.esc(plan)}</td>
+          <td>${pill ? `<span class="x-pill ${pill[1]}">${pill[0]}</span>` : `<span class="x-dim">${X.esc(type)}</span>`}</td>
           <td><span class="x-pill ${tone}">${X.esc(label)}</span></td><td>${bar(l7)}</td>
           <td class="x-num">${X.n(a.session.requests)}</td><td class="x-num">${X.n(a.session.errors)}</td><td class="x-num">${a.in_flight || ''}</td>
           <td class="x-acts"><button data-act="Switch to ${X.esc(X.short(a.name))}">Use now</button><button data-act="${a.paused ? 'Resume' : 'Pause'} ${X.esc(X.short(a.name))}">${a.paused ? 'Resume' : 'Pause'}</button><button data-act="Set limits">Limits</button><button data-act="Re-login ${X.esc(X.short(a.name))}">Re-login</button><button class="danger" data-act="Remove ${X.esc(X.short(a.name))}">Remove</button></td></tr>`;
@@ -212,7 +234,7 @@
     }).join('');
     return `<div class="x-toolbar"><b>${doc.accounts.length} accounts</b><span class="x-dim">scheduler ${X.esc(p.mode)} · 7d ≤ ${p.seven_day_max}</span><span class="x-sp"></span>
       <button class="x-primary" data-act="Add account (browser login: Claude / Codex / Grok / OpenRouter / Gemini)">+ Add account</button><button data-act="Import accounts">Import</button><button data-act="Refresh usage">Refresh usage</button></div>
-      <table class="x-table"><thead><tr><th></th><th>account</th><th>state</th><th>7d left</th><th class="x-num">requests</th><th class="x-num">errors</th><th class="x-num">now</th><th></th></tr></thead>${rows}</table>`;
+      <table class="x-table"><thead><tr><th></th><th>account</th><th>plan</th><th>type</th><th>state</th><th>7d left</th><th class="x-num">requests</th><th class="x-num">errors</th><th class="x-num">now</th><th></th></tr></thead>${rows}</table>`;
   };
 
   /* ---------- Activities view (every request, all sessions) ---------- */

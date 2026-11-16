@@ -134,9 +134,11 @@ pub(crate) struct DashboardView {
     /// so local and attach render identically.
     pub usage_controls:
         std::collections::BTreeMap<String, crate::proxy::usage_controls::UsageControlDoc>,
-    /// Subscription plan label per account name (`.prd/25`), carried on the
-    /// document. An account with no entry has no known plan.
-    pub plans: std::collections::BTreeMap<String, String>,
+    /// Subscription plan per account name (`.prd/25`): its label, whether it
+    /// is a personal subscription or a team seat (amended 2026-11-16) and the
+    /// upstream values they come from, carried on the document. An account
+    /// with no entry has no known plan.
+    pub plans: std::collections::BTreeMap<String, crate::proxy::plans::AccountPlan>,
     pub auth_history: std::collections::BTreeMap<String, Vec<crate::account_history::AccountEvent>>,
     /// Rolling 5-minute status-class counts for the header health verdict
     /// (glance-triage), carried on the document. `None` from an older daemon
@@ -496,8 +498,8 @@ impl DashboardView {
                 .filter_map(|a| {
                     a.plan
                         .as_ref()
-                        .and_then(|p| p.label.clone())
-                        .map(|label| (a.name.clone(), label))
+                        .filter(|p| p.label.is_some() || p.account_type.is_some())
+                        .map(|plan| (a.name.clone(), plan.clone()))
                 })
                 .collect(),
             health: doc.health.as_ref().map(|h| super::activity::HealthCounts {
@@ -597,6 +599,77 @@ pub(crate) fn earliest_expiry(
         })
         .min_by_key(|(at, _)| *at)
         .map(|(_, raw)| raw)
+}
+
+/// Whether a credential kind can carry a subscription plan at all (`.prd/25`):
+/// Claude OAuth and Codex. Every other kind's plan cells read `-` (n/a), not
+/// `?` (unknown).
+pub(crate) fn has_plan(credential_kind: &str) -> bool {
+    matches!(credential_kind, "oauth" | "codex")
+}
+
+/// The accounts-table `plan` cell (`.prd/25` amendment 2026-11-16): the
+/// plan label (`max20`, `max5`, `pro`, `team`, `promax`, …), `?` for a
+/// plan-capable account whose plan is not known yet, `-` for a provider
+/// without plans.
+pub(crate) fn plan_cell(
+    plan: Option<&crate::proxy::plans::AccountPlan>,
+    credential_kind: &str,
+) -> String {
+    if !has_plan(credential_kind) {
+        return "-".to_string();
+    }
+    plan.and_then(|p| p.label.clone())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// The accounts-table `type` cell: `personal` or `team`, `?` when the plan
+/// does not say (not learned yet, or an older daemon), `-` for a provider
+/// without plans.
+pub(crate) fn type_cell(
+    plan: Option<&crate::proxy::plans::AccountPlan>,
+    credential_kind: &str,
+) -> &'static str {
+    if !has_plan(credential_kind) {
+        return "-";
+    }
+    plan.and_then(|p| p.account_type)
+        .map_or("?", crate::auth::plan::AccountType::as_str)
+}
+
+/// One-phrase plan summary for the detail pane and the modal: `max20
+/// personal`, `max5 team`, `team` (a plan word that already says team is not
+/// repeated); `None` when neither half is known.
+pub(crate) fn plan_summary(plan: &crate::proxy::plans::AccountPlan) -> Option<String> {
+    let kind = plan
+        .account_type
+        .map(crate::auth::plan::AccountType::as_str);
+    match (plan.label.as_deref(), kind) {
+        (Some(label), Some(kind)) if label == kind => Some(label.to_string()),
+        (Some(label), Some(kind)) => Some(format!("{label} {kind}")),
+        (Some(label), None) => Some(label.to_string()),
+        (None, Some(kind)) => Some(kind.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// The upstream values behind a plan, for the account modal: `org
+/// claude_team · tier default_claude_max_5x · seat premium · named "Team"`
+/// (Claude) or `plan_type promax` (Codex). `None` when there are none.
+pub(crate) fn plan_source_detail(plan: &crate::proxy::plans::AccountPlan) -> Option<String> {
+    let parts: Vec<String> = [
+        plan.organization_type
+            .as_deref()
+            .map(|v| format!("org {v}")),
+        plan.rate_limit_tier.as_deref().map(|v| format!("tier {v}")),
+        plan.seat_tier.as_deref().map(|v| format!("seat {v}")),
+        plan.plan_type.as_deref().map(|v| format!("plan_type {v}")),
+        plan.plan_name.as_deref().map(|v| format!("named \"{v}\"")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// The compact accounts-table cell for an account's reset count:
@@ -1557,6 +1630,74 @@ mod tests {
         assert_eq!(
             DashboardView::from_doc(&wire).auth_history["a"],
             vec![event]
+        );
+    }
+
+    fn team_seat() -> crate::proxy::plans::AccountPlan {
+        crate::proxy::plans::AccountPlan {
+            label: Some("max5".into()),
+            rate_limit_tier: Some("default_claude_max_5x".into()),
+            plan_type: None,
+            account_type: Some(crate::auth::plan::AccountType::Team),
+            organization_type: Some("claude_team".into()),
+            plan_name: Some("Team".into()),
+            seat_tier: Some("premium".into()),
+        }
+    }
+
+    /// `.prd/25` amendment 2026-11-16: the table cells say the plan and
+    /// whether it is a team seat; `?` = not known yet, `-` = no plans here.
+    #[test]
+    fn plan_and_type_cells() {
+        let seat = team_seat();
+        assert_eq!(plan_cell(Some(&seat), "oauth"), "max5");
+        assert_eq!(type_cell(Some(&seat), "oauth"), "team");
+        let codex = crate::proxy::plans::AccountPlan::codex("promax");
+        assert_eq!(plan_cell(Some(&codex), "codex"), "promax");
+        assert_eq!(type_cell(Some(&codex), "codex"), "personal");
+        // known label, unknown type (an older daemon)
+        let bare = crate::proxy::plans::AccountPlan::claude("default_claude_max_20x");
+        assert_eq!(plan_cell(Some(&bare), "oauth"), "max20");
+        assert_eq!(type_cell(Some(&bare), "oauth"), "?");
+        assert_eq!(plan_cell(None, "oauth"), "?");
+        assert_eq!(type_cell(None, "codex"), "?");
+        assert_eq!(plan_cell(None, "grok"), "-");
+        assert_eq!(type_cell(None, "apikey"), "-");
+    }
+
+    #[test]
+    fn plan_summary_and_source_detail() {
+        let seat = team_seat();
+        assert_eq!(plan_summary(&seat).as_deref(), Some("max5 team"));
+        assert_eq!(
+            plan_source_detail(&seat).as_deref(),
+            Some("org claude_team · tier default_claude_max_5x · seat premium · named \"Team\"")
+        );
+        let codex_team = crate::proxy::plans::AccountPlan::codex("team");
+        assert_eq!(plan_summary(&codex_team).as_deref(), Some("team"));
+        assert_eq!(
+            plan_source_detail(&codex_team).as_deref(),
+            Some("plan_type team")
+        );
+        let bare = crate::proxy::plans::AccountPlan::claude("default_claude_max_20x");
+        assert_eq!(plan_summary(&bare).as_deref(), Some("max20"));
+    }
+
+    /// The document carries the account type to the TUI (local and attach).
+    #[test]
+    fn the_document_carries_the_account_type() {
+        let mut wire = doc_json();
+        wire["accounts"][0]["plan"] = serde_json::json!({
+            "label": "max5", "rate_limit_tier": "default_claude_max_5x",
+            "account_type": "team", "organization_type": "claude_team"
+        });
+        let doc: crate::dashboard::DashboardDoc = serde_json::from_value(wire).unwrap();
+        let view = DashboardView::from_doc(&doc);
+        let plan = &view.plans["a"];
+        assert_eq!(plan.label.as_deref(), Some("max5"));
+        assert_eq!(
+            plan.account_type,
+            Some(crate::auth::plan::AccountType::Team)
         );
     }
 }

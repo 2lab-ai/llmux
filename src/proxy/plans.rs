@@ -36,15 +36,56 @@ pub struct AccountPlan {
     /// Codex: the token's `chatgpt_plan_type`, verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_type: Option<String>,
+    /// Personal subscription or team seat (`.prd/25` amendment 2026-11-16);
+    /// `None` when the upstream value names neither. Additive: an older
+    /// daemon's document has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_type: Option<crate::auth::plan::AccountType>,
+    /// Claude: `organization.organization_type`, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_type: Option<String>,
+    /// Claude: Anthropic's own name for the plan (`organization.plan_display_name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    /// Claude: the team seat tier (`organization.seat_tier`), verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_tier: Option<String>,
 }
 
 impl AccountPlan {
+    /// A Claude plan known only by its `rate_limit_tier` (no organization
+    /// data: the account type stays unknown).
     pub fn claude(rate_limit_tier: &str) -> Self {
         Self {
             label: crate::auth::plan::claude_label(rate_limit_tier),
             rate_limit_tier: Some(rate_limit_tier.to_string()),
             plan_type: None,
+            account_type: None,
+            organization_type: None,
+            plan_name: None,
+            seat_tier: None,
         }
+    }
+
+    /// A Claude plan from one profile read: the tier, the organization type
+    /// (→ label fallback and account type), the display name and the seat.
+    /// `None` when the profile reports neither a tier nor an organization
+    /// type — nothing to show, and the store keeps the last known plan.
+    pub fn from_claude_profile(profile: &crate::auth::profile::Profile) -> Option<Self> {
+        let tier = profile.rate_limit_tier.as_deref();
+        let org_type = profile.organization_type.as_deref();
+        if tier.is_none() && org_type.is_none() {
+            return None;
+        }
+        Some(Self {
+            label: crate::auth::plan::claude_plan_label(tier, org_type),
+            rate_limit_tier: profile.rate_limit_tier.clone(),
+            plan_type: None,
+            account_type: org_type.and_then(crate::auth::plan::claude_account_type),
+            organization_type: profile.organization_type.clone(),
+            plan_name: profile.plan_display_name.clone(),
+            seat_tier: profile.seat_tier.clone(),
+        })
     }
 
     pub fn codex(plan_type: &str) -> Self {
@@ -52,6 +93,10 @@ impl AccountPlan {
             label: crate::auth::plan::codex_label(plan_type),
             rate_limit_tier: None,
             plan_type: Some(plan_type.to_string()),
+            account_type: crate::auth::plan::codex_account_type(plan_type),
+            organization_type: None,
+            plan_name: None,
+            seat_tier: None,
         }
     }
 }
@@ -136,7 +181,8 @@ pub fn plan_source(credential: &AccountCredential, now_ms: u64) -> PlanSource {
 
 /// One pass over the pool: every account's plan, fetched or decoded. Errors
 /// and expired tokens read as "unknown this pass" (the store keeps the last
-/// known value); a profile without a `rate_limit_tier` reads the same.
+/// known value); a profile with neither a `rate_limit_tier` nor an
+/// `organization_type` reads the same.
 /// Returns how many plan-capable accounts (Claude oauth, Codex) still have no
 /// plan after the pass — the caller retries soon while that is non-zero.
 pub async fn refresh_plans(
@@ -169,7 +215,7 @@ pub async fn refresh_plans(
             PlanSource::ClaudeProfile { access_token } => {
                 capable.push(name.clone());
                 match crate::auth::profile::fetch_profile(client, upstream, &access_token).await {
-                    Ok(profile) => profile.rate_limit_tier.as_deref().map(AccountPlan::claude),
+                    Ok(profile) => AccountPlan::from_claude_profile(&profile),
                     Err(err) => {
                         tracing::info!(account = %name, status = ?err.http_status(), "plan: profile read failed; retrying on the next pass");
                         None
@@ -274,7 +320,95 @@ mod tests {
         let json = serde_json::to_value(AccountPlan::codex("pro")).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "label": "pro", "plan_type": "pro" })
+            serde_json::json!({ "label": "pro", "plan_type": "pro", "account_type": "personal" })
+        );
+        let json = serde_json::to_value(AccountPlan::claude("default_claude_max_20x")).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "label": "max20", "rate_limit_tier": "default_claude_max_20x" })
+        );
+    }
+
+    /// An older daemon's document carries no account type: it still parses.
+    #[test]
+    fn an_older_document_without_the_type_still_parses() {
+        let plan: AccountPlan =
+            serde_json::from_value(serde_json::json!({ "label": "max20" })).unwrap();
+        assert_eq!(plan.label.as_deref(), Some("max20"));
+        assert_eq!(plan.account_type, None);
+    }
+
+    fn profile(tier: Option<&str>, org_type: Option<&str>) -> crate::auth::profile::Profile {
+        crate::auth::profile::Profile {
+            account_uuid: "u".into(),
+            email: "e@x.com".into(),
+            tier: None,
+            display_name: None,
+            org_name: None,
+            org_uuid: None,
+            has_claude_max: None,
+            has_claude_pro: None,
+            rate_limit_tier: tier.map(String::from),
+            organization_type: org_type.map(String::from),
+            plan_display_name: Some("Ultra".into()),
+            seat_tier: None,
+        }
+    }
+
+    /// `.prd/25` amendment 2026-11-16: a Claude Team seat with a Max x5
+    /// tier keeps the `max5` label consumers weigh, and says `team`; a
+    /// personal Max x20 says `personal`; a team tier that names no plan
+    /// still gets a label.
+    #[test]
+    fn a_claude_profile_names_the_plan_and_whether_it_is_a_team_seat() {
+        let team = AccountPlan::from_claude_profile(&profile(
+            Some("default_claude_max_5x"),
+            Some("claude_team"),
+        ))
+        .unwrap();
+        assert_eq!(team.label.as_deref(), Some("max5"));
+        assert_eq!(
+            team.account_type,
+            Some(crate::auth::plan::AccountType::Team)
+        );
+        assert_eq!(team.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(team.plan_name.as_deref(), Some("Ultra"));
+
+        let personal = AccountPlan::from_claude_profile(&profile(
+            Some("default_claude_max_20x"),
+            Some("claude_max"),
+        ))
+        .unwrap();
+        assert_eq!(personal.label.as_deref(), Some("max20"));
+        assert_eq!(
+            personal.account_type,
+            Some(crate::auth::plan::AccountType::Personal)
+        );
+
+        let raven =
+            AccountPlan::from_claude_profile(&profile(Some("default_raven"), Some("claude_team")))
+                .unwrap();
+        assert_eq!(raven.label.as_deref(), Some("team"));
+        assert_eq!(raven.rate_limit_tier.as_deref(), Some("default_raven"));
+
+        // tier only (an older profile shape): label, no type
+        let bare = AccountPlan::from_claude_profile(&profile(Some("default_claude_max_20x"), None))
+            .unwrap();
+        assert_eq!(bare.label.as_deref(), Some("max20"));
+        assert_eq!(bare.account_type, None);
+
+        assert_eq!(AccountPlan::from_claude_profile(&profile(None, None)), None);
+    }
+
+    #[test]
+    fn a_codex_workspace_plan_is_a_team_seat() {
+        assert_eq!(
+            AccountPlan::codex("team").account_type,
+            Some(crate::auth::plan::AccountType::Team)
+        );
+        assert_eq!(
+            AccountPlan::codex("promax").account_type,
+            Some(crate::auth::plan::AccountType::Personal)
         );
     }
 }

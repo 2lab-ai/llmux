@@ -2670,6 +2670,13 @@ pub fn status_json(
                     "plan": plan.and_then(|p| p.label.clone()),
                     "rate_limit_tier": plan.and_then(|p| p.rate_limit_tier.clone()),
                     "plan_type": plan.and_then(|p| p.plan_type.clone()),
+                    // Personal subscription or team seat (`.prd/25` amendment
+                    // 2026-11-16, additive; null when not known), plus the
+                    // Claude organization data it is read from.
+                    "account_type": plan.and_then(|p| p.account_type).map(|t| t.as_str()),
+                    "organization_type": plan.and_then(|p| p.organization_type.clone()),
+                    "plan_name": plan.and_then(|p| p.plan_name.clone()),
+                    "seat_tier": plan.and_then(|p| p.seat_tier.clone()),
                     "cooldown_until": account.cooldown_until.filter(|_| cooling).map(epoch_secs),
                     "in_flight": account.in_flight,
                     // Token health (additive): expiry + last refresh, epoch
@@ -4826,12 +4833,30 @@ mod tests {
     #[test]
     fn status_json_reports_each_accounts_plan() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_783_000_000);
-        let pool = AccountPool::new(&[oauth_account("dev1"), oauth_account("plain")]);
+        let pool = AccountPool::new(&[
+            oauth_account("dev1"),
+            oauth_account("plain"),
+            oauth_account("seat"),
+        ]);
         pool.evaluate(None, &params(), now);
         let mut plans = HashMap::new();
         plans.insert(
             "dev1".to_string(),
             crate::proxy::plans::AccountPlan::claude("default_claude_max_20x"),
+        );
+        // `.prd/25` amendment 2026-11-16: a Claude Team seat with a Max x5
+        // tier — the label consumers weigh stays `max5`, the type says team.
+        plans.insert(
+            "seat".to_string(),
+            crate::proxy::plans::AccountPlan {
+                label: Some("max5".into()),
+                rate_limit_tier: Some("default_claude_max_5x".into()),
+                plan_type: None,
+                account_type: Some(crate::auth::plan::AccountType::Team),
+                organization_type: Some("claude_team".into()),
+                plan_name: Some("Team".into()),
+                seat_tier: Some("premium".into()),
+            },
         );
         let meta = ServerMeta {
             pid: 1,
@@ -4860,9 +4885,17 @@ mod tests {
         assert_eq!(dev1["plan"], "max20");
         assert_eq!(dev1["rate_limit_tier"], "default_claude_max_20x");
         assert_eq!(dev1["plan_type"], serde_json::Value::Null);
+        assert_eq!(dev1["account_type"], serde_json::Value::Null);
         let plain = by("plain");
         assert_eq!(plain["plan"], serde_json::Value::Null);
         assert_eq!(plain["rate_limit_tier"], serde_json::Value::Null);
+        assert_eq!(plain["account_type"], serde_json::Value::Null);
+        let seat = by("seat");
+        assert_eq!(seat["plan"], "max5");
+        assert_eq!(seat["account_type"], "team");
+        assert_eq!(seat["organization_type"], "claude_team");
+        assert_eq!(seat["plan_name"], "Team");
+        assert_eq!(seat["seat_tier"], "premium");
     }
 
     #[test]

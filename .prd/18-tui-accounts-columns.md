@@ -82,3 +82,14 @@ headers that fed the 5h slot), stores one, gates on one or serves one:
 write), `/llmux/settings` and `/llmux/account-limits`. The `5h ceiling`
 config row and the `FiveHourOverThreshold` reason are gone, and the limits
 editor takes `7d,fbl`. Scoring is `servable_now = 7d headroom` (`.prd/09`).
+
+## Amendment 2026-11-16 — `plan` and `type` columns
+
+Owner 2026-11-16: "tui랑 대시보드에 플랜 구분하고 필드 추가해줘. 그리고 팀인지 개인인지도
+표시해줘야함" (`.prd/25` amendment of the same date). Two fixed columns sit between `account`
+and `status`: `plan` (as wide as the widest label on screen, 4–10 cells) and `type` (8 cells:
+`personal`, `team`, `?`, `-`). They appear only when the daemon reports a plan for some account
+(`type` only when some plan says personal or team), so an older daemon's table is unchanged.
+They count toward the wide-set fit — the operator asked for them, so they outrank `req` / `tok`.
+Give-way order becomes: status 20→8 → `type` drops → `plan` drops → `account` 20→7 → clip.
+The `z` fold block does not carry them (the detail pane names the selected account's plan).
