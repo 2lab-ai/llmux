@@ -156,18 +156,26 @@ impl AuthCause {
         }
     }
 
-    /// Whether this cause is a downstream symptom of a dead or refused
-    /// credential (a request or usage read failing) rather than a verdict on
-    /// the login or the account. A symptom never replaces a verdict already
-    /// recorded for the same credential.
-    pub fn is_symptom(self) -> bool {
-        matches!(
-            self,
+    /// How strong a verdict this cause is on the credential, for deciding
+    /// whether a later failure of the SAME credential replaces it: a newer
+    /// failure replaces the recorded one only when it is at least as strong.
+    /// 0 — a downstream symptom (a request or usage read failing);
+    /// 1 — the token endpoint refused without saying why;
+    /// 2 — the token endpoint named what happened to the login or client;
+    /// 3 — the provider refused or suspended the account itself.
+    pub fn rank(self) -> u8 {
+        match self {
             AuthCause::TokenRejected
-                | AuthCause::KeyRejected
-                | AuthCause::UsageForbidden
-                | AuthCause::ProviderError
-        )
+            | AuthCause::KeyRejected
+            | AuthCause::UsageForbidden
+            | AuthCause::ProviderError => 0,
+            AuthCause::RefreshRejected => 1,
+            AuthCause::LoginExpired
+            | AuthCause::LoginRotated
+            | AuthCause::LoginRevoked
+            | AuthCause::ClientRejected => 2,
+            AuthCause::AccountRejected | AuthCause::AccessSuspended => 3,
+        }
     }
 
     /// Whether signing in again is the fix (it is for every login-side cause).
@@ -192,10 +200,9 @@ impl AuthCause {
             AuthCause::AccountRejected => format!(
                 "check the account's standing with the provider, then sign in again: `{login}`"
             ),
-            AuthCause::AccessSuspended => {
-                "resolve the suspension with the provider, or remove the account (`llmux remove <name>`)"
-                    .to_string()
-            }
+            AuthCause::AccessSuspended => format!(
+                "resolve the suspension with the provider, then sign in again to re-enable the account (`{login}`), or remove it (`llmux remove <name>`)"
+            ),
             AuthCause::KeyRejected => format!("add a valid key: `{login}`"),
             AuthCause::ProviderError => format!(
                 "check the provider's status and the daemon log; sign in again to retry: `{login}`"

@@ -723,18 +723,17 @@ impl PoolState {
     ) {
         self.clear_manual_pin_for(account);
         if let Some(acct) = self.account_mut(account) {
-            // A verdict on the login or the account (it expired, was
-            // rotated or revoked, the provider suspended it) is the root
-            // cause; a later symptom on the SAME credential — a usage poll
-            // already in flight answering 403, a request 401 — must not
-            // replace it (or its status and time). A newer verdict does: an
-            // explicit suspension outranks a bare refresh rejection. A
-            // re-login clears the verdict first.
+            // The strongest verdict on this credential stays the reported
+            // cause (with its status and time): a later, weaker failure of
+            // the SAME credential — a usage poll already in flight answering
+            // 403, a request 401, a bare refresh rejection after the provider
+            // suspended the account — must not replace it. An equal or
+            // stronger verdict does (`AuthCause::rank`). A re-login clears
+            // the verdict first.
             let keeps_root_cause = acct.health == AccountHealth::AuthFailed
-                && acct
-                    .auth_failure
-                    .is_some_and(|known| !known.cause.is_symptom())
-                && failure.is_none_or(|new| new.cause.is_symptom());
+                && acct.auth_failure.is_some_and(|known| {
+                    failure.map_or(0, |new| new.cause.rank()) < known.cause.rank()
+                });
             acct.health = AccountHealth::AuthFailed;
             if !keeps_root_cause {
                 acct.auth_failure_status = status.map(|code| code.as_u16());
@@ -2998,13 +2997,32 @@ mod tests {
         assert!(!pool.snapshot().accounts[0].healthy);
     }
 
-    /// A usage poll already in flight when the background refresh benched
-    /// the login as expired completes with a 403 for the same credential: the
-    /// expiry stays the reported cause (status and time too) — the 403 is
-    /// its symptom.
+    /// A usage poll or a request already in flight when the background
+    /// refresh benched the login as expired completes with a 403 / 401 for
+    /// the same credential: the expiry stays the reported cause (status and
+    /// time too) — those failures are its symptoms.
     #[test]
     fn late_usage_403_keeps_the_refresh_verdict() {
         use crate::auth_cause::AuthCause;
+        for (status, symptom) in [
+            (http::StatusCode::FORBIDDEN, AuthCause::UsageForbidden),
+            (http::StatusCode::UNAUTHORIZED, AuthCause::TokenRejected),
+        ] {
+            let pool = AccountPool::new(&[oauth_account("a")]);
+            let fp = pool.fingerprint(&id("a")).expect("fingerprint");
+            assert!(pool.record_auth_failure_if(
+                &id("a"),
+                &fp,
+                Some(http::StatusCode::BAD_REQUEST),
+                AuthCause::LoginExpired,
+            ));
+            let first = pool.snapshot().accounts[0].auth_failure.expect("cause");
+            assert!(pool.record_auth_failure_if(&id("a"), &fp, Some(status), symptom));
+            let account = &pool.snapshot().accounts[0];
+            assert!(!account.healthy);
+            assert_eq!(account.auth_failure, Some(first), "{symptom:?}");
+            assert_eq!(account.auth_failure_status, Some(400), "{symptom:?}");
+        }
         let pool = AccountPool::new(&[oauth_account("a")]);
         let fp = pool.fingerprint(&id("a")).expect("fingerprint");
         assert!(pool.record_auth_failure_if(
@@ -3013,25 +3031,21 @@ mod tests {
             Some(http::StatusCode::BAD_REQUEST),
             AuthCause::LoginExpired,
         ));
-        let first = pool.snapshot().accounts[0].auth_failure.expect("cause");
-        assert!(pool.record_auth_failure_if(
-            &id("a"),
-            &fp,
-            Some(http::StatusCode::FORBIDDEN),
-            AuthCause::UsageForbidden,
-        ));
         let account = &pool.snapshot().accounts[0];
-        assert!(!account.healthy);
-        assert_eq!(account.auth_failure, Some(first));
         assert_eq!(account.auth_failure_status, Some(400));
-        // A later verdict is new evidence and does replace it: a bare
-        // refresh rejection, then an explicit suspension of the account.
+        // A weaker verdict (a bare refresh rejection) does not replace the
+        // named expiry; a stronger one (the provider suspending the account)
+        // does.
         assert!(pool.record_auth_failure_if(
             &id("a"),
             &fp,
             Some(http::StatusCode::BAD_REQUEST),
             AuthCause::RefreshRejected,
         ));
+        assert_eq!(
+            pool.snapshot().accounts[0].auth_failure.map(|f| f.cause),
+            Some(AuthCause::LoginExpired)
+        );
         assert!(pool.record_auth_failure_if(
             &id("a"),
             &fp,
@@ -3044,6 +3058,17 @@ mod tests {
             Some(AuthCause::AccessSuspended)
         );
         assert_eq!(account.auth_failure_status, Some(403));
+        // …and a later bare refresh rejection does not undo the suspension.
+        assert!(pool.record_auth_failure_if(
+            &id("a"),
+            &fp,
+            Some(http::StatusCode::BAD_REQUEST),
+            AuthCause::RefreshRejected,
+        ));
+        assert_eq!(
+            pool.snapshot().accounts[0].auth_failure.map(|f| f.cause),
+            Some(AuthCause::AccessSuspended)
+        );
     }
 
     #[test]

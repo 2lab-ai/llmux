@@ -1280,7 +1280,7 @@ only the display, not scheduling priority or retry policy.
 | `token rejected` | the provider refused the access token, even after a refresh where one was possible | sign in again |
 | `key rejected` | the provider refused an API key (nothing to refresh) | add a valid key (`llmux login --api`) |
 | `account rejected` | the provider refused the account itself on a request | check the account's standing, then sign in again |
-| `access suspended` | the provider suspended the account (Google ToS on gemini) | resolve it with the provider, or `llmux remove` |
+| `access suspended` | the provider suspended the account (Google ToS on gemini) | resolve it with the provider, then sign in again to re-enable it; or `llmux remove` |
 | `usage forbidden` | the Claude usage endpoint answered 403 | sign in again |
 | `provider error` | a persistent non-auth provider error benched the account | check the provider and the daemon log; sign in again to retry |
 
@@ -1323,12 +1323,13 @@ history above. Ordinary inference 404 responses still relay and ordinary 503
 responses remain transient.
 A successful credential refresh or changed credentials on re-login clear the
 stored failure code and cause; late failures from replaced credentials cannot
-restore them. Once a verdict on the login or the account is recorded
-(`login expired` / `rotated` / `revoked`, `refresh rejected`, `client
-rejected`, `account rejected`, `access suspended`), a later symptom on the
-same credential — a usage read already in flight answering 403, a request
-401 — does not replace that cause, its status or its time; a newer verdict
-does (an explicit suspension outranks a bare refresh rejection). An OAuth
+restore them. The strongest verdict on a credential stays its reported cause
+(with its status and time): an account verdict (`account rejected`, `access
+suspended`) outranks a named login verdict (`login expired` / `rotated` /
+`revoked`, `client rejected`), which outranks a bare `refresh rejected`, which
+outranks a symptom (a usage read already in flight answering 403, a request
+401). A later failure of the same credential replaces the cause only when it
+is at least as strong. An OAuth
 description that names both expiry and revocation ("Token has been expired or
 revoked.") is reported as `refresh rejected`, not as an expiry.
 The numeric status and safe structured lifecycle receipts are included in account
