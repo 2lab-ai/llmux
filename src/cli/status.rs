@@ -208,11 +208,21 @@ fn action_lines(doc: &serde_json::Value, now: SystemTime) -> Vec<String> {
                 failure["why"].as_str().unwrap_or_default().to_string(),
                 failure["fix"].as_str().unwrap_or_default().to_string(),
             ),
+            // No recorded cause: name the login command only when the
+            // document says which kind of credential this is — an unknown
+            // failure must not imply a Claude login.
             None => (
                 "auth failed".to_string(),
                 "no cause recorded (older daemon or unclassified failure)".to_string(),
-                "check the daemon log, then sign in again on the daemon's host: `llmux login`"
-                    .to_string(),
+                match account["type"].as_str() {
+                    Some(kind) => format!(
+                        "check the daemon log, then sign in again on the daemon's host: `{}`",
+                        crate::auth_cause::login_command(kind)
+                    ),
+                    None => {
+                        "check the daemon log, then sign in again on the daemon's host".to_string()
+                    }
+                },
             ),
         };
         let since = failure["since_ms"]
@@ -340,6 +350,7 @@ mod tests {
             {"name":"a@x", "status":"auth_failed", "blocked":"! 400 login expired", "auth_failure": expired},
             {"name":"b@x", "status":"auth_failed", "blocked":"! 400 login expired", "auth_failure": expired},
             {"name":"c@x", "status":"auth_failed", "blocked":"! 401 auth X", "auth_failure": null},
+            {"name":"codex:d@x", "type":"codex", "status":"auth_failed", "blocked":"! 401 auth X"},
         ]});
         let lines = action_lines(&doc, test_now());
         assert_eq!(
@@ -352,7 +363,10 @@ mod tests {
                 "      fix: sign in again on the daemon's host: `llmux login`",
                 "    auth failed ×1 — no cause recorded (older daemon or unclassified failure)",
                 "      c@x",
-                "      fix: check the daemon log, then sign in again on the daemon's host: `llmux login`",
+                "      fix: check the daemon log, then sign in again on the daemon's host",
+                "    auth failed ×1 — no cause recorded (older daemon or unclassified failure)",
+                "      codex:d@x",
+                "      fix: check the daemon log, then sign in again on the daemon's host: `llmux login --codex`",
             ]
         );
         let healthy = serde_json::json!({"accounts":[{"name":"ok@x","status":"ok"}]});

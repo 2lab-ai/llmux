@@ -155,6 +155,7 @@
     refresh_rejected: ['Refresh rejected', 'sign in again'],
     client_rejected: ['OAuth client rejected', 'update llmux'],
     token_rejected: ['Token rejected', 'sign in again'],
+    key_rejected: ['Key rejected', 'add a valid key'],
     account_rejected: ['Account rejected', 'check the account'],
     access_suspended: ['Access suspended', 'contact the provider'],
     usage_forbidden: ['Usage forbidden', 'sign in again'],

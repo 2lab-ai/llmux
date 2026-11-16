@@ -219,26 +219,20 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
 /// account's cause is unknown (an older daemon) the text stays the plain
 /// "AUTH BROKEN" / "AUTH BROKEN +N" — no guessed cause.
 fn auth_broken_text(broken: &[&AccountSnapshot]) -> String {
-    let causes: Vec<Option<crate::auth_cause::AuthCause>> = broken
-        .iter()
-        .map(|a| a.auth_failure.map(|f| f.cause))
-        .collect();
-    let Some(Some(cause)) = causes.first().copied() else {
+    let mut causes = broken.iter().map(|a| a.auth_failure.map(|f| f.cause));
+    let Some(Some(cause)) = causes.clone().next() else {
         return match broken.len().saturating_sub(1) {
             0 => "AUTH BROKEN".to_string(),
             extra => format!("AUTH BROKEN +{extra}"),
         };
     };
-    let same = causes.iter().filter(|c| **c == Some(cause)).count();
+    let same = causes.clone().filter(|c| *c == Some(cause)).count();
     let mut text = format!("AUTH BROKEN: {} ×{same}", cause.label());
-    let other = causes.len() - same;
+    let other = broken.len() - same;
     if other > 0 {
         text.push_str(&format!(" +{other} other"));
     }
-    if causes
-        .iter()
-        .all(|c| c.is_some_and(crate::auth_cause::AuthCause::needs_relogin))
-    {
+    if causes.all(|c| c.is_some_and(crate::auth_cause::AuthCause::needs_relogin)) {
         text.push_str(" · re-login");
     }
     text

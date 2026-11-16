@@ -250,6 +250,18 @@ mod tests {
         }
     }
 
+    /// The web dashboard's Accounts view maps every cause id the daemon can
+    /// emit; a cause missing there falls back to "Sign-in failed".
+    #[test]
+    fn web_dashboard_maps_every_cause_id() {
+        let web = include_str!("../webui/public/core.js");
+        for cause in AuthCause::ALL {
+            let id = serde_json::to_value(cause).expect("serialize");
+            let key = format!("{}: [", id.as_str().expect("string id"));
+            assert!(web.contains(&key), "webui/public/core.js lacks {key}");
+        }
+    }
+
     /// An API key was never refreshed: its rejection must not be explained
     /// as a failed refresh, and its fix is a new key.
     #[test]
