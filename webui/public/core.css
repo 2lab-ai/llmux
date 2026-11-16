@@ -71,14 +71,13 @@
 /* ---- tables / toolbar (accounts, keys) ---- */
 .x-toolbar{display:flex;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--x-line);flex-wrap:wrap}
 .x-toolbar .x-sp{flex:1}
-.x-toolbar button,.x-acts button{font:500 12px var(--x-sans);border:1px solid var(--x-line);background:var(--x-bg);color:var(--x-ink);border-radius:7px;padding:5px 10px;cursor:pointer}
+.x-toolbar button,.x-acts button{font:500 12px var(--x-sans);border:1px solid var(--x-line);background:var(--x-bg);color:var(--x-ink);border-radius:7px;padding:5px 10px;cursor:pointer;min-height:28px}
 .x-toolbar button.on{background:var(--x-ink);color:var(--x-bg);border-color:var(--x-ink)}
-.x-toolbar .x-primary{background:var(--x-accent);border-color:var(--x-accent);color:#fff;font-weight:600}
+.x-toolbar .x-primary{background:var(--x-accent);border-color:var(--x-accent);color:var(--x-bg);font-weight:600}
 .x-acts{white-space:nowrap;text-align:right}
-.x-acts button{padding:3px 8px;font-size:11.5px;margin-left:3px;opacity:.75}
-tr:hover .x-acts button{opacity:1}
+.x-acts button{padding:3px 8px;font-size:11.5px;margin-left:3px;min-height:24px}
 .x-acts button.danger{color:var(--x-bad)}
-.x-filter{font:12px var(--x-mono);border:1px solid var(--x-line);background:var(--x-bg);color:var(--x-ink);border-radius:7px;padding:5px 9px;min-width:260px}
+.x-filter{font:12px var(--x-mono);border:1px solid var(--x-line);background:var(--x-bg);color:var(--x-ink);border-radius:7px;padding:5px 9px;min-width:260px;min-height:28px;box-sizing:border-box}
 .x-table{border-collapse:collapse;width:100%;font-size:13px}
 .x-table th{text-align:left;font-weight:500;font-size:11.5px;color:var(--x-ink3);padding:8px 10px;border-bottom:1px solid var(--x-line);position:sticky;top:0;background:var(--x-bg)}
 .x-table td{padding:7px 10px;border-bottom:1px solid var(--x-line);white-space:nowrap}
