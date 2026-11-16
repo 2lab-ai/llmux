@@ -51,3 +51,34 @@ test('every cause the daemon emits has a label and a fix in the web view', () =>
     assert.match(label, / 400 · \S/, `${id} → ${label}`);
   }
 });
+
+// `llmux status` lists a login as expiring inside LOGIN_EXPIRY_WARN
+// (src/scheduler/select.rs); the web view must use the same window.
+function daemonLoginWarnSecs() {
+  const rs = readFileSync(new URL('../../src/scheduler/select.rs', import.meta.url), 'utf8');
+  const m = /pub const LOGIN_EXPIRY_WARN: Duration = Duration::from_secs\(([\d_ *]+)\);/.exec(rs);
+  assert.ok(m, 'LOGIN_EXPIRY_WARN not found in select.rs');
+  return m[1].split('*').map((n) => Number(n.replaceAll('_', '').trim())).reduce((a, b) => a * b, 1);
+}
+
+test('a login inside the warning window says when it ends', () => {
+  const X = loadCore();
+  const p = { seven_day_max: 0.99 };
+  const hour = 3600 * 1000;
+  const at = (ms, a = {}) => X.accountState({ healthy: true, login_expires_at_ms: Date.now() + ms, ...a }, p);
+  const [kind, label, tone] = at(8 * hour + 60 * 1000);
+  assert.equal(kind, 'ok');
+  assert.match(label, /^Ready · login ends in 8h [01]m · sign in again$/);
+  assert.equal(tone, 'warn');
+  assert.match(at(2 * hour, { status: 'active' })[1], /^Serving · login ends in 1h 59m|^Serving · login ends in 2h 0m/);
+  assert.equal(at(-hour)[1], 'Ready · login ended · sign in again');
+  assert.deepEqual([...at(10 * 24 * hour)], ['ok', 'Ready', 'ok'], 'outside the window: unchanged');
+  assert.deepEqual([...X.accountState({ healthy: true }, p)], ['ok', 'Ready', 'ok'], 'end unknown: unchanged');
+  const benched = X.accountState({ healthy: false, auth_failure_status: 400, auth_failure: { cause: 'login_expired', at_ms: 1 },
+    login_expires_at_ms: Date.now() - hour }, p);
+  assert.equal(benched[1], 'Login expired 400 · sign in again', 'a benched account keeps its cause');
+});
+
+test('the web view warns in the same window as llmux status', () => {
+  assert.equal(loadCore().LOGIN_EXPIRY_WARN_S, daemonLoginWarnSecs());
+});
