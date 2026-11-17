@@ -93,3 +93,10 @@ and `status`: `plan` (as wide as the widest label on screen, 4–10 cells) and `
 They count toward the wide-set fit — the operator asked for them, so they outrank `req` / `tok`.
 Give-way order becomes: status 20→8 → `type` drops → `plan` drops → `account` 20→7 → clip.
 The `z` fold block does not carry them (the detail pane names the selected account's plan).
+
+## Amendment 2026-11-17 — `type` names team seats only
+
+Owner 2026-11-17: "tui에서 type은 team만 표기 디폴트는 그냥 아무것도 보여주지마". The `type`
+column shows `team` for a team seat and is blank for everything else (personal, unknown, n/a);
+it is 4 cells wide (`type` / `team`) and appears only when some account is a team seat. The
+detail pane's plan phrase follows: `max5 team`, but `max20` for a personal subscription.

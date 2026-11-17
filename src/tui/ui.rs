@@ -75,8 +75,9 @@ const NAME_COL_MIN: u16 = 7;
 const PLAN_COL_MAX: u16 = 10;
 /// Floor of the `plan` column: the header word `plan`.
 const PLAN_COL_MIN: u16 = 4;
-/// Width of the `type` column: `personal` (the widest cell; `team`, `?`, `-`).
-const TYPE_COL_WIDTH: u16 = 8;
+/// Width of the `type` column: the header word `type` and its only value,
+/// `team` (every other row is blank — owner 2026-11-17).
+const TYPE_COL_WIDTH: u16 = 4;
 /// Width of the reset-inventory column (.prd/16): 3 columns hold the header
 /// (`rst`) and every realistic cell — `?`, `—`, `3`, `3*`, `12` — so the
 /// column survives the narrow layout, where the width budget is tight.
@@ -4316,8 +4317,9 @@ fn account_modal_lines(
             yes_no(triage::urgent(account, gate)),
         ),
     ));
-    // Plan (`.prd/25`, amended 2026-11-16): the label and personal / team,
-    // then the upstream values they are read from.
+    // Plan (`.prd/25`, amended 2026-11-16): the label, `team` for a team
+    // seat (a personal one is the default and says nothing, 2026-11-17), then
+    // the upstream values they are read from.
     if super::view::has_plan(account.credential_kind) {
         let plan = view.plans.get(&account.id.0);
         let summary = plan.and_then(super::view::plan_summary);
@@ -6021,7 +6023,7 @@ struct TableLayout {
     /// The `plan` column and its width (`.prd/25` amendment 2026-11-16).
     show_plan: bool,
     plan_width: u16,
-    /// The `type` column (personal / team).
+    /// The `type` column (team seats only; personal rows are blank).
     show_type: bool,
     name_width: u16,
     status_width: u16,
@@ -6062,13 +6064,19 @@ fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout
     // `plan` / `type` (`.prd/25` amendment 2026-11-16): shown only when the
     // daemon reports a plan label or type for some account (an older daemon's
     // table is unchanged; a record of upstream values alone does not count),
-    // `type` only when some plan says personal or team. The plan
-    // column is as wide as the widest label on screen.
+    // `type` only when some account is a team seat: the column names team
+    // seats alone and leaves personal ones blank (owner 2026-11-17: "tui에서
+    // type은 team만 표기 디폴트는 그냥 아무것도 보여주지마"), so a pool of
+    // personal subscriptions gets no column. The plan column is as wide as
+    // the widest label on screen.
     let plan_wanted = view
         .plans
         .values()
         .any(|p| p.label.is_some() || p.account_type.is_some());
-    let type_wanted = view.plans.values().any(|p| p.account_type.is_some());
+    let type_wanted = view
+        .plans
+        .values()
+        .any(|p| p.account_type == Some(crate::auth::plan::AccountType::Team));
     let plan_width = (ctx
         .order
         .iter()
@@ -6872,8 +6880,8 @@ fn account_row_parts(
         Span::styled(label, style)
     });
     // Plan / type (`.prd/25` amendment 2026-11-16), in the slots the
-    // header/constraints reserve. A team seat is colored so it stands out from
-    // personal subscriptions; unknown (`?`) and n/a (`-`) are dimmed.
+    // header/constraints reserve. `type` names a team seat in the accent color
+    // and is blank otherwise; an unknown (`?`) or n/a (`-`) plan is dimmed.
     let plan_entry = view.plans.get(&account.id.0);
     let plan = layout.show_plan.then(|| {
         let label = super::view::plan_cell(plan_entry, account.credential_kind);
@@ -6885,13 +6893,10 @@ fn account_row_parts(
         Span::styled(label, style)
     });
     let kind = layout.show_type.then(|| {
-        let label = super::view::type_cell(plan_entry, account.credential_kind);
-        let style = match label {
-            "team" => Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
-            "personal" => Style::new(),
-            _ => dim(),
-        };
-        Span::styled(label, style)
+        Span::styled(
+            super::view::type_cell(plan_entry),
+            Style::new().fg(THEME.accent).add_modifier(Modifier::BOLD),
+        )
     });
     RowParts {
         marker,
@@ -9028,7 +9033,7 @@ fn history_failure_lines(
 }
 
 /// ` {id}` bold + ` · {kind}` dim, then ` · {plan}` when the daemon knows the
-/// account's subscription plan (`.prd/25`; `max20 personal`, `max5 team` —
+/// account's subscription plan (`.prd/25`; `max20`, `max5 team` —
 /// [`super::view::plan_summary`]) — the detail pane's first line.
 fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'static>> {
     let mut spans = vec![
@@ -13938,7 +13943,9 @@ mod tests {
             crate::proxy::plans::AccountPlan::codex("promax"),
         );
         let after = render_rows(&view, &chrome, 160, 30).join("\n");
-        assert!(after.contains("· codex · promax personal"), "{after}");
+        // personal is the default and is not named (owner 2026-11-17)
+        assert!(after.contains("· codex · promax"), "{after}");
+        assert!(!after.contains("personal"), "{after}");
     }
 
     /// A Claude Team seat with a Max x5 tier (`.prd/25` amendment 2026-11-16).
@@ -13983,8 +13990,8 @@ mod tests {
     /// `.prd/25` amendment 2026-11-16 (owner: "tui랑 대시보드에 플랜 구분하고
     /// 필드 추가해줘. 그리고 팀인지 개인인지도 표시해줘야함"): the accounts
     /// table carries a `plan` and a `type` column beside the account name; a
-    /// team seat reads `team`, a personal subscription `personal`, a provider
-    /// without plans `-`.
+    /// team seat reads `team`; a personal subscription leaves `type` blank
+    /// (owner 2026-11-17), a provider without plans reads `-` under `plan`.
     #[test]
     fn accounts_table_shows_the_plan_and_whether_it_is_a_team_seat() {
         let view = plan_view();
@@ -14017,11 +14024,35 @@ mod tests {
             Some(col("type")),
             "{seat}\n{header}"
         );
-        assert!(
-            rows.iter()
-                .any(|r| r.contains(" promax ") && r.contains(" personal ")),
-            "{frame}"
-        );
+        // a personal subscription leaves `type` blank (owner 2026-11-17)
+        assert!(!frame.contains("personal"), "{frame}");
+        let codex = rows
+            .iter()
+            .find(|r| r.contains(" promax "))
+            .unwrap_or_else(|| panic!("codex row:\n{frame}"));
+        let type_cell: String = codex.chars().skip(col("type")).take(4).collect();
+        assert_eq!(type_cell, "    ", "{codex}\n{header}");
+    }
+
+    /// Owner 2026-11-17: the `type` column names team seats only, so a pool
+    /// of personal subscriptions gets no `type` column at all — the `plan`
+    /// column stays.
+    #[test]
+    fn accounts_table_without_team_seats_has_no_type_column() {
+        let mut view = plan_view();
+        for plan in view.plans.values_mut() {
+            if plan.account_type == Some(crate::auth::plan::AccountType::Team) {
+                plan.account_type = Some(crate::auth::plan::AccountType::Personal);
+            }
+        }
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 30);
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .expect("header row");
+        assert!(header.contains("plan"), "{header}");
+        assert!(!header.contains("type"), "{header}");
+        assert!(!rows.join("\n").contains("personal"));
     }
 
     /// No plan reported at all (an older daemon): the table is the one it was

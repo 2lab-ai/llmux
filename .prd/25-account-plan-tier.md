@@ -109,3 +109,7 @@ seat was available to measure; the team side follows Claude Code's own mapping a
 **Known gap (not fixed here).** One email cannot hold a personal login and a team login at once:
 Claude dedupes by `account_uuid`, which both logins share (it names the person, not the
 organization), so the second login replaces the first and the row shows the new plan.
+
+**2026-11-17 (owner):** in the TUI, `type` names team seats only; a personal subscription is the
+default and shows nothing there (`.prd/18` amendment of the same date). `/llmux/status`,
+`llmux status` and the web page keep `personal` explicit.

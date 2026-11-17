@@ -623,29 +623,27 @@ pub(crate) fn plan_cell(
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// The accounts-table `type` cell: `personal` or `team`, `?` when the plan
-/// does not say (not learned yet, or an older daemon), `-` for a provider
-/// without plans.
-pub(crate) fn type_cell(
-    plan: Option<&crate::proxy::plans::AccountPlan>,
-    credential_kind: &str,
-) -> &'static str {
-    if !has_plan(credential_kind) {
-        return "-";
+/// The accounts-table `type` cell: `team` for a seat in a team, blank for
+/// everything else — a personal subscription is the default and says nothing
+/// (owner 2026-11-17: "tui에서 type은 team만 표기 디폴트는 그냥 아무것도
+/// 보여주지마"). Unknown and n/a are blank too.
+pub(crate) fn type_cell(plan: Option<&crate::proxy::plans::AccountPlan>) -> &'static str {
+    match plan.and_then(|p| p.account_type) {
+        Some(crate::auth::plan::AccountType::Team) => "team",
+        _ => "",
     }
-    plan.and_then(|p| p.account_type)
-        .map_or("?", crate::auth::plan::AccountType::as_str)
 }
 
-/// One-phrase plan summary for the detail pane and the modal: `max20
-/// personal`, `max5 team`, `team` (a plan word that already says team is not
-/// repeated); `None` when neither half is known.
+/// One-phrase plan summary for the TUI detail pane and the modal: `max20`,
+/// `max5 team`, `team` — like [`crate::auth::plan::plan_summary`], but the
+/// TUI names only a team seat; a personal subscription is the default and
+/// adds nothing (owner 2026-11-17). `None` when nothing is known.
 pub(crate) fn plan_summary(plan: &crate::proxy::plans::AccountPlan) -> Option<String> {
-    crate::auth::plan::plan_summary(
-        plan.label.as_deref(),
-        plan.account_type
-            .map(crate::auth::plan::AccountType::as_str),
-    )
+    let team = plan
+        .account_type
+        .filter(|t| *t == crate::auth::plan::AccountType::Team)
+        .map(crate::auth::plan::AccountType::as_str);
+    crate::auth::plan::plan_summary(plan.label.as_deref(), team)
 }
 
 /// The upstream values behind a plan, for the account modal: `org
@@ -1642,22 +1640,24 @@ mod tests {
 
     /// `.prd/25` amendment 2026-11-16: the table cells say the plan and
     /// whether it is a team seat; `?` = not known yet, `-` = no plans here.
+    /// The `type` cell names only a team seat (owner 2026-11-17).
     #[test]
     fn plan_and_type_cells() {
         let seat = team_seat();
         assert_eq!(plan_cell(Some(&seat), "oauth"), "max5");
-        assert_eq!(type_cell(Some(&seat), "oauth"), "team");
+        assert_eq!(type_cell(Some(&seat)), "team");
         let codex = crate::proxy::plans::AccountPlan::codex("promax");
         assert_eq!(plan_cell(Some(&codex), "codex"), "promax");
-        assert_eq!(type_cell(Some(&codex), "codex"), "personal");
+        assert_eq!(type_cell(Some(&codex)), "", "personal says nothing");
+        let codex_team = crate::proxy::plans::AccountPlan::codex("team");
+        assert_eq!(type_cell(Some(&codex_team)), "team");
         // known label, unknown type (an older daemon)
         let bare = crate::proxy::plans::AccountPlan::claude("default_claude_max_20x");
         assert_eq!(plan_cell(Some(&bare), "oauth"), "max20");
-        assert_eq!(type_cell(Some(&bare), "oauth"), "?");
+        assert_eq!(type_cell(Some(&bare)), "");
         assert_eq!(plan_cell(None, "oauth"), "?");
-        assert_eq!(type_cell(None, "codex"), "?");
+        assert_eq!(type_cell(None), "");
         assert_eq!(plan_cell(None, "grok"), "-");
-        assert_eq!(type_cell(None, "apikey"), "-");
     }
 
     #[test]
@@ -1676,6 +1676,9 @@ mod tests {
         );
         let bare = crate::proxy::plans::AccountPlan::claude("default_claude_max_20x");
         assert_eq!(plan_summary(&bare).as_deref(), Some("max20"));
+        // a personal subscription adds nothing in the TUI (owner 2026-11-17)
+        let personal = crate::proxy::plans::AccountPlan::codex("promax");
+        assert_eq!(plan_summary(&personal).as_deref(), Some("promax"));
     }
 
     /// Review P2: a plan with upstream values only (a tier that names no
