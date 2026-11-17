@@ -44,49 +44,52 @@
   X.when = (ms) => { if (!ms) return '—'; const d = new Date(ms), now = new Date(); return d.toDateString() === now.toDateString() ? X.time(ms).slice(0, 5) : `${d.getMonth() + 1}/${d.getDate()} ${X.time(ms).slice(0, 5)}`; };
   X.clean = (t) => String(t || '').replace(/<speaker>[^<]*<\/speaker>/g, '').replace(/<\/?[a-z_-]+(\s[^>]*)?>/gi, ' ').replace(/\s+/g, ' ').trim();
   /* ---------- provider marks left of model names ----------
-   * The drawings are @2lab.ai/ui's model marks, loaded by app.js (X.setMarks) from /ui/llmux-model-mark.js;
-   * the provider is X.providerOf (provider.js). Until the marks load, or if they cannot, names stay plain.
-   * When they arrive, component watchers waiting for them run once and `llmux-marks` tells the page to repaint. */
-  let MARKS = null;
-  const waiting = new Set();
-  X.setMarks = (mod) => {
-    if (!mod || typeof mod.modelMarkSvg !== 'function') return;
-    MARKS = mod;
-    for (const run of waiting) run();
+   * The drawings are @2lab.ai/ui's model marks, loaded by app.js from /ui/llmux-model-mark.js (X.setMarks, or
+   * X.marksFailed when the load fails); the provider is X.providerOf (provider.js). Until the marks load, or if they
+   * cannot, names stay plain. When they arrive, component watchers still on the page run once and `llmux-marks`
+   * tells the page to repaint its light-DOM views. */
+  let MARKS = null, SETTLED = false;
+  const waiting = new Map(); // host → run, only while the load is pending; hosts that left the page are dropped
+  const settle = (mod) => {
+    SETTLED = true; MARKS = mod;
+    if (mod) for (const [host, run] of waiting) if (host.isConnected) run();
     waiting.clear();
-    document.dispatchEvent(new Event('llmux-marks'));
+    if (mod) document.dispatchEvent(new Event('llmux-marks'));
   };
+  X.setMarks = (mod) => settle(mod && typeof mod.modelMarkSvg === 'function' ? mod : null);
+  X.marksFailed = () => settle(null);
   const markSvg = (v) => MARKS.modelMarkSvg(v).replace('<svg ', '<svg width="100%" height="100%" ');
   const markHue = (v) => (MARKS.MODEL_MAKER_COLOR || {})[v] || '';
-  // Light DOM: styled by .mm in core.css.
   // A Claude Code placeholder in the model slot (`<synthetic>`, its own error and interrupt notes) is not a model.
   const markable = (model) => MARKS && X.providerOf && model && !/^<[^>]*>$/.test(String(model).trim());
+  // Light DOM: styled by .mm in core.css.
   X.mark = (model, group) => {
     if (!markable(model)) return '';
     const v = X.providerOf(model, group), hue = markHue(v), who = X.providerName(v);
     return `<span class="mm" data-vendor="${v}"${hue ? ` style="--mm-hue:${hue}"` : ''}${who ? ` title="${who}"` : ''} aria-hidden="true">${markSvg(v)}</span>`;
   };
-  // Inside a component's shadow root, where core.css does not reach: the same mark with inline styles.
+  // Inside a component's shadow root, where core.css does not reach: the same mark, with its layout inline.
   X.markNode = (model, group) => {
-    if (!markable(model)) return null;
-    const v = X.providerOf(model, group), hue = markHue(v), who = X.providerName(v);
-    const el = document.createElement('span');
-    el.className = 'lx-mm'; el.dataset.vendor = v; el.setAttribute('aria-hidden', 'true');
-    if (who) el.title = who;
-    el.style.cssText = `display:inline-block;width:1.05em;height:1.05em;vertical-align:-0.17em;margin-right:0.3em;flex:none;color:${hue || 'currentColor'}`;
-    el.innerHTML = markSvg(v);
+    const html = X.mark(model, group); if (!html) return null;
+    const el = document.createRange().createContextualFragment(html).firstElementChild;
+    el.className = 'lx-mm';
+    el.style.cssText += ';display:inline-block;width:1.05em;height:1.05em;vertical-align:-0.17em;margin-right:0.3em;flex:none;color:var(--mm-hue,currentColor)';
     return el;
   };
   // Keep marks in a component that renders its own text (ui-task-runs, ui-context-window, ui-conversation):
   // `apply(shadowRoot)` adds the marks that are missing, after the first render and after every re-render.
   X.watchMarks = (host, apply) => {
+    if (SETTLED && !MARKS) return; // the marks will never come: names stay plain, nothing to watch
     const start = () => {
       const root = host.shadowRoot; if (!root) return;
       // MutationObserver already batches a render into one callback; apply() adds only missing marks, so its own
       // insertions trigger one more pass that changes nothing.
       const run = () => { if (MARKS) apply(root); };
       new MutationObserver(run).observe(root, { childList: true, subtree: true, characterData: true });
-      if (MARKS) run(); else waiting.add(() => { if (host.isConnected) run(); });
+      if (MARKS) { run(); return; }
+      if (SETTLED) return;
+      for (const h of waiting.keys()) if (!h.isConnected) waiting.delete(h);
+      waiting.set(host, run);
     };
     if (host.shadowRoot) start(); else customElements.whenDefined(host.localName).then(() => requestAnimationFrame(start));
   };

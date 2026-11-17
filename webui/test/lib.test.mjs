@@ -338,14 +338,15 @@ test('a card names the backend group of its own model, newest request first, els
   const sid = '44444444-4444-4444-4444-444444444444';
   const now = Date.now();
   const row = (id, ago, model, group) => ix.addRow({ id, at_ms: now - ago, tenant: 'local', user_id: uid(sid), msg_kind: 'user', excerpt: 'route this', model, group, status: 200 });
-  // The session's model is the one most of its requests used; a newer request for another model carries another group.
+  // The session's model is the one most of its requests used. Its backend changed (codex, then openrouter), its newest
+  // request carries no group, and a still newer request for another model carries grok: the card takes openrouter.
   row(1, 9000, 'house-model-7', 'codex');
-  row(2, 8000, 'house-model-7', undefined);
-  row(3, 7000, 'house-model-7', 'codex');
+  row(2, 8000, 'house-model-7', 'openrouter');
+  row(3, 7000, 'house-model-7', undefined);
   row(4, 1000, 'other-model', 'grok');
   let card = ix.list().cards.find(c => c.sid === sid);
   assert.equal(card.model, 'house-model-7');
-  assert.equal(card.group, 'codex');
+  assert.equal(card.group, 'openrouter');
   // No request of the session's model carries a group → none, never another model's group.
   const ix2 = new SessionIndex();
   const sid2 = '55555555-5555-5555-5555-555555555555';

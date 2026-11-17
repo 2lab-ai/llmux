@@ -10,7 +10,7 @@ const HOUR = 3600000;
 // Provider marks left of model names: @2lab.ai/ui's drawings, one chunk (lib/uishim.mjs). Loaded beside the page,
 // never in front of it: names paint plain at first and get their marks when the chunk arrives (the `llmux-marks`
 // listener below repaints); if it never arrives, they stay plain.
-import('/ui/llmux-model-mark.js').then(X.setMarks, (e) => console.warn('[llmux] model marks unavailable', e));
+import('/ui/llmux-model-mark.js').then(X.setMarks, (e) => { X.marksFailed(); console.warn('[llmux] model marks unavailable', e); });
 
 const st = {
   view: viewFromPath(),
