@@ -7,6 +7,9 @@ const X = window.X;
 const $ = (id) => document.getElementById(id);
 const E = X.esc;
 const HOUR = 3600000;
+// Provider marks left of model names: @2lab.ai/ui's drawings, one chunk (lib/uishim.mjs). Loaded before the first
+// paint so every model name is drawn with its mark; if they cannot load, names stay plain.
+try { X.setMarks(await import('/ui/llmux-model-mark.js')); } catch (e) { console.warn('[llmux] model marks unavailable', e); }
 
 const st = {
   view: viewFromPath(),
@@ -112,7 +115,8 @@ function cardOf(c) {
   if (c.project) metrics.push({ text: c.project + (c.branch && c.branch !== 'HEAD' ? ` · ${c.branch}` : ''), glyph: 'file', title: c.cwd || '' });
   metrics.push({ text: placeText(c), title: placeLong(c) });
   metrics.push({ text: `${X.n(c.requests)} 요청`, title: `메인 ${c.mainRequests} · 서브에이전트 ${c.subagentRequests} · 부속 ${c.sideRequests}${c.errors ? ' · 오류 ' + c.errors : ''}` });
-  if (c.model) metrics.push({ text: modelShort(c.model), glyph: 'model', effort: c.effort || undefined, title: c.model });
+  // glyph = the provider: ui-agent-inbox draws that maker's mark left of the model name ('model' = any other)
+  if (c.model) metrics.push({ text: modelShort(c.model), glyph: X.providerOf(c.model, c.group), effort: c.effort || undefined, title: c.model });
   for (const f of c.flags || []) metrics.unshift({ text: f.text, tone: f.tone === 'danger' ? 'danger' : 'warn', title: '주의' });
   const subRun = (c.inflightKinds || []).filter(k => k === 'subagent').length;
   return {
@@ -343,7 +347,7 @@ function paintOverview(d, c, ov) {
     ['출처', `${c.client} · ${placeLong(c)}${c.version ? ' · Claude Code ' + c.version : ''}${m.osVersion ? ' · ' + m.osVersion : ''}`],
     ['작업 폴더', c.cwd || '—'],
     ['브랜치', c.branch || '—'],
-    ['모델', `${c.model || '—'}${c.effort ? ' · effort ' + c.effort : ''}${m.thinking ? ' · thinking ' + m.thinking : ''}`],
+    ['모델', { html: c.model ? X.mark(c.model, c.group) + E(`${c.model}${c.effort ? ' · effort ' + c.effort : ''}${m.thinking ? ' · thinking ' + m.thinking : ''}`) : '—' }],
     ['구독 계정', accounts.length ? accounts.slice(0, 4).map(([a, n]) => `${X.short(a)} ${n}`).join(' · ') + (accounts.length > 4 ? ` 외 ${accounts.length - 4}` : '') : '—'],
     m.mcp && m.mcp.length ? ['MCP', m.mcp.join(', ')] : null,
     m.claudeMd && m.claudeMd.length ? ['지침 파일', m.claudeMd.map(p => relPath(p, c.cwd)).join(' · ')] : null,
@@ -372,7 +376,7 @@ function paintOverview(d, c, ov) {
         ${c.context ? '<ui-context-window id="ov-ctx" lang="ko"></ui-context-window>' : ''}
         ${links.length ? `<h4 class="ui-section-head">링크</h4><div class="lks">${links.map(u => `<a class="ui-chip is-sm" href="${E(u)}" target="_blank" rel="noopener">${E(refOf(u))}</a>`).join('')}</div>` : ''}
         <h4 class="ui-section-head">정보</h4>
-        <dl class="ui-dl">${facts.map(([k, v]) => `<div><dt>${E(k)}</dt><dd>${E(v)}</dd></div>`).join('')}</dl>
+        <dl class="ui-dl">${facts.map(([k, v]) => `<div><dt>${E(k)}</dt><dd>${v && v.html != null ? v.html : E(v)}</dd></div>`).join('')}</dl>
       </div>
     </div>`;
   $('ov-stats').data = {
@@ -387,7 +391,17 @@ function paintOverview(d, c, ov) {
       { key: 'err', label: '오류', value: c.errors, format: 'int' },
     ],
   };
-  if (c.context) $('ov-ctx').data = { model: modelShort(c.context.model || c.model), window: c.context.window, parts: c.context.parts };
+  if (c.context) {
+    const el = $('ov-ctx');
+    el.data = { model: modelShort(c.context.model || c.model), window: c.context.window, parts: c.context.parts };
+    if (!el._marks) {
+      el._marks = true;
+      X.watchMarks(el, (root) => {
+        const name = root.querySelector('.cw-model'), cc = st.detail && st.detail.card;
+        if (name && cc && !name.querySelector('.lx-mm')) { const n = X.markNode((cc.context && cc.context.model) || cc.model, cc.group); if (n) name.prepend(n); }
+      });
+    }
+  }
 }
 $('t-ov').addEventListener('click', (e) => {
   const b = e.target.closest('[data-g]'); if (!b) return;
@@ -491,6 +505,16 @@ function paintConversation(d, c) {
   if (tail && c.status === 'running') turns.push({ id: 'p', role: 'pending', name: modelShort(c.model) || 'Claude', progress: { startedAt: c.last_ms || Date.now(), verb: '작업 중' }, facts: tail });
   $('p-conv').data = { turns: turns.slice(-200), hasMore: turns.length > 200, assistantName: 'Claude', emptyText: '대화 기록이 없습니다', live: c.status === 'running' };
 }
+// provider mark left of each answer's model name
+X.watchMarks($('p-conv'), (root) => {
+  const cc = st.detail && st.detail.card;
+  for (const name of root.querySelectorAll('.cv-turn:not([data-role="user"]):not([data-role="system"]) .cv-name')) {
+    if (name.querySelector('.lx-mm')) continue;
+    const text = name.textContent.trim();
+    const n = X.markNode(text, cc && text === modelShort(cc.model) ? cc.group : null);
+    if (n) name.prepend(n);
+  }
+});
 
 /* 요청: newest first. The first page loads with the tab; the next older page loads by itself when the end of the
    list scrolls into view (GET /api/session/:sid/requests?before=<cursor>); a running session's new requests are
@@ -590,6 +614,14 @@ function addRuns(rows, where) {
   const el = document.createElement('ui-task-runs');
   el.setAttribute('lang', 'ko'); el.setAttribute('flush', '');
   el.data = { title: '', runs: rows.map(runOf), totals: false };
+  // provider mark left of the model name in each row title (`${kind} · ${model} · …`)
+  const byId = new Map(rows.map(r => [`${r.id}:${r.at_ms}`, r]));
+  X.watchMarks(el, (root) => {
+    for (const li of root.querySelectorAll('.tr-run[data-id]')) {
+      const name = li.querySelector('.tr-name'), r = byId.get(li.dataset.id);
+      if (name && r && r.model && !name.querySelector('.lx-mm')) X.insertBefore(name, modelShort(r.model), X.markNode(r.model, r.group));
+    }
+  });
   $('p-runs')[where](el);
 }
 $('p-pager').addEventListener('change', (e) => {
@@ -704,7 +736,7 @@ function paintUserDetail() {
     <h4 class="ui-section-head">지금 <span class="ui-count">${active.length}</span></h4><div class="slist">${active.map(srow).join('') || '<div class="ui-empty">진행 중인 세션이 없습니다</div>'}</div>
     <h4 class="ui-section-head">최근 세션</h4><div class="slist">${recent.map(srow).join('') || '<div class="ui-empty">최근 세션이 없습니다</div>'}</div>
     <div class="ov-grid2">
-      <div><h4 class="ui-section-head">모델 (${E(st.window)})</h4><dl class="ui-dl">${(us.models || []).sort((a, b) => b.cost_usd - a.cost_usd).map(m => `<div><dt>${E(modelShort(m.model))}</dt><dd>${usd(m.cost_usd)} · ${X.n(m.requests)} 요청</dd></div>`).join('') || '<div class="ui-empty">—</div>'}</dl></div>
+      <div><h4 class="ui-section-head">모델 (${E(st.window)})</h4><dl class="ui-dl">${(us.models || []).sort((a, b) => b.cost_usd - a.cost_usd).map(m => `<div><dt>${X.mark(m.model, m.group)}${E(modelShort(m.model))}</dt><dd>${usd(m.cost_usd)} · ${X.n(m.requests)} 요청</dd></div>`).join('') || '<div class="ui-empty">—</div>'}</dl></div>
       <div><h4 class="ui-section-head">쓴 구독 계정 (24시간)</h4><dl class="ui-dl">${u.accounts.map(a => `<div><dt>${E(X.short(a.name))}</dt><dd>${X.n(a.n)} 요청</dd></div>`).join('') || '<div class="ui-empty">—</div>'}</dl></div>
     </div>
     <p class="hint"><a href="/?user=${encodeURIComponent(u.tenant)}" data-board="${E(u.tenant)}">세션 보드에서 ${E(u.short)}만 보기 →</a></p>`;

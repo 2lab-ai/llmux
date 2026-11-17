@@ -8,6 +8,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+// Claude Code writes `<synthetic>` (and similar placeholders) in the model slot of its own notes — an
+// interrupt, an API error it reports — so the session's model is the newest real one, not the placeholder.
+const realModel = (m) => (m && !/^<[^>]*>$/.test(String(m).trim()) ? m : null);
+
 const MAX_TEXT = 6000;
 const MAX_RESULT = 2400;
 
@@ -141,7 +145,7 @@ export function readTranscript(file) {
       const m = o.message;
       const ts = o.timestamp ? Date.parse(o.timestamp) : null;
       if (o.type === 'assistant') {
-        meta.steps++; meta.model = m.model || meta.model; meta.lastStop = m.stop_reason || meta.lastStop; meta.lastRole = 'assistant';
+        meta.steps++; meta.model = realModel(m.model) || meta.model; meta.lastStop = m.stop_reason || meta.lastStop; meta.lastRole = 'assistant';
         if (o.requestId && m.usage) usageByReq.set(o.requestId, { usage: m.usage, model: m.model, ts });
       } else {
         const isPrompt = typeof m.content === 'string' || (Array.isArray(m.content) && m.content.some(b => b.type === 'text'));
@@ -187,7 +191,7 @@ export function transcriptMeta(file) {
     if (o.version) v.version = o.version;
     if (o.timestamp) v.last_ts = Date.parse(o.timestamp);
     if (o.isSidechain) continue;
-    if (o.type === 'assistant' && o.message) { v.model = o.message.model || v.model; v.lastStop = o.message.stop_reason; v.lastRole = 'assistant'; }
+    if (o.type === 'assistant' && o.message) { v.model = realModel(o.message.model) || v.model; v.lastStop = o.message.stop_reason; v.lastRole = 'assistant'; }
     if (o.type === 'user' && o.message) {
       v.lastRole = 'user';
       const txt = typeof o.message.content === 'string' ? o.message.content : Array.isArray(o.message.content) ? (o.message.content.find(b => b.type === 'text') || {}).text : null;

@@ -11,6 +11,12 @@ opens both. Only soma-work admins (`ADMIN_USERS`) get in.
 
 **세션 (sessions).** One card per Claude Code, Codex or soma-work conversation that went through llmux.
 
+Every model name on the page has its provider's mark on the left: Anthropic (Claude models), OpenAI (gpt, codex and
+the `sol` / `terra` / `luna` / `astra` aliases), xAI (grok) and Google (gemini, `argon`). An OpenRouter model shows its
+maker's mark, and a model of an unknown maker shows a plain chip. The marks appear on session cards, the session
+detail (model, context window, conversation answers, requests), the raw viewer, the users view and the activity
+table.
+
 - Columns: 응답 필요 (waiting for a person), 실행 중 (running), 완료 (done, by day).
 - The name pill on each card is the person whose issued key sent its requests. The chips above the board
   filter by person. The number on a chip is how many of their sessions are running.

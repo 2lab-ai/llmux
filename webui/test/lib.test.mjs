@@ -5,7 +5,13 @@ import { solveRates, priceRow, rowTokens, avgPerRequest } from '../lib/pricing.m
 import { cleanPrompt, buildOverview } from '../lib/overview.mjs';
 import { promptOf, AUX_RE, SessionIndex, requestPage, cursorOf } from '../lib/sessions.mjs';
 import { parseRawMeta, userPrompts } from '../lib/rawmeta.mjs';
-import { messagesToEntries } from '../lib/transcript.mjs';
+import { messagesToEntries, transcriptMeta, readTranscript } from '../lib/transcript.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { modelMarkShim } from '../lib/uishim.mjs';
+import { createRequire } from 'node:module';
+const { providerOf, providerName } = createRequire(import.meta.url)('../public/provider.js');
 
 test('solveRates recovers the linear per-token rates the daemon priced with', () => {
   const rate = { in: 5e-6, out: 25e-6, cr: 0.5e-6, cc: 6.25e-6 };
@@ -286,3 +292,43 @@ test('a session keeps its newest 4000 requests and counts the older ones it let 
   assert.equal(last.rows[0].id, 205); assert.equal(last.rows.at(-1).id, 6); assert.equal(last.rows.length, 200);
   assert.equal(last.more, false);
 });
+
+test('the provider mark follows the model name, then the backend group', () => {
+  const cases = [
+    ['claude-opus-5-5', 'claude', 'claude'], ['opus-5-5', null, 'claude'], ['claude-fable-5-2[1m]', null, 'claude'],
+    ['claude-haiku-5-5', 'codex', 'claude'],          // the name decides: the mark sits beside it
+    ['gpt-6.1-sol', 'codex', 'openai'], ['gpt-6-astra', null, 'openai'], ['sol', null, 'openai'], ['o4-mini', null, 'openai'],
+    ['grok-4.7[1m]', 'grok', 'grok'], ['gemini-3-pro', 'gemini', 'gemini'], ['argon', null, 'gemini'],
+    ['anthropic/claude-x', 'openrouter', 'claude'], ['x-ai/grok-5', 'openrouter', 'grok'], ['google/gemma-9', 'openrouter', 'gemini'],
+    ['meta-llama/llama-5', 'openrouter', 'model'],     // unknown maker: the generic chip
+    ['mystery-1', 'codex', 'openai'],                   // unknown name, known backend
+    ['', null, 'model'], [null, 'grok', 'grok'],
+  ];
+  for (const [model, group, want] of cases) assert.equal(providerOf(model, group), want, `${model} / ${group}`);
+  assert.equal(providerName('claude'), 'Anthropic');
+  assert.equal(providerName('model'), '');
+});
+
+test('the model-mark shim re-exports the one chunk under the public names, else the index', () => {
+  const index = `import { e as define } from "./html-X1.js";
+import { M, a as a8, b as b7, m as m4, c as c7, d as d6 } from "./model-mark-AbC_12.js";
+export { M as MODEL_MAKER_COLOR, a8 as MODEL_VENDORS, b7 as asModelVendor, m4 as modelMarkHtml, c7 as modelMarkSvg, d6 as modelVendor };`;
+  assert.equal(modelMarkShim(index), "export { c as modelMarkSvg, M as MODEL_MAKER_COLOR } from './model-mark-AbC_12.js';\n");
+  const fallback = "export { modelMarkSvg, MODEL_MAKER_COLOR } from './index.js';\n";
+  assert.equal(modelMarkShim(''), fallback);
+  assert.equal(modelMarkShim(index.replace('c7 as modelMarkSvg, ', '')), fallback);  // a name it cannot place
+});
+
+test('a Claude Code placeholder model (<synthetic>) never becomes the session model', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'llmux-webui-'));
+  const file = path.join(dir, '11111111-1111-1111-1111-111111111111.jsonl');
+  const line = (o) => JSON.stringify(o);
+  fs.writeFileSync(file, [
+    line({ type: 'user', timestamp: '2026-11-17T00:00:00Z', message: { role: 'user', content: 'fix the bug' } }),
+    line({ type: 'assistant', timestamp: '2026-11-17T00:00:05Z', requestId: 'r1', message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'on it' }], stop_reason: 'end_turn' } }),
+    line({ type: 'assistant', timestamp: '2026-11-17T00:00:09Z', message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'API Error' }] } }),
+  ].join('\n') + '\n');
+  assert.equal(transcriptMeta(file).model, 'claude-opus-5-5');
+  assert.equal(readTranscript(file).meta.model, 'claude-opus-5-5');
+});
+
