@@ -340,6 +340,9 @@ export class SessionIndex {
       deviceInfo: rm ? { os: rm.os, arch: rm.arch, version: rm.version, osVersion: rm.osVersion } : null,
       cwd, project: cwd ? path.basename(cwd) : null, branch: (t && t.branch) || (rm && rm.branch) || null, version: (t && t.version) || (rm && rm.version) || null,
       model,
+      // the backend group that served the model (claude / codex / grok / openrouter / gemini): names the
+      // provider mark when the model name alone does not
+      group: (model && rows.findLast(r => r.model === model && r.group) || {}).group || null,
       effort: (main[main.length - 1] || {}).effort || null,
       firstPrompt: firstPrompt.slice(0, 300) || null,
       lastPrompt: lastPrompt.slice(0, 300) || null,

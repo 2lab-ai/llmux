@@ -11,10 +11,13 @@ See it: ▶ [llmux film, 48 s](https://github.com/2lab-ai/llmux/releases/downloa
 - `lib/overview.mjs` — instructions → tools, files, requests, cost.
 - `lib/pricing.mjs` — per-token rates solved from the daemon's `usage_stats`, per model and price class.
 - `public/app.html`, `app.js`, `app.css` — the page, built from `@2lab.ai/ui` elements served at `/ui/*` from `UI_DIST`
-  (default: the host's soma-work install; falls back to jsDelivr `@2lab.ai/ui@0.39.0`). `core.js`/`core.css` keep the
+  (default: the host's soma-work install; falls back to jsDelivr `@2lab.ai/ui@0.42.1`). `core.js`/`core.css` keep the
   activity and account renderers. `ccview.js`/`ccview.css` draw the Claude Code screen; `rawview.js` is the raw viewer
   (`GET /api/raw-full`). Requests page through `GET /api/session/:sid/requests?limit=&kind=` with cursor `before=<at_ms:id>` (the next
   older page, loaded as the list scrolls) or `after=<at_ms:id>` (new requests of a running session); `offset=` still works.
+- `public/provider.js` — which provider a model belongs to (`X.providerOf(model, group)`); the mark beside each model
+  name is `@2lab.ai/ui`'s model mark, served by `GET /ui/llmux-model-mark.js` (`lib/uishim.mjs`: the one mark chunk,
+  not the whole library).
 
 Run locally: `PORT=4780 node server.mjs` (no auth, 127.0.0.1). Behind the soma-work login: `deploy/` (LaunchAgent + Caddy).
 Tests: `node --test webui/test/`.

@@ -171,7 +171,7 @@
       ${f('status', `<b class="${(rec.status || 0) >= 400 ? 'bad' : 'ok'}">${E(rec.status ?? '?')}</b> · ${E(X.ms(rec.duration_ms))} elapsed`)}
       ${f('time', E(new Date(rec.ts_ms).toLocaleString('ko-KR')))}
       ${f('id', '#' + E(rec.id))}
-      ${f('model', E([rec.group, rec.model].filter(Boolean).join(' ') + (r.effort ? ' · effort ' + r.effort : '') + (r.fast ? ' · fast' : '')))}
+      ${f('model', [rec.group ? E(rec.group) : '', rec.model ? X.mark(rec.model, rec.group) + E(rec.model) : ''].filter(Boolean).join(' ') + E((r.effort ? ' · effort ' + r.effort : '') + (r.fast ? ' · fast' : '')))}
       ${f('account', E(rec.account || '?'))}
       ${r.msg_kind ? f('kind', E(r.msg_kind)) : ''}
       ${r.tokens ? f('tokens', E(`in ${X.n(r.tokens.input)} · out ${X.n(r.tokens.output)} · cache read ${X.n(r.tokens.cache_read)} · cache write ${X.n(r.tokens.cache_creation)}`)) : ''}
@@ -260,7 +260,13 @@
     const rec = await r.json().catch(() => ({ error: '응답을 읽을 수 없습니다' }));
     if (!r.ok || rec.error) { document.getElementById('raw-body').innerHTML = `<div class="ui-empty">${E(rec.error || 'HTTP ' + r.status)}</div>`; return; }
     st.rec = rec; st.legs = buildLegs(rec, row);
-    document.getElementById('raw-head').textContent = `요청 원문 #${rec.id} · ${rec.model || ''} · ${X.short(rec.account || '')}`;
+    paintHead();
     paint();
   };
+  function paintHead() {
+    const rec = st.rec;
+    document.getElementById('raw-head').innerHTML = `요청 원문 #${E(rec.id)} · ${X.mark(rec.model, rec.group)}${E(rec.model || '')} · ${E(X.short(rec.account || ''))}`;
+  }
+  // The provider marks arrived while a record was open: draw them into its header and general block.
+  document.addEventListener('llmux-marks', () => { if (st.rec) { paintHead(); paint(); } });
 })();

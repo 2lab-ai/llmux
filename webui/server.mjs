@@ -3,11 +3,13 @@
 // The admin key is read from ~/.config/llmux.json on the server side only; it is
 // never sent to the browser. Binds only to the hosts in BIND (no 0.0.0.0).
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SessionIndex, requestPage } from './lib/sessions.mjs';
+import { modelMarkShim } from './lib/uishim.mjs';
 import { parseResponse, recoverMessages } from './lib/transcript.mjs';
 import { buildOverview } from './lib/overview.mjs';
 
@@ -157,7 +159,16 @@ async function getDoc() {
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json' };
 const ROUTES = { '/': 'app.html', '/users': 'app.html', '/activity': 'app.html', '/accounts': 'app.html' };
 const UI_DIST = process.env.UI_DIST || '/opt/soma-work/dev/node_modules/@2lab.ai/ui/dist';
-const UI_CDN = 'https://cdn.jsdelivr.net/npm/@2lab.ai/ui@0.39.0/dist/';
+const UI_CDN = 'https://cdn.jsdelivr.net/npm/@2lab.ai/ui@0.42.1/dist/';
+// The library index, from UI_DIST, else the pinned CDN build (kept for the life of the process: it never changes).
+// The model-mark shim reads its import lines; '' when neither can be read (the shim then re-exports the index).
+let cdnIndex = null;
+const uiIndex = () => fs.promises.readFile(path.join(UI_DIST, 'index.js'), 'utf8').catch(() => {
+  cdnIndex = cdnIndex || fetch(UI_CDN + 'index.js', { signal: AbortSignal.timeout(5000) })
+    .then(r => (r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status))))
+    .catch((e) => { cdnIndex = null; console.error('[webui] ui index', e.message); return ''; });
+  return cdnIndex;
+});
 
 // ---------- soma-work single sign-on (AUTH=soma) ----------
 // The soma-work dashboard (SSO_ORIGIN) owns login. Its session cookie (soma_dash_token) is host-only,
@@ -309,6 +320,19 @@ async function handler(req, res) {
   if (url.pathname === '/api/health') {
     res.writeHead(200, { ...sec, 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, host: HOST, daemon: DAEMON, cached_age_ms: cache.at ? Date.now() - cache.at : null }));
+  }
+  // The provider marks drawn left of model names, from @2lab.ai/ui without loading the whole library.
+  if (url.pathname === '/ui/llmux-model-mark.js') {
+    // Revalidated on every load (ETag): the chunk name changes with each @2lab.ai/ui build, so a cached shim
+    // must not outlive an upgrade of UI_DIST.
+    return uiIndex().then((src) => {
+      const body = modelMarkShim(src);
+      const etag = '"' + crypto.createHash('sha1').update(body).digest('base64url') + '"';
+      const head = { 'x-content-type-options': 'nosniff', 'cache-control': 'no-cache', etag, 'content-type': TYPES['.js'] };
+      if (req.headers['if-none-match'] === etag) { res.writeHead(304, head); return res.end(); }
+      res.writeHead(200, head);
+      res.end(req.method === 'HEAD' ? undefined : body);
+    });
   }
   if ((m = /^\/ui\/([A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:js|css))$/.exec(url.pathname))) {
     const f = path.join(UI_DIST, m[1]);

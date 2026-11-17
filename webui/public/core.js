@@ -43,6 +43,68 @@
   X.time = (ms) => { if (!ms) return ''; const d = new Date(ms); return [d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join(':'); };
   X.when = (ms) => { if (!ms) return '—'; const d = new Date(ms), now = new Date(); return d.toDateString() === now.toDateString() ? X.time(ms).slice(0, 5) : `${d.getMonth() + 1}/${d.getDate()} ${X.time(ms).slice(0, 5)}`; };
   X.clean = (t) => String(t || '').replace(/<speaker>[^<]*<\/speaker>/g, '').replace(/<\/?[a-z_-]+(\s[^>]*)?>/gi, ' ').replace(/\s+/g, ' ').trim();
+  /* ---------- provider marks left of model names ----------
+   * The drawings are @2lab.ai/ui's model marks, loaded by app.js from /ui/llmux-model-mark.js (X.setMarks, or
+   * X.marksFailed when the load fails); the provider is X.providerOf (provider.js). Until the marks load, or if they
+   * cannot, names stay plain. When they arrive, component watchers still on the page run once and `llmux-marks`
+   * tells the page to repaint its light-DOM views. */
+  let MARKS = null, SETTLED = false;
+  const waiting = new Map(); // host → run, only while the load is pending; hosts that left the page are dropped
+  const settle = (mod) => {
+    SETTLED = true; MARKS = mod;
+    if (mod) for (const [host, run] of waiting) if (host.isConnected) run();
+    waiting.clear();
+    if (mod) document.dispatchEvent(new Event('llmux-marks'));
+  };
+  X.setMarks = (mod) => settle(mod && typeof mod.modelMarkSvg === 'function' ? mod : null);
+  X.marksFailed = () => settle(null);
+  const markSvg = (v) => MARKS.modelMarkSvg(v).replace('<svg ', '<svg width="100%" height="100%" ');
+  const markHue = (v) => (MARKS.MODEL_MAKER_COLOR || {})[v] || '';
+  // A Claude Code placeholder in the model slot (`<synthetic>`, its own error and interrupt notes) is not a model.
+  const markable = (model) => MARKS && X.providerOf && model && !/^<[^>]*>$/.test(String(model).trim());
+  // Light DOM: styled by .mm in core.css.
+  X.mark = (model, group) => {
+    if (!markable(model)) return '';
+    const v = X.providerOf(model, group), hue = markHue(v), who = X.providerName(v);
+    return `<span class="mm" data-vendor="${v}"${hue ? ` style="--mm-hue:${hue}"` : ''}${who ? ` title="${who}"` : ''} aria-hidden="true">${markSvg(v)}</span>`;
+  };
+  // Inside a component's shadow root, where core.css does not reach: the same mark, with its layout inline.
+  X.markNode = (model, group) => {
+    const html = X.mark(model, group); if (!html) return null;
+    const el = document.createRange().createContextualFragment(html).firstElementChild;
+    el.className = 'lx-mm';
+    el.style.cssText += ';display:inline-block;width:1.05em;height:1.05em;vertical-align:-0.17em;margin-right:0.3em;flex:none;color:var(--mm-hue,currentColor)';
+    return el;
+  };
+  // Keep marks in a component that renders its own text (ui-task-runs, ui-context-window, ui-conversation):
+  // `apply(shadowRoot)` adds the marks that are missing, after the first render and after every re-render.
+  X.watchMarks = (host, apply) => {
+    if (SETTLED && !MARKS) return; // the marks will never come: names stay plain, nothing to watch
+    const start = () => {
+      const root = host.shadowRoot; if (!root) return;
+      // MutationObserver already batches a render into one callback; apply() adds only missing marks, so its own
+      // insertions trigger one more pass that changes nothing.
+      const run = () => { if (MARKS) apply(root); };
+      new MutationObserver(run).observe(root, { childList: true, subtree: true, characterData: true });
+      if (MARKS) { run(); return; }
+      if (SETTLED) return;
+      for (const h of waiting.keys()) if (!h.isConnected) waiting.delete(h);
+      waiting.set(host, run);
+    };
+    if (host.shadowRoot) start(); else customElements.whenDefined(host.localName).then(() => requestAnimationFrame(start));
+  };
+  // Put `node` in front of the first occurrence of `text` inside `el` (splitting the text node it sits in).
+  X.insertBefore = (el, text, node) => {
+    if (!el || !node || !text) return false;
+    const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let t = walk.nextNode(); t; t = walk.nextNode()) {
+      const i = t.data.indexOf(text); if (i < 0) continue;
+      const rest = i > 0 ? t.splitText(i) : t;
+      rest.parentNode.insertBefore(node, rest);
+      return true;
+    }
+    return false;
+  };
   X.short = (acct) => !acct ? '—' : acct.includes(':') ? acct.slice(acct.indexOf(':') + 1) : acct;
   X.group = (acct) => (acct || '').split(':')[0];
 
@@ -103,7 +165,7 @@
     const list = rows.slice().sort((a, b) => b.at_ms - a.at_ms).slice(0, opt.limit || 400);
     if (opt.compact) return `<div class="x-wl x-wl-c x-wl-h"><span>time</span><span>kind</span><span>model · account</span><span>st</span><span>dur</span><span>out</span></div>` + list.map(r => {
       const err = r.status >= 400;
-      return `<div class="x-wl x-wl-c ${err ? 'x-err' : ''} ${r.msg_kind === 'subagent' ? 'x-sub' : ''}" data-raw="${r.id}:${r.at_ms}"><span class="x-wl-t">${X.time(r.at_ms)}</span><span class="x-wl-k">${KIND_ICON[r.msg_kind] || '·'} ${X.esc(r.msg_kind || '')}</span><span class="x-wl-m">${X.esc((r.model || '').replace(/^claude-/, ''))} <span class="x-dim">${X.esc(X.short(r.account).split('@')[0])}</span></span><span class="x-wl-s">${r.status}</span><span class="x-wl-n">${X.ms(r.duration_ms)}</span><span class="x-wl-n">${X.n(r.tokens ? r.tokens.output : null)}</span></div>`;
+      return `<div class="x-wl x-wl-c ${err ? 'x-err' : ''} ${r.msg_kind === 'subagent' ? 'x-sub' : ''}" data-raw="${r.id}:${r.at_ms}"><span class="x-wl-t">${X.time(r.at_ms)}</span><span class="x-wl-k">${KIND_ICON[r.msg_kind] || '·'} ${X.esc(r.msg_kind || '')}</span><span class="x-wl-m">${X.mark(r.model, r.group)}${X.esc((r.model || '').replace(/^claude-/, ''))} <span class="x-dim">${X.esc(X.short(r.account).split('@')[0])}</span></span><span class="x-wl-s">${r.status}</span><span class="x-wl-n">${X.ms(r.duration_ms)}</span><span class="x-wl-n">${X.n(r.tokens ? r.tokens.output : null)}</span></div>`;
     }).join('');
     return list.map(r => {
       const err = r.status >= 400;
@@ -111,7 +173,7 @@
       return `<div class="x-wl ${err ? 'x-err' : ''} ${r.msg_kind === 'subagent' ? 'x-sub' : ''}" data-raw="${r.id}:${r.at_ms}">
         <span class="x-wl-t">${X.time(r.at_ms)}</span>
         <span class="x-wl-k" title="${X.esc(r.msg_kind)}">${KIND_ICON[r.msg_kind] || '·'} ${X.esc(r.msg_kind || '')}</span>
-        <span class="x-wl-m">${X.esc(r.model || '')}${r.effort ? ` <span class="x-dim">${X.esc(r.effort)}</span>` : ''}</span>
+        <span class="x-wl-m">${X.mark(r.model, r.group)}${X.esc(r.model || '')}${r.effort ? ` <span class="x-dim">${X.esc(r.effort)}</span>` : ''}</span>
         <span class="x-wl-a">${X.esc(X.short(r.account))}</span>
         <span class="x-wl-s ${err ? 'x-bad' : ''}">${r.status}</span>
         <span class="x-wl-n">${X.ms(r.duration_ms)}</span>
@@ -129,7 +191,7 @@
     const hdr = (h) => `<table class="x-hdr">${h.map(([k, v]) => `<tr><td>${X.esc(k)}</td><td>${X.esc(v)}</td></tr>`).join('')}</table>`;
     const blocks = r.response.blocks.map(b => b.type === 'text' ? `<div class="x-rb"><span class="x-tag">text</span><pre>${X.esc(b.text)}</pre></div>` : b.type === 'tool_use' ? `<div class="x-rb"><span class="x-tag">tool_use · ${X.esc(b.name)}</span><pre>${X.esc(b.input)}</pre></div>` : `<div class="x-rb"><span class="x-tag">${X.esc(b.type)}</span>${b.chars ? X.n(b.chars) + ' chars' : ''}</div>`).join('');
     return `<div class="x-raw">
-      <div class="x-raw-h">#${r.id} · ${X.esc(r.model)} · ${X.esc(X.short(r.account))} · <b class="${r.status >= 400 ? 'x-bad' : ''}">${r.status}</b> · ${X.ms(r.duration_ms)}</div>
+      <div class="x-raw-h">#${r.id} · ${X.mark(r.model, r.group)}${X.esc(r.model)} · ${X.esc(X.short(r.account))} · <b class="${r.status >= 400 ? 'x-bad' : ''}">${r.status}</b> · ${X.ms(r.duration_ms)}</div>
       <h5>Request <span class="x-dim">${X.n(r.request.bytes)}B · ${r.request.messages} messages${r.request.tools != null ? ' · ' + r.request.tools + ' tools' : ''}${r.request.truncated ? ' · <span class="x-warn">clipped at raw_io.max_body_bytes</span>' : ''}</span></h5>
       ${r.request.last ? `<div class="x-rb"><span class="x-tag">last message · ${X.esc(r.request.last.role)}</span><pre>${X.esc(r.request.last.content)}</pre></div>` : ''}
       <details><summary>request headers</summary>${hdr(r.request.headers)}</details>
@@ -246,7 +308,7 @@
       <div class="x-acts-h x-wl x-wl-h"><span>time</span><span>kind</span><span>model</span><span>account</span><span>st</span><span>dur</span><span>out</span><span>client</span><span>$</span></div>
       ${shown.map(r => `<div class="x-wl ${r._run ? 'x-run' : ''} ${r.status >= 400 ? 'x-err' : ''}" ${r._run ? '' : `data-raw="${r.id}:${r.at_ms}"`}>
         <span class="x-wl-t">${X.time(r.at_ms)}</span><span class="x-wl-k">${KIND_ICON[r.msg_kind] || '·'} ${X.esc(r.msg_kind || '')}</span>
-        <span class="x-wl-m">${X.esc(r.model || '')}</span><span class="x-wl-a">${X.esc(X.short(r.account))}</span>
+        <span class="x-wl-m">${X.mark(r.model, r.group)}${X.esc(r.model || '')}</span><span class="x-wl-a">${X.esc(X.short(r.account))}</span>
         <span class="x-wl-s">${r._run ? '<span class="x-spin"></span>' : r.status}</span><span class="x-wl-n">${r._run ? X.ms(Date.now() - r.started_at_ms) : X.ms(r.duration_ms)}</span>
         <span class="x-wl-n">${r._run ? '—' : X.n(r.tokens ? r.tokens.output : null)}</span><span class="x-wl-a">${X.esc(r.client_name || r.tenant || '')}</span><span class="x-wl-n">${r._run ? '—' : X.usd(r.cost_usd)}</span></div>`).join('')}`;
   };
