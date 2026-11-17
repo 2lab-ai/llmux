@@ -7,9 +7,10 @@ const X = window.X;
 const $ = (id) => document.getElementById(id);
 const E = X.esc;
 const HOUR = 3600000;
-// Provider marks left of model names: @2lab.ai/ui's drawings, one chunk (lib/uishim.mjs). Loaded before the first
-// paint so every model name is drawn with its mark; if they cannot load, names stay plain.
-try { X.setMarks(await import('/ui/llmux-model-mark.js')); } catch (e) { console.warn('[llmux] model marks unavailable', e); }
+// Provider marks left of model names: @2lab.ai/ui's drawings, one chunk (lib/uishim.mjs). Loaded beside the page,
+// never in front of it: names paint plain at first and get their marks when the chunk arrives (the `llmux-marks`
+// listener below repaints); if it never arrives, they stay plain.
+import('/ui/llmux-model-mark.js').then(X.setMarks, (e) => console.warn('[llmux] model marks unavailable', e));
 
 const st = {
   view: viewFromPath(),
@@ -394,13 +395,10 @@ function paintOverview(d, c, ov) {
   if (c.context) {
     const el = $('ov-ctx');
     el.data = { model: modelShort(c.context.model || c.model), window: c.context.window, parts: c.context.parts };
-    if (!el._marks) {
-      el._marks = true;
-      X.watchMarks(el, (root) => {
-        const name = root.querySelector('.cw-model'), cc = st.detail && st.detail.card;
-        if (name && cc && !name.querySelector('.lx-mm')) { const n = X.markNode((cc.context && cc.context.model) || cc.model, cc.group); if (n) name.prepend(n); }
-      });
-    }
+    X.watchMarks(el, (root) => {
+      const name = root.querySelector('.cw-model');
+      if (name && !name.querySelector('.lx-mm')) { const n = X.markNode(c.context.model || c.model, c.group); if (n) name.prepend(n); }
+    });
   }
 }
 $('t-ov').addEventListener('click', (e) => {
@@ -765,6 +763,14 @@ document.addEventListener('click', async (e) => {
   if (st.view === 'activity') { const raw = e.target.closest('[data-raw]'); if (raw) { const [id, at] = raw.dataset.raw.split(':').map(Number); const all = st.doc ? (st.doc.activity.completed || []) : []; const row = all.find(r => r.id === id && Math.abs(r.at_ms - at) < 5) || { id, at_ms: at }; X.openRaw({ ...row, msg_kind: row.msg_kind || row.kind_detail, at_ms: at }); } }
 });
 document.addEventListener('input', (e) => { if (e.target.classList.contains('x-filter')) { st.actFilter = e.target.value; const pos = e.target.selectionStart; paintOther(); const f = document.querySelector('.x-filter'); if (f) { f.focus(); f.setSelectionRange(pos, pos); } } });
+
+// The provider marks arrived after the first paint: repaint what draws model names in light DOM.
+// (Marks inside components — requests, context window, conversation — are added by their watchers.)
+document.addEventListener('llmux-marks', () => {
+  if (st.sel && st.detail) paintDetail(false);
+  if (st.view === 'users' && st.users) { paintUsers(); if (st.selUser) paintUserDetail(); }
+  paintOther();
+});
 
 /* ---------------- polling ---------------- */
 X.poll(loadSessions, 3000);

@@ -332,3 +332,28 @@ test('a Claude Code placeholder model (<synthetic>) never becomes the session mo
   assert.equal(readTranscript(file).meta.model, 'claude-opus-5-5');
 });
 
+test('a card names the backend group of its own model, newest request first, else none', () => {
+  const ix = new SessionIndex();
+  const uid = (sid) => JSON.stringify({ device_id: 'dev1', account_uuid: '', session_id: sid });
+  const sid = '44444444-4444-4444-4444-444444444444';
+  const now = Date.now();
+  const row = (id, ago, model, group) => ix.addRow({ id, at_ms: now - ago, tenant: 'local', user_id: uid(sid), msg_kind: 'user', excerpt: 'route this', model, group, status: 200 });
+  // The session's model is the one most of its requests used; a newer request for another model carries another group.
+  row(1, 9000, 'house-model-7', 'codex');
+  row(2, 8000, 'house-model-7', undefined);
+  row(3, 7000, 'house-model-7', 'codex');
+  row(4, 1000, 'other-model', 'grok');
+  let card = ix.list().cards.find(c => c.sid === sid);
+  assert.equal(card.model, 'house-model-7');
+  assert.equal(card.group, 'codex');
+  // No request of the session's model carries a group → none, never another model's group.
+  const ix2 = new SessionIndex();
+  const sid2 = '55555555-5555-5555-5555-555555555555';
+  for (const [id, ago, model, group] of [[1, 9000, 'house-model-7', undefined], [2, 8000, 'house-model-7', undefined], [3, 1000, 'other-model', 'grok']]) {
+    ix2.addRow({ id, at_ms: now - ago, tenant: 'local', user_id: uid(sid2), msg_kind: 'user', excerpt: 'route this', model, group, status: 200 });
+  }
+  card = ix2.list().cards.find(c => c.sid === sid2);
+  assert.equal(card.model, 'house-model-7');
+  assert.equal(card.group, null);
+});
+

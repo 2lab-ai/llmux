@@ -45,9 +45,17 @@
   X.clean = (t) => String(t || '').replace(/<speaker>[^<]*<\/speaker>/g, '').replace(/<\/?[a-z_-]+(\s[^>]*)?>/gi, ' ').replace(/\s+/g, ' ').trim();
   /* ---------- provider marks left of model names ----------
    * The drawings are @2lab.ai/ui's model marks, loaded by app.js (X.setMarks) from /ui/llmux-model-mark.js;
-   * the provider is X.providerOf (provider.js). Until the marks load, or if they cannot, names stay plain. */
+   * the provider is X.providerOf (provider.js). Until the marks load, or if they cannot, names stay plain.
+   * When they arrive, component watchers waiting for them run once and `llmux-marks` tells the page to repaint. */
   let MARKS = null;
-  X.setMarks = (mod) => { if (mod && typeof mod.modelMarkSvg === 'function') MARKS = mod; };
+  const waiting = new Set();
+  X.setMarks = (mod) => {
+    if (!mod || typeof mod.modelMarkSvg !== 'function') return;
+    MARKS = mod;
+    for (const run of waiting) run();
+    waiting.clear();
+    document.dispatchEvent(new Event('llmux-marks'));
+  };
   const markSvg = (v) => MARKS.modelMarkSvg(v).replace('<svg ', '<svg width="100%" height="100%" ');
   const markHue = (v) => (MARKS.MODEL_MAKER_COLOR || {})[v] || '';
   // Light DOM: styled by .mm in core.css.
@@ -74,10 +82,11 @@
   X.watchMarks = (host, apply) => {
     const start = () => {
       const root = host.shadowRoot; if (!root) return;
-      let queued = false;
-      const run = () => { queued = false; if (MARKS) apply(root); };
-      new MutationObserver(() => { if (!queued) { queued = true; queueMicrotask(run); } }).observe(root, { childList: true, subtree: true, characterData: true });
-      run();
+      // MutationObserver already batches a render into one callback; apply() adds only missing marks, so its own
+      // insertions trigger one more pass that changes nothing.
+      const run = () => { if (MARKS) apply(root); };
+      new MutationObserver(run).observe(root, { childList: true, subtree: true, characterData: true });
+      if (MARKS) run(); else waiting.add(() => { if (host.isConnected) run(); });
     };
     if (host.shadowRoot) start(); else customElements.whenDefined(host.localName).then(() => requestAnimationFrame(start));
   };
