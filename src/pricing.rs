@@ -2020,7 +2020,7 @@ mod tests {
         );
         approx(creation, 12.50);
         // The bare ALIAS is deliberately absent from the price table: the
-        // codex provider resolves `astra` to `gpt-6-astra` BEFORE the request
+        // codex provider resolves `astra` to `gpt-6.2-astra` BEFORE the request
         // (and the recorded model) leaves llmux, so pricing only ever sees the
         // resolved slug. Pricing the alias too would be a second source of
         // truth that could silently disagree with the wire model.

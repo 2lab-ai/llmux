@@ -184,8 +184,10 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     // serves it, so keeping it could only make every bare `or` request fail.
     // Adopt the current default. A live slug is an operator's choice and is
     // kept verbatim.
-    if crate::catalog::RETIRED_OPENROUTER_SLUGS.contains(&config.openrouter.default_model.as_str())
-    {
+    // Matched the way the provider reads a pin: trimmed, lowercased, and in
+    // either the wire slug (`stealth/ox-alpha`) or the advertised id
+    // (`or-ox-alpha`) spelling.
+    if crate::catalog::is_retired_openrouter_pin(&config.openrouter.default_model) {
         config.openrouter.default_model = crate::catalog::OPENROUTER_DEFAULT_PIN.to_string();
     }
     // Demo mode: swap account identities for stable fakes at the source so every
@@ -821,8 +823,12 @@ mod tests {
             );
             fs::write(&path, raw).expect("write config");
         };
-        for retired in crate::catalog::RETIRED_OPENROUTER_SLUGS {
-            write(retired);
+        let spellings = crate::catalog::RETIRED_OPENROUTER_SLUGS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(["or-ox-alpha".to_string(), " Stealth/Ox-Alpha ".to_string()]);
+        for retired in spellings {
+            write(&retired);
             assert_eq!(
                 load_path(&path).expect("load").openrouter.default_model,
                 crate::catalog::OPENROUTER_DEFAULT_PIN,

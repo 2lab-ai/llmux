@@ -425,6 +425,25 @@ pub(crate) const RETIRED_OPENROUTER_SLUGS: &[&str] = &[
     "openai/gpt-oss-20b:free",
 ];
 
+/// The advertised ids of the retired rows, in [`RETIRED_OPENROUTER_SLUGS`]
+/// order. A pin may be written in either spelling (`provider::openrouter`
+/// accepts both), so the config migration matches both.
+const RETIRED_OPENROUTER_IDS: &[&str] = &[
+    "or-ox-alpha",
+    "or-glm-5.2",
+    "or-laguna-s-2.1",
+    "or-gpt-oss-20b",
+];
+
+/// Whether a persisted `openrouter.default_model` names a retired row, read
+/// the way the provider reads a pin: trimmed, case-insensitive, as the wire
+/// slug or the advertised id.
+pub(crate) fn is_retired_openrouter_pin(pin: &str) -> bool {
+    let pin = pin.trim().to_ascii_lowercase();
+    RETIRED_OPENROUTER_SLUGS.contains(&pin.as_str())
+        || RETIRED_OPENROUTER_IDS.contains(&pin.as_str())
+}
+
 /// Resolve a curated OpenRouter advertised id (`or-nemotron-3-ultra`) to its
 /// upstream slug (`nvidia/nemotron-3-ultra-550b-a55b:free`), or `None` when
 /// it is not curated — the provider then applies the verbatim-passthrough
@@ -1936,9 +1955,10 @@ mod tests {
             resolve_openrouter_alias("or-nemotron-3-ultra"),
             Some(OPENROUTER_DEFAULT_PIN)
         );
-        // A config that still pins the retired slug keeps it (only the
-        // default moved): the alias goes to a synthesized null-metadata row,
-        // the same as any other uncurated pin.
+        // A loaded config can no longer carry a retired slug (`config::load_path`
+        // moves it to the new default), but a pin that reaches `catalog()` any
+        // other way is treated like any other uncurated pin: the alias goes to
+        // a synthesized null-metadata row.
         let stale = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
         assert_eq!(stale.len(), entries.len() + 1);
         let synth = find(&stale, "or-stealth/ox-alpha");

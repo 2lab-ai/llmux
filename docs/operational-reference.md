@@ -1160,7 +1160,7 @@ Unlike the Codex and Grok backends, the OpenRouter provider is a **passthrough, 
 
 Model selection is the `or-` prefix — `/model or-nemotron-3-ultra` routes to the openrouter group and reaches OpenRouter as `nvidia/nemotron-3-ultra-550b-a55b:free`. A bare `or` (or a model-less request) uses `openrouter.default_model` (default `nvidia/nemotron-3-ultra-550b-a55b:free` since 2026-11-18), `or-<vendor>/<slug>` passes through verbatim for the models llmux does not curate, and an unrecognized bare name is forwarded as typed so OpenRouter's own 404 reaches you. The curated rows, their wire slugs, and their context windows are in [models.md](models.md#alias-semantics).
 
-Cost: the ten curated models are free (`$0` in and out). An uncurated openrouter model has **no known rate** — the usage tab shows `—` and marks the bucket `+?` rather than pricing it as free, because the same group also fronts OpenRouter's paid catalog.
+Cost: the six curated models are free (`$0` in and out). An uncurated openrouter model has **no known rate** — the usage tab shows `—` and marks the bucket `+?` rather than pricing it as free, because the same group also fronts OpenRouter's paid catalog.
 
 ## Gemini backend
 
