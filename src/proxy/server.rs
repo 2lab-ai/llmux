@@ -5370,7 +5370,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 53 curated (15 claude + 16 codex + 4 grok + 10 openrouter + 8
+        // 53 curated (15 claude + 20 codex + 4 grok + 6 openrouter + 8
         // gemini) + 1 synthesized (grok-4.3 is out-of-catalog now).
         assert_eq!(models.len(), 54);
 
@@ -5401,12 +5401,51 @@ mod tests {
             by_id("gpt-5.6-sol")["aliases"],
             serde_json::json!(["gpt-5.6"])
         );
+        // `sol` moved to gpt-6.2-sol and `astra` to gpt-6.2-astra[1m] on
+        // 2026-11-18; the bare generation ids stay with their generation.
+        // gpt-6.1-sol's base row follows models.json from 272000 to 500000.
+        assert_eq!(
+            by_id("gpt-6.2-sol")["aliases"],
+            serde_json::json!(["sol", "gpt-6.2"])
+        );
+        assert_eq!(by_id("gpt-6.2-sol")["max_context"], 500_000);
+        assert_eq!(by_id("gpt-6.2-sol[1m]")["max_context"], 1_000_000);
+        assert_eq!(
+            by_id("gpt-6.2-astra[1m]")["aliases"],
+            serde_json::json!(["astra"])
+        );
+        assert_eq!(by_id("gpt-6.2-astra[1m]")["max_context"], 1_000_000);
+        assert_eq!(by_id("gpt-6.2-astra")["aliases"], serde_json::json!([]));
+        assert_eq!(by_id("gpt-6.2-astra")["max_context"], 272_000);
+        assert_eq!(
+            by_id("gpt-6-astra[1m]")["aliases"],
+            serde_json::json!(["gpt-6"])
+        );
         assert_eq!(
             by_id("gpt-6.1-sol")["aliases"],
-            serde_json::json!(["sol", "gpt-6.1"])
+            serde_json::json!(["gpt-6.1"])
         );
-        assert_eq!(by_id("gpt-6.1-sol")["max_context"], 272_000);
+        assert_eq!(by_id("gpt-6.1-sol")["max_context"], 500_000);
         assert_eq!(by_id("gpt-6.1-sol[1m]")["max_context"], 1_000_000);
+        // Opus 4.6 advertises no xhigh (2026-11-18).
+        assert_eq!(
+            by_id("claude-opus-4-6[1m]")["efforts"],
+            serde_json::json!(["low", "medium", "high", "max"])
+        );
+        // The four dead openrouter rows are retired (#243); bare `or` lands
+        // on the Nemotron 3 Ultra row.
+        for gone in [
+            "or-ox-alpha",
+            "or-glm-5.2",
+            "or-laguna-s-2.1",
+            "or-gpt-oss-20b",
+        ] {
+            assert!(models.iter().all(|m| m["id"] != gone), "{gone} retired");
+        }
+        assert_eq!(
+            by_id("or-nemotron-3-ultra")["aliases"],
+            serde_json::json!(["or"])
+        );
         // `terra` moved to gpt-6.1-terra on 2026-11-10; its base row carries
         // the models.json 500000, its twin the published 1M.
         assert_eq!(

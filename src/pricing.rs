@@ -13,9 +13,9 @@
 //! its prompt size (long-context tiers: OpenAI `> 272,000`, xAI `>= 200,000`,
 //! Anthropic Haiku 5.5 `> 100,000` prompt tokens bill the WHOLE request at
 //! the long rates), the codex Fast service tier, the UTC day it ran on (dated
-//! rate changes: Gemini 4 Argon from 2026-12-01, Gemini 3.8 Flash from
-//! 2027-01-01) and whether it was an Anthropic refusal that is not billed. A
-//! request's [`PriceClass`] is resolved ONCE, when the request is recorded
+//! rate changes: Gemini 4 Argon and Gemini 4 Carbon from 2026-12-01, Gemini
+//! 3.8 Flash from 2027-01-01) and whether it was an Anthropic refusal that is
+//! not billed. A request's [`PriceClass`] is resolved ONCE, when the request is recorded
 //! ([`PriceClass::resolve`]), from those facts and built-in data only (the
 //! boundaries and the change dates are not configurable), and travels with
 //! the request: the activity log, every aggregate and the key-usage store
@@ -40,7 +40,11 @@
 //! (and the pricing page), both read 2026-11-10. Mythos 5.2 / 5.1 / 5 rows and
 //! the gpt-5.6-terra / gpt-5.6-luna cache-write rates read 2026-11-11 (see
 //! the rows). The long-context and Fast tiers, the Opus 4.1 / 4 rows and the
-//! dated Gemini rates read 2026-11-11 (see the rows).
+//! dated Gemini rates read 2026-11-11 (see the rows). gpt-6.2-sol /
+//! gpt-6.2-astra from https://developers.openai.com/api/docs/pricing and their
+//! model pages, Gemini 4 Carbon / Hydrogen from
+//! https://aistudio.google.com/docs/pricing, all read 2026-11-18 (see the
+//! rows).
 
 use std::collections::HashMap;
 
@@ -802,9 +806,10 @@ const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5)
     .with_long(OPENAI_LONG, tier(20.0, 75.0, 2.0, 25.0, Some(50.0)))
     .with_fast(OPENAI_FAST);
 /// gpt-6.1-sol (released 2026-09-29; the openai/codex catalog's priority-1
-/// default). OpenAI pricing page, read 2026-10-06 (standard, ≤272k input):
-/// $2 in / $0.10 cached / $2.50 cache write / $10 out; 12h writes $5 (read
-/// 2026-11-11). Long: $4 / $0.20 / $5 / $10 / $15 (read 2026-11-11).
+/// default until gpt-6.2-sol on 2026-11-17). OpenAI pricing page, read
+/// 2026-10-06 (standard, ≤272k input): $2 in / $0.10 cached / $2.50 cache
+/// write / $10 out; 12h writes $5 (read 2026-11-11). Long: $4 / $0.20 / $5 /
+/// $10 / $15 (read 2026-11-11). Re-read 2026-11-18: unchanged.
 const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5)
     .with_extended(5.0)
     .with_long(OPENAI_LONG, tier(4.0, 15.0, 0.20, 5.0, Some(10.0)))
@@ -818,6 +823,28 @@ const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5)
 const GPT_6_1_TERRA: ModelPrice = ModelPrice::new(1.0, 5.0, 0.05, 1.25)
     .with_extended(2.5)
     .with_long(OPENAI_LONG, tier(2.0, 7.50, 0.10, 2.5, Some(5.0)))
+    .with_fast(OPENAI_FAST);
+/// gpt-6.2-sol (released 2026-11-17; the openai/codex catalog's new
+/// priority-1 default). https://developers.openai.com/api/docs/pricing and
+/// https://developers.openai.com/api/docs/models/gpt-6.2-sol, read 2026-11-18
+/// (standard, ≤272k input): $2 in / $0.10 cached / $2.50 cache write (30m) /
+/// $5 (12h) / $10 out — the same card as gpt-6.1-sol. Long: $4 / $0.20 / $5 /
+/// $10 / $15. Fast 2x ([`OPENAI_FAST`]); Ultrafast and Batch are not modeled.
+/// Before this row the id matched no prefix and took the codex group fallback
+/// (gpt-5.5's $5 / $30).
+const GPT_6_2_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.10, 2.5)
+    .with_extended(5.0)
+    .with_long(OPENAI_LONG, tier(4.0, 15.0, 0.20, 5.0, Some(10.0)))
+    .with_fast(OPENAI_FAST);
+/// gpt-6.2-astra (released 2026-11-17; catalog priority 2). Same pages, read
+/// 2026-11-18 (standard, ≤272k input): $8 in / $0.40 cached / $10 cache write
+/// (30m) / $20 (12h) / $40 out — four times sol and CHEAPER than gpt-6-astra
+/// ($10 / $50), so neither may price it. Long: $16 / $0.80 / $20 / $40 / $60.
+/// Fast 2x; Ultrafast and Batch are not modeled. Before this row it took the
+/// codex group fallback, like sol.
+const GPT_6_2_ASTRA: ModelPrice = ModelPrice::new(8.0, 40.0, 0.40, 10.0)
+    .with_extended(20.0)
+    .with_long(OPENAI_LONG, tier(16.0, 60.0, 0.80, 20.0, Some(40.0)))
     .with_fast(OPENAI_FAST);
 /// gpt-6-sol (released 2026-09-22). developers.openai.com model page, read
 /// 2026-10-06: $2 in / $0.20 cached / $2.50 cache write / $10 out (absent
@@ -874,6 +901,17 @@ const GROK_4_7: ModelPrice =
 /// `or-<vendor>/<slug>` escape hatch, and asserting $0 for those would be an
 /// invented number.
 const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
+/// Upstream slugs of the curated free rows retired from
+/// `crate::catalog::OPENROUTER_MODELS` on 2026-11-18 (#243: 0 endpoints, gone
+/// from `GET /api/v1/models`). Requests recorded while they were served were
+/// free, so history booked under them keeps [`OPENROUTER_FREE`] rather than
+/// turning unpriced — accounting never follows a catalog change.
+const RETIRED_OPENROUTER_FREE_SLUGS: &[&str] = &[
+    "stealth/ox-alpha",
+    "z-ai/glm-5.2:free",
+    "poolside/laguna-s-2.1:free",
+    "openai/gpt-oss-20b:free",
+];
 /// Gemini 3.8 Flash (ai.google.dev/gemini-api/docs/pricing, updated
 /// 2026-10-14): $0.75 in / $3.75 out / $0.075 cached input, no cache-write
 /// rate. These rates apply "through December 31, 2026"; "starting January 1,
@@ -905,6 +943,30 @@ const GEMINI_4_ARGON: ModelPrice =
     }]);
 /// Gemini 4 Argon from 2026-12-01 (see [`GEMINI_4_ARGON`]).
 const GEMINI_4_ARGON_DEC_2026: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 0.0);
+/// Gemini 4 Carbon (GA 2026-11-10 as `gemini-4-carbon`;
+/// https://aistudio.google.com/docs/pricing and
+/// https://aistudio.google.com/docs/models/gemini-4-carbon, read 2026-11-18):
+/// Argon's card — $2 in / $10 out / $0.10 cached through 2026-11-30, then $4 /
+/// $20 / $0.20 from 2026-12-01 ([`GEMINI_4_CARBON_DEC_2026`]; no time zone
+/// named, so the UTC day boundary). No >200k tier, no cache-write rate
+/// (implicit caching only). No catalog row: the daemon's Antigravity account
+/// cannot see it and the Antigravity id form is unpublished (#310), but any
+/// `gemini-*` id passes through, and without this row it fell to the Flash
+/// fallback. API-list-price-equivalent estimate, like the Flash row.
+const GEMINI_4_CARBON: ModelPrice =
+    ModelPrice::new(2.0, 10.0, 0.10, 0.0).with_changes(&[RateChange {
+        from: RateDay::ymd(2026, 12, 1),
+        price: GEMINI_4_CARBON_DEC_2026,
+    }]);
+/// Gemini 4 Carbon from 2026-12-01 (see [`GEMINI_4_CARBON`]).
+const GEMINI_4_CARBON_DEC_2026: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 0.0);
+/// Gemini 4 Hydrogen (GA 2026-11-12 as `gemini-4-hydrogen`; same pricing page
+/// and https://aistudio.google.com/docs/models/gemini-4-hydrogen, read
+/// 2026-11-18): $1.50 in / $7.50 out / $0.075 cached, flat — "flat across its
+/// entire 1 million-token context window", no dated change, no cache-write
+/// rate. No catalog row (#310), priced for the same passthrough reason as
+/// Carbon: the Flash fallback is half these rates.
+const GEMINI_4_HYDROGEN: ModelPrice = ModelPrice::new(1.50, 7.50, 0.075, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -939,6 +1001,8 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-6-luna" => Some(GPT_6_LUNA),
         "gpt-6.1" | "gpt-6.1-sol" => Some(GPT_6_1_SOL),
         "gpt-6.1-terra" => Some(GPT_6_1_TERRA),
+        "gpt-6.2" | "gpt-6.2-sol" => Some(GPT_6_2_SOL),
+        "gpt-6.2-astra" => Some(GPT_6_2_ASTRA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
         "grok-4.6" => Some(GROK_4_6),
@@ -953,19 +1017,24 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         | "gemini-3.8-flash-medium"
         | "gemini-3.8-flash-low" => Some(GEMINI_3_8_FLASH),
         "argon" | "gemini-4-argon" => Some(GEMINI_4_ARGON),
+        "gemini-4-carbon" => Some(GEMINI_4_CARBON),
+        "gemini-4-hydrogen" => Some(GEMINI_4_HYDROGEN),
         _ => None,
     };
     if exact.is_some() {
         return exact;
     }
     // Curated OpenRouter free models, keyed by the UPSTREAM slug — which is
-    // what the activity log records (the proxy rewrites `or-ox-alpha` to
-    // `stealth/ox-alpha` before the request leaves, and `finished_meta`
-    // reports the wire model). `crate::catalog::OPENROUTER_MODELS` is the SSOT
-    // for the set, so adding a row there prices it automatically.
+    // what the activity log records (the proxy rewrites `or-nemotron-3-ultra`
+    // to `nvidia/nemotron-3-ultra-550b-a55b:free` before the request leaves,
+    // and `finished_meta` reports the wire model).
+    // `crate::catalog::OPENROUTER_MODELS` is the SSOT for the set, so adding a
+    // row there prices it automatically; a retired row keeps its $0 for
+    // history ([`RETIRED_OPENROUTER_FREE_SLUGS`]).
     if crate::catalog::OPENROUTER_MODELS
         .iter()
         .any(|(_, slug, ..)| *slug == model_norm_lower)
+        || RETIRED_OPENROUTER_FREE_SLUGS.contains(&model_norm_lower)
     {
         return Some(OPENROUTER_FREE);
     }
@@ -1040,6 +1109,16 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
         // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.2-astra-") {
+        // Astra is four times sol's price, so a dated / suffixed astra id
+        // must be caught before the `gpt-6.2-` branch below underprices it.
+        // The trailing `-` is the variant boundary (`gpt-6.2-astrax` misses).
+        Some(GPT_6_2_ASTRA)
+    } else if model_norm_lower.starts_with("gpt-6.2-") {
+        // Sol is generation 6.2's flagship, so it is the `gpt-6.2-` default
+        // (astra has its own exact and prefix rows above). `gpt-6.20-*` must
+        // miss this branch, hence the required `-`.
+        Some(GPT_6_2_SOL)
     } else if model_norm_lower.starts_with("gpt-6.1-terra-") {
         // Terra is half sol's price, so a dated / suffixed terra id must be
         // caught before the `gpt-6.1-` branch below overcharges it.
@@ -1061,6 +1140,13 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // underpriced. The trailing `-` is the version boundary
         // (`gemini-4-argonx` must miss this branch).
         Some(GEMINI_4_ARGON)
+    } else if model_norm_lower.starts_with("gemini-4-carbon-") {
+        // Same reason and boundary as Argon: a thinking-level-suffixed
+        // Antigravity id (`gemini-4-carbon-high`) or a dated one must not be
+        // priced as Flash.
+        Some(GEMINI_4_CARBON)
+    } else if model_norm_lower.starts_with("gemini-4-hydrogen-") {
+        Some(GEMINI_4_HYDROGEN)
     } else if model_norm_lower.starts_with("gpt-6-") {
         // Astra is generation 6's flagship, so it is the `gpt-6-` default
         // exactly as sol is for `gpt-5.6-` (sol/luna have their own exact and
@@ -1495,6 +1581,30 @@ mod tests {
     }
 
     #[test]
+    fn retired_openrouter_free_slugs_keep_their_zero_price_for_history() {
+        // The four rows retired on 2026-11-18 (#243) are no longer curated,
+        // but what they served was free: history booked under their wire
+        // slugs stays $0 instead of turning unpriced.
+        for slug in RETIRED_OPENROUTER_FREE_SLUGS {
+            assert!(
+                crate::catalog::OPENROUTER_MODELS
+                    .iter()
+                    .all(|&(_, curated, ..)| curated != *slug),
+                "{slug} is retired, not curated"
+            );
+            assert_eq!(
+                price_for("openrouter", slug, &empty()),
+                Some(OPENROUTER_FREE),
+                "{slug}"
+            );
+        }
+        // The paid twins of two of them are different slugs: still unknown.
+        for paid in ["z-ai/glm-5.2", "openai/gpt-oss-20b"] {
+            assert_eq!(price_for("openrouter", paid, &empty()), None, "{paid}");
+        }
+    }
+
+    #[test]
     fn openrouter_group_has_no_fallback_price() {
         let overrides = std::collections::HashMap::new();
         // The group fronts ~400 PAID models through the `or-<vendor>/<slug>`
@@ -1598,6 +1708,77 @@ mod tests {
         }
         // Version boundary: a different model id must not take Argon rates.
         assert_eq!(builtin_price("gemini-4-argonx"), None);
+    }
+
+    #[test]
+    fn gemini_4_carbon_and_hydrogen_take_their_own_rates_not_flash() {
+        // aistudio.google.com/docs/pricing, read 2026-11-18: Carbon $2 / $10
+        // / $0.10 cached (Argon's card, doubling 2026-12-01 — see
+        // `dated_rates_follow_the_request_day`), Hydrogen $1.50 / $7.50 /
+        // $0.075 flat. No catalog rows (#310), but the passthrough reaches
+        // them: the bare id, a thinking-level-suffixed Antigravity id, a
+        // dated id and the `[1m]` spelling all price here.
+        for model in [
+            "gemini-4-carbon",
+            "gemini-4-carbon[1m]",
+            "GEMINI-4-CARBON",
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-20261110",
+        ] {
+            assert_eq!(
+                price_for("gemini", model, &empty()),
+                Some(GEMINI_4_CARBON),
+                "{model}"
+            );
+            let p = price_for("gemini", model, &empty()).expect("priced");
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_creation),
+                (2.0, 10.0, 0.10, 0.0),
+                "{model}"
+            );
+        }
+        for model in [
+            "gemini-4-hydrogen",
+            "gemini-4-hydrogen[1m]",
+            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-low",
+        ] {
+            assert_eq!(
+                price_for("gemini", model, &empty()),
+                Some(GEMINI_4_HYDROGEN),
+                "{model}"
+            );
+        }
+        approx(
+            cost_usd(
+                "gemini",
+                "gemini-4-hydrogen",
+                &tc(1_000_000, 1_000_000, Some(1_000_000), None),
+                &empty(),
+            ),
+            1.50 + 7.50 + 0.075,
+        );
+        // They no longer fall to the 3.8 Flash fallback ($0.75 / $3.75),
+        // which underpriced Carbon ~2.7x and Hydrogen 2x.
+        for model in ["gemini-4-carbon", "gemini-4-hydrogen"] {
+            assert_ne!(
+                price_for("gemini", model, &empty()),
+                Some(GEMINI_3_8_FLASH),
+                "{model}"
+            );
+        }
+        // Version boundary, as for Argon: look-alikes miss the model rows
+        // and take the group fallback.
+        for lookalike in ["gemini-4-carbonx", "gemini-4-hydrogenx", "gemini-40-carbon"] {
+            assert_eq!(builtin_price(lookalike), None, "{lookalike}");
+            assert_eq!(
+                price_for("gemini", lookalike, &empty()),
+                Some(GEMINI_3_8_FLASH),
+                "{lookalike}"
+            );
+        }
+        // Argon keeps its own row.
+        assert_eq!(builtin_price("gemini-4-argon"), Some(GEMINI_4_ARGON));
     }
 
     #[test]
@@ -2181,6 +2362,75 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_2_sol_and_astra_take_their_own_rates() {
+        // developers.openai.com/api/docs/pricing and the model pages, read
+        // 2026-11-18 (standard, ≤272k input): gpt-6.2-sol $2 / $0.10 cached /
+        // $2.50 write (30m) / $10 out; gpt-6.2-astra $8 / $0.40 / $10 / $40.
+        // The exact id, the bare `gpt-6.2` (sol), the `[1m]` spelling and a
+        // dated snapshot all price here.
+        for model in [
+            "gpt-6.2-sol",
+            "gpt-6.2",
+            "gpt-6.2-sol[1m]",
+            "GPT-6.2-SOL",
+            "gpt-6.2-sol-20261117",
+        ] {
+            assert_eq!(
+                price_for("codex", model, &empty()),
+                Some(GPT_6_2_SOL),
+                "{model}"
+            );
+        }
+        for model in [
+            "gpt-6.2-astra",
+            "gpt-6.2-astra[1m]",
+            "GPT-6.2-Astra",
+            "gpt-6.2-astra-20261117",
+        ] {
+            assert_eq!(
+                price_for("codex", model, &empty()),
+                Some(GPT_6_2_ASTRA),
+                "{model}"
+            );
+        }
+        for (model, tokens, expected) in [
+            ("gpt-6.2-sol", tc(1_000_000, 0, None, None), 2.0),
+            ("gpt-6.2-sol", tc(0, 1_000_000, None, None), 10.0),
+            ("gpt-6.2-sol", tc(0, 0, Some(1_000_000), None), 0.10),
+            ("gpt-6.2-sol", tc(0, 0, None, Some(1_000_000)), 2.50),
+            ("gpt-6.2-astra", tc(1_000_000, 0, None, None), 8.0),
+            ("gpt-6.2-astra", tc(0, 1_000_000, None, None), 40.0),
+            ("gpt-6.2-astra", tc(0, 0, Some(1_000_000), None), 0.40),
+            ("gpt-6.2-astra", tc(0, 0, None, Some(1_000_000)), 10.0),
+        ] {
+            approx(cost_usd("codex", model, &tokens, &empty()), expected);
+        }
+        // Before these rows both ids took the codex group fallback.
+        for model in ["gpt-6.2-sol", "gpt-6.2-astra"] {
+            assert_ne!(
+                price_for("codex", model, &empty()),
+                Some(GPT_5_5_FLAT),
+                "{model}"
+            );
+        }
+        // Boundaries. A variant look-alike without the `-` is not astra and
+        // takes the generation default, sol; a wider `gpt-6.20-` generation
+        // is not 6.2 at all; generation 6's astra and 6.2's astra are
+        // different rows, as are 6.1-sol and 6.2-sol.
+        assert_eq!(builtin_price("gpt-6.2-solx"), Some(GPT_6_2_SOL));
+        assert_eq!(builtin_price("gpt-6.2-astrax"), Some(GPT_6_2_SOL));
+        assert_eq!(builtin_price("gpt-6.20-sol"), None);
+        assert_eq!(builtin_price("gpt-6.20-astra"), None);
+        assert_eq!(builtin_price("gpt-6.20"), None);
+        assert_eq!(builtin_price("gpt-6-astra"), Some(GPT_6_ASTRA));
+        assert_eq!(builtin_price("gpt-6-astra-20260903"), Some(GPT_6_ASTRA));
+        assert_ne!(builtin_price("gpt-6.2-astra"), Some(GPT_6_ASTRA));
+        assert_eq!(builtin_price("gpt-6.1-sol"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.1"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.1-terra"), Some(GPT_6_1_TERRA));
+    }
+
+    #[test]
     fn gpt_5_60_does_not_resolve_to_gpt_5_6_pricing() {
         // Generation boundary: `gpt-5.60-sol` is NOT a gpt-5.6 model. It must
         // miss the built-in table entirely (no bare `gpt-5.6` prefix match)
@@ -2480,6 +2730,9 @@ mod tests {
             ("codex", "gpt-6-luna", 0.25),
             ("codex", "gpt-6.1-sol", 5.0),
             ("codex", "gpt-6.1-terra", 2.50),
+            // 12h writes, read 2026-11-18.
+            ("codex", "gpt-6.2-sol", 5.0),
+            ("codex", "gpt-6.2-astra", 20.0),
         ] {
             let price = price_for(group, model, &empty()).expect("priced");
             assert_eq!(price.cache_creation_extended, Some(want), "{model}");
@@ -2490,6 +2743,8 @@ mod tests {
             ("codex", "gpt-5.5"),
             ("grok", "grok-4.7"),
             ("gemini", "gemini-4-argon"),
+            ("gemini", "gemini-4-carbon"),
+            ("gemini", "gemini-4-hydrogen"),
         ] {
             let price = price_for(group, model, &empty()).expect("priced");
             assert_eq!(price.cache_creation_extended, None, "{model}");
@@ -2661,6 +2916,10 @@ mod tests {
         // (developers.openai.com/api/docs/pricing, read 2026-11-11). The
         // prompt counts fresh input, cache reads and cache writes.
         for model in [
+            "gpt-6.2-sol",
+            "gpt-6.2",
+            "gpt-6.2-astra",
+            "gpt-6.2-astra-20261117",
             "gpt-6.1-terra",
             "gpt-6.1-terra-20261026",
             "gpt-6.1-sol",
@@ -2719,6 +2978,8 @@ mod tests {
             ("codex", "gpt-5.5-codex"),
             ("codex", "gpt-7-mini"),
             ("gemini", "gemini-4-argon"),
+            ("gemini", "gemini-4-carbon"),
+            ("gemini", "gemini-4-hydrogen"),
         ] {
             assert!(!is_long(group, model, prompt(900_000, 0, 0)), "{model}");
         }
@@ -2730,6 +2991,17 @@ mod tests {
         // write). OpenAI long rows of the Standard table, xAI "≥ 200k" rows,
         // the Haiku 5.5 "over 100,000" row — all read 2026-11-11.
         for (group, model, want) in [
+            // gpt-6.2 long rows, read 2026-11-18.
+            (
+                "codex",
+                "gpt-6.2-sol",
+                rates(4.0, 15.0, 0.20, 5.0, Some(10.0)),
+            ),
+            (
+                "codex",
+                "gpt-6.2-astra",
+                rates(16.0, 60.0, 0.80, 20.0, Some(40.0)),
+            ),
             (
                 "codex",
                 "gpt-6.1-terra",
@@ -2824,6 +3096,8 @@ mod tests {
             ..PriceClass::STANDARD
         };
         for model in [
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
             "gpt-6.1-terra",
             "gpt-6.1-sol",
             "gpt-6-astra",
@@ -2897,11 +3171,15 @@ mod tests {
             let class = PriceClass::STANDARD.resolve(group, model, &t, false, day);
             class_cost(group, model, class, &t, &empty()).expect("priced")
         };
+        // Gemini 4 Carbon carries the same dated card (read 2026-11-18).
         for model in [
             "gemini-4-argon",
             "argon",
             "gemini-4-argon[1m]",
             "gemini-4-argon-20261014",
+            "gemini-4-carbon",
+            "gemini-4-carbon[1m]",
+            "gemini-4-carbon-high",
         ] {
             approx(cost_on("gemini", model, NOV_11), 2.0 + 10.0 + 0.10);
             approx(
@@ -2921,6 +3199,13 @@ mod tests {
             approx(
                 cost_on("gemini", model, RateDay::ymd(2027, 1, 1)),
                 1.50 + 7.50 + 0.15,
+            );
+        }
+        // Gemini 4 Hydrogen is flat: no dated change, no Flash 2027 rise.
+        for day in [NOV_11, RateDay::ymd(2026, 12, 1), RateDay::ymd(2027, 1, 1)] {
+            approx(
+                cost_on("gemini", "gemini-4-hydrogen", day),
+                1.50 + 7.50 + 0.075,
             );
         }
         // The gemini group fallback is Flash, dated changes included.

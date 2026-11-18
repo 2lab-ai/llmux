@@ -116,8 +116,11 @@ use view::DashboardView;
 /// endpoint; this is the quick-pick set. `gpt-6-astra` added 2026-09-07: it is
 /// in [`crate::provider::codex`]'s passthrough list, so a pin set from here is
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
-/// `gpt-6.1-terra` added 2026-11-10 on the same terms.
+/// `gpt-6.1-terra` added 2026-11-10 and `gpt-6.2-sol` / `gpt-6.2-astra`
+/// 2026-11-18 on the same terms.
 const CODEX_MODELS: &[&str] = &[
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
     "gpt-6-astra",
@@ -132,7 +135,8 @@ const CODEX_MODELS: &[&str] = &[
 /// Reasoning-effort levels cycled with `e` (and the group-settings bar);
 /// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
 /// U12). A concrete value OVERRIDES every request. `max` is native on the
-/// gpt-5.6 / gpt-6 / gpt-6.1 families, and clamps to `xhigh` on older models.
+/// gpt-5.6 / gpt-6 / gpt-6.1 / gpt-6.2 families, and clamps to `xhigh` on
+/// older models.
 const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
 /// Values are the config superset (`none|low|medium|high|xhigh`) — per-model
@@ -7794,13 +7798,16 @@ mod tests {
     /// a model llmux can route but cannot be cycled to is not switchable.
     #[test]
     fn codex_model_cycle_reaches_gpt_6_astra_from_the_sol_pin() {
-        // Newest generation first (gpt-6.1-sol, the openai/codex catalog's
-        // priority-1 default since 2026-09-29), and every entry is distinct (a
+        // Newest generation first (gpt-6.2-sol, the openai/codex catalog's
+        // priority-1 default since 2026-11-17), and every entry is distinct (a
         // duplicate would make the modulo cycle skip a model forever).
-        assert_eq!(CODEX_MODELS[0], "gpt-6.1-sol");
-        // gpt-6.1-terra (2026-11-10) sits next to its generation's flagship.
-        assert_eq!(CODEX_MODELS[1], "gpt-6.1-terra");
-        assert_eq!(CODEX_MODELS.len(), 10);
+        assert_eq!(CODEX_MODELS[0], "gpt-6.2-sol");
+        // gpt-6.2-astra (priority 2) sits next to its generation's flagship,
+        // then generation 6.1 (sol, then terra since 2026-11-10).
+        assert_eq!(CODEX_MODELS[1], "gpt-6.2-astra");
+        assert_eq!(CODEX_MODELS[2], "gpt-6.1-sol");
+        assert_eq!(CODEX_MODELS[3], "gpt-6.1-terra");
+        assert_eq!(CODEX_MODELS.len(), 12);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -7837,7 +7844,7 @@ mod tests {
         app.cycle_codex_model(Some(&view));
         assert_eq!(
             app.take_pending_codex().map(|c| c.model),
-            Some("gpt-6.1-sol".to_string())
+            Some("gpt-6.2-sol".to_string())
         );
     }
 

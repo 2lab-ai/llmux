@@ -797,6 +797,39 @@ mod tests {
         assert_eq!(config.grok.reasoning_effort.as_deref(), Some("high"));
     }
 
+    /// The OpenRouter default-pin roll (`stealth/ox-alpha` →
+    /// `nvidia/nemotron-3-ultra-550b-a55b:free`, 2026-11-18, #243) follows the
+    /// grok rule: only the DEFAULT moves. A config that names the retired slug
+    /// keeps it (the operator re-points `openrouter.default_model`), and a
+    /// fresh or model-less section takes the new pin.
+    #[test]
+    fn openrouter_default_pin_roll_moves_only_the_default() {
+        let raw = r#"{
+  "version": 1,
+  "openrouter": { "default_model": "stealth/ox-alpha" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(
+            config.openrouter.default_model, "stealth/ox-alpha",
+            "an explicit pin is never rewritten to the new default"
+        );
+        let raw = r#"{
+  "version": 1,
+  "openrouter": { "upstream": "https://openrouter.ai/api" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(
+            config.openrouter.default_model,
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            Config::default().openrouter.default_model,
+            crate::catalog::OPENROUTER_DEFAULT_PIN
+        );
+    }
+
     pub(crate) fn oauth_account(name: &str, uuid: &str) -> AccountConfig {
         AccountConfig {
             name: name.to_string(),

@@ -744,7 +744,11 @@ mod tests {
     /// row per catalog entry, in catalog order.
     #[test]
     fn model_picker_settings_round_trips_the_real_catalog() {
-        let entries = crate::catalog::catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = crate::catalog::catalog(
+            "grok-4.6",
+            "gpt-5.6-sol",
+            crate::catalog::OPENROUTER_DEFAULT_PIN,
+        );
         let doc = serde_json::json!({ "models": entries }).to_string();
         let rows = serde_json::from_str::<CatalogResponse>(&doc)
             .expect("the served catalog parses as CLI catalog rows")
@@ -761,6 +765,18 @@ mod tests {
             json.contains(r#"{"model":"claude-fable-5-1[1m]","label":"Claude Fable 5.1","description":"claude · efforts low…max · ctx 1000000"}"#),
             "{json}"
         );
+        // The gpt-6.2 rows (2026-11-18) lead the codex block, each id verbatim.
+        for option in [
+            r#"{"model":"gpt-6.2-sol[1m]","label":"GPT-6.2-Sol [1M]","description":"codex · efforts low…ultra · ctx 1000000"}"#,
+            r#"{"model":"gpt-6.2-sol","label":"GPT-6.2-Sol","description":"codex · efforts low…ultra · ctx 500000"}"#,
+            r#"{"model":"gpt-6.2-astra[1m]","label":"GPT-6.2-Astra [1M]","description":"codex · efforts low…ultra · ctx 1000000"}"#,
+            r#"{"model":"gpt-6.2-astra","label":"GPT-6.2-Astra","description":"codex · efforts low…ultra · ctx 272000"}"#,
+            r#"{"model":"gpt-6.1-sol","label":"GPT-6.1-Sol","description":"codex · efforts low…ultra · ctx 500000"}"#,
+        ] {
+            assert!(json.contains(option), "{option} in {json}");
+        }
+        // The retired openrouter rows (#243) are gone from the picker.
+        assert!(!json.contains("or-ox-alpha"), "{json}");
         let gemini_rows = rows.iter().filter(|row| row.group == "gemini").count();
         assert!(gemini_rows > 0, "the real catalog carries gemini rows");
         assert_eq!(
@@ -886,7 +902,11 @@ mod tests {
     /// Code's 200k denominator.
     #[test]
     fn alias_env_covers_every_family_of_the_real_catalog() {
-        let entries = crate::catalog::catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = crate::catalog::catalog(
+            "grok-4.7",
+            "gpt-5.6-sol",
+            crate::catalog::OPENROUTER_DEFAULT_PIN,
+        );
         let doc = serde_json::json!({ "models": entries }).to_string();
         let rows = serde_json::from_str::<CatalogResponse>(&doc)
             .expect("the served catalog parses as CLI catalog rows")

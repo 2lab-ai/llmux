@@ -82,6 +82,13 @@ shape), not the translate path. No SSE converter, no format translation, no
 
 Curated rows are a **convenience layer, not a gate**: any `or-<slug>` passes through.
 
+Update 2026-11-18 ([#243](https://github.com/2lab-ai/llmux/issues/243)): `stealth/ox-alpha`,
+`z-ai/glm-5.2:free`, `poolside/laguna-s-2.1:free` and `openai/gpt-oss-20b:free` had 0
+endpoints from 2026-11-10 and were gone from `GET /api/v1/models` on 2026-11-18, so their
+rows (`or-ox-alpha`, `or-glm-5.2`, `or-laguna-s-2.1`, `or-gpt-oss-20b`) were retired. The
+default pin moved to `nvidia/nemotron-3-ultra-550b-a55b:free` (`or-nemotron-3-ultra`). The
+current curated set is in [models.md](../models.md#alias-semantics).
+
 ## Requirements → design
 
 ### R1. `openrouter` backend group
@@ -110,11 +117,12 @@ matches `or-`/`or`. (`o1`/`o3`/`o4` are prefixes, not `o*`.)
 `src/provider/openrouter.rs::resolve_model`:
 
 1. Trim, lowercase. Strip a leading `or-` (or accept a bare `or`).
-2. Bare `or` → the live pin (`config.openrouter.default_model`, default `stealth/ox-alpha`).
-3. If the remainder contains `/` → use it VERBATIM (`or-openai/gpt-oss-20b:free`
-   → `openai/gpt-oss-20b:free`). This is the escape hatch for the other 400 models.
-4. Else look up the curated alias table (`or-ox-alpha` → `stealth/ox-alpha`,
-   `or-glm-5.2` → `z-ai/glm-5.2:free`, …).
+2. Bare `or` → the live pin (`config.openrouter.default_model`, default
+   `nvidia/nemotron-3-ultra-550b-a55b:free` since 2026-11-18; `stealth/ox-alpha` before).
+3. If the remainder contains `/` → use it VERBATIM (`or-google/gemma-4-26b-a4b-it:free`
+   → `google/gemma-4-26b-a4b-it:free`). This is the escape hatch for the other 400 models.
+4. Else look up the curated alias table (`or-nemotron-3-ultra` →
+   `nvidia/nemotron-3-ultra-550b-a55b:free`, `or-gemma-4-31b` → `google/gemma-4-31b-it:free`, …).
 5. No match → pass the remainder through verbatim and let OpenRouter 404 it with its own
    message (never silently substitute a different model).
 
