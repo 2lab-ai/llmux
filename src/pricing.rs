@@ -901,17 +901,6 @@ const GROK_4_7: ModelPrice =
 /// `or-<vendor>/<slug>` escape hatch, and asserting $0 for those would be an
 /// invented number.
 const OPENROUTER_FREE: ModelPrice = ModelPrice::new(0.0, 0.0, 0.0, 0.0);
-/// Upstream slugs of the curated free rows retired from
-/// `crate::catalog::OPENROUTER_MODELS` on 2026-11-18 (#243: 0 endpoints, gone
-/// from `GET /api/v1/models`). Requests recorded while they were served were
-/// free, so history booked under them keeps [`OPENROUTER_FREE`] rather than
-/// turning unpriced — accounting never follows a catalog change.
-const RETIRED_OPENROUTER_FREE_SLUGS: &[&str] = &[
-    "stealth/ox-alpha",
-    "z-ai/glm-5.2:free",
-    "poolside/laguna-s-2.1:free",
-    "openai/gpt-oss-20b:free",
-];
 /// Gemini 3.8 Flash (ai.google.dev/gemini-api/docs/pricing, updated
 /// 2026-10-14): $0.75 in / $3.75 out / $0.075 cached input, no cache-write
 /// rate. These rates apply "through December 31, 2026"; "starting January 1,
@@ -1030,11 +1019,11 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     // and `finished_meta` reports the wire model).
     // `crate::catalog::OPENROUTER_MODELS` is the SSOT for the set, so adding a
     // row there prices it automatically; a retired row keeps its $0 for
-    // history ([`RETIRED_OPENROUTER_FREE_SLUGS`]).
+    // history ([`crate::catalog::RETIRED_OPENROUTER_SLUGS`]).
     if crate::catalog::OPENROUTER_MODELS
         .iter()
         .any(|(_, slug, ..)| *slug == model_norm_lower)
-        || RETIRED_OPENROUTER_FREE_SLUGS.contains(&model_norm_lower)
+        || crate::catalog::RETIRED_OPENROUTER_SLUGS.contains(&model_norm_lower)
     {
         return Some(OPENROUTER_FREE);
     }
@@ -1585,7 +1574,7 @@ mod tests {
         // The four rows retired on 2026-11-18 (#243) are no longer curated,
         // but what they served was free: history booked under their wire
         // slugs stays $0 instead of turning unpriced.
-        for slug in RETIRED_OPENROUTER_FREE_SLUGS {
+        for slug in crate::catalog::RETIRED_OPENROUTER_SLUGS {
             assert!(
                 crate::catalog::OPENROUTER_MODELS
                     .iter()

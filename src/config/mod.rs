@@ -178,6 +178,16 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     {
         config.proxy.idle_probe = IdleProbeConfig::default();
     }
+    // OpenRouter default-pin migration (#243, sweep 2026-11-18). Every config
+    // written before the roll serialized the old default `stealth/ox-alpha`,
+    // so a persisted RETIRED slug reads as "unset" — and OpenRouter no longer
+    // serves it, so keeping it could only make every bare `or` request fail.
+    // Adopt the current default. A live slug is an operator's choice and is
+    // kept verbatim.
+    if crate::catalog::RETIRED_OPENROUTER_SLUGS.contains(&config.openrouter.default_model.as_str())
+    {
+        config.openrouter.default_model = crate::catalog::OPENROUTER_DEFAULT_PIN.to_string();
+    }
     // Demo mode: swap account identities for stable fakes at the source so every
     // surface (dashboard, logs, status) shows the alias. Credentials are keyed
     // by token/uuid, not name, so they keep working.
@@ -798,21 +808,32 @@ mod tests {
     }
 
     /// The OpenRouter default-pin roll (`stealth/ox-alpha` →
-    /// `nvidia/nemotron-3-ultra-550b-a55b:free`, 2026-11-18, #243) follows the
-    /// grok rule: only the DEFAULT moves. A config that names the retired slug
-    /// keeps it (the operator re-points `openrouter.default_model`), and a
-    /// fresh or model-less section takes the new pin.
+    /// `nvidia/nemotron-3-ultra-550b-a55b:free`, 2026-11-18, #243): a fresh or
+    /// model-less section takes the new pin, a persisted RETIRED slug is
+    /// moved to it at load, and a live slug the operator chose is kept.
     #[test]
-    fn openrouter_default_pin_roll_moves_only_the_default() {
-        let raw = r#"{
-  "version": 1,
-  "openrouter": { "default_model": "stealth/ox-alpha" },
-  "accounts": []
-}"#;
-        let config: Config = serde_json::from_str(raw).expect("config parses");
+    fn openrouter_default_pin_roll_heals_retired_slugs_only() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let write = |model: &str| {
+            let raw = format!(
+                r#"{{ "version": 1, "openrouter": {{ "default_model": "{model}" }}, "accounts": [] }}"#
+            );
+            fs::write(&path, raw).expect("write config");
+        };
+        for retired in crate::catalog::RETIRED_OPENROUTER_SLUGS {
+            write(retired);
+            assert_eq!(
+                load_path(&path).expect("load").openrouter.default_model,
+                crate::catalog::OPENROUTER_DEFAULT_PIN,
+                "a persisted retired slug {retired} moves to the current pin"
+            );
+        }
+        write("google/gemma-4-26b-a4b-it:free");
         assert_eq!(
-            config.openrouter.default_model, "stealth/ox-alpha",
-            "an explicit pin is never rewritten to the new default"
+            load_path(&path).expect("load").openrouter.default_model,
+            "google/gemma-4-26b-a4b-it:free",
+            "a live slug the operator chose is never rewritten"
         );
         let raw = r#"{
   "version": 1,

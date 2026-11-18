@@ -405,10 +405,25 @@ pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str)] = &[
 /// Re-pinned 2026-11-18 (#243) from `stealth/ox-alpha`, which OpenRouter no
 /// longer serves, to the `or-nemotron-3-ultra` row: free, live since
 /// 2026-06, 1 endpoint and a 1,000,000-token window on the 2026-11-18 probe.
-/// Like the grok default-pin roll, only the DEFAULT moves: a config file that
-/// already names `stealth/ox-alpha` keeps it until the operator edits
-/// `openrouter.default_model`.
+/// Unlike the grok default-pin roll, a config file that still names a
+/// RETIRED slug ([`RETIRED_OPENROUTER_SLUGS`]) is moved to this pin at load
+/// (`crate::config::load_path`): every pre-roll config serialized
+/// `stealth/ox-alpha` as its default, and a slug OpenRouter no longer serves
+/// can only fail. Any live slug an operator chose is kept verbatim.
 pub(crate) const OPENROUTER_DEFAULT_PIN: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
+
+/// Upstream slugs of the curated free rows retired from
+/// [`OPENROUTER_MODELS`] on 2026-11-18 (#243: 0 endpoints, gone from
+/// `GET /api/v1/models`). Two readers: pricing keeps them at $0, because
+/// requests recorded while they were served were free and accounting never
+/// follows a catalog change; config load moves a persisted
+/// `openrouter.default_model` naming one of them to [`OPENROUTER_DEFAULT_PIN`].
+pub(crate) const RETIRED_OPENROUTER_SLUGS: &[&str] = &[
+    "stealth/ox-alpha",
+    "z-ai/glm-5.2:free",
+    "poolside/laguna-s-2.1:free",
+    "openai/gpt-oss-20b:free",
+];
 
 /// Resolve a curated OpenRouter advertised id (`or-nemotron-3-ultra`) to its
 /// upstream slug (`nvidia/nemotron-3-ultra-550b-a55b:free`), or `None` when

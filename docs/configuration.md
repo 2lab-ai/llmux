@@ -214,7 +214,7 @@ OpenRouter serves **Anthropic Messages** natively. For incoming Messages, llmux 
 | Key | Default | Meaning |
 |---|---|---|
 | `openrouter.upstream` | `https://openrouter.ai/api` | Base URL the client's verbatim path is appended to, so the request goes to `{upstream}/v1/messages`. Host root, **not** `…/api/v1` — that would compose `…/api/v1/v1/messages`, which 404s. |
-| `openrouter.default_model` | `nvidia/nemotron-3-ultra-550b-a55b:free` | The slug a bare `or` — or a request that names no model — resolves to. The default was `stealth/ox-alpha` until 2026-11-18, when OpenRouter stopped serving it ([#243](https://github.com/2lab-ai/llmux/issues/243)); a config file that still names it keeps it, so set the new slug or delete the key. |
+| `openrouter.default_model` | `nvidia/nemotron-3-ultra-550b-a55b:free` | The slug a bare `or` — or a request that names no model — resolves to. The default was `stealth/ox-alpha` until 2026-11-18, when OpenRouter stopped serving it ([#243](https://github.com/2lab-ai/llmux/issues/243)); a config file that still names it, or another retired slug, is moved to the new default when the daemon loads it; any other slug you set is kept. |
 
 Model selection is the `or-` prefix: `or-nemotron-3-ultra` and the other curated ids resolve to their OpenRouter slug, `or-<vendor>/<slug>` reaches any of the ~400 uncurated models verbatim, and an unknown bare name is passed through so OpenRouter's own 404 answers it. See [models.md](models.md#alias-semantics).
 
