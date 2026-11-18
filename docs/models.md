@@ -66,21 +66,24 @@ not that it is zero.
   metadata on both sides.
 - **codex variant aliases** — `sol` / `terra` / `luna` / `astra` resolve to the
   NEWEST gpt generation that ships that variant (openai/codex `models.json`,
-  read 2026-10-06 and 2026-11-10): `sol` → `gpt-6.1-sol` (released
-  2026-09-29), `terra` → `gpt-6.1-terra` (2026-10-26), `luna` → `gpt-6-luna`
-  (2026-09-22) and `astra` → `gpt-6-astra`. Generation 6 shipped no terra
+  read 2026-10-06, 2026-11-10 and 2026-11-18): `sol` → `gpt-6.2-sol` and
+  `astra` → `gpt-6.2-astra` (both released 2026-11-17), `terra` →
+  `gpt-6.1-terra` (2026-10-26) and `luna` → `gpt-6-luna` (2026-09-22).
+  Generation 6.2 ships no terra or luna tier, and generation 6 shipped no terra
   tier, so `terra` stayed on `gpt-5.6-terra` until generation 6.1 shipped one.
   The bare generation ids resolve to that generation's flagship: `gpt-5.6` →
-  `gpt-5.6-sol`, `gpt-6` → `gpt-6-astra`, `gpt-6.1` → `gpt-6.1-sol`. `sol`
-  moved from `gpt-5.6-sol` and `luna` from `gpt-5.6-luna` on 2026-10-06, and
-  `terra` from `gpt-5.6-terra` on 2026-11-10 — the 5.6 rows stay in the
-  catalog and remain addressable by full id.
-  `astra` and the bare `gpt-6` id advertise on `gpt-6-astra[1m]` — a deliberate
-  asymmetry: on astra the bare aliases advertise the 1M row, so `astra` /
-  `gpt-6` resolve to that row's upstream slug and to the ~1,050,000-token window
-  this catalog publishes for it, while the explicit base id `gpt-6-astra` is the
-  way to pick the openai/codex catalog's 272000. The 6.1-sol / 6.1-terra /
-  6-sol / 6-luna pairs follow the 5.6 convention instead (aliases on the base row; the `[1m]`
+  `gpt-5.6-sol`, `gpt-6` → `gpt-6-astra`, `gpt-6.1` → `gpt-6.1-sol`, `gpt-6.2`
+  → `gpt-6.2-sol`. `sol` moved from `gpt-5.6-sol` and `luna` from
+  `gpt-5.6-luna` on 2026-10-06, `terra` from `gpt-5.6-terra` on 2026-11-10, and
+  `sol` from `gpt-6.1-sol` and `astra` from `gpt-6-astra` on 2026-11-18 — the
+  older rows stay in the catalog and remain addressable by full id.
+  `astra` advertises on `gpt-6.2-astra[1m]` and the bare `gpt-6` id on
+  `gpt-6-astra[1m]` — a deliberate asymmetry: on astra the bare aliases
+  advertise the 1M row, so `astra` / `gpt-6` resolve to that row's upstream slug
+  and to the ~1,050,000-token window this catalog publishes for it, while the
+  explicit base ids `gpt-6.2-astra` / `gpt-6-astra` are the way to pick the
+  openai/codex catalog's 272000. The 6.2-sol / 6.1-sol / 6.1-terra / 6-sol /
+  6-luna pairs follow the 5.6 convention instead (aliases on the base row; the `[1m]`
   twin is an explicit opt-in). That is catalog resolution, **not** a client-side
   window: Claude Code sizes its readout off the id you submit, and a bare alias
   — an id it does not know — gets its 200k assumption. Type `sol[1m]` /
@@ -129,36 +132,40 @@ not that it is zero.
   one exception is Claude Code's bare `quota` probe, which gets the Claude Code
   system block ([provider contract](provider-compatibility.md#haiku-55-catalog-update)) —
   and the `efforts` menu on claude rows is the Claude Code `/effort` level list,
-  per the user contract.
+  per the user contract — minus the levels a model lacks: `claude-opus-4-6[1m]`
+  lists low, medium, high, max (no `xhigh`; corrected 2026-11-18).
 - **openrouter `or-` aliases** — the openrouter rows advertise the id a client
-  SENDS (`or-ox-alpha`); the OpenRouter slug it is rewritten to on the wire
-  (`stealth/ox-alpha`) is a different string, because the advertised id has to
-  carry the `or-` prefix that routes the request to the openrouter group in the
-  first place. The curated mapping:
+  SENDS (`or-nemotron-3-ultra`); the OpenRouter slug it is rewritten to on the
+  wire (`nvidia/nemotron-3-ultra-550b-a55b:free`) is a different string,
+  because the advertised id has to carry the `or-` prefix that routes the
+  request to the openrouter group in the first place. The curated mapping:
 
   | request slug                | model on the wire                        |
   | --------------------------- | ---------------------------------------- |
-  | `or-ox-alpha`               | `stealth/ox-alpha`                       |
   | `or-free`                   | `openrouter/free`                        |
-  | `or-glm-5.2`                | `z-ai/glm-5.2:free`                      |
   | `or-nemotron-3-ultra`       | `nvidia/nemotron-3-ultra-550b-a55b:free` |
   | `or-nemotron-3.5-lightning` | `nvidia/nemotron-3.5-lightning:free`     |
   | `or-dots-3-note`            | `dots-studio/dots-3-note-preview:free`   |
-  | `or-laguna-s-2.1`           | `poolside/laguna-s-2.1:free`             |
   | `or-north-mini-code`        | `cohere/north-mini-code:free`            |
   | `or-gemma-4-31b`            | `google/gemma-4-31b-it:free`             |
-  | `or-gpt-oss-20b`            | `openai/gpt-oss-20b:free`                |
+
+  `or-ox-alpha`, `or-glm-5.2`, `or-laguna-s-2.1` and `or-gpt-oss-20b` were
+  retired on 2026-11-18 ([#243](https://github.com/2lab-ai/llmux/issues/243)):
+  OpenRouter no longer serves their slugs. Sent today, they are uncurated: the
+  `or-` selector is dropped and the rest (`ox-alpha`, …) is forwarded, so
+  OpenRouter's own error reaches the client (see the last rule below).
 
   Three rules sit around that table, and the table is a convenience layer, not
   a gate:
 
   - **bare `or`** — like bare `grok`, it resolves to the live pin
-    (`config.openrouter.default_model`, default `stealth/ox-alpha`), and so
-    does a request that names no model at all.
+    (`config.openrouter.default_model`, default
+    `nvidia/nemotron-3-ultra-550b-a55b:free` since 2026-11-18, was
+    `stealth/ox-alpha`), and so does a request that names no model at all.
   - **`or-<vendor>/<slug>` escape hatch** — anything containing a `/` is used
     VERBATIM minus the `or-` selector, so the ~400 OpenRouter models outside
-    the curated set are reachable: `or-openai/gpt-oss-20b:free` →
-    `openai/gpt-oss-20b:free`. A bare `openrouter/…` slug also routes here and
+    the curated set are reachable: `or-google/gemma-4-26b-a4b-it:free` →
+    `google/gemma-4-26b-a4b-it:free`. A bare `openrouter/…` slug also routes here and
     rides through unchanged.
   - **no silent substitution** — an uncurated bare name passes through as it
     was typed, so OpenRouter's own 404 reaches the user instead of llmux
@@ -191,9 +198,11 @@ not that it is zero.
   `gpt-6.1-sol` and `luna` from `gpt-5.6-luna` to `gpt-6-luna`. On
   2026-11-10 `fable` moved from `claude-fable-5-1[1m]` to
   `claude-fable-5-2[1m]` (Fable 5.2 released 2026-11-09) and `terra` from
-  `gpt-5.6-terra` to `gpt-6.1-terra`. The version
-  aliases `opus-5` / `sonnet-5` / `fable-5-1` and the bare generation id
-  `gpt-5.6` did NOT move — they stay on their generation, because floating a version-pinned
+  `gpt-5.6-terra` to `gpt-6.1-terra`. On 2026-11-18 `sol` moved from
+  `gpt-6.1-sol` to `gpt-6.2-sol` and `astra` from `gpt-6-astra[1m]` to
+  `gpt-6.2-astra[1m]` (both released 2026-11-17). The version
+  aliases `opus-5` / `sonnet-5` / `fable-5-1` and the bare generation ids
+  `gpt-5.6` / `gpt-6` / `gpt-6.1` did NOT move — they stay on their generation, because floating a version-pinned
   alias onto a new model would be silent substitution. Anyone who needs one specific model must send
   its full catalog id — that is the stable handle. On 2026-10-08, `haiku`
   moved from `claude-haiku-4-5` to `claude-haiku-5-5[1m]`; the explicit 4.5 id
@@ -262,18 +271,22 @@ model it does not curate.
 | claude-opus-5[1m]   | opus-5       | Claude Opus 5 [1M]  | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
+| claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, max               | 1000000     | claude |
 | claude-sonnet-5-5[1m] | sonnet, sonnet-5-5 | Claude Sonnet 5.5 [1M] | low, medium, high, xhigh, max | 1000000     | claude |
 | claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-haiku-5-5[1m] | haiku, haiku-5-5 | Claude Haiku 5.5 [1M] | low, medium, high, xhigh, max | 1000000 | claude |
 | claude-haiku-5-5 | — | Claude Haiku 5.5 | low, medium, high, xhigh, max | 1000000 | claude |
+| gpt-6.2-sol[1m]     | —            | GPT-6.2-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6.2-sol         | sol, gpt-6.2 | GPT-6.2-Sol         | low, medium, high, xhigh, max, ultra | 500000      | codex  |
+| gpt-6.2-astra[1m]   | astra        | GPT-6.2-Astra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6.2-astra       | —            | GPT-6.2-Astra       | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-6.1-sol         | sol, gpt-6.1 | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-6.1-sol         | gpt-6.1      | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 500000      | codex  |
 | gpt-6.1-terra[1m]   | —            | GPT-6.1-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6.1-terra       | terra        | GPT-6.1-Terra       | low, medium, high, xhigh, max, ultra | 500000      | codex  |
-| gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6-astra[1m]     | gpt-6        | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6-sol[1m]       | —            | GPT-6-Sol [1M]      | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-sol           | —            | GPT-6-Sol           | low, medium, high, xhigh, max, ultra | 272000      | codex  |
@@ -289,16 +302,12 @@ model it does not curate.
 | grok-4.7[1m]        | —            | Grok 4.7 [1M] (500k upstream) | low, medium, high, xhigh   | 500000      | grok   |
 | grok-4.6            | —            | Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.5            | —            | Grok 4.5            | low, medium, high                    | 500000      | grok   |
-| or-ox-alpha         | or (pinned)  | Ox Alpha (free)     | low, high, max                       | 1048576     | openrouter |
 | or-free             | —            | OpenRouter Free Models Router | —                          | 200000      | openrouter |
-| or-glm-5.2          | —            | Z.ai GLM 5.2 (free) | high, xhigh                          | 256000      | openrouter |
-| or-nemotron-3-ultra | —            | NVIDIA Nemotron 3 Ultra (free) | medium, high              | 1000000     | openrouter |
+| or-nemotron-3-ultra | or (pinned)  | NVIDIA Nemotron 3 Ultra (free) | medium, high              | 1000000     | openrouter |
 | or-nemotron-3.5-lightning | —      | NVIDIA Nemotron 3.5 Lightning (free) | —                   | 1000000     | openrouter |
 | or-dots-3-note      | —            | Dots3-Note Preview (free) | —                              | 512000      | openrouter |
-| or-laguna-s-2.1     | —            | Poolside Laguna S 2.1 (free) | —                           | 262144      | openrouter |
 | or-north-mini-code  | —            | Cohere North Mini Code (free) | —                          | 256000      | openrouter |
 | or-gemma-4-31b      | —            | Google Gemma 4 31B (free) | —                              | 262144      | openrouter |
-| or-gpt-oss-20b      | —            | OpenAI gpt-oss-20b (free) | low, medium, high              | 131072      | openrouter |
 | gemini-3.8-flash-high[1m] | gemini, gemini-3.8-flash | Gemini 3.8 Flash (High) [1M] | — | 1048576  | gemini |
 | gemini-3.8-flash-high | —          | Gemini 3.8 Flash (High) | —                                | 1048576     | gemini |
 | gemini-3.8-flash-medium[1m] | —    | Gemini 3.8 Flash (Medium) [1M] | —                         | 1048576     | gemini |
@@ -316,7 +325,8 @@ never hands the alias to the `[1m]` twin; pinning the suffixed id does
 (see [The grok `[1m]` twin](#the-grok-1m-twin)). "or (pinned)" reads
 the same way for the openrouter pin (see
 [Out-of-catalog openrouter pin](#out-of-catalog-openrouter-pin)); with the
-default pin it sits on `or-ox-alpha`. The openrouter ids are what a client
+default pin it sits on `or-nemotron-3-ultra` (on `or-ox-alpha` until
+2026-11-18). The openrouter ids are what a client
 sends — the slug that reaches OpenRouter is the one in the
 [alias table](#alias-semantics), and every curated openrouter row is a free
 model (priced `$0` in and out; an UNCURATED openrouter model has no known
@@ -374,7 +384,7 @@ configured model string to size its context readout; llmux strips one trailing
 `[1m]` before resolving the model, so upstream never sees it and
 `gpt-5.6-sol[1m]` reaches the backend as `gpt-5.6-sol`. The strip happens ahead
 of every resolution rule, so a suffixed alias works too (`sol[1m]` →
-`gpt-5.6-sol`), and it applies to routing as well (`sol[1m]` classifies to the
+`gpt-6.2-sol`), and it applies to routing as well (`sol[1m]` classifies to the
 codex group exactly like `sol`). A client that sends the id verbatim — curl, an
 SDK — gets the model it asked for instead of falling back to the configured pin.
 
@@ -393,10 +403,12 @@ no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
 published 1,050,000-token window for Astra — it has **not** been probed through
 the daemon, unlike the 5.6 rows above (the only astra probe so far is the
 2026-09-07 acceptance check, which confirms the backend takes the slug, not its
-ceiling). On astra the bare aliases `astra` / `gpt-6` sit on the `[1m]` row —
-opposite the 5.6 convention — so the ergonomic name resolves to the 1M row's
-slug and advertised window; the explicit base id `gpt-6-astra` keeps the
-openai/codex catalog's 272000 and advertises no aliases. Note this is the
+ceiling). On astra the bare aliases sit on the `[1m]` row — `gpt-6` on
+`gpt-6-astra[1m]`, and `astra` on `gpt-6.2-astra[1m]` since 2026-11-18 —
+opposite the 5.6 convention, so the ergonomic name resolves to the 1M row's
+slug and advertised window; the explicit base ids `gpt-6-astra` /
+`gpt-6.2-astra` keep the openai/codex catalog's 272000 and advertise no
+aliases. Note this is the
 CATALOG window, not Claude Code's: a bare `astra` is still a 200k session in
 the client, which sizes off the submitted id — type `astra[1m]` or pick the
 `[1M]` picker row for the 1M denominator. The catalog
@@ -406,10 +418,14 @@ advertise.
 `gpt-6.1-sol[1m]`, `gpt-6-sol[1m]` and `gpt-6-luna[1m]` (added 2026-10-06)
 follow the same pattern as astra's twin — 1000000 advertised on the strength of
 OpenAI's published 1,050,000 window for those models, unprobed through the
-daemon — but keep the 5.6 alias convention: the bare `sol` / `luna` aliases
-sit on the BASE rows (`gpt-6.1-sol`, `gpt-6-luna`, catalog context 272000),
-and the `[1m]` twin is an explicit opt-in. models.json lists the same
-272,000 / 872,000 pair for all three, which llmux does not advertise.
+daemon — but keep the 5.6 alias convention: the bare aliases sit on the BASE
+rows (`gpt-6.1` on `gpt-6.1-sol`, `luna` on `gpt-6-luna`), and the `[1m]` twin
+is an explicit opt-in. models.json lists 272,000 / 872,000 for `gpt-6-sol` and
+`gpt-6-luna`; for `gpt-6.1-sol` it listed the same until commit `6c0cee5`
+(2026-11-17) raised the context_window to 500,000, which the base row
+advertises since 2026-11-18 (the Codex models page says the same: "GPT-6.1 Sol
+uses a default context window of 500,000 tokens in Codex"). llmux does not
+advertise the 872,000 `max_context_window`.
 
 `gpt-6.1-terra[1m]` (added 2026-11-10) follows the same pattern: 1000000
 advertised on the strength of OpenAI's published 1,050,000 window (128K
@@ -418,6 +434,17 @@ output), with `terra` on the base row. Its base row is the one exception to
 **500000** (max_context_window 872000), so the base row advertises 500000.
 Neither row has been probed through the daemon yet; a live probe follows the
 preview deploy.
+
+`gpt-6.2-sol[1m]` and `gpt-6.2-astra[1m]` (added 2026-11-18) advertise 1000000
+on the same basis (OpenAI's published 1,050,000 window, 128K output; the Codex
+models page says both reach 1M through `model_context_window`). Their base rows
+carry the models.json context_window: **500000** for `gpt-6.2-sol`, 272000 for
+`gpt-6.2-astra` (max_context_window 872000 on both). `sol` and the bare
+`gpt-6.2` sit on the `gpt-6.2-sol` base row; `astra` sits on the
+`gpt-6.2-astra[1m]` twin, the astra arrangement. Neither slug has been probed as
+a passthrough slug through the daemon yet; before they were passthrough slugs, a
+2026-11-18 probe asked for `gpt-6.2-sol` and was served by the codex pin
+(`gpt-6-astra`).
 
 ### Gemini
 
@@ -469,6 +496,14 @@ are not affected by this gate. Details:
 Costs shown for gemini rows use the public API list prices (see
 [Sources](#sources)) for display only; subscription traffic is not billed per
 token.
+
+Gemini 4 Carbon (GA 2026-11-10) and Gemini 4 Hydrogen (GA 2026-11-12) have no
+rows yet: the daemon's Google AI Free/Plus account cannot use either, and Google
+publishes no Antigravity id form for them beyond `gemini-4-hydrogen-xhigh`
+([#310](https://github.com/2lab-ai/llmux/issues/310)). A request naming
+`gemini-4-carbon…` or `gemini-4-hydrogen…` still passes through like any
+`gemini-*` id, and is priced at its own list rate rather than at Flash (see
+[price classes](#per-request-price-classes)).
 
 ## Selecting a model
 
@@ -609,14 +644,59 @@ the same as for `claude-fable-5-1[1m]`.
 
 **These four vars are the only mechanism that changes what a bare native alias
 means, and they do not generalize.** An id Claude Code does not know (`astra`,
-`gpt-6`, `grok`, `or-ox-alpha`, …) has no such var: it is submitted verbatim
+`gpt-6`, `grok`, `or-nemotron-3-ultra`, …) has no such var: it is submitted verbatim
 and gets the client's 200k assumption. Catalog alias ownership decides the
 UPSTREAM slug, never the client's window — bare `astra` resolves to
-`gpt-6-astra[1m]`'s slug upstream and is still a 200k session in Claude Code.
+`gpt-6.2-astra[1m]`'s slug upstream and is still a 200k session in Claude Code.
 To move the client-side denominator for those, the SUBMITTED id has to end in
 `[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
+
+## Model sweep: 2026-11-18
+
+Checked all four providers against their current primary sources for 2026-11-10 → 2026-11-18
+(all fetched 2026-11-18). Two new text models joined the catalog, `gpt-6.2-sol` and
+`gpt-6.2-astra`, each with a `[1m]` twin, and the `sol` and `astra` aliases moved to them.
+`gpt-6.1-sol`'s base context rose to 500000 and `claude-opus-4-6[1m]` lost `xhigh` from its effort
+menu. The four dead OpenRouter rows were retired and the default `or` pin moved to
+`or-nemotron-3-ultra` ([#243](https://github.com/2lab-ai/llmux/issues/243)). Gemini 4 Carbon and
+Hydrogen got reference prices but no rows. Catalog size: 53 curated rows (4 codex rows added, 4
+openrouter rows removed).
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | No new model id and no price or context change. Claude Code 2.1.327 (npm `latest`, 2026-11-17) and Agent SDK 0.3.327 carry no unknown `claude-*` id, and their aliases are unchanged: `fable` → `claude-fable-5-2`, `opus` → `claude-opus-5-5`, `sonnet` → `claude-sonnet-5-5`, `haiku` → `claude-haiku-5-5`. Corrected `claude-opus-4-6[1m]`'s efforts to low, medium, high, max. The 2.1.327 binary gives Opus 4.6 the `effort` and `max_effort` capabilities but not `xhigh_effort`, which every other catalog row has. The model-config page agrees: Opus 4.6 accepts low, medium, high and max, and `xhigh` falls back to `high`. This did not change in the window; llmux had advertised the full list. Every row re-checked against the pricing page: unchanged. | [models overview](https://platform.claude.com/docs/en/models/overview), [pricing](https://platform.claude.com/docs/en/about-claude/pricing), [release notes](https://platform.claude.com/docs/en/release-notes/overview), [deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations), [news](https://www.anthropic.com/news), [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md), [Claude Code model config](https://code.claude.com/docs/en/model-config), npm `@anthropic-ai/claude-code-darwin-arm64@2.1.327`, npm `@anthropic-ai/claude-agent-sdk@0.3.327` |
+| Codex / OpenAI | Added `gpt-6.2-sol` (GPT-6.2-Sol) and `gpt-6.2-astra` (GPT-6.2-Astra), both released 2026-11-17, each with a `[1m]` twin. `models.json` @ `6c0cee502d21` ("Add GPT-6.2 Sol and Astra to model catalogs", 2026-11-17) is the only commit to touch the file since the last sweep. It gives sol context_window 500000 and astra 272000 (max_context_window 872000 on both), efforts low…ultra (default low), minimal client 0.166.0, and picker priority 1 (sol) and 2 (astra). The base rows carry the `models.json` figure; the twins carry OpenAI's published 1,050,000 as 1000000. Reference prices (Standard, ≤272K input): sol $2.00 in / $0.10 cached / $2.50 cache write 30m / $5.00 cache write 12h / $10.00 out; astra $8.00 / $0.40 / $10.00 / $20.00 / $40.00. Above 272K input the whole request bills at 2× input and cache rates and 1.5× output; Fast is 2×. Before these rows both ids took the codex group fallback (gpt-5.5's $5 / $30). `sol` moved from `gpt-6.1-sol` to `gpt-6.2-sol`, and `astra` from `gpt-6-astra[1m]` to `gpt-6.2-astra[1m]` (astra keeps its alias on the `[1m]` row). The new bare `gpt-6.2` resolves to `gpt-6.2-sol`. `gpt-6.1` stays on `gpt-6.1-sol` and `gpt-6` on `gpt-6-astra[1m]`; `terra` and `luna` are unchanged, because 6.2 has no terra or luna tier. Both slugs joined the codex passthrough list and the TUI `m` quick-pick; neither has been probed as a passthrough slug yet. The same commit raised `gpt-6.1-sol`'s context_window from 272000 to 500000, so its base row now advertises 500000; the Codex models page agrees ("GPT-6.1 Sol uses a default context window of 500,000 tokens in Codex"). No other row's price, context or efforts changed. | [models.json @ 6c0cee5](https://github.com/openai/codex/blob/6c0cee502d215e5df2dd9a303cf2e252229c9e12/codex-rs/models-manager/models.json), [commit 6c0cee5](https://github.com/openai/codex/commit/6c0cee502d215e5df2dd9a303cf2e252229c9e12), [gpt-6.2-sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol), [gpt-6.2-astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra), [pricing](https://developers.openai.com/api/docs/pricing), [latest-model guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra), [API changelog](https://developers.openai.com/api/docs/changelog), [Codex changelog](https://developers.openai.com/codex/changelog), [Codex models](https://developers.openai.com/codex/models) |
+| Grok / xAI | No new text model id and no row change: `grok-4.7`, `grok-4.6` and `grok-4.5` keep 500k context and the same prices and efforts. Grok 4.8 is not on the API (its docs page returns 404), and Grok 5 has no API id. `grok-4.5`'s docs still list `xhigh` while the live menu llmux follows does not; this is unchanged and was already recorded. | [release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models), [pricing](https://docs.x.ai/developers/pricing), [grok-4.7](https://docs.x.ai/developers/models/grok-4.7), [grok-4.6](https://docs.x.ai/developers/models/grok-4.6), [grok-4.5](https://docs.x.ai/developers/models/grok-4.5) |
+| Gemini / Google (Antigravity) | Two new GA text models, neither added as a row. `gemini-4-carbon` went GA on 2026-11-10; Antigravity offers it on Ultra and Enterprise. This supersedes the 2026-11-10 entry, which said Carbon had no published id. `gemini-4-hydrogen` went GA on 2026-11-12; Antigravity offers it on paid Pro, Ultra and Enterprise. Both have a 1,048,576-token context. Neither is visible on the daemon's Free/Plus Antigravity account, and Google publishes no Antigravity id form for them except `gemini-4-hydrogen-xhigh`, so the rows wait for a Pro/Ultra probe ([#310](https://github.com/2lab-ai/llmux/issues/310)). Any `gemini-*` id passes through, and both used to fall to the 3.8 Flash fallback ($0.75 / $3.75), so they now have reference prices. `gemini-4-carbon*`: $2.00 in / $10.00 out / $0.10 cached through 2026-11-30, then $4.00 / $20.00 / $0.20 from 2026-12-01 (Argon's dated card). `gemini-4-hydrogen*`: a flat $1.50 / $7.50 / $0.075 ("flat across its entire 1 million-token context window"). The Flash and Argon rows are unchanged. | [Gemini API changelog](https://aistudio.google.com/docs/changelog), [models](https://aistudio.google.com/docs/models), [pricing](https://aistudio.google.com/docs/pricing), [Gemini 4 Carbon](https://aistudio.google.com/docs/models/gemini-4-carbon), [Gemini 4 Hydrogen](https://aistudio.google.com/docs/models/gemini-4-hydrogen), [Gemini 4 Argon](https://aistudio.google.com/docs/models/gemini-4-argon), [Carbon announcement](https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-carbon-now-available/), [Hydrogen announcement](https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-hydrogen/), [Antigravity models](https://antigravity.google/docs/models/), [Antigravity changelog](https://antigravity.google/docs/changelog) |
+| OpenRouter | Retired `or-ox-alpha`, `or-glm-5.2`, `or-laguna-s-2.1` and `or-gpt-oss-20b`. They have had 0 endpoints since 2026-11-10, and on 2026-11-18 none was listed in `/api/v1/models` ([#243](https://github.com/2lab-ai/llmux/issues/243)). The default `or` pin moved from `stealth/ox-alpha` to `nvidia/nemotron-3-ultra-550b-a55b:free`, so a bare `or` lands on the existing `or-nemotron-3-ultra` row (free, live since 2026-06, 1 endpoint, 1,000,000 context). Unlike the grok pin rolls, a config whose `openrouter.default_model` still names `stealth/ox-alpha` (or another retired slug) is moved to the new default at load, because every config written before the roll serialized the old default and the slug can no longer be served; a live slug an operator chose is kept. Usage recorded under the retired slugs keeps its $0 price. The other six rows were live and free, with unchanged context. | [`GET /api/v1/models`](https://openrouter.ai/api/v1/models), `GET /api/v1/models/<slug>/endpoints` for every curated slug, [#243](https://github.com/2lab-ai/llmux/issues/243) |
+
+Not changed, recorded:
+
+- **`gpt-5.5` is dead on the ChatGPT backend.** A probe through the daemon on 2026-11-18 returned
+  400 "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account." It is
+  missing from the live Codex server list; OpenAI retired it from Codex with ChatGPT sign-in on
+  2026-10-14. The row and its passthrough stay for now
+  ([#309](https://github.com/2lab-ai/llmux/issues/309)).
+- **Gemini 4 Carbon / Hydrogen rows** wait for a Pro or Ultra account to probe the Antigravity id
+  form ([#310](https://github.com/2lab-ai/llmux/issues/310)). This is the same open question as
+  Argon's ([#244](https://github.com/2lab-ai/llmux/issues/244)).
+- **GPT-6.2 Responses behaviour.** GPT-6.2 appends the top-level `instructions` after `input`, so
+  reusable instructions stay cacheable only as a developer message at the start of `input`. The
+  API drops reasoning items after prefix edits, after some model switches (downgrades included)
+  and after end-user or organization changes. `temperature`, `top_p` and `logprobs` are not
+  supported. Recorded for the codex translation; this sweep does not change it.
+- **Opus 4.8 fast mode** is removed on 2026-11-30 (deprecated 2026-10-30). After that date
+  `claude-opus-4-8` with `speed: "fast"` returns an error. The base row is unaffected, and the
+  price row keeps its fast tier for history.
+- **`gpt-5.6-sol` promotional price** ends 2026-11-30. The price after that is still not
+  published.
+- **`or-dots-3-note`** carries an OpenRouter `expiration_date` of 2026-12-31.
+- **Evidence from before the change.** On 2026-11-18, a request for `gpt-6.2-sol` through the
+  daemon (llmux 0.2.26 preview) was served by the codex pin, `gpt-6-astra`, and so was one for
+  `gpt-6.2-astra`. Neither slug was a passthrough slug yet, so the request silently took the
+  pin. The same probe showed `sol` served by `gpt-6.1-sol` and `astra` by `gpt-6-astra`.
 
 ## Reference price corrections: 2026-11-11
 
@@ -649,7 +729,7 @@ price, context window or effort menu. Catalog size: 53 curated rows (was 50).
 | Claude | Added `claude-fable-5-2[1m]` (Claude Fable 5.2, released 2026-11-09, all Claude API customers): 1,000,000 context (the default and the maximum, no 200K mode), 128K max output, efforts low…max. Reference prices $8.00 in / $40.00 out / $0.20 cache read / $10.00 cache write (5m) / $16.00 (1h), no long-context tier; before this row the id fell to the Fable 5 tier and was overpriced. One `[1m]` row and no bare twin, like Fable 5.1: Claude Code 2.1.321 (npm `latest` since 2026-11-09, and the minimum for Fable 5.2) accepts the suffix on Fable but ignores it. `fable` moved from `claude-fable-5-1[1m]` to the new row, matching Claude Code 2.1.321, which resolves its own `fable` to `claude-fable-5-2`; `fable-5-1` stays on 5.1. Every existing row re-checked against the pricing page: no price, context or max-output change. | [Fable 5.2 model page](https://platform.claude.com/docs/en/models/fable-5-2/overview), [What's new in Fable 5.2](https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2), [pricing](https://platform.claude.com/docs/en/about-claude/pricing), [release notes](https://platform.claude.com/docs/en/release-notes/overview), [announcement](https://www.anthropic.com/claude-fable-and-mythos-5-2), [models overview](https://platform.claude.com/docs/en/models/overview), [deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations), [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md), [Claude Code model config](https://code.claude.com/docs/en/model-config), npm `@anthropic-ai/claude-code-darwin-arm64@2.1.321` |
 | Codex / OpenAI | Added `gpt-6.1-terra` (GPT-6.1 Terra, released 2026-10-26) and its `[1m]` twin. `models.json` @ `caae161dd0c8` (2026-11-09); its only change since the last sweep is commit `126a0ee92ed2`, which adds this entry: context_window 500000, max_context_window 872000, efforts low…ultra (default low), minimal client 0.153.0. The base row carries 500000; the twin carries OpenAI's published 1,050,000 (128K output) as 1000000. Reference prices $1.00 in / $0.05 cached / $1.25 cache write (30-minute retention) / $5.00 out; before this row the id fell to the `gpt-6.1-sol` rate, twice its list price. Above 272K input tokens the whole request bills at 2× input and cache rates and 1.5× output; llmux did not model that then (priced per request since 2026-11-12, [price classes](#per-request-price-classes)). `terra` moved from `gpt-5.6-terra` to `gpt-6.1-terra`. The slug is in the codex passthrough list but has not been probed through the daemon; a live probe follows the preview deploy. `sol`, `luna`, `astra` and the bare generation ids are unchanged, and every existing price still matches. | [models.json @ caae161](https://github.com/openai/codex/blob/caae161dd0c82f2e04e57e6f9d738fafbce503ba/codex-rs/models-manager/models.json), [commit 126a0ee](https://github.com/openai/codex/commit/126a0ee92ed2c5e73cd8a8f7e37563e8527552d7), [gpt-6.1-terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra), [pricing](https://developers.openai.com/api/docs/pricing), [API changelog](https://developers.openai.com/api/docs/changelog), [Codex changelog](https://developers.openai.com/codex/changelog), [Codex models](https://developers.openai.com/codex/models) |
 | Grok / xAI | No new text model id since `grok-4.7` (September). `grok-4.7`, `grok-4.6` and `grok-4.5` are unchanged: 500k context, the same prices and efforts. Grok 4.8 and Grok 5 have been announced or are in training, but neither has an API id. | [Release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models), [pricing](https://docs.x.ai/developers/pricing), [grok-4.7](https://docs.x.ai/developers/models/grok-4.7), [grok-4.6](https://docs.x.ai/developers/models/grok-4.6), [grok-4.5](https://docs.x.ai/developers/models/grok-4.5) |
-| Gemini / Google (Antigravity) | No new servable text id and no row change. Gemini 4 Carbon was announced on 2026-10-28 with no published id, for a closed cyber-defender programme only. Argon's list price doubles to $4.00 / $20.00 / $0.20 from 2026-12-01; llmux's static rate did not model that then (dated rates since 2026-11-12, [price classes](#per-request-price-classes)). The Antigravity models page now lists Argon for paid Google AI Pro (or a trial on eligible premium devices), Ultra and Enterprise, not Free or Plus (see [Gemini](#gemini)). Third-party reports, not from Google and not verified by llmux, say Antigravity serves Argon as `gemini-4-argon-high` / `-medium` / `-low` and gates it on a client User-Agent of 2.29 or later; llmux sends the bare `gemini-4-argon` with UA `antigravity/hub/2.23.1` ([#244](https://github.com/2lab-ai/llmux/issues/244)). | [Gemini API changelog](https://aistudio.google.com/docs/changelog), [models](https://aistudio.google.com/docs/models), [pricing](https://aistudio.google.com/docs/pricing), [Gemini 4 Argon](https://aistudio.google.com/docs/models/gemini-4-argon), [Antigravity models](https://antigravity.google/docs/models/), [Antigravity changelog](https://antigravity.google/docs/changelog), [Gemini 4 Carbon](https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/) |
+| Gemini / Google (Antigravity) | No new servable text id and no row change. Gemini 4 Carbon was announced on 2026-10-28 with no published id, for a closed cyber-defender programme only (superseded: it went GA as `gemini-4-carbon` on 2026-11-10, see [Model sweep: 2026-11-18](#model-sweep-2026-11-18)). Argon's list price doubles to $4.00 / $20.00 / $0.20 from 2026-12-01; llmux's static rate did not model that then (dated rates since 2026-11-12, [price classes](#per-request-price-classes)). The Antigravity models page now lists Argon for paid Google AI Pro (or a trial on eligible premium devices), Ultra and Enterprise, not Free or Plus (see [Gemini](#gemini)). Third-party reports, not from Google and not verified by llmux, say Antigravity serves Argon as `gemini-4-argon-high` / `-medium` / `-low` and gates it on a client User-Agent of 2.29 or later; llmux sends the bare `gemini-4-argon` with UA `antigravity/hub/2.23.1` ([#244](https://github.com/2lab-ai/llmux/issues/244)). | [Gemini API changelog](https://aistudio.google.com/docs/changelog), [models](https://aistudio.google.com/docs/models), [pricing](https://aistudio.google.com/docs/pricing), [Gemini 4 Argon](https://aistudio.google.com/docs/models/gemini-4-argon), [Antigravity models](https://antigravity.google/docs/models/), [Antigravity changelog](https://antigravity.google/docs/changelog), [Gemini 4 Carbon](https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/) |
 
 Not changed, recorded:
 
@@ -659,7 +739,8 @@ Not changed, recorded:
   untested.
 - **`gpt-6.1-sol` context.** The live Codex server list (`~/.codex/models_cache.json`, fetched
   2026-11-09, Codex CLI 0.167.0) and OpenAI's docs give it 500000 in Codex, while `models.json`
-  still says 272000. The row keeps the `models.json` value.
+  still says 272000. The row keeps the `models.json` value (`models.json` moved to 500000 on
+  2026-11-17 and the row followed on 2026-11-18).
 - **`gpt-5.6-sol` promotional price** now runs until 2026-11-30. The price after that is not
   published.
 - **Fable 5.2 passthrough behaviour.** Upstream, editing an earlier turn always fails the
@@ -672,7 +753,7 @@ Not changed, recorded:
   which llmux follows, did not on its last read. Unchanged.
 - **OpenRouter.** The curated `or-ox-alpha` (the default `or` pin), `or-glm-5.2`,
   `or-laguna-s-2.1` and `or-gpt-oss-20b` had 0 endpoints on 2026-11-10
-  ([#243](https://github.com/2lab-ai/llmux/issues/243)).
+  ([#243](https://github.com/2lab-ai/llmux/issues/243); retired 2026-11-18).
 
 ## Model sweep: 2026-10-23
 
@@ -784,12 +865,14 @@ The web-search fee is not a token rate and is not overridden.
 
 USD per million tokens, the "30m write" and "12h write" columns of the
 [OpenAI pricing page](https://developers.openai.com/api/docs/pricing) (standard
-tier, ≤272K input), read 2026-11-11. Writes are a part of input; the 12-hour
+tier, ≤272K input), read 2026-11-11 (the gpt-6.2 rows 2026-11-18). Writes are a part of input; the 12-hour
 part is the one a response reports in
 `input_tokens_details.cache_write_tokens_details.ttl_12h_tokens`.
 
 | Model | Input | Cache write, 30m | Cache write, 12h |
 | --- | --- | --- | --- |
+| gpt-6.2-sol | $2.00 | $2.50 | $5.00 |
+| gpt-6.2-astra | $8.00 | $10.00 | $20.00 |
 | gpt-6-astra | $10.00 | $12.50 | $25.00 |
 | gpt-6.1-sol | $2.00 | $2.50 | $5.00 |
 | gpt-6.1-terra | $1.00 | $1.25 | $2.50 |
@@ -845,6 +928,8 @@ pages:
 
 | Model | Boundary | Long rates | Fast | Fast + long |
 | --- | --- | --- | --- | --- |
+| gpt-6.2-sol (read 2026-11-18) | > 272,000 | $4 / $0.20 / $5 / $10 / $15 | 2× Standard | 2× long |
+| gpt-6.2-astra (read 2026-11-18) | > 272,000 | $16 / $0.80 / $20 / $40 / $60 | 2× Standard | 2× long |
 | gpt-6-astra | > 272,000 | $20 / $2 / $25 / $50 / $75 | 2× Standard | 2× long |
 | gpt-6.1-sol | > 272,000 | $4 / $0.20 / $5 / $10 / $15 | 2× Standard | 2× long |
 | gpt-6.1-terra | > 272,000 | $2 / $0.10 / $2.50 / $5 / $7.50 | 2× Standard | 2× long |
@@ -863,6 +948,11 @@ read 2026-11-11): `gemini-4-argon` (and `argon`, `gemini-4-argon-*`) $2.00 /
 $10.00 / $0.10 through 2026-11-30, $4.00 / $20.00 / $0.20 from 2026-12-01;
 Gemini 3.8 Flash (every thinking variant, and the gemini fallback) $0.75 /
 $3.75 / $0.075 through 2026-12-31, $1.50 / $7.50 / $0.15 from 2027-01-01.
+Read 2026-11-18: `gemini-4-carbon` (and `gemini-4-carbon-*`) carries Argon's
+card, $2.00 / $10.00 / $0.10 through 2026-11-30 and $4.00 / $20.00 / $0.20 from
+2026-12-01; `gemini-4-hydrogen` (and `gemini-4-hydrogen-*`) is a flat $1.50 /
+$7.50 / $0.075. Neither has a catalog row; both are priced because any
+`gemini-*` id passes through.
 
 Claude fast mode ([fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode),
 read 2026-11-12) "is priced at a multiplier on standard rates across the full
@@ -902,7 +992,12 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
 - **Claude rows** — user-curated 2026-07-27 from the Claude Code model picker.
   The `[1m]` suffix marks the 1M-context variant ids. Effort menus are the
   Claude Code `/effort` levels (`low, medium, high, xhigh, max`), applied per
-  the user contract; llmux does not itself shape claude requests. The claude
+  the user contract; llmux does not itself shape claude requests. Opus 4.6 has
+  no `xhigh` (corrected 2026-11-18): the Claude Code 2.1.327 binary gives its
+  record the `effort` and `max_effort` capabilities but not `xhigh_effort`, and
+  [model config](https://code.claude.com/docs/en/model-config) (read
+  2026-11-18) lists low, medium, high, max for Opus 4.6, with `xhigh` falling
+  back to `high`. The claude
   rows now live as the `CLAUDE_MODELS` const in `src/catalog.rs`, which is also
   the source for alias→id resolution in `src/provider/anthropic.rs`.
 - **claude-opus-5-5** — Anthropic announcement 2026-09-22
@@ -951,6 +1046,21 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   $5.00/M output; above 272K input tokens the request bills at 2× input and
   cache rates and 1.5× output (priced per request since 2026-11-12, see
   [price classes](#per-request-price-classes)). Not probed through the daemon yet.
+- **gpt-6.2-sol / gpt-6.2-astra** — openai/codex
+  [models.json @ 6c0cee5](https://github.com/openai/codex/blob/6c0cee502d215e5df2dd9a303cf2e252229c9e12/codex-rs/models-manager/models.json)
+  ([commit 6c0cee5](https://github.com/openai/codex/commit/6c0cee502d215e5df2dd9a303cf2e252229c9e12),
+  "Add GPT-6.2 Sol and Astra to model catalogs", 2026-11-17), read 2026-11-18:
+  context_window 500000 (sol) / 272000 (astra), max_context_window 872000,
+  efforts low…ultra (default low), minimal client version 0.166.0, picker
+  priority 1 and 2. The same commit raised `gpt-6.1-sol`'s context_window from
+  272000 to 500000. The [gpt-6.2-sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol)
+  and [gpt-6.2-astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
+  model pages and the [pricing page](https://developers.openai.com/api/docs/pricing),
+  read the same day: released 2026-11-17, 1,050,000 context, 128K max output;
+  sol $2.00/M input, $0.10/M cached, $2.50/M 30-minute write, $5.00/M 12-hour
+  write, $10.00/M output; astra $8.00 / $0.40 / $10.00 / $20.00 / $40.00; above
+  272K input the request bills at 2× input and cache rates and 1.5× output;
+  Fast 2×. Not probed as passthrough slugs through the daemon yet.
 - **Codex `[1m]` context window** — live probes through the daemon against the
   ChatGPT-account codex backend, 2026-08-21: `gpt-5.6-sol` accepted 910,229
   input tokens and was rejected at ~936k (`Your input exceeds the context window
@@ -958,9 +1068,13 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   "369,755 pass / ~380k rejected" note that made 372000 look probe-confirmed.
 - **OpenRouter rows** — the live `GET https://openrouter.ai/api/v1/models`
   probe on 2026-08-21: 420 models, 21 of them with `pricing.prompt == "0"`; the
-  ten curated rows take their wire slug, display name, `max_context`, and
+  curated rows take their wire slug, display name, `max_context`, and
   effort menu (`reasoning.supported_efforts`, re-sorted low→high) from that
-  response. They are the `OPENROUTER_MODELS` const in `src/catalog.rs`, which
+  response. Ten rows were curated then; four were retired on 2026-11-18, when
+  the same endpoint (478 models) no longer listed their slugs and
+  `/api/v1/models/<slug>/endpoints` returned none
+  ([#243](https://github.com/2lab-ai/llmux/issues/243)). The six that remain
+  were live and free that day, context unchanged. They are the `OPENROUTER_MODELS` const in `src/catalog.rs`, which
   is also the source for `or-…` → slug resolution in
   `src/provider/openrouter.rs`. The design record, including the probe evidence
   that OpenRouter serves a NATIVE Anthropic Messages endpoint, is
@@ -1018,5 +1132,9 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   2026-11-30 (both then double; re-read 2026-11-11 at
   [aistudio.google.com/docs/pricing](https://aistudio.google.com/docs/pricing),
   where ai.google.dev pricing now redirects — llmux prices each request at the
-  rates of its own UTC day). llmux uses these for cost display only;
+  rates of its own UTC day). Gemini 4 Carbon and Hydrogen:
+  [pricing](https://aistudio.google.com/docs/pricing),
+  [Gemini 4 Carbon](https://aistudio.google.com/docs/models/gemini-4-carbon) and
+  [Gemini 4 Hydrogen](https://aistudio.google.com/docs/models/gemini-4-hydrogen),
+  read 2026-11-18 (see the dated rates above). llmux uses these for cost display only;
   Antigravity subscription traffic is not billed per token.

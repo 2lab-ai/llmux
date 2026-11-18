@@ -177,7 +177,7 @@ The incoming model name selects the backend in either client. For example, insid
 /model opus[1m]
 /model gpt-6-astra[1m]
 /model grok-4.7
-/model or-ox-alpha
+/model or-nemotron-3-ultra
 ```
 
 | Name pattern | Backend group |
@@ -188,7 +188,7 @@ The incoming model name selects the backend in either client. For example, insid
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
 | `gemini` / `gemini-*` / `argon` | Gemini accounts (Codex only; Claude Code gets a local 400) |
 
-Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-opus-5-5[1m]` (opus), `claude-sonnet-5-5[1m]` (sonnet), `claude-haiku-5-5[1m]` (haiku, preview), `gpt-6.1-sol` (sol), `gpt-6-astra[1m]` (astra), `gpt-6-luna` (luna), `gpt-5.6-sol`, `gpt-5.6-terra` (terra), `gpt-5.5`, `grok-4.7` (grok), `grok-4.6`, `grok-4.5`, `or-ox-alpha` (or). Added 2026-10-15: `gemini-3.8-flash-high[1m]` (gemini), `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-low[1m]` and `gemini-4-argon[1m]` (argon), each with its base row. Added 2026-11-10: `claude-fable-5-2[1m]`, which now owns `fable` (`claude-fable-5-1[1m]` keeps `fable-5-1`), and `gpt-6.1-terra` (terra, moved off `gpt-5.6-terra`) with its `[1m]` twin.
+Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-opus-5-5[1m]` (opus), `claude-sonnet-5-5[1m]` (sonnet), `claude-haiku-5-5[1m]` (haiku, preview), `gpt-6.1-sol` (sol), `gpt-6-astra[1m]` (astra), `gpt-6-luna` (luna), `gpt-5.6-sol`, `gpt-5.6-terra` (terra), `gpt-5.5`, `grok-4.7` (grok), `grok-4.6`, `grok-4.5`, `or-ox-alpha` (or). Added 2026-10-15: `gemini-3.8-flash-high[1m]` (gemini), `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-low[1m]` and `gemini-4-argon[1m]` (argon), each with its base row. Added 2026-11-10: `claude-fable-5-2[1m]`, which now owns `fable` (`claude-fable-5-1[1m]` keeps `fable-5-1`), and `gpt-6.1-terra` (terra, moved off `gpt-5.6-terra`) with its `[1m]` twin. Added 2026-11-18: `gpt-6.2-sol` (sol, moved off `gpt-6.1-sol`; also the bare `gpt-6.2`) and `gpt-6.2-astra[1m]` (astra, moved off `gpt-6-astra[1m]`), each with its twin; `or-ox-alpha` and three other dead OpenRouter rows were retired, and `or` now lands on `or-nemotron-3-ultra`.
 
 Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. Gemini rows are left out: Google's Antigravity backend refused Claude Code requests (2026-10-15), so llmux does not forward them and answers a Claude Code request for a gemini model with a local 400. Use gemini from Codex: `llmux run --codex -- -m gemini` ([details](docs/models.md#gemini)). The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
 

@@ -178,6 +178,18 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     {
         config.proxy.idle_probe = IdleProbeConfig::default();
     }
+    // OpenRouter default-pin migration (#243, sweep 2026-11-18). Every config
+    // written before the roll serialized the old default `stealth/ox-alpha`,
+    // so a persisted RETIRED slug reads as "unset" — and OpenRouter no longer
+    // serves it, so keeping it could only make every bare `or` request fail.
+    // Adopt the current default. A live slug is an operator's choice and is
+    // kept verbatim.
+    // Matched the way the provider reads a pin: trimmed, lowercased, and in
+    // either the wire slug (`stealth/ox-alpha`) or the advertised id
+    // (`or-ox-alpha`) spelling.
+    if crate::catalog::is_retired_openrouter_pin(&config.openrouter.default_model) {
+        config.openrouter.default_model = crate::catalog::OPENROUTER_DEFAULT_PIN.to_string();
+    }
     // Demo mode: swap account identities for stable fakes at the source so every
     // surface (dashboard, logs, status) shows the alias. Credentials are keyed
     // by token/uuid, not name, so they keep working.
@@ -795,6 +807,54 @@ mod tests {
         let config: Config = serde_json::from_str(raw).expect("config parses");
         assert_eq!(config.grok.default_model, "grok-4.7");
         assert_eq!(config.grok.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// The OpenRouter default-pin roll (`stealth/ox-alpha` →
+    /// `nvidia/nemotron-3-ultra-550b-a55b:free`, 2026-11-18, #243): a fresh or
+    /// model-less section takes the new pin, a persisted RETIRED slug is
+    /// moved to it at load, and a live slug the operator chose is kept.
+    #[test]
+    fn openrouter_default_pin_roll_heals_retired_slugs_only() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let write = |model: &str| {
+            let raw = format!(
+                r#"{{ "version": 1, "openrouter": {{ "default_model": "{model}" }}, "accounts": [] }}"#
+            );
+            fs::write(&path, raw).expect("write config");
+        };
+        let spellings = crate::catalog::RETIRED_OPENROUTER_SLUGS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(["or-ox-alpha".to_string(), " Stealth/Ox-Alpha ".to_string()]);
+        for retired in spellings {
+            write(&retired);
+            assert_eq!(
+                load_path(&path).expect("load").openrouter.default_model,
+                crate::catalog::OPENROUTER_DEFAULT_PIN,
+                "a persisted retired slug {retired} moves to the current pin"
+            );
+        }
+        write("google/gemma-4-26b-a4b-it:free");
+        assert_eq!(
+            load_path(&path).expect("load").openrouter.default_model,
+            "google/gemma-4-26b-a4b-it:free",
+            "a live slug the operator chose is never rewritten"
+        );
+        let raw = r#"{
+  "version": 1,
+  "openrouter": { "upstream": "https://openrouter.ai/api" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(
+            config.openrouter.default_model,
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            Config::default().openrouter.default_model,
+            crate::catalog::OPENROUTER_DEFAULT_PIN
+        );
     }
 
     pub(crate) fn oauth_account(name: &str, uuid: &str) -> AccountConfig {

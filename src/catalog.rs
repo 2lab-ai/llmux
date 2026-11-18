@@ -15,7 +15,10 @@
 //! to add the `claude-opus-5-5` pair and roll the floating `opus` alias off
 //! `claude-opus-5[1m]` onto `claude-opus-5-5[1m]`; grok rows re-probed
 //! 2026-09-23 for the `grok-4.7` row and the default-pin roll 4.6 → 4.7;
-//! fable alias rolled to 5.2 and `terra` to `gpt-6.1-terra` on 2026-11-10):
+//! fable alias rolled to 5.2 and `terra` to `gpt-6.1-terra` on 2026-11-10;
+//! `sol` rolled to `gpt-6.2-sol` and `astra` to `gpt-6.2-astra[1m]`, Opus
+//! 4.6's effort menu corrected and the dead OpenRouter rows retired on
+//! 2026-11-18):
 //! - Fable 5.2: platform.claude.com/docs/en/models/fable-5-2/overview and
 //!   the pricing page, read 2026-11-10: `claude-fable-5-2` released
 //!   2026-11-09, 1,000,000 context (the default and the maximum; no 200K
@@ -44,14 +47,17 @@
 //! - Codex context windows and effort menus: the openai/codex model catalog
 //!   (`models-manager/models.json`), fetched 2026-07-14, re-fetched
 //!   2026-09-07 for generation 6, 2026-10-06 (commit d63a9b83) for
-//!   `gpt-6.1-sol` / `gpt-6-sol` / `gpt-6-luna` and 2026-11-10 (HEAD
+//!   `gpt-6.1-sol` / `gpt-6-sol` / `gpt-6-luna`, 2026-11-10 (HEAD
 //!   caae161dd0c8; the entry landed in commit 126a0ee92ed2) for
-//!   `gpt-6.1-terra`. `gpt-6.1-sol/terra`, `gpt-6-astra`, `gpt-6-sol` and
-//!   `gpt-5.6-sol/terra` support low..ultra; `gpt-6-luna` and
-//!   `gpt-5.6-luna` low..max; `gpt-5.5` low..xhigh. Every generation-6 /
-//!   6.1 row carries the catalog's 272,000 base context (astra was the only
-//!   gen-6 tier until 2026-09-22), except `gpt-6.1-terra`, whose models.json
-//!   entry says 500,000. The `[1m]` rows are the codex side of the `[1m]` opt-in
+//!   `gpt-6.1-terra` and 2026-11-18 (commit 6c0cee502d21, 2026-11-17) for
+//!   `gpt-6.2-sol` / `gpt-6.2-astra`. `gpt-6.2-sol/astra`,
+//!   `gpt-6.1-sol/terra`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol/terra`
+//!   support low..ultra; `gpt-6-luna` and `gpt-5.6-luna` low..max; `gpt-5.5`
+//!   low..xhigh. The base rows carry the models.json `context_window`:
+//!   500,000 on `gpt-6.2-sol`, `gpt-6.1-terra` and (since 6c0cee502d21
+//!   raised it from 272,000) `gpt-6.1-sol`; 272,000 on `gpt-6.2-astra` and
+//!   every generation-6 row (astra was the only gen-6 tier until
+//!   2026-09-22). The `[1m]` rows are the codex side of the `[1m]` opt-in
 //!   and carry OpenAI's published ~1,050,000-token window rather than the
 //!   catalog figure; live probes 2026-08-21 against the ChatGPT-account
 //!   backend corroborate it on SOL specifically (910,229 accepted, ~936k
@@ -113,10 +119,27 @@ pub struct ModelEntry {
 /// `model`; these values are client metadata).
 const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// Claude Opus 4.6's menu: no `xhigh`. Its record in the Claude Code 2.1.327
+/// binary lists the `effort` and `max_effort` capabilities but not
+/// `xhigh_effort` (every other catalog row has all three), and
+/// https://code.claude.com/docs/en/model-config (read 2026-11-18) says Opus
+/// 4.6 accepts low / medium / high / max, with `xhigh` falling back to
+/// `high`. Advertising `xhigh` would offer a level the model never runs.
+const CLAUDE_EFFORTS_OPUS_4_6: &[&str] = &["low", "medium", "high", "max"];
+
+/// The effort menu of a [`CLAUDE_MODELS`] row: [`CLAUDE_EFFORTS`], except on
+/// the rows whose model lacks a level.
+fn claude_efforts(id: &str) -> &'static [&'static str] {
+    match id {
+        "claude-opus-4-6[1m]" => CLAUDE_EFFORTS_OPUS_4_6,
+        _ => CLAUDE_EFFORTS,
+    }
+}
+
 // ---- codex effort menus (openai/codex models.json, 2026-07-14;
 //      gpt-6-astra added from the 2026-09-07 fetch) ----
-/// The full six-level menu, shared by `gpt-6.1-sol/terra`, `gpt-6-astra`,
-/// `gpt-6-sol` and `gpt-5.6-sol/terra`.
+/// The full six-level menu, shared by `gpt-6.2-sol/astra`,
+/// `gpt-6.1-sol/terra`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol/terra`.
 const CODEX_EFFORTS_FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_EFFORTS_LUNA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
@@ -257,48 +280,39 @@ const GROK_MODELS: &[(&str, &str, u64)] = &[
 
 // ---- openrouter effort menus (live `GET /api/v1/models`
 //      `reasoning.supported_efforts`, 2026-08-21, re-sorted low→high) ----
-const OR_EFFORTS_OX: &[&str] = &["low", "high", "max"];
-const OR_EFFORTS_GLM: &[&str] = &["high", "xhigh"];
 const OR_EFFORTS_NEMOTRON_ULTRA: &[&str] = &["medium", "high"];
-const OR_EFFORTS_GPT_OSS: &[&str] = &["low", "medium", "high"];
 const OR_EFFORTS_NONE: &[&str] = &[];
 
 /// The curated OpenRouter catalog — SSOT for BOTH the `/models` rows and the
 /// `or-…` → upstream-slug resolution in [`crate::provider::openrouter`].
 ///
-/// Column 0 is the id llmux ADVERTISES and the client SENDS (`or-ox-alpha`);
-/// column 1 is the OpenRouter slug it is rewritten to on the wire
-/// (`stealth/ox-alpha`). They differ on purpose: the advertised id must match
-/// the `or-` routing rule (docs/openrouter/spec.md §R2) so Claude Code's model
-/// picker produces something that actually routes to this group, while the
-/// wire slug is whatever OpenRouter calls the model.
+/// Column 0 is the id llmux ADVERTISES and the client SENDS
+/// (`or-nemotron-3-ultra`); column 1 is the OpenRouter slug it is rewritten to
+/// on the wire (`nvidia/nemotron-3-ultra-550b-a55b:free`). They differ on
+/// purpose: the advertised id must match the `or-` routing rule
+/// (docs/openrouter/spec.md §R2) so Claude Code's model picker produces
+/// something that actually routes to this group, while the wire slug is
+/// whatever OpenRouter calls the model.
 ///
 /// This table is a CONVENIENCE layer, not a gate — `or-<vendor>/<slug>` passes
 /// through verbatim for the ~400 models not listed here (spec §R3 step 3).
 ///
 /// Tuple = (advertised id, upstream slug, display name, max_context, efforts).
 /// Every value is from the live `GET /api/v1/models` probe on 2026-08-21.
+/// Retired 2026-11-18 (#243): `or-ox-alpha` (`stealth/ox-alpha`, the old
+/// default pin), `or-glm-5.2` (`z-ai/glm-5.2:free`), `or-laguna-s-2.1`
+/// (`poolside/laguna-s-2.1:free`) and `or-gpt-oss-20b`
+/// (`openai/gpt-oss-20b:free`) had 0 endpoints on 2026-11-10 and were gone
+/// from `GET /api/v1/models` on 2026-11-18. The other six rows were live and
+/// free that day, context unchanged (`or-dots-3-note` carries an
+/// `expiration_date` of 2026-12-31).
 pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
-    (
-        "or-ox-alpha",
-        "stealth/ox-alpha",
-        "Ox Alpha (free)",
-        1_048_576,
-        OR_EFFORTS_OX,
-    ),
     (
         "or-free",
         "openrouter/free",
         "OpenRouter Free Models Router",
         200_000,
         OR_EFFORTS_NONE,
-    ),
-    (
-        "or-glm-5.2",
-        "z-ai/glm-5.2:free",
-        "Z.ai GLM 5.2 (free)",
-        256_000,
-        OR_EFFORTS_GLM,
     ),
     (
         "or-nemotron-3-ultra",
@@ -322,13 +336,6 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
         OR_EFFORTS_NONE,
     ),
     (
-        "or-laguna-s-2.1",
-        "poolside/laguna-s-2.1:free",
-        "Poolside Laguna S 2.1 (free)",
-        262_144,
-        OR_EFFORTS_NONE,
-    ),
-    (
         "or-north-mini-code",
         "cohere/north-mini-code:free",
         "Cohere North Mini Code (free)",
@@ -341,13 +348,6 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
         "Google Gemma 4 31B (free)",
         262_144,
         OR_EFFORTS_NONE,
-    ),
-    (
-        "or-gpt-oss-20b",
-        "openai/gpt-oss-20b:free",
-        "OpenAI gpt-oss-20b (free)",
-        131_072,
-        OR_EFFORTS_GPT_OSS,
     ),
 ];
 
@@ -401,11 +401,53 @@ pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str)] = &[
 /// the provider exports); it lives here because [`OPENROUTER_MODELS`] is
 /// already the model SSOT and two literal copies would drift silently — a
 /// config advertising one pin while the provider resolved another.
-pub(crate) const OPENROUTER_DEFAULT_PIN: &str = "stealth/ox-alpha";
+///
+/// Re-pinned 2026-11-18 (#243) from `stealth/ox-alpha`, which OpenRouter no
+/// longer serves, to the `or-nemotron-3-ultra` row: free, live since
+/// 2026-06, 1 endpoint and a 1,000,000-token window on the 2026-11-18 probe.
+/// Unlike the grok default-pin roll, a config file that still names a
+/// RETIRED slug ([`RETIRED_OPENROUTER_SLUGS`]) is moved to this pin at load
+/// (`crate::config::load_path`): every pre-roll config serialized
+/// `stealth/ox-alpha` as its default, and a slug OpenRouter no longer serves
+/// can only fail. Any live slug an operator chose is kept verbatim.
+pub(crate) const OPENROUTER_DEFAULT_PIN: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 
-/// Resolve a curated OpenRouter advertised id (`or-ox-alpha`) to its upstream
-/// slug (`stealth/ox-alpha`), or `None` when it is not curated — the provider
-/// then applies the verbatim-passthrough rules of spec §R3.
+/// Upstream slugs of the curated free rows retired from
+/// [`OPENROUTER_MODELS`] on 2026-11-18 (#243: 0 endpoints, gone from
+/// `GET /api/v1/models`). Two readers: pricing keeps them at $0, because
+/// requests recorded while they were served were free and accounting never
+/// follows a catalog change; config load moves a persisted
+/// `openrouter.default_model` naming one of them to [`OPENROUTER_DEFAULT_PIN`].
+pub(crate) const RETIRED_OPENROUTER_SLUGS: &[&str] = &[
+    "stealth/ox-alpha",
+    "z-ai/glm-5.2:free",
+    "poolside/laguna-s-2.1:free",
+    "openai/gpt-oss-20b:free",
+];
+
+/// The advertised ids of the retired rows, in [`RETIRED_OPENROUTER_SLUGS`]
+/// order. A pin may be written in either spelling (`provider::openrouter`
+/// accepts both), so the config migration matches both.
+const RETIRED_OPENROUTER_IDS: &[&str] = &[
+    "or-ox-alpha",
+    "or-glm-5.2",
+    "or-laguna-s-2.1",
+    "or-gpt-oss-20b",
+];
+
+/// Whether a persisted `openrouter.default_model` names a retired row, read
+/// the way the provider reads a pin: trimmed, case-insensitive, as the wire
+/// slug or the advertised id.
+pub(crate) fn is_retired_openrouter_pin(pin: &str) -> bool {
+    let pin = pin.trim().to_ascii_lowercase();
+    RETIRED_OPENROUTER_SLUGS.contains(&pin.as_str())
+        || RETIRED_OPENROUTER_IDS.contains(&pin.as_str())
+}
+
+/// Resolve a curated OpenRouter advertised id (`or-nemotron-3-ultra`) to its
+/// upstream slug (`nvidia/nemotron-3-ultra-550b-a55b:free`), or `None` when
+/// it is not curated — the provider then applies the verbatim-passthrough
+/// rules of spec §R3.
 ///
 /// Trimmed and ASCII-lowercased before matching, matching the classifier's
 /// normalization so an id that ROUTES here also RESOLVES here.
@@ -519,7 +561,7 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
             id: Cow::Borrowed(id),
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
             name: Cow::Borrowed(name),
-            efforts: CLAUDE_EFFORTS,
+            efforts: claude_efforts(id),
             max_context: Some(ctx),
             group: "claude",
         });
@@ -528,21 +570,23 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // ---- codex ----
     // Newest generation first. `gpt-6-astra` (openai/codex models.json,
     // fetched 2026-09-07) shipped as a single tier — there is no
-    // gpt-6-sol/terra/luna — so it owns the bare `astra` and `gpt-6` aliases
-    // the way sol owns `sol` / `gpt-5.6`. Deliberate asymmetry with the 5.6
-    // rows: on astra those bare aliases sit on the `[1m]` TWIN rather than the
-    // base row, so `astra` / `gpt-6` RESOLVE to the 1M row — i.e. to that
-    // row's upstream slug and to the 1_000_000 this catalog advertises for it
-    // (OpenAI's published ~1,050,000) — while the explicit base id
-    // `gpt-6-astra` (no aliases) picks the openai/codex catalog's 272,000.
-    // That is a catalog fact, NOT a client-window fact: Claude Code sizes its
-    // own readout off the SUBMITTED id, and an id it does not know (a bare
-    // `astra` / `gpt-6`) gets its 200k assumption. Only a `[1m]`-suffixed
-    // submission (`astra[1m]`, or picking the `[1M]` picker row) moves the
-    // client-side denominator. The provider strips one trailing `[1m]` before
-    // the request leaves llmux, so bare and suffixed aliases reach the codex
-    // backend as the same upstream slug `gpt-6-astra` — the split is a
-    // client-side context denominator, not two upstream models.
+    // gpt-6-sol/terra/luna — so it owned the bare `astra` and owns the bare
+    // `gpt-6` alias the way gpt-5.6-sol owns `gpt-5.6`. Deliberate asymmetry
+    // with the sol/terra/luna rows: on astra those bare aliases sit on the
+    // `[1m]` TWIN rather than the base row, so `astra` (on
+    // `gpt-6.2-astra[1m]` since 2026-11-18) and `gpt-6` (on `gpt-6-astra[1m]`)
+    // RESOLVE to a 1M row — i.e. to that row's upstream slug and to the
+    // 1_000_000 this catalog advertises for it (OpenAI's published
+    // ~1,050,000) — while the explicit base ids (no aliases) pick the
+    // openai/codex catalog's 272,000. That is a catalog fact, NOT a
+    // client-window fact: Claude Code sizes its own readout off the SUBMITTED
+    // id, and an id it does not know (a bare `astra` / `gpt-6`) gets its 200k
+    // assumption. Only a `[1m]`-suffixed submission (`astra[1m]`, or picking
+    // the `[1M]` picker row) moves the client-side denominator. The provider
+    // strips one trailing `[1m]` before the request leaves llmux, so bare and
+    // suffixed aliases reach the codex backend as the same upstream slug
+    // (`gpt-6.2-astra` / `gpt-6-astra`) — the split is a client-side context
+    // denominator, not two upstream models.
     //
     // The `[1m]` rows mirror the claude convention: a client-side
     // context-denominator opt-in that the provider strips before the request
@@ -554,23 +598,68 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // rejected at ~936k ("Your input exceeds the context window of this
     // model") — while `gpt-5.6-terra` was only probed to 555,029 accepted,
     // with no upper bound found; terra rides the family figure. The base rows
-    // keep the openai/codex catalog's 272,000 (re-read 2026-10-08), client
+    // keep the openai/codex catalog's `context_window` (272,000 on most rows,
+    // re-read 2026-10-08; 500,000 where models.json says so), client
     // metadata rather than a measured backend limit; legacy Claude base rows
     // keep 200,000 next to their `[1m]` twins. No `gpt-5.6-luna[1m]` (luna still 404s upstream) and
-    // no `gpt-5.5[1m]` (272k family). For the 5.6 rows aliases stay on the
-    // base row — a suffix is an explicit opt-in, never something an alias
-    // silently picks; astra is the exception noted above.
-    // `gpt-6-astra[1m]` rides OpenAI's published 1,050,000 window for astra;
-    // unlike the 5.6 rows it has NOT been probed through the daemon.
+    // no `gpt-5.5[1m]` (272k family). For the sol/terra/luna rows aliases stay
+    // on the base row — a suffix is an explicit opt-in, never something an
+    // alias silently picks; astra is the exception noted above.
+    // The astra `[1m]` rows ride OpenAI's published 1,050,000 window; unlike
+    // the 5.6 rows they have NOT been probed through the daemon.
+    //
+    // Generation 6.2 (openai/codex models.json @ 6c0cee502d21, "Add GPT-6.2
+    // Sol and Astra", committed 2026-11-17, fetched 2026-11-18; both released
+    // 2026-11-17, minimal client 0.166.0, low..ultra, default low). Sol is
+    // catalog priority 1, astra priority 2. `sol` MOVED here from
+    // `gpt-6.1-sol` and `astra` from `gpt-6-astra[1m]` on 2026-11-18 — the
+    // family aliases float to the newest generation of the variant; the bare
+    // `gpt-6.2` generation id resolves to its flagship, sol. Generation 6.2
+    // has no terra or luna tier, so `terra` / `luna` stay put. models.json
+    // gives context_window 500000 for sol and 272000 for astra (both
+    // max_context_window 872000); the Codex models page says both reach 1M
+    // through `model_context_window`. Base rows carry the models.json figure,
+    // twins OpenAI's published 1,050,000 as 1_000_000. Before these rows the
+    // ids were not passthrough slugs: a 2026-11-18 probe through the daemon
+    // asked for `gpt-6.2-sol` and was served by the pin, `gpt-6-astra`.
+    entries.push(codex_entry(
+        "gpt-6.2-sol[1m]",
+        "GPT-6.2-Sol [1M]",
+        CODEX_EFFORTS_FULL,
+        Some(1_000_000),
+        Vec::new(),
+    ));
+    entries.push(codex_entry(
+        "gpt-6.2-sol",
+        "GPT-6.2-Sol",
+        CODEX_EFFORTS_FULL,
+        Some(500_000),
+        vec!["sol".into(), "gpt-6.2".into()],
+    ));
+    entries.push(codex_entry(
+        "gpt-6.2-astra[1m]",
+        "GPT-6.2-Astra [1M]",
+        CODEX_EFFORTS_FULL,
+        Some(1_000_000),
+        vec!["astra".into()],
+    ));
+    entries.push(codex_entry(
+        "gpt-6.2-astra",
+        "GPT-6.2-Astra",
+        CODEX_EFFORTS_FULL,
+        Some(272_000),
+        Vec::new(),
+    ));
     // Generation 6.1 (openai/codex models.json @ d63a9b83, fetched
-    // 2026-10-06; `gpt-6.1-sol` released 2026-09-29, catalog priority 1).
-    // `sol` MOVED here from `gpt-5.6-sol` on 2026-10-06 — the family alias
-    // floats to the newest generation of that variant; the bare `gpt-6.1`
-    // generation id resolves to its flagship, sol (models.json priority 1;
-    // terra is the 6.1 mid tier since 2026-10-26). Same base/[1m] split as the
-    // other codex rows: models.json says context_window 272000 /
-    // max_context_window 872000, the OpenAI model page says 1,050,000 — the
-    // base row carries the models.json figure, the twin the published 1M.
+    // 2026-10-06; `gpt-6.1-sol` released 2026-09-29). `sol` owned this row
+    // from 2026-10-06 (moved off `gpt-5.6-sol`) until 2026-11-18 (moved to
+    // `gpt-6.2-sol`); the bare `gpt-6.1` generation id still resolves to its
+    // flagship, sol (terra is the 6.1 mid tier since 2026-10-26). Same
+    // base/[1m] split as the other codex rows: the base row carries the
+    // models.json context_window — 272000 until commit 6c0cee502d21
+    // (2026-11-17) raised it to 500000, which the Codex models page confirms
+    // ("GPT-6.1 Sol uses a default context window of 500,000 tokens in
+    // Codex", read 2026-11-18) — and the twin OpenAI's published 1M.
     entries.push(codex_entry(
         "gpt-6.1-sol[1m]",
         "GPT-6.1-Sol [1M]",
@@ -582,17 +671,17 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "gpt-6.1-sol",
         "GPT-6.1-Sol",
         CODEX_EFFORTS_FULL,
-        Some(272_000),
-        vec!["sol".into(), "gpt-6.1".into()],
+        Some(500_000),
+        // `sol` moved to gpt-6.2-sol (2026-11-18).
+        vec!["gpt-6.1".into()],
     ));
     // `gpt-6.1-terra` (released 2026-10-26; openai/codex models.json @
     // caae161dd0c8, entry added in commit 126a0ee92ed2: low..ultra, default
     // low, minimal client 0.153.0). `terra` MOVED here from `gpt-5.6-terra`
-    // on 2026-11-10 — generation 6.1 now ships the variant. Same base/[1m]
-    // split, except that this models.json entry lists context_window 500000
-    // (max_context_window 872000), not the 272000 of the other 6.x entries,
-    // so the base row carries 500_000; the twin carries OpenAI's published
-    // 1,050,000 as 1_000_000. Not yet probed through the daemon.
+    // on 2026-11-10 — generation 6.1 now ships the variant (6.2 has none).
+    // Same base/[1m] split; this models.json entry lists context_window
+    // 500000 (max_context_window 872000), so the base row carries 500_000;
+    // the twin carries OpenAI's published 1,050,000 as 1_000_000.
     entries.push(codex_entry(
         "gpt-6.1-terra[1m]",
         "GPT-6.1-Terra [1M]",
@@ -612,7 +701,9 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "GPT-6-Astra [1M]",
         CODEX_EFFORTS_FULL,
         Some(1_000_000),
-        vec!["astra".into(), "gpt-6".into()],
+        // `astra` moved to gpt-6.2-astra[1m] (2026-11-18); the bare gpt-6
+        // generation id still names this flagship.
+        vec!["gpt-6".into()],
     ));
     entries.push(codex_entry(
         "gpt-6-astra",
@@ -862,8 +953,10 @@ mod tests {
         // gpt-6-luna pairs landed (2026-10-06); 41 before Haiku 5.5 (2026-10-08);
         // 43 before the 8 gemini rows landed (2026-10-15); 50 after the
         // claude-haiku-4-5 row was retired (2026-10-23); 53 after the
-        // claude-fable-5-2 row and the gpt-6.1-terra pair landed (2026-11-10).
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        // claude-fable-5-2 row and the gpt-6.1-terra pair landed (2026-11-10);
+        // still 53 after the gpt-6.2-sol / gpt-6.2-astra pairs landed (+4) and
+        // the four dead openrouter rows were retired (-4, #243) on 2026-11-18.
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(entries.len(), 53);
         let claude_ids: Vec<&str> = entries
             .iter()
@@ -894,7 +987,7 @@ mod tests {
 
     #[test]
     fn catalog_groups_in_canonical_order() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let groups: Vec<&str> = entries.iter().map(|e| e.group).collect();
         let first_codex = groups.iter().position(|g| *g == "codex").unwrap();
         let first_grok = groups.iter().position(|g| *g == "grok").unwrap();
@@ -917,7 +1010,7 @@ mod tests {
 
     #[test]
     fn g16_gemini_rows_ids_names_context_and_empty_efforts() {
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let gemini: Vec<(&str, &str)> = entries
             .iter()
             .filter(|e| e.group == "gemini")
@@ -949,7 +1042,7 @@ mod tests {
 
     #[test]
     fn g16_gemini_aliases_are_owned_once_by_the_1m_rows() {
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for (alias, owner) in [
             ("gemini", "gemini-3.8-flash-high[1m]"),
             ("gemini-3.8-flash", "gemini-3.8-flash-high[1m]"),
@@ -986,7 +1079,7 @@ mod tests {
 
     #[test]
     fn g16_gemini_entry_serializes_the_wire_contract() {
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let json = serde_json::to_string(find(&entries, "gemini-4-argon[1m]")).unwrap();
         assert_eq!(
             json,
@@ -996,8 +1089,11 @@ mod tests {
 
     #[test]
     fn claude_entries_carry_curated_efforts_and_context() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for e in entries.iter().filter(|e| e.group == "claude") {
+            if e.id == "claude-opus-4-6[1m]" {
+                continue; // no xhigh: see `opus_4_6_advertises_no_xhigh`
+            }
             assert_eq!(
                 e.efforts,
                 &["low", "medium", "high", "xhigh", "max"],
@@ -1109,6 +1205,28 @@ mod tests {
             find(&entries, "claude-sonnet-5-5").max_context,
             Some(200_000)
         );
+    }
+
+    /// Opus 4.6 has no `xhigh` level: the Claude Code 2.1.327 binary gives
+    /// its record the `effort` and `max_effort` capabilities only (every
+    /// other catalog row also has `xhigh_effort`), and
+    /// code.claude.com/docs/en/model-config (read 2026-11-18) lists low /
+    /// medium / high / max, with `xhigh` falling back to `high`.
+    #[test]
+    fn opus_4_6_advertises_no_xhigh() {
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
+        assert_eq!(
+            find(&entries, "claude-opus-4-6[1m]").efforts,
+            &["low", "medium", "high", "max"]
+        );
+        // The neighbouring Opus rows keep the full menu.
+        for id in [
+            "claude-opus-4-8[1m]",
+            "claude-opus-5[1m]",
+            "claude-opus-5-5",
+        ] {
+            assert_eq!(find(&entries, id).efforts, CLAUDE_EFFORTS, "{id}");
+        }
     }
 
     /// `CLAUDE_MODELS` is now ALSO the alias→id resolution source for
@@ -1310,7 +1428,7 @@ mod tests {
 
     #[test]
     fn curated_grok_rows_carry_context_and_efforts() {
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         // grok-4.7: live /v1/models probe 2026-09-23 (ctx 500000, efforts
         // xhigh/high/medium/low with default high — no `none`).
         let g47 = find(&entries, "grok-4.7");
@@ -1359,7 +1477,7 @@ mod tests {
         // that llmux advertises the conservative row as the family default
         // rather than the id Claude Code reads as an 800k budget against
         // xAI's real 500,000 ceiling.
-        let pinned = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        let pinned = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(find(&pinned, "grok-4.7").aliases, vec!["grok".to_string()]);
         assert!(
             find(&pinned, "grok-4.7[1m]").aliases.is_empty(),
@@ -1372,7 +1490,7 @@ mod tests {
         // Pinning the SUFFIXED id is a different, explicit request: the match
         // is on the full id, so the twin owns the alias and the base row does
         // not. Still a curated row, so nothing is synthesized.
-        let pinned = catalog("grok-4.7[1m]", "gpt-5.6-sol", "stealth/ox-alpha");
+        let pinned = catalog("grok-4.7[1m]", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(
             find(&pinned, "grok-4.7[1m]").aliases,
             vec!["grok".to_string()],
@@ -1382,14 +1500,14 @@ mod tests {
         assert_eq!(pinned.len(), 53, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
-        let pinned = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let pinned = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(find(&pinned, "grok-4.6").aliases, vec!["grok".to_string()]);
         assert!(find(&pinned, "grok-4.7[1m]").aliases.is_empty());
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
         assert!(find(&pinned, "grok-4.5").aliases.is_empty());
 
         // The older curated row can be pinned too — the alias moves to it.
-        let pinned = catalog("grok-4.5", "gpt-5.6-sol", "stealth/ox-alpha");
+        let pinned = catalog("grok-4.5", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(find(&pinned, "grok-4.5").aliases, vec!["grok".to_string()]);
         assert!(find(&pinned, "grok-4.7[1m]").aliases.is_empty());
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
@@ -1397,7 +1515,7 @@ mod tests {
 
         // Out-of-catalog pin: alias moves to the synthesized row, and NO
         // curated row keeps it.
-        let pinned = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
+        let pinned = catalog("grok-4.3", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert!(find(&pinned, "grok-4.7[1m]").aliases.is_empty());
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
         assert!(find(&pinned, "grok-4.6").aliases.is_empty());
@@ -1412,7 +1530,7 @@ mod tests {
             "grok-4.5",
             "grok-4.3",
         ] {
-            let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
+            let entries = catalog(pin, "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
             let owners = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1432,7 +1550,7 @@ mod tests {
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
-            let entries = catalog(pin, "gpt-5.6-sol", "stealth/ox-alpha");
+            let entries = catalog(pin, "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
             assert_eq!(entries.len(), 53, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
@@ -1447,7 +1565,7 @@ mod tests {
     fn out_of_catalog_pin_synthesizes_a_null_metadata_row() {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
-        let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(entries.len(), 54);
         let owners: Vec<&ModelEntry> = entries
             .iter()
@@ -1474,7 +1592,7 @@ mod tests {
     fn synthesized_pin_keeps_known_thinking_levels() {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
-        let entries = catalog("grok-4.3", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.3", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         assert_eq!(entries.len(), 54);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
@@ -1491,7 +1609,7 @@ mod tests {
     fn gpt_5_6_sol_aliases_context_and_effort_count() {
         // `sol` moved to gpt-6.1-sol on 2026-10-06; the bare `gpt-5.6`
         // generation id stays here.
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let sol = find(&entries, "gpt-5.6-sol");
         assert_eq!(sol.aliases, vec!["gpt-5.6".to_string()]);
         assert_eq!(sol.max_context, Some(272_000));
@@ -1500,17 +1618,20 @@ mod tests {
     }
 
     #[test]
-    fn gpt_6_1_sol_owns_the_sol_alias_and_gen6_tiers_exist() {
+    fn gpt_6_1_sol_keeps_gpt_6_1_and_gen6_tiers_exist() {
         // openai/codex models.json @ d63a9b83 (2026-10-06): gpt-6.1-sol
-        // (priority 1, low..ultra), gpt-6-sol (low..ultra), gpt-6-luna
-        // (low..max). The base rows carry models.json's 272000 and the `[1m]`
-        // twins the published 1,050,000 (advertised as 1_000_000, same as
-        // astra). Family aliases float: `sol` → 6.1-sol, `luna` → 6-luna;
-        // `terra` → 6.1-terra since 2026-11-10 (generation 6 has no terra).
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        // (low..ultra), gpt-6-sol (low..ultra), gpt-6-luna (low..max). The
+        // `[1m]` twins carry the published 1,050,000 (advertised as
+        // 1_000_000, same as astra). Family aliases float: `sol` → 6.1-sol
+        // from 2026-10-06 until it moved to 6.2-sol on 2026-11-18, `luna` →
+        // 6-luna; `terra` → 6.1-terra since 2026-11-10 (generation 6 has no
+        // terra). The bare `gpt-6.1` generation id stays on 6.1-sol, whose
+        // base row carries models.json's context_window — 500000 since
+        // commit 6c0cee502d21 (2026-11-17) raised it from 272000.
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let sol = find(&entries, "gpt-6.1-sol");
-        assert_eq!(sol.aliases, vec!["sol".to_string(), "gpt-6.1".to_string()]);
-        assert_eq!(sol.max_context, Some(272_000));
+        assert_eq!(sol.aliases, vec!["gpt-6.1".to_string()]);
+        assert_eq!(sol.max_context, Some(500_000));
         assert_eq!(sol.efforts.len(), 6);
         assert_eq!(sol.group, "codex");
         let twin = find(&entries, "gpt-6.1-sol[1m]");
@@ -1534,7 +1655,7 @@ mod tests {
             find(&entries, "gpt-6.1-terra").aliases,
             vec!["terra".to_string()]
         );
-        for alias in ["sol", "terra", "luna", "gpt-6.1"] {
+        for alias in ["sol", "terra", "luna", "gpt-6.1", "gpt-6.2"] {
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == alias))
@@ -1553,10 +1674,10 @@ mod tests {
         // openai/codex models.json @ caae161dd0c8 (entry added in commit
         // 126a0ee92ed2, released 2026-10-26): context_window 500000,
         // max_context_window 872000, low..ultra. The base row carries the
-        // models.json 500000 (not the 272000 of the other 6.x rows); the
-        // `[1m]` twin the published 1,050,000 as 1_000_000. `terra` moved
-        // here from gpt-5.6-terra on 2026-11-10.
-        let entries = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        // models.json 500000; the `[1m]` twin the published 1,050,000 as
+        // 1_000_000. `terra` moved here from gpt-5.6-terra on 2026-11-10 and
+        // stays here: generation 6.2 ships no terra tier.
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let terra = find(&entries, "gpt-6.1-terra");
         assert_eq!(terra.name, "GPT-6.1-Terra");
         assert_eq!(terra.aliases, vec!["terra".to_string()]);
@@ -1578,7 +1699,7 @@ mod tests {
             .map(|e| e.id.as_ref())
             .collect();
         assert_eq!(
-            &codex_ids[..4],
+            &codex_ids[4..8],
             &[
                 "gpt-6.1-sol[1m]",
                 "gpt-6.1-sol",
@@ -1586,7 +1707,7 @@ mod tests {
                 "gpt-6.1-terra"
             ]
         );
-        assert_eq!(codex_ids.len(), 16);
+        assert_eq!(codex_ids.len(), 20);
         // Every codex alias has exactly one owner.
         let mut aliases: Vec<&str> = entries
             .iter()
@@ -1600,45 +1721,123 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_2_sol_and_astra_own_sol_and_astra() {
+        // openai/codex models.json @ 6c0cee502d21 ("Add GPT-6.2 Sol and
+        // Astra", 2026-11-17; fetched 2026-11-18): both low..ultra, sol
+        // context_window 500000, astra 272000 (max_context_window 872000 on
+        // both). Base rows carry those figures, the `[1m]` twins OpenAI's
+        // published 1,050,000 as 1_000_000. `sol` moved here from
+        // gpt-6.1-sol and `astra` from gpt-6-astra[1m]; the new bare
+        // `gpt-6.2` generation id names the flagship, sol.
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
+        for (id, name, ctx, aliases) in [
+            (
+                "gpt-6.2-sol",
+                "GPT-6.2-Sol",
+                500_000,
+                vec!["sol", "gpt-6.2"],
+            ),
+            ("gpt-6.2-sol[1m]", "GPT-6.2-Sol [1M]", 1_000_000, vec![]),
+            ("gpt-6.2-astra", "GPT-6.2-Astra", 272_000, vec![]),
+            (
+                "gpt-6.2-astra[1m]",
+                "GPT-6.2-Astra [1M]",
+                1_000_000,
+                vec!["astra"],
+            ),
+        ] {
+            let e = find(&entries, id);
+            assert_eq!(e.name, name, "{id}");
+            assert_eq!(e.max_context, Some(ctx), "{id}");
+            assert_eq!(e.efforts, CODEX_EFFORTS_FULL, "{id}");
+            assert_eq!(e.group, "codex", "{id}");
+            assert_eq!(e.aliases, aliases, "{id}");
+        }
+        // The newest generation is listed first, sol pair then astra pair,
+        // twin first in each.
+        let codex_ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "codex")
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert_eq!(
+            &codex_ids[..4],
+            &[
+                "gpt-6.2-sol[1m]",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra[1m]",
+                "gpt-6.2-astra"
+            ]
+        );
+        // Each moved or new alias has exactly one owner; the ones that did
+        // not move stay put (6.2 has no terra / luna tier, and the bare
+        // generation ids keep naming their own generation's flagship).
+        for (alias, owner) in [
+            ("sol", "gpt-6.2-sol"),
+            ("astra", "gpt-6.2-astra[1m]"),
+            ("gpt-6.2", "gpt-6.2-sol"),
+            ("gpt-6.1", "gpt-6.1-sol"),
+            ("gpt-6", "gpt-6-astra[1m]"),
+            ("terra", "gpt-6.1-terra"),
+            ("luna", "gpt-6-luna"),
+        ] {
+            let owners: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.aliases.iter().any(|a| a == alias))
+                .map(|e| e.id.as_ref())
+                .collect();
+            assert_eq!(owners, vec![owner], "alias {alias:?}");
+        }
+    }
+
+    #[test]
     fn gpt_6_astra_aliases_context_and_effort_count() {
         // Astra alias ownership contract (fix-astra-alias-1m): unlike the
-        // 5.6 sol/terra pattern where the base row owns the bare variant
-        // alias, the astra bare aliases (`astra`, `gpt-6`) belong to the
-        // `[1m]` twin — so `astra` / `gpt-6` RESOLVE to that row's upstream
-        // slug and to the 1M figure this catalog advertises for it. That is
-        // catalog resolution only: Claude Code still gives a BARE `astra` its
-        // 200k assumption (it sizes off the submitted id), so the client-side
-        // 1M denominator needs `astra[1m]` or the `[1M]` picker row. The base
-        // row keeps its openai/codex catalog window (272_000) and advertises
-        // NO aliases; six efforts on both.
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
-        let astra = find(&entries, "gpt-6-astra");
-        assert!(
-            astra.aliases.is_empty(),
-            "base gpt-6-astra must carry no aliases (they belong to the [1m] twin), \
-             got {:?}",
-            astra.aliases
-        );
-        assert_eq!(astra.name, "GPT-6-Astra");
-        assert_eq!(astra.max_context, Some(272_000));
-        assert_eq!(astra.efforts.len(), 6);
-        assert_eq!(astra.group, "codex");
-        // The `[1m]` twin owns both bare aliases and advertises OpenAI's
+        // sol/terra/luna pattern where the base row owns the bare variant
+        // alias, the astra bare aliases belong to a `[1m]` twin — so they
+        // RESOLVE to that row's upstream slug and to the 1M figure this
+        // catalog advertises for it. That is catalog resolution only: Claude
+        // Code still gives a BARE `astra` its 200k assumption (it sizes off
+        // the submitted id), so the client-side 1M denominator needs
+        // `astra[1m]` or the `[1M]` picker row. `astra` moved to
+        // gpt-6.2-astra[1m] on 2026-11-18; the bare generation id `gpt-6`
+        // stays on gpt-6-astra[1m]. The base rows keep their openai/codex
+        // catalog window (272_000) and advertise NO aliases; six efforts on
+        // every row.
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
+        for base in ["gpt-6-astra", "gpt-6.2-astra"] {
+            let astra = find(&entries, base);
+            assert!(
+                astra.aliases.is_empty(),
+                "base {base} must carry no aliases (they belong to the [1m] twin), \
+                 got {:?}",
+                astra.aliases
+            );
+            assert_eq!(astra.max_context, Some(272_000), "{base}");
+            assert_eq!(astra.efforts.len(), 6, "{base}");
+            assert_eq!(astra.group, "codex", "{base}");
+        }
+        assert_eq!(find(&entries, "gpt-6-astra").name, "GPT-6-Astra");
+        // The `[1m]` twins own the bare aliases and advertise OpenAI's
         // published 1M window.
         let twin = find(&entries, "gpt-6-astra[1m]");
         assert_eq!(twin.name, "GPT-6-Astra [1M]");
         assert_eq!(twin.max_context, Some(1_000_000));
-        assert_eq!(twin.efforts, astra.efforts);
+        assert_eq!(twin.efforts, find(&entries, "gpt-6-astra").efforts);
         assert_eq!(
             twin.aliases,
-            vec!["astra".to_string(), "gpt-6".to_string()],
-            "gpt-6-astra[1m] must own the astra/gpt-6 aliases"
+            vec!["gpt-6".to_string()],
+            "gpt-6-astra[1m] keeps only the gpt-6 generation alias"
         );
-        // Catalog-wide uniqueness: the ONLY row that advertises `astra` or
-        // `gpt-6` must be `gpt-6-astra[1m]`. Without this scan, the base-row
-        // emptiness above would still pass if some unrelated row silently
-        // grabbed the same alias.
-        for alias in ["astra", "gpt-6"] {
+        assert_eq!(
+            find(&entries, "gpt-6.2-astra[1m]").aliases,
+            vec!["astra".to_string()],
+            "gpt-6.2-astra[1m] owns the astra alias"
+        );
+        // Catalog-wide uniqueness: without this scan, the base-row emptiness
+        // above would still pass if some unrelated row silently grabbed the
+        // same alias.
+        for (alias, owner) in [("astra", "gpt-6.2-astra[1m]"), ("gpt-6", "gpt-6-astra[1m]")] {
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == alias))
@@ -1646,8 +1845,8 @@ mod tests {
                 .collect();
             assert_eq!(
                 owners,
-                vec!["gpt-6-astra[1m]"],
-                "alias {alias:?} must be owned solely by gpt-6-astra[1m], got {owners:?}"
+                vec![owner],
+                "alias {alias:?} must be owned solely by {owner}, got {owners:?}"
             );
         }
     }
@@ -1660,7 +1859,7 @@ mod tests {
         // rejected; terra: 555,029 accepted, no ceiling found). The base rows
         // keep the openai/codex catalog's 272,000 (re-read 2026-10-08) (the non-opt-in
         // denominator).
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for (id, name) in [
             ("gpt-5.6-sol[1m]", "GPT-5.6-Sol [1M]"),
             ("gpt-5.6-terra[1m]", "GPT-5.6-Terra [1M]"),
@@ -1687,7 +1886,7 @@ mod tests {
 
     #[test]
     fn dropped_ids_are_absent() {
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for gone in [
             "gpt-5.5-codex",
             "gpt-5-codex",
@@ -1704,8 +1903,73 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_dead_rows_are_retired_and_or_lands_on_nemotron_ultra() {
+        // #243: 0 endpoints on 2026-11-10, absent from `GET /api/v1/models`
+        // on 2026-11-18 — retired from the curated set and its resolver.
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
+        for (gone, slug) in [
+            ("or-ox-alpha", "stealth/ox-alpha"),
+            ("or-glm-5.2", "z-ai/glm-5.2:free"),
+            ("or-laguna-s-2.1", "poolside/laguna-s-2.1:free"),
+            ("or-gpt-oss-20b", "openai/gpt-oss-20b:free"),
+        ] {
+            assert!(
+                !entries.iter().any(|e| e.id == gone),
+                "{gone} must not be curated"
+            );
+            assert_eq!(resolve_openrouter_alias(gone), None, "{gone}");
+            assert!(
+                OPENROUTER_MODELS.iter().all(|&(_, s, ..)| s != slug),
+                "{slug} must not be curated"
+            );
+        }
+        let or_ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "openrouter")
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert_eq!(
+            or_ids,
+            vec![
+                "or-free",
+                "or-nemotron-3-ultra",
+                "or-nemotron-3.5-lightning",
+                "or-dots-3-note",
+                "or-north-mini-code",
+                "or-gemma-4-31b",
+            ]
+        );
+        // The default pin is the curated Nemotron 3 Ultra slug, so a bare
+        // `or` lands on that row and nothing is synthesized.
+        assert_eq!(
+            OPENROUTER_DEFAULT_PIN,
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        let owners: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.aliases.iter().any(|a| a == "or"))
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert_eq!(owners, vec!["or-nemotron-3-ultra"]);
+        assert_eq!(
+            resolve_openrouter_alias("or-nemotron-3-ultra"),
+            Some(OPENROUTER_DEFAULT_PIN)
+        );
+        // A loaded config can no longer carry a retired slug (`config::load_path`
+        // moves it to the new default), but a pin that reaches `catalog()` any
+        // other way is treated like any other uncurated pin: the alias goes to
+        // a synthesized null-metadata row.
+        let stale = catalog("grok-4.7", "gpt-5.6-sol", "stealth/ox-alpha");
+        assert_eq!(stale.len(), entries.len() + 1);
+        let synth = find(&stale, "or-stealth/ox-alpha");
+        assert_eq!(synth.aliases, vec!["or".to_string()]);
+        assert_eq!(synth.max_context, None);
+        assert!(find(&stale, "or-nemotron-3-ultra").aliases.is_empty());
+    }
+
+    #[test]
     fn entry_serializes_with_all_required_fields() {
-        let entries = catalog("grok-4.5", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.5", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let value = serde_json::to_value(find(&entries, "grok-4.5")).unwrap();
         let obj = value.as_object().unwrap();
         // Required keys present (additive evolution may add more).
@@ -1722,7 +1986,7 @@ mod tests {
         );
 
         // Same contract for the newer curated row, pinned so it owns the alias.
-        let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
+        let entries = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         let json = serde_json::to_string(find(&entries, "grok-4.6")).unwrap();
         assert_eq!(
             json,

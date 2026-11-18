@@ -55,12 +55,13 @@ const ANTHROPIC_DIRECT_BROWSER: HeaderName =
 ///    contains `/`, it is a bare OpenRouter slug (`openrouter/free`) and rides
 ///    through verbatim.
 /// 5. A remainder containing `/` is used VERBATIM
-///    (`or-openai/gpt-oss-20b:free` → `openai/gpt-oss-20b:free`) — the escape
-///    hatch for the ~400 models the curated table does not carry.
+///    (`or-google/gemma-4-26b-a4b-it:free` →
+///    `google/gemma-4-26b-a4b-it:free`) — the escape hatch for the ~400
+///    models the curated table does not carry.
 /// 6. Otherwise the curated alias table ([`crate::catalog::OPENROUTER_MODELS`]
 ///    behind [`crate::catalog::resolve_openrouter_alias`], keyed by the FULL
-///    advertised id including the `or-` prefix) maps `or-ox-alpha` →
-///    `stealth/ox-alpha`.
+///    advertised id including the `or-` prefix) maps `or-nemotron-3-ultra` →
+///    `nvidia/nemotron-3-ultra-550b-a55b:free`.
 /// 7. No match → the remainder verbatim, so OpenRouter's own 404 reaches the
 ///    user. A curated set is a convenience layer, never a gate, and silently
 ///    substituting a DIFFERENT model would bill/answer from something the user
@@ -86,8 +87,8 @@ pub fn resolve_model(requested: Option<&str>, pin: &str) -> String {
     // the input minus the `or-` selector prefix (or the input itself when the
     // client already spelled a bare OpenRouter slug).
     // Not `or-`-prefixed → forward VERBATIM. That covers a vendor-shaped slug
-    // named directly (`openrouter/free`, `z-ai/glm-5.2:free`) and, just as
-    // importantly, any slug a `routing.openrouter_models` override assigned
+    // named directly (`openrouter/free`, `google/gemma-4-31b-it:free`) and,
+    // just as importantly, any slug a `routing.openrouter_models` override assigned
     // here: a config that says `openrouter_models = ["free-"]` means
     // `free-model-1` IS an OpenRouter model, and answering it with the pin
     // instead would silently serve a different model than the one asked for.
@@ -133,8 +134,8 @@ pub fn resolve_model(requested: Option<&str>, pin: &str) -> String {
 /// (`provider/responses.rs`), Claude Code replays the assistant turn verbatim
 /// on the next request, and llmux is a multi-group proxy whose whole point is
 /// that you can switch `/model` mid-session. So a codex or grok answer
-/// followed by `/model or-ox-alpha` sends an unsigned thinking block to
-/// OpenRouter, whose Messages schema requires `signature` on such a block.
+/// followed by `/model or-nemotron-3-ultra` sends an unsigned thinking block
+/// to OpenRouter, whose Messages schema requires `signature` on such a block.
 /// Being a native passthrough is exactly why this does NOT come for free —
 /// nothing between the client and OpenRouter would otherwise touch it.
 ///
@@ -230,14 +231,15 @@ pub struct OpenRouterProvider {
 impl OpenRouterProvider {
     /// The `default_model` pin is NORMALIZED through the curated alias table
     /// on the way in, so a config that pins the ADVERTISED id
-    /// (`openrouter.default_model = "or-ox-alpha"` — the string the user sees
-    /// everywhere in `/models` and types into Claude Code) resolves to the
-    /// wire slug `stealth/ox-alpha` instead of being sent upstream verbatim
-    /// and 400ing. Normalizing here rather than at each use keeps the two
-    /// consumers — `resolve_model`'s pin path and `catalog()`'s
-    /// `slug == openrouter_pin` alias-owner comparison — reading the same
-    /// value; otherwise an advertised-id pin also orphans the bare `or` alias
-    /// onto a synthesized `or-or-ox-alpha` row. A real slug is left untouched.
+    /// (`openrouter.default_model = "or-nemotron-3-ultra"` — the string the
+    /// user sees everywhere in `/models` and types into Claude Code) resolves
+    /// to the wire slug `nvidia/nemotron-3-ultra-550b-a55b:free` instead of
+    /// being sent upstream verbatim and 400ing. Normalizing here rather than
+    /// at each use keeps the two consumers — `resolve_model`'s pin path and
+    /// `catalog()`'s `slug == openrouter_pin` alias-owner comparison — reading
+    /// the same value; otherwise an advertised-id pin also orphans the bare
+    /// `or` alias onto a synthesized `or-or-nemotron-3-ultra` row. A real slug
+    /// is left untouched.
     pub fn new(base_url: impl Into<String>, default_model: impl Into<String>) -> Self {
         let default_model = default_model.into();
         let default_model = crate::catalog::resolve_openrouter_alias(&default_model)
@@ -349,23 +351,27 @@ mod tests {
     /// the route exists). Every openrouter request would have 404'd.
     /// A config that pins the ADVERTISED id must still reach the right model.
     /// Without normalization in `new`, `openrouter.default_model =
-    /// "or-ox-alpha"` would be sent upstream verbatim (400) AND would make
-    /// `catalog()` synthesize an `or-or-ox-alpha` row that steals the bare
+    /// "or-nemotron-3-ultra"` would be sent upstream verbatim (400) AND would make
+    /// `catalog()` synthesize an `or-or-nemotron-3-ultra` row that steals the bare
     /// `or` alias from the real one.
     #[test]
     fn advertised_id_as_the_pin_is_normalized_to_the_wire_slug() {
-        let provider = OpenRouterProvider::new("https://example.invalid", "or-ox-alpha");
-        assert_eq!(provider.model(), "stealth/ox-alpha");
+        let provider = OpenRouterProvider::new("https://example.invalid", "or-nemotron-3-ultra");
+        assert_eq!(provider.model(), "nvidia/nemotron-3-ultra-550b-a55b:free");
         // The bare `or` alias and a model-less request both follow the pin.
         assert_eq!(
             resolve_model(Some("or"), provider.model()),
-            "stealth/ox-alpha"
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
         );
-        assert_eq!(resolve_model(None, provider.model()), "stealth/ox-alpha");
+        assert_eq!(
+            resolve_model(None, provider.model()),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
         // A real slug is untouched, and an uncurated pin stays verbatim.
         assert_eq!(
-            OpenRouterProvider::new("https://example.invalid", "z-ai/glm-5.2:free").model(),
-            "z-ai/glm-5.2:free"
+            OpenRouterProvider::new("https://example.invalid", "google/gemma-4-31b-it:free")
+                .model(),
+            "google/gemma-4-31b-it:free"
         );
         assert_eq!(
             OpenRouterProvider::new("https://example.invalid", "some/future-model").model(),
@@ -382,14 +388,17 @@ mod tests {
     /// passthrough does NOT inherit for free.
     #[test]
     fn unsigned_thinking_from_a_translated_turn_is_stripped() {
-        const BODY: &str = r#"{"model":"or-ox-alpha","messages":[
+        const BODY: &str = r#"{"model":"or-nemotron-3-ultra","messages":[
             {"role":"assistant","content":[
                 {"type":"thinking","thinking":"synthesized by the codex translator"},
                 {"type":"text","text":"the answer"}]},
             {"role":"user","content":"follow-up"}]}"#;
         let out = normalize_body(bytes::Bytes::from_static(BODY.as_bytes()), PIN);
         let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
-        assert_eq!(v["model"], "stealth/ox-alpha", "model still rewritten");
+        assert_eq!(
+            v["model"], "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "model still rewritten"
+        );
         let blocks = v["messages"][0]["content"].as_array().expect("blocks");
         assert!(
             !blocks.iter().any(|b| b["type"] == "thinking"),
@@ -405,7 +414,7 @@ mod tests {
     /// A SIGNED thinking block is genuine upstream content and must survive.
     #[test]
     fn signed_thinking_is_preserved() {
-        const BODY: &str = r#"{"model":"or-ox-alpha","messages":[
+        const BODY: &str = r#"{"model":"or-nemotron-3-ultra","messages":[
             {"role":"assistant","content":[
                 {"type":"thinking","thinking":"real","signature":"sig-abc"}]}]}"#;
         let out = normalize_body(bytes::Bytes::from_static(BODY.as_bytes()), PIN);
@@ -467,16 +476,22 @@ mod tests {
 
     #[test]
     fn no_model_resolves_to_the_pin() {
-        assert_eq!(resolve_model(None, PIN), "stealth/ox-alpha");
         assert_eq!(
-            resolve_model(None, "z-ai/glm-5.2:free"),
-            "z-ai/glm-5.2:free"
+            resolve_model(None, PIN),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            resolve_model(None, "google/gemma-4-31b-it:free"),
+            "google/gemma-4-31b-it:free"
         );
     }
 
     #[test]
     fn bare_or_resolves_to_the_pin() {
-        assert_eq!(upstream_model("or"), "stealth/ox-alpha");
+        assert_eq!(
+            upstream_model("or"),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
         assert_eq!(
             resolve_model(Some("or"), "openrouter/free"),
             "openrouter/free"
@@ -485,9 +500,22 @@ mod tests {
 
     #[test]
     fn curated_alias_resolves_to_its_slug() {
-        assert_eq!(upstream_model("or-ox-alpha"), "stealth/ox-alpha");
-        assert_eq!(upstream_model("or-glm-5.2"), "z-ai/glm-5.2:free");
+        assert_eq!(
+            upstream_model("or-nemotron-3-ultra"),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            upstream_model("or-gemma-4-31b"),
+            "google/gemma-4-31b-it:free"
+        );
         assert_eq!(upstream_model("or-free"), "openrouter/free");
+        // The rows retired on 2026-11-18 (#243) are no longer curated: their
+        // ids fall through to the verbatim remainder, so OpenRouter's own
+        // answer reaches the user instead of a silently substituted model.
+        assert_eq!(upstream_model("or-ox-alpha"), "ox-alpha");
+        assert_eq!(upstream_model("or-glm-5.2"), "glm-5.2");
+        assert_eq!(upstream_model("or-laguna-s-2.1"), "laguna-s-2.1");
+        assert_eq!(upstream_model("or-gpt-oss-20b"), "gpt-oss-20b");
     }
 
     /// The escape hatch for the ~400 non-curated models: anything with a `/`
@@ -495,8 +523,8 @@ mod tests {
     #[test]
     fn slug_after_the_prefix_passes_through_verbatim() {
         assert_eq!(
-            upstream_model("or-openai/gpt-oss-20b:free"),
-            "openai/gpt-oss-20b:free"
+            upstream_model("or-google/gemma-4-26b-a4b-it:free"),
+            "google/gemma-4-26b-a4b-it:free"
         );
     }
 
@@ -518,19 +546,31 @@ mod tests {
 
     #[test]
     fn resolution_is_case_insensitive_and_trimmed() {
-        assert_eq!(upstream_model("OR-Ox-Alpha "), "stealth/ox-alpha");
-        assert_eq!(upstream_model("  OR  "), "stealth/ox-alpha");
+        assert_eq!(
+            upstream_model("OR-Nemotron-3-Ultra "),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            upstream_model("  OR  "),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
     }
 
     /// `[1m]` is Claude-Code display metadata (the same suffix
     /// `routing::Classifier::classify` strips), never part of the slug.
     #[test]
     fn client_context_suffix_is_stripped_before_resolution() {
-        assert_eq!(upstream_model("or-ox-alpha[1m]"), "stealth/ox-alpha");
-        assert_eq!(upstream_model("or[1m]"), "stealth/ox-alpha");
         assert_eq!(
-            upstream_model("or-openai/gpt-oss-20b:free[1m]"),
-            "openai/gpt-oss-20b:free"
+            upstream_model("or-nemotron-3-ultra[1m]"),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            upstream_model("or[1m]"),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            upstream_model("or-google/gemma-4-26b-a4b-it:free[1m]"),
+            "google/gemma-4-26b-a4b-it:free"
         );
     }
 
@@ -538,9 +578,15 @@ mod tests {
     /// rather than sending `"model": ""` upstream.
     #[test]
     fn empty_model_resolves_to_the_pin() {
-        assert_eq!(upstream_model(""), "stealth/ox-alpha");
-        assert_eq!(upstream_model("  "), "stealth/ox-alpha");
-        assert_eq!(upstream_model("or-"), "stealth/ox-alpha");
+        assert_eq!(upstream_model(""), "nvidia/nemotron-3-ultra-550b-a55b:free");
+        assert_eq!(
+            upstream_model("  "),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
+        assert_eq!(
+            upstream_model("or-"),
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+        );
     }
 
     // ---- request_out / request_in ----
@@ -549,10 +595,10 @@ mod tests {
     fn request_out_extracts_model_and_stream() {
         let unified = provider()
             .request_out(request(
-                r#"{"model":"or-ox-alpha","stream":true,"messages":[]}"#,
+                r#"{"model":"or-nemotron-3-ultra","stream":true,"messages":[]}"#,
             ))
             .expect("unified");
-        assert_eq!(unified.model.as_deref(), Some("or-ox-alpha"));
+        assert_eq!(unified.model.as_deref(), Some("or-nemotron-3-ultra"));
         assert!(unified.stream);
     }
 
@@ -567,14 +613,13 @@ mod tests {
 
     #[test]
     fn request_in_rewrites_the_body_model_and_keeps_everything_else() {
-        let body =
-            r#"{"model":"or-ox-alpha","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+        let body = r#"{"model":"or-nemotron-3-ultra","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
         let p = provider();
         let unified = p.request_out(request(body)).expect("out");
         let provider_req = p.request_in(unified).expect("in");
         let upstream: serde_json::Value =
             serde_json::from_slice(&provider_req.body).expect("upstream json");
-        assert_eq!(upstream["model"], "stealth/ox-alpha");
+        assert_eq!(upstream["model"], "nvidia/nemotron-3-ultra-550b-a55b:free");
         assert_eq!(upstream["max_tokens"], 8);
         assert_eq!(upstream["messages"][0]["content"], "hi");
         assert_eq!(provider_req.path, "/v1/messages");
@@ -619,7 +664,7 @@ mod tests {
     /// refcounted byte-identity fast path.
     #[test]
     fn request_in_is_byte_identical_when_the_model_is_already_resolved() {
-        let body = r#"{"model":"stealth/ox-alpha","messages":[]}"#;
+        let body = r#"{"model":"nvidia/nemotron-3-ultra-550b-a55b:free","messages":[]}"#;
         let out = normalize_body(bytes::Bytes::from_static(body.as_bytes()), PIN);
         assert_eq!(out.as_ref(), body.as_bytes());
     }
@@ -646,7 +691,7 @@ mod tests {
     fn request_in_inserts_the_pin_when_the_body_has_no_model() {
         let out = normalize_body(bytes::Bytes::from_static(br#"{"messages":[]}"#), PIN);
         let upstream: serde_json::Value = serde_json::from_slice(&out).expect("json");
-        assert_eq!(upstream["model"], "stealth/ox-alpha");
+        assert_eq!(upstream["model"], "nvidia/nemotron-3-ultra-550b-a55b:free");
     }
 
     // ---- auth (§R4) ----

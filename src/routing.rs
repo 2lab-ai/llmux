@@ -178,9 +178,9 @@ impl Rule {
 /// change — the same rationale as the pre-existing `gpt-5.5` / `gpt-5.6`
 /// rules), and the bare variant aliases `sol` / `terra` / `luna` / `astra`,
 /// which carry NO `gpt-` prefix and therefore NEED their exact rules. The
-/// codex provider resolves each alias to a concrete slug: sol/terra/luna to
-/// the latest gpt generation of that variant, astra to the single-tier
-/// `gpt-6-astra` — see [`crate::provider::codex`].
+/// codex provider resolves each alias to a concrete slug, the latest gpt
+/// generation of that variant (`sol` / `astra` → `gpt-6.2-sol` /
+/// `gpt-6.2-astra` since 2026-11-18) — see [`crate::provider::codex`].
 fn builtin_codex_rules() -> Vec<Rule> {
     vec![
         Rule::Prefix("gpt-".to_string()),
@@ -217,7 +217,8 @@ fn builtin_grok_rules() -> Vec<Rule> {
 }
 
 /// Builtin openrouter rules (docs/openrouter/spec.md §R2): the user-facing
-/// `or-` model prefix (`or-ox-alpha`, `or-glm-5.2`, `or-openai/gpt-oss-20b:free`),
+/// `or-` model prefix (`or-nemotron-3-ultra`, `or-gemma-4-31b`,
+/// `or-google/gemma-4-26b-a4b-it:free`),
 /// the bare `or` family alias (resolves to the live free-model pin, mirroring
 /// bare `grok`), and the raw `openrouter/` vendor prefix so OpenRouter's own
 /// router slugs (`openrouter/free`) route here when named verbatim.
@@ -573,20 +574,29 @@ mod tests {
         assert_eq!(builtin().classify(Some("sol")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("terra")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("luna")), BackendGroup::Codex);
-        // `astra` is the generation-6 flagship alias (single tier).
+        // `astra` is the astra-variant alias (gpt-6.2-astra since
+        // 2026-11-18, gpt-6-astra before).
         assert_eq!(builtin().classify(Some("astra")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("gpt-6-astra")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("gpt-6")), BackendGroup::Codex);
-        // `terra`'s owner since 2026-11-10 rides the `gpt-` prefix, `[1m]`
-        // twin included — no per-id rule needed.
-        assert_eq!(
-            builtin().classify(Some("gpt-6.1-terra")),
-            BackendGroup::Codex
-        );
-        assert_eq!(
-            builtin().classify(Some("gpt-6.1-terra[1m]")),
-            BackendGroup::Codex
-        );
+        // `terra`'s owner since 2026-11-10 and the `sol` / `astra` owners
+        // since 2026-11-18 ride the `gpt-` prefix, `[1m]` twins and the bare
+        // `gpt-6.2` generation id included — no per-id rule needed.
+        for model in [
+            "gpt-6.1-terra",
+            "gpt-6.1-terra[1m]",
+            "gpt-6.2",
+            "gpt-6.2-sol",
+            "gpt-6.2-sol[1m]",
+            "gpt-6.2-astra",
+            "gpt-6.2-astra[1m]",
+        ] {
+            assert_eq!(
+                builtin().classify(Some(model)),
+                BackendGroup::Codex,
+                "{model}"
+            );
+        }
         // Exact, case-insensitive like the rest.
         assert_eq!(builtin().classify(Some("SOL")), BackendGroup::Codex);
         assert_eq!(builtin().classify(Some("ASTRA")), BackendGroup::Codex);
@@ -760,11 +770,11 @@ mod tests {
     fn openrouter_builtin_rules_classify_the_or_family() {
         let c = Classifier::default();
         for model in [
-            "or-ox-alpha",
-            "or-glm-5.2",
-            "or-gpt-oss-20b",
+            "or-nemotron-3-ultra",
+            "or-gemma-4-31b",
+            "or-free",
             // The verbatim escape hatch: a full vendor slug behind `or-`.
-            "or-openai/gpt-oss-20b:free",
+            "or-google/gemma-4-26b-a4b-it:free",
             // OpenRouter's own router slug, named without the `or-` prefix.
             "openrouter/free",
         ] {
@@ -778,7 +788,7 @@ mod tests {
         assert_eq!(c.classify(Some("or")), BackendGroup::OpenRouter);
         assert_eq!(c.classify(Some("  OR  ")), BackendGroup::OpenRouter);
         assert_eq!(
-            c.classify(Some("or-ox-alpha[1m]")),
+            c.classify(Some("or-nemotron-3-ultra[1m]")),
             BackendGroup::OpenRouter
         );
     }
@@ -797,7 +807,7 @@ mod tests {
             // …and the other families' markers, for the same reason.
             "or-anthropic/claude-sonnet-4",
             "or-x-ai/grok-3",
-            "or-openai/gpt-oss-20b:free",
+            "or-openai/gpt-oss-120b",
         ] {
             assert_eq!(
                 c.classify(Some(model)),
@@ -844,7 +854,10 @@ mod tests {
         }
         // And the reverse direction: an `or-` id is claimed by nobody else,
         // which is what makes the check order in `classify` irrelevant here.
-        assert_eq!(c.classify(Some("or-ox-alpha")), BackendGroup::OpenRouter);
+        assert_eq!(
+            c.classify(Some("or-nemotron-3-ultra")),
+            BackendGroup::OpenRouter
+        );
     }
 
     #[test]
@@ -852,7 +865,7 @@ mod tests {
         let c = Classifier::from_config(&[], &[], &[], &["free-".to_string()], &[], "claude");
         assert_eq!(c.classify(Some("free-model-1")), BackendGroup::OpenRouter);
         assert_eq!(
-            c.classify(Some("or-ox-alpha")),
+            c.classify(Some("or-nemotron-3-ultra")),
             BackendGroup::Claude,
             "builtin or- prefix dropped when config provides its own openrouter list"
         );
@@ -943,7 +956,7 @@ mod tests {
             ("terra", BackendGroup::Codex),
             ("grok-4.7", BackendGroup::Grok),
             ("grok", BackendGroup::Grok),
-            ("or-ox-alpha", BackendGroup::OpenRouter),
+            ("or-nemotron-3-ultra", BackendGroup::OpenRouter),
             ("or", BackendGroup::OpenRouter),
             ("openrouter/free", BackendGroup::OpenRouter),
             // OpenRouter's Google slugs stay OpenRouter's: the `or-` anchor

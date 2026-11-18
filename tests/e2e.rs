@@ -3673,7 +3673,7 @@ fn openrouter_config(mock: &MockUpstream, accounts: Vec<AccountConfig>) -> Confi
 async fn openrouter_account_passthrough_rewrites_only_the_model() {
     const UPSTREAM_BODY: &str =
         r#"{"id":"msg_or","type":"message","usage":{"input_tokens":11,"output_tokens":5}}"#;
-    const CLIENT_BODY: &str = r#"{"model":"or-ox-alpha","max_tokens":16,"system":"Be brief.","messages":[{"role":"user","content":"hi"}]}"#;
+    const CLIENT_BODY: &str = r#"{"model":"or-nemotron-3-ultra","max_tokens":16,"system":"Be brief.","messages":[{"role":"user","content":"hi"}]}"#;
 
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
@@ -3709,8 +3709,8 @@ async fn openrouter_account_passthrough_rewrites_only_the_model() {
 
     let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json body");
     assert_eq!(
-        sent["model"], "stealth/ox-alpha",
-        "or-ox-alpha resolved to its OpenRouter slug"
+        sent["model"], "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "or-nemotron-3-ultra resolved to its OpenRouter slug"
     );
     // Everything else survived untouched — still an Anthropic Messages body,
     // NOT a Responses-API one (no `input`/`instructions` keys).
@@ -3725,7 +3725,7 @@ async fn openrouter_account_passthrough_rewrites_only_the_model() {
 #[tokio::test]
 async fn openrouter_verbatim_slug_escape_hatch_reaches_upstream() {
     const UPSTREAM_BODY: &str = r#"{"id":"msg_or2","type":"message"}"#;
-    const CLIENT_BODY: &str = r#"{"model":"or-openai/gpt-oss-20b:free","max_tokens":8,"messages":[{"role":"user","content":"yo"}]}"#;
+    const CLIENT_BODY: &str = r#"{"model":"or-google/gemma-4-26b-a4b-it:free","max_tokens":8,"messages":[{"role":"user","content":"yo"}]}"#;
 
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::ok(UPSTREAM_BODY));
@@ -3742,7 +3742,7 @@ async fn openrouter_verbatim_slug_escape_hatch_reaches_upstream() {
     let seen = mock.seen();
     assert_eq!(seen.len(), 1);
     let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json body");
-    assert_eq!(sent["model"], "openai/gpt-oss-20b:free");
+    assert_eq!(sent["model"], "google/gemma-4-26b-a4b-it:free");
 }
 
 /// `/v1/messages/count_tokens` on an openrouter account must be answered
@@ -3766,7 +3766,7 @@ async fn openrouter_count_tokens_is_answered_locally_not_proxied() {
         .post(proxy.url("/v1/messages/count_tokens"))
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
-        .body(r#"{"model":"or-ox-alpha","messages":[{"role":"user","content":"hello there"}]}"#)
+        .body(r#"{"model":"or-nemotron-3-ultra","messages":[{"role":"user","content":"hello there"}]}"#)
         .send()
         .await
         .expect("proxy reachable");
@@ -3798,7 +3798,7 @@ async fn openrouter_account_refuses_non_messages_endpoints() {
     let response = client
         .post(proxy.url("/v1/complete"))
         .header("content-type", "application/json")
-        .body(r#"{"model":"or-ox-alpha","prompt":"hi"}"#)
+        .body(r#"{"model":"or-nemotron-3-ultra","prompt":"hi"}"#)
         .send()
         .await
         .expect("proxy reachable");
@@ -3832,7 +3832,7 @@ async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer
     let response = post_messages(
         &client,
         &proxy,
-        r#"{"model":"or-ox-alpha","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"or-nemotron-3-ultra","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
     assert_eq!(response.status(), 200);
@@ -3890,11 +3890,11 @@ async fn raw_io_openrouter_captures_the_real_upstream_leg_with_a_redacted_bearer
         .as_str()
         .expect("upstream request body");
     assert!(
-        sent.contains("stealth/ox-alpha"),
-        "the upstream leg shows the REWRITTEN wire model, not `or-ox-alpha`: {sent}"
+        sent.contains("nvidia/nemotron-3-ultra-550b-a55b:free"),
+        "the upstream leg shows the REWRITTEN wire model, not `or-nemotron-3-ultra`: {sent}"
     );
     assert!(
-        !sent.contains("or-ox-alpha"),
+        !sent.contains("or-nemotron-3-ultra"),
         "the client's id must not survive into the upstream leg: {sent}"
     );
 
