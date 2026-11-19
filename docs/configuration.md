@@ -149,7 +149,7 @@ defaults on load; any other explicit combination is kept verbatim.
 With `routing.enabled = true`, the inbound `model` string selects a backend group:
 
 - `claude-*`, `opus`, `sonnet`, `haiku`, `fable-5` route to the Claude group.
-- `gpt-*`, `gpt-5.5`, `codex`, `o1`/`o3`/`o4` route to the Codex group.
+- `gpt-*`, `codex`, `o1`/`o3`/`o4` route to the Codex group.
 - `grok`, `grok-*` route to the Grok group.
 - `or-*`, a bare `or`, and `openrouter/*` route to the OpenRouter group.
 - `gemini`, `gemini-*`, and a bare `argon` route to the Gemini group.
@@ -184,7 +184,7 @@ Override tokens are matched in order, first-match-wins, case-insensitively:
 
 - `gpt-` means prefix match.
 - `~codex` means substring match.
-- `=gpt-5.5` means exact match.
+- `=gpt-6.2-sol` means exact match.
 
 ## Codex request shaping
 
@@ -196,7 +196,7 @@ Codex settings are configurable in the config file and adjustable live from the 
 | `codex.fast` | Sends `service_tier: "priority"` when true. |
 | `codex.reasoning_effort` | Optional: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (`ultra` on `gpt-6.2-sol`/`-astra`, `gpt-6.1-sol`/`-terra`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol`/`-terra`). `max`/`ultra` clamp to `xhigh` on models below the gpt-5.6 family. |
 
-For Claude Code model-selection details, including `gpt-5.5[1m]` and the long-context compaction workaround, see [operational-reference.md](operational-reference.md#selecting-the-codex-model-from-claude-code) and [faq.md](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
+For Claude Code model-selection details, including `gpt-6.2-sol[1m]` and the long-context compaction workaround, see [operational-reference.md](operational-reference.md#selecting-the-codex-model-from-claude-code) and [faq.md](faq.md#gpt-55-stops-around-265k-context-what-should-i-do).
 
 ## Grok request shaping
 

@@ -297,7 +297,6 @@ model it does not curate.
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-5.6-terra       | —            | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-5.6-luna        | —            | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 272000      | codex  |
-| gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
 | grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.7[1m]        | —            | Grok 4.7 [1M] (500k upstream) | low, medium, high, xhigh   | 500000      | grok   |
 | grok-4.6            | —            | Grok 4.6            | low, medium, high, xhigh             | 500000      | grok   |
@@ -396,8 +395,7 @@ window of this model` (`gpt-5.6-terra` accepted 555,029). OpenAI publishes
 1,050,000 total for the gpt-5.6 family. The base rows keep the openai/codex
 catalog's current 272000 (re-read 2026-10-08), client metadata rather than a
 newly measured upstream limit. The `[1m]` twins keep their published 1M metadata. There is deliberately
-no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
-`gpt-5.5[1m]` row (272k family).
+no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream).
 
 `gpt-6-astra[1m]` advertises the same 1000000 on the strength of OpenAI's
 published 1,050,000-token window for Astra — it has **not** been probed through
@@ -677,8 +675,10 @@ Not changed, recorded:
 - **`gpt-5.5` is dead on the ChatGPT backend.** A probe through the daemon on 2026-11-18 returned
   400 "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account." It is
   missing from the live Codex server list; OpenAI retired it from Codex with ChatGPT sign-in on
-  2026-10-14. The row and its passthrough stay for now
-  ([#309](https://github.com/2lab-ai/llmux/issues/309)).
+  2026-10-14. The row was removed on 2026-11-19 (catalog 53 → 52 rows,
+  [#309](https://github.com/2lab-ai/llmux/issues/309)); the passthrough stays so a request that
+  names it gets that 400 instead of silently running on the codex pin, and its price row stays
+  for recorded usage.
 - **Gemini 4 Carbon / Hydrogen rows** wait for a Pro or Ultra account to probe the Antigravity id
   form ([#310](https://github.com/2lab-ai/llmux/issues/310)). This is the same open question as
   Argon's ([#244](https://github.com/2lab-ai/llmux/issues/244)).
@@ -736,7 +736,8 @@ Not changed, recorded:
 - **`gpt-5.5` on Codex.** It was retired from Codex for ChatGPT sign-in on 2026-10-14
   ([Codex changelog](https://developers.openai.com/codex/changelog)), and llmux uses the
   ChatGPT-account backend. The row and its passthrough stay; whether it still answers is
-  untested.
+  untested. (Superseded: the 2026-11-18 probe returned 400 and the row was removed on
+  2026-11-19, [#309](https://github.com/2lab-ai/llmux/issues/309).)
 - **`gpt-6.1-sol` context.** The live Codex server list (`~/.codex/models_cache.json`, fetched
   2026-11-09, Codex CLI 0.167.0) and OpenAI's docs give it 500000 in Codex, while `models.json`
   still says 272000. The row keeps the `models.json` value (`models.json` moved to 500000 on
@@ -1019,7 +1020,7 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
 - **Codex effort menus and base context windows** — the openai/codex model
   catalog (`models-manager/models.json`), fetched 2026-07-14. `gpt-5.6-sol` /
   `-terra` support low→ultra; `gpt-5.6-luna` low→max; `gpt-5.5` low→xhigh
-  (context 272000). The legacy `gpt-5.5-codex` / `gpt-5-codex` ids are no longer
+  (context 272000; row removed 2026-11-19, #309). The legacy `gpt-5.5-codex` / `gpt-5-codex` ids are no longer
   curated.
 - **gpt-6-astra** — same catalog re-fetched 2026-09-07: slug `gpt-6-astra`,
   display name "GPT-6-Astra", context_window 272000, max_context_window 872000,

@@ -60,6 +60,8 @@ No. llmux is for one human using their own accounts. It is not for credential po
 
 ## `gpt-5.5` stops around 265k context. What should I do?
 
+`gpt-5.5` left the catalog on 2026-11-19: the ChatGPT-account backend rejects it since 2026-10-14 ([#309](https://github.com/2lab-ai/llmux/issues/309)). Pick a current codex model such as `gpt-6.2-sol[1m]`. The record below is kept for the client-side compaction steps.
+
 Observed 2026-08. Use a Claude 1M-context model for compaction, then switch back to `gpt-5.5[1m]`.
 
 A practical sequence inside Claude Code:
@@ -81,14 +83,14 @@ The ~265k cutoff is empirical client behavior, not an llmux routing limit. `gpt-
 
 This does not change your llmux account configuration. It is a Claude Code session-management workaround.
 
-## Why does `[1m]` matter in `/model gpt-5.5[1m]`?
+## Why does `[1m]` matter in `/model gpt-6.2-sol[1m]`?
 
-Claude Code derives its displayed context window from the model-name string. Bare `gpt-5.5` can be treated as an unknown or smaller-window model by the client. The `[1m]` suffix tells Claude Code to use a 1M context display while llmux still routes the request by the `gpt-` prefix.
+Claude Code derives its displayed context window from the model-name string. A bare codex id such as `gpt-6.2-sol` can be treated as an unknown or smaller-window model by the client. The `[1m]` suffix tells Claude Code to use a 1M context display while llmux still routes the request by the `gpt-` prefix.
 
-llmux strips one trailing `[1m]` before resolving the codex model, so the suffix never reaches upstream and works on any codex id or alias (`gpt-5.6-sol[1m]`, `sol[1m]`). `gpt-5.6-sol[1m]` and `gpt-5.6-terra[1m]` are also catalog rows advertising a 1000000 window — probed 2026-08-21 at 910,229 input tokens accepted / ~936k rejected against the ChatGPT-account backend (OpenAI publishes 1,050,000 total for the gpt-5.6 family). `gpt-5.5` is a 272k model, so `gpt-5.5[1m]` remains a display-only workaround.
+llmux strips one trailing `[1m]` before resolving the codex model, so the suffix never reaches upstream and works on any codex id or alias (`gpt-5.6-sol[1m]`, `sol[1m]`). `gpt-5.6-sol[1m]` and `gpt-5.6-terra[1m]` are also catalog rows advertising a 1000000 window — probed 2026-08-21 at 910,229 input tokens accepted / ~936k rejected against the ChatGPT-account backend (OpenAI publishes 1,050,000 total for the gpt-5.6 family). `gpt-5.5`, a 272k model for which `[1m]` was display-only, left the catalog on 2026-11-19 ([#309](https://github.com/2lab-ai/llmux/issues/309)).
 
 See [operational-reference.md](operational-reference.md#context-window-display-for-codex-models) for the routing details, and [models.md](models.md#the-codex-1m-rows) for the catalog rows.
 
-## Does `gpt-5.5[1m]` still route to Codex?
+## Does `gpt-6.2-sol[1m]` still route to Codex?
 
 Yes. The `gpt-` prefix still matches the Codex group. llmux strips the display suffix for routing and usage attribution.

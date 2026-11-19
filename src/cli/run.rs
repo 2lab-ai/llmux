@@ -441,7 +441,15 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
 fn codex_catalog(models: &[CatalogRow], cached: Option<&serde_json::Value>) -> serde_json::Value {
     use serde_json::json;
     let native = cached.and_then(|v| v["models"].as_array());
-    let fallback = native.and_then(|a| a.iter().find(|m| m["slug"] == "gpt-5.5"));
+    // The template for rows Codex has no entry for (claude, grok, …): a
+    // current codex model's, else the first entry. It was keyed on `gpt-5.5`
+    // until 2026-11-19, which the live Codex list stopped carrying when the
+    // ChatGPT backend retired it (#309), so every such row lost its template.
+    let fallback = native.and_then(|a| {
+        a.iter()
+            .find(|m| m["slug"] == crate::provider::codex::CODEX_MODEL)
+            .or_else(|| a.first())
+    });
     let mut entries = Vec::new();
     for (priority, row) in models.iter().enumerate() {
         let base_id = row.id.strip_suffix("[1m]").unwrap_or(&row.id);
@@ -662,6 +670,30 @@ mod tests {
         let (_base_url, key, remove) = claude_env(&endpoint(false, Some("lm-local")));
         assert!(key.is_none());
         assert!(!remove);
+    }
+
+    /// #309: rows Codex has no entry for take a CURRENT codex model's
+    /// template (the default pin's), not the retired `gpt-5.5`'s, and fall back
+    /// to the first entry when the pin is missing too.
+    #[test]
+    fn codex_catalog_template_follows_a_live_codex_model() {
+        let rows = vec![row(
+            "claude-opus-5-5[1m]",
+            "Opus",
+            &[],
+            Some(1_000_000),
+            "claude",
+        )];
+        let cached = serde_json::json!({"models": [
+            {"slug": "gpt-6.2-sol", "base_instructions": "first"},
+            {"slug": crate::provider::codex::CODEX_MODEL, "base_instructions": "pin"}
+        ]});
+        let out = codex_catalog(&rows, Some(&cached));
+        assert_eq!(out["models"][0]["base_instructions"], "pin");
+        let cached =
+            serde_json::json!({"models": [{"slug": "gpt-6.2-sol", "base_instructions": "first"}]});
+        let out = codex_catalog(&rows, Some(&cached));
+        assert_eq!(out["models"][0]["base_instructions"], "first");
     }
 
     fn row(

@@ -50,7 +50,7 @@ pub const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// `config.codex`. They mirror exactly what the codex CLI sets on the wire:
 /// the model slug, `service_tier: "priority"` when `fast`, and a
 /// `reasoning.effort` value. [`Default`] reproduces the original behavior
-/// (pinned `gpt-5.5`, no fast tier, backend-default effort) so existing tests
+/// (pinned [`CODEX_MODEL`], no fast tier, backend-default effort) so existing tests
 /// and the bare `new` constructor are unaffected.
 #[derive(Debug, Clone)]
 pub struct CodexShape {
@@ -114,7 +114,7 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    /// Construct with the default request shape (pinned `gpt-5.5`). Used by
+    /// Construct with the default request shape (pinned [`CODEX_MODEL`]). Used by
     /// tests; production uses [`CodexProvider::with_shape`].
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_shape(base_url, CodexShape::default())
@@ -342,6 +342,9 @@ pub fn translate_request(body: &Value, session_id: &str) -> Result<(Value, bool)
 /// ids map to their flagship ([`GENERATION_ALIASES`]; the backend rejects
 /// bare generation ids); any other requested model keeps the configured pin.
 const PASSTHROUGH_MODELS: &[&str] = &[
+    // Retired from the catalog 2026-11-19 (#309; the ChatGPT backend answers
+    // 400 since 2026-10-14). Kept here so a request naming it gets that clear
+    // 400 instead of silently running on the pin.
     "gpt-5.5",
     "gpt-5.5-codex",
     "gpt-5-codex",
