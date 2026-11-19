@@ -128,7 +128,6 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
-    "gpt-5.5",
     "gpt-5.5-codex",
     "gpt-5-codex",
 ];
@@ -7807,7 +7806,8 @@ mod tests {
         assert_eq!(CODEX_MODELS[1], "gpt-6.2-astra");
         assert_eq!(CODEX_MODELS[2], "gpt-6.1-sol");
         assert_eq!(CODEX_MODELS[3], "gpt-6.1-terra");
-        assert_eq!(CODEX_MODELS.len(), 12);
+        // 11 since gpt-5.5 left the set (2026-11-19, #309).
+        assert_eq!(CODEX_MODELS.len(), 11);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

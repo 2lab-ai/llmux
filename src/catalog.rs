@@ -52,8 +52,8 @@
 //!   `gpt-6.1-terra` and 2026-11-18 (commit 6c0cee502d21, 2026-11-17) for
 //!   `gpt-6.2-sol` / `gpt-6.2-astra`. `gpt-6.2-sol/astra`,
 //!   `gpt-6.1-sol/terra`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol/terra`
-//!   support low..ultra; `gpt-6-luna` and `gpt-5.6-luna` low..max; `gpt-5.5`
-//!   low..xhigh. The base rows carry the models.json `context_window`:
+//!   support low..ultra; `gpt-6-luna` and `gpt-5.6-luna` low..max (`gpt-5.5`,
+//!   low..xhigh, left the catalog on 2026-11-19, #309). The base rows carry the models.json `context_window`:
 //!   500,000 on `gpt-6.2-sol`, `gpt-6.1-terra` and (since 6c0cee502d21
 //!   raised it from 272,000) `gpt-6.1-sol`; 272,000 on `gpt-6.2-astra` and
 //!   every generation-6 row (astra was the only gen-6 tier until
@@ -142,7 +142,6 @@ fn claude_efforts(id: &str) -> &'static [&'static str] {
 /// `gpt-6.1-sol/terra`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol/terra`.
 const CODEX_EFFORTS_FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_EFFORTS_LUNA: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const CODEX_EFFORTS_GPT55: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// The curated claude catalog — SSOT for BOTH the `/models` rows below and the
 /// alias→id resolution in [`crate::provider::anthropic`]. Before this table
@@ -786,13 +785,11 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         // `luna` moved to gpt-6-luna (2026-10-06).
         Vec::new(),
     ));
-    entries.push(codex_entry(
-        "gpt-5.5",
-        "GPT-5.5",
-        CODEX_EFFORTS_GPT55,
-        Some(272_000),
-        Vec::new(),
-    ));
+    // `gpt-5.5` left the catalog on 2026-11-19 (#309): the ChatGPT-account
+    // backend rejects it since 2026-10-14 ("The 'gpt-5.5' model is not
+    // supported when using Codex with a ChatGPT account."). It stays in the
+    // codex passthrough so a request naming it fails loudly, and in pricing
+    // so recorded usage keeps its rate.
 
     // ---- grok (curated) ----
     // The `"grok"` alias rides the pin: exactly the curated row whose id IS
@@ -941,8 +938,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_53_entries() {
-        // The pinned (curated) case: exactly 53 rows, claude ids in order.
+    fn catalog_matches_user_contract_52_entries() {
+        // The pinned (curated) case: exactly 52 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
@@ -955,9 +952,10 @@ mod tests {
         // claude-haiku-4-5 row was retired (2026-10-23); 53 after the
         // claude-fable-5-2 row and the gpt-6.1-terra pair landed (2026-11-10);
         // still 53 after the gpt-6.2-sol / gpt-6.2-astra pairs landed (+4) and
-        // the four dead openrouter rows were retired (-4, #243) on 2026-11-18.
+        // the four dead openrouter rows were retired (-4, #243) on 2026-11-18;
+        // 52 after the gpt-5.5 row was retired (2026-11-19, #309).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 53);
+        assert_eq!(entries.len(), 52);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -1497,7 +1495,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 53, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 52, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
@@ -1544,14 +1542,14 @@ mod tests {
         // A curated pin: no synthesized row, alias on the row whose id IS the
         // pin — a base-slug pin never hands it to the `[1m]` twin (the
         // suffixed-pin case is in `grok_family_alias_follows_the_pin`),
-        // count 53.
+        // count 52.
         for (pin, owner) in [
             ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-            assert_eq!(entries.len(), 53, "pin {pin}");
+            assert_eq!(entries.len(), 52, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1561,12 +1559,22 @@ mod tests {
         }
     }
 
+    /// `gpt-5.5` left the catalog on 2026-11-19 (#309): the ChatGPT-account
+    /// backend rejects it. Neither spelling is advertised any more.
+    #[test]
+    fn gpt_5_5_is_not_in_the_catalog() {
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
+        for id in ["gpt-5.5", "gpt-5.5[1m]"] {
+            assert!(entries.iter().all(|e| e.id != id), "{id} is not a catalog row");
+        }
+    }
+
     #[test]
     fn out_of_catalog_pin_synthesizes_a_null_metadata_row() {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 54);
+        assert_eq!(entries.len(), 53);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1593,7 +1601,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 54);
+        assert_eq!(entries.len(), 53);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));
@@ -1707,7 +1715,8 @@ mod tests {
                 "gpt-6.1-terra"
             ]
         );
-        assert_eq!(codex_ids.len(), 20);
+        // 19 since the gpt-5.5 row left (2026-11-19, #309).
+        assert_eq!(codex_ids.len(), 19);
         // Every codex alias has exactly one owner.
         let mut aliases: Vec<&str> = entries
             .iter()

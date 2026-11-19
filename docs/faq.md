@@ -60,6 +60,8 @@ No. llmux is for one human using their own accounts. It is not for credential po
 
 ## `gpt-5.5` stops around 265k context. What should I do?
 
+`gpt-5.5` left the catalog on 2026-11-19: the ChatGPT-account backend rejects it since 2026-10-14 ([#309](https://github.com/2lab-ai/llmux/issues/309)). Pick a current codex model such as `gpt-6.2-sol[1m]`. The record below is kept for the client-side compaction steps.
+
 Observed 2026-08. Use a Claude 1M-context model for compaction, then switch back to `gpt-5.5[1m]`.
 
 A practical sequence inside Claude Code:
