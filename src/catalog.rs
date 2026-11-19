@@ -1565,7 +1565,10 @@ mod tests {
     fn gpt_5_5_is_not_in_the_catalog() {
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for id in ["gpt-5.5", "gpt-5.5[1m]"] {
-            assert!(entries.iter().all(|e| e.id != id), "{id} is not a catalog row");
+            assert!(
+                entries.iter().all(|e| e.id != id),
+                "{id} is not a catalog row"
+            );
         }
     }
 
