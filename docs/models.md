@@ -736,7 +736,8 @@ Not changed, recorded:
 - **`gpt-5.5` on Codex.** It was retired from Codex for ChatGPT sign-in on 2026-10-14
   ([Codex changelog](https://developers.openai.com/codex/changelog)), and llmux uses the
   ChatGPT-account backend. The row and its passthrough stay; whether it still answers is
-  untested.
+  untested. (Superseded: the 2026-11-18 probe returned 400 and the row was removed on
+  2026-11-19, [#309](https://github.com/2lab-ai/llmux/issues/309).)
 - **`gpt-6.1-sol` context.** The live Codex server list (`~/.codex/models_cache.json`, fetched
   2026-11-09, Codex CLI 0.167.0) and OpenAI's docs give it 500000 in Codex, while `models.json`
   still says 272000. The row keeps the `models.json` value (`models.json` moved to 500000 on

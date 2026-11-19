@@ -128,6 +128,44 @@ pub fn load() -> Result<Config, ConfigError> {
     load_path(&config_path()?)
 }
 
+/// Codex ids the ChatGPT-account backend no longer serves. `gpt-5.5` left the
+/// catalog on 2026-11-19 (#309; the backend answers 400 since 2026-10-14).
+const RETIRED_CODEX_MODELS: &[&str] = &["gpt-5.5"];
+
+fn is_retired_codex_model(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let base = value.strip_suffix("[1m]").unwrap_or(&value);
+    RETIRED_CODEX_MODELS.contains(&base)
+}
+
+/// Retired-codex-model migration (#309, 2026-11-19). A config may name
+/// `gpt-5.5` where llmux picks a codex model: `codex.default_model` defaulted
+/// to it from 2026-06-13 to 2026-07-10 and is always written out, and the
+/// `claude_code` mapping accepted it while it was a catalog row. The backend
+/// rejects it, and the `claude_code` check now refuses a non-catalog id, so
+/// such a config would stop loading. Each such field moves to its default
+/// BEFORE validation; any other value is kept verbatim.
+fn heal_retired_codex_models(config: &mut Config) {
+    if is_retired_codex_model(&config.codex.default_model) {
+        config.codex.default_model = schema::CodexConfig::default().default_model;
+    }
+    let defaults = schema::ClaudeCodeConfig::default();
+    let mapping = &mut config.claude_code.gpt_model_mapping;
+    for (value, default) in [
+        (&mut mapping.opus, &defaults.gpt_model_mapping.opus),
+        (&mut mapping.sonnet, &defaults.gpt_model_mapping.sonnet),
+        (&mut mapping.haiku, &defaults.gpt_model_mapping.haiku),
+        (
+            &mut config.claude_code.auto_classifier_model,
+            &defaults.auto_classifier_model,
+        ),
+    ] {
+        if is_retired_codex_model(value) {
+            *value = default.clone();
+        }
+    }
+}
+
 /// [`load`] against an explicit path.
 pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     let raw = match fs::read_to_string(path) {
@@ -138,6 +176,7 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
         Err(err) => return Err(io_err(path, err)),
     };
     let mut config: Config = serde_json::from_str(&raw)?;
+    heal_retired_codex_models(&mut config);
     config
         .claude_code
         .validate()
@@ -854,6 +893,44 @@ mod tests {
         assert_eq!(
             Config::default().openrouter.default_model,
             crate::catalog::OPENROUTER_DEFAULT_PIN
+        );
+    }
+
+    /// #309: a config naming the retired `gpt-5.5` (any case, with or without
+    /// `[1m]`) as a codex pick still loads; each such field moves to its
+    /// default, and a live value is kept.
+    #[test]
+    fn retired_codex_model_heals_to_field_defaults() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let raw = r#"{
+  "version": 1,
+  "codex": { "default_model": "gpt-5.5" },
+  "claude_code": {
+    "gpt_model_mapping": { "opus": "GPT-5.5[1m]", "sonnet": "sol", "haiku": " gpt-5.5 " },
+    "auto_classifier_model": "gpt-5.5"
+  },
+  "accounts": []
+}"#;
+        fs::write(&path, raw).expect("write config");
+        let config = load_path(&path).expect("a retired codex pick no longer blocks loading");
+        let defaults = schema::ClaudeCodeConfig::default();
+        assert_eq!(
+            config.codex.default_model,
+            schema::CodexConfig::default().default_model
+        );
+        assert_eq!(
+            config.claude_code.gpt_model_mapping.opus,
+            defaults.gpt_model_mapping.opus
+        );
+        assert_eq!(config.claude_code.gpt_model_mapping.sonnet, "sol");
+        assert_eq!(
+            config.claude_code.gpt_model_mapping.haiku,
+            defaults.gpt_model_mapping.haiku
+        );
+        assert_eq!(
+            config.claude_code.auto_classifier_model,
+            defaults.auto_classifier_model
         );
     }
 

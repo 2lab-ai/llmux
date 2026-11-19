@@ -600,8 +600,7 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
     // keep the openai/codex catalog's `context_window` (272,000 on most rows,
     // re-read 2026-10-08; 500,000 where models.json says so), client
     // metadata rather than a measured backend limit; legacy Claude base rows
-    // keep 200,000 next to their `[1m]` twins. No `gpt-5.6-luna[1m]` (luna still 404s upstream) and
-    // no `gpt-5.5[1m]` (272k family). For the sol/terra/luna rows aliases stay
+    // keep 200,000 next to their `[1m]` twins. No `gpt-5.6-luna[1m]` (luna still 404s upstream). For the sol/terra/luna rows aliases stay
     // on the base row — a suffix is an explicit opt-in, never something an
     // alias silently picks; astra is the exception noted above.
     // The astra `[1m]` rows ride OpenAI's published 1,050,000 window; unlike

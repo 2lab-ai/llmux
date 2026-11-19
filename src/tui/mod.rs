@@ -117,7 +117,8 @@ use view::DashboardView;
 /// in [`crate::provider::codex`]'s passthrough list, so a pin set from here is
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
 /// `gpt-6.1-terra` added 2026-11-10 and `gpt-6.2-sol` / `gpt-6.2-astra`
-/// 2026-11-18 on the same terms.
+/// 2026-11-18 on the same terms. `gpt-5.5`, `gpt-5.5-codex` and `gpt-5-codex`
+/// left on 2026-11-19 (#309): picking one made every pinned request fail.
 const CODEX_MODELS: &[&str] = &[
     "gpt-6.2-sol",
     "gpt-6.2-astra",
@@ -128,8 +129,6 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
-    "gpt-5.5-codex",
-    "gpt-5-codex",
 ];
 /// Reasoning-effort levels cycled with `e` (and the group-settings bar);
 /// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
@@ -7806,8 +7805,9 @@ mod tests {
         assert_eq!(CODEX_MODELS[1], "gpt-6.2-astra");
         assert_eq!(CODEX_MODELS[2], "gpt-6.1-sol");
         assert_eq!(CODEX_MODELS[3], "gpt-6.1-terra");
-        // 11 since gpt-5.5 left the set (2026-11-19, #309).
-        assert_eq!(CODEX_MODELS.len(), 11);
+        // 9 since gpt-5.5, gpt-5.5-codex and gpt-5-codex left the set
+        // (2026-11-19, #309): the ChatGPT backend serves none of them.
+        assert_eq!(CODEX_MODELS.len(), 9);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
