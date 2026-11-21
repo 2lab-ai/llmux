@@ -1,4 +1,4 @@
-//! `llmux run [--codex] [-- args]` — ensure the proxy is running
+//! `llmux run [--codex | --agy] [-- args]` — ensure the proxy is running
 //! (auto-starting a background daemon when needed), then launch the selected
 //! client frontend pointed at it and propagate its exit code.
 //!
@@ -14,10 +14,14 @@
 //!   llmux custom headers.
 //! - [`codex`] — Codex CLI (`codex`, OpenAI Responses ingress): the
 //!   session-scoped `-c` provider flags and the Codex model catalog file.
+//! - [`agy`] — the Antigravity CLI (`agy`, Google Gemini API ingress): the
+//!   LLM-gateway environment and the starting `--model`; its model list is
+//!   the daemon's own `GET /v1beta/models`, so no catalog fetch here.
 //!
 //! A new client frontend is one more [`Frontend`] case, one more module with
 //! a `launch`, and one more arm in [`run`].
 
+pub(crate) mod agy;
 mod claude;
 mod codex;
 
@@ -39,15 +43,20 @@ pub(crate) enum Frontend {
     ClaudeCode,
     /// Codex CLI over the OpenAI Responses ingress (`/v1/responses`).
     Codex,
+    /// The Antigravity CLI over the Google Gemini API ingress
+    /// (`/v1beta/models/…`).
+    Agy,
 }
 
 impl Frontend {
-    /// The frontend `llmux run` launches: `--codex` selects Codex, no flag
-    /// Claude Code. The flags share one clap group in [`RunArgs`], so at most
-    /// one is ever set.
+    /// The frontend `llmux run` launches: `--codex` selects Codex, `--agy`
+    /// the Antigravity CLI, no flag Claude Code. The flags share one clap
+    /// group in [`RunArgs`], so at most one is ever set.
     pub(crate) fn from_run_args(args: &RunArgs) -> Frontend {
         if args.codex {
             Frontend::Codex
+        } else if args.agy {
+            Frontend::Agy
         } else {
             Frontend::ClaudeCode
         }
@@ -57,6 +66,8 @@ impl Frontend {
     pub(crate) fn from_env_args(args: &EnvArgs) -> Frontend {
         if args.codex {
             Frontend::Codex
+        } else if args.agy {
+            Frontend::Agy
         } else {
             Frontend::ClaudeCode
         }
@@ -67,6 +78,7 @@ impl Frontend {
         match self {
             Frontend::ClaudeCode => "claude",
             Frontend::Codex => "codex",
+            Frontend::Agy => "agy",
         }
     }
 
@@ -75,6 +87,7 @@ impl Frontend {
         match self {
             Frontend::ClaudeCode => "Claude Code",
             Frontend::Codex => "Codex CLI",
+            Frontend::Agy => "the Antigravity CLI",
         }
     }
 
@@ -282,6 +295,11 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
 pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
+    let frontend = Frontend::from_run_args(&args);
+    // agy cannot reach a plain-http remote: refuse before anything starts.
+    if frontend == Frontend::Agy {
+        agy::check_endpoint(&endpoint)?;
+    }
 
     // Remote mode: never auto-start a local daemon — point the client straight
     // at the remote proxy. Off-loopback the proxy enforces its `x-api-key`, so
@@ -322,7 +340,7 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
         client_args = &client_args[1..];
     }
 
-    let launched = match Frontend::from_run_args(&args) {
+    let launched = match frontend {
         Frontend::ClaudeCode => claude::launch(&endpoint, client_args, args.no_model_picker).await,
         Frontend::Codex => {
             codex::launch(
@@ -333,6 +351,7 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
             )
             .await
         }
+        Frontend::Agy => agy::launch(&endpoint, client_args, &config.agy_default_model()).await,
     };
     match launched? {}
 }
@@ -447,6 +466,12 @@ mod tests {
         };
         assert_eq!(parse(&["llmux", "run"]), Frontend::ClaudeCode);
         assert_eq!(parse(&["llmux", "run", "--codex"]), Frontend::Codex);
+        assert_eq!(parse(&["llmux", "run", "--agy"]), Frontend::Agy);
+        assert!(
+            crate::cli::Cli::try_parse_from(["llmux", "run", "--agy", "--codex"]).is_err(),
+            "one frontend per run"
+        );
+        assert_eq!(parse(&["llmux", "env", "--agy"]), Frontend::Agy);
         assert_eq!(
             parse(&["llmux", "run", "--", "--codex"]),
             Frontend::ClaudeCode,
@@ -472,6 +497,10 @@ mod tests {
         assert_eq!(
             message(Frontend::Codex, &missing),
             "codex not found in PATH — install Codex CLI first"
+        );
+        assert_eq!(
+            message(Frontend::Agy, &missing),
+            "agy not found in PATH — install the Antigravity CLI first"
         );
         assert_eq!(
             message(Frontend::ClaudeCode, &denied),

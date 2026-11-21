@@ -1426,3 +1426,145 @@ fn islands_connection_cold_start_reads_only_then_authenticates_dashboard() {
         "authenticated empty dashboard must succeed"
     );
 }
+
+/// `run --agy` starts agy in gateway mode against the selected endpoint:
+/// the ingress URL, the genai wire, the endpoint's key, the subagent tiers
+/// and `--model` on the agy default; other agy backends and stray gateway
+/// variables are removed; a user `--model` wins; the exit code propagates.
+#[cfg(unix)]
+#[test]
+fn run_agy_sets_the_gateway_env_and_the_default_model() {
+    let h = Harness::new();
+    h.seed_config(
+        r#"{"version":1,"remote":{"host":"127.0.0.1","port":45679,"api_key":"remote-key"},"agy":{"default_model":"opus"},"accounts":[]}"#,
+    );
+    let bindir = h.dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let stub = bindir.join("agy");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\nenv | grep -E '^(AGY_|GEMINI_|GOOGLE_|CLOUD_CODE)' | sort\nexit 5\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| {
+        h.cmd()
+            .arg("run")
+            .arg("--agy")
+            .arg("--")
+            .args(args)
+            .env("PATH", &path)
+            .env("GEMINI_API_KEY", "stray-gemini-key")
+            .env("CLOUD_CODE_URL", "http://elsewhere")
+            .env("AGY_LLM_GATEWAY_MODELS", "a,b")
+            .env("AGY_LLM_GATEWAY_HEADERS", "X-A: 1")
+            .env("AGY_LLM_GATEWAY_CA_CERT", "/tmp/ca.pem")
+            .output()
+            .unwrap()
+    };
+    let output = run(&["-p", "hello"]);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        out.starts_with("--model\nclaude-opus-5-5\n-p\nhello\n"),
+        "{out}"
+    );
+    for line in [
+        "AGY_LLM_GATEWAY_URL=http://127.0.0.1:45679",
+        "AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai",
+        "AGY_LLM_GATEWAY_API_KEY=remote-key",
+        "AGY_LLM_GATEWAY_TIER_PRO=claude-opus-5-5",
+        "AGY_LLM_GATEWAY_TIER_FLASH=claude-opus-5-5",
+        "AGY_LLM_GATEWAY_TIER_FLASH_LITE=claude-opus-5-5",
+        "AGY_LLM_GATEWAY_CA_CERT=/tmp/ca.pem",
+    ] {
+        assert!(out.lines().any(|l| l == line), "{line}: {out}");
+    }
+    for gone in [
+        "GEMINI_API_KEY",
+        "CLOUD_CODE_URL",
+        "AGY_LLM_GATEWAY_MODELS",
+        "AGY_LLM_GATEWAY_HEADERS",
+    ] {
+        assert!(
+            !out.lines().any(|l| l.starts_with(&format!("{gone}="))),
+            "{gone}: {out}"
+        );
+    }
+
+    let output = run(&["--model", "gpt-6.2-sol", "-p", "hi"]);
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(out.starts_with("--model\ngpt-6.2-sol\n-p\nhi\n"), "{out}");
+    assert_eq!(out.matches("--model").count(), 1, "{out}");
+}
+
+/// agy refuses plain http to a non-loopback host, so `run --agy` and
+/// `env --agy` fail before launching or printing anything.
+#[test]
+fn agy_refuses_a_plain_http_remote_up_front() {
+    let h = Harness::new();
+    h.seed_config(
+        r#"{"version":1,"remote":{"host":"gateway.example","port":4567,"api_key":"lmk-remote"},"accounts":[]}"#,
+    );
+    for args in [&["run", "--agy"][..], &["env", "--agy"][..]] {
+        let out = Output::run({
+            let mut c = h.cmd();
+            c.args(args).env("PATH", "/nonexistent");
+            c
+        });
+        assert_ne!(out.code, Some(0), "{args:?}");
+        assert_eq!(out.stdout, "", "{args:?}");
+        assert!(
+            out.stderr.contains("plain http"),
+            "{args:?}: {}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("4567:localhost:4567"), "{}", out.stderr);
+        assert!(!out.stderr.contains("lmk-remote"));
+    }
+}
+
+/// `env --agy` on the local daemon exports its (initialized) key next to
+/// the gateway URL and the codex default model, and unsets other backends.
+#[test]
+fn env_agy_exports_the_local_gateway() {
+    let h = Harness::new();
+    h.seed_config(r#"{"version":1,"proxy":{"port":39105},"accounts":[]}"#);
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.args(["env", "--agy"]);
+        c
+    });
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert!(out
+        .stdout
+        .contains("export AGY_LLM_GATEWAY_URL=http://localhost:39105\n"));
+    assert!(out
+        .stdout
+        .contains("export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n"));
+    assert!(out.stdout.contains(&format!(
+        "export AGY_LLM_GATEWAY_TIER_PRO={}\n",
+        llmux::provider::codex::CODEX_MODEL
+    )));
+    let unset = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("unset "))
+        .expect("unset line");
+    assert!(out.stdout.contains("export AGY_LLM_GATEWAY_API_KEY=lm-"));
+    assert!(!unset.contains("AGY_LLM_GATEWAY_API_KEY"), "{unset}");
+    assert!(unset.contains("GEMINI_API_KEY"), "{unset}");
+}
