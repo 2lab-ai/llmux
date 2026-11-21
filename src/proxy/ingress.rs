@@ -15,13 +15,26 @@
 //! A new client protocol is one more [`Endpoint`] case in [`origin`], one more
 //! [`NativeInput`] variant, and one more arm in each function here; the
 //! compiler flags those arms and the native-backend builder in `forward.rs`.
-//! It does NOT flag these, which a new protocol must check by hand: the
-//! translated-backend arms in `forward.rs` (they chain `if served == …` and
-//! fall through to OpenRouter, with no Codex arm, because Codex is native on
-//! Responses), the Responses-only checks behind `responses_input()`, the relay's
-//! native-stream handling (keyed on the `x-llmux-native-responses` header in
-//! `sse.rs`), the `client_auth` key extraction (Bearer or `x-api-key` only),
-//! the count-tokens path test, and `translate_converter` reading `ctx.body`.
+//! It does NOT flag these, which a new protocol must check by hand (what the
+//! Gemini API did at each, in brackets):
+//!
+//! - the translated-backend arms in `forward.rs`, which chain
+//!   `if served == …` and fall through to OpenRouter [the Gemini API added
+//!   the Codex arm — Codex is native only on Responses — and OpenRouter is
+//!   reached at `/v1/messages` with Messages headers, never the client's path];
+//! - the Responses-only checks behind `responses_input()` [none: the Gemini
+//!   API validates in [`decode`], and drops what a backend refuses in
+//!   [`messages_request`]];
+//! - the relay's native-stream handling, keyed on the
+//!   `x-llmux-native-responses` header in `sse.rs` [not used: the native
+//!   gemini answer goes through the transform relay, `native_request`
+//!   returning `Some(true)`, and its `NativeStream` reads usage and ends];
+//! - the `client_auth` key extraction [Bearer, `x-api-key` or
+//!   `x-goog-api-key`, refusals in the Google envelope];
+//! - the count-tokens path test [`:countTokens` has its own route in
+//!   `server.rs`, answered locally];
+//! - `translate_converter` reading `ctx.body` [the native gemini answer takes
+//!   `TranslateConverter::GenAi` before that body is read].
 
 use axum::response::Response;
 use bytes::Bytes;
@@ -155,8 +168,9 @@ pub(crate) fn decode(
 /// on Messages.
 ///
 /// The client-auth gate's key-registry refusals (denied / suspended / revoked)
-/// deliberately do NOT come through here: they keep the Anthropic
-/// `authentication_error` shape on every path, as they always have.
+/// keep the Anthropic `authentication_error` shape on the Messages and
+/// Responses paths, as they always have; on the Gemini API paths the gate
+/// answers through here with the Google envelope.
 pub(crate) fn error(origin: Endpoint, status: StatusCode, detail: &str) -> Response {
     match origin {
         Endpoint::OpenAi => responses::error(status, detail),

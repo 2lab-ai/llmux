@@ -85,7 +85,7 @@ options override injected launch defaults.
 
 | Key | Meaning |
 | --- | --- |
-| `agy.default_model` | The model `llmux run --agy` starts agy on (`--model`, and the `AGY_LLM_GATEWAY_TIER_*` subagent tiers), listed first in `GET /v1beta/models`. A catalog id or alias. Unset (the default, omitted from the file) = `codex.default_model`. A user `--model` wins. See [agy frontend](agy-frontend/README.md). |
+| `agy.default_model` | The model `llmux run --agy` starts agy on (`--model`), listed first in `GET /v1beta/models`. A catalog id or alias. Unset (the default, omitted from the file) = `codex.default_model`. A user `--model` wins, and the `AGY_LLM_GATEWAY_TIER_*` subagent tiers follow the model the session starts on. See [agy frontend](agy-frontend/README.md). |
 
 Daemon-side routing and configured provider effort overrides still apply.
 `--no-model-picker` disables the selected client’s catalog injection.

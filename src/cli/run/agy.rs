@@ -45,18 +45,18 @@ pub(crate) struct GatewayEnv {
 }
 
 /// agy refuses plain `http://` to a host that is not loopback; fail before
-/// anything starts, with the two ways out.
+/// anything starts, with the way out: an ssh tunnel, then remote mode on the
+/// tunnel's loopback end (so the remote's key is used and no local daemon is
+/// started or restarted).
 pub(crate) fn check_endpoint(endpoint: &Endpoint) -> Result<(), CliError> {
     if !endpoint.base_url.starts_with("http://") || is_loopback(&endpoint.host) {
         return Ok(());
     }
     Err(CliError::Message(format!(
-        "agy refuses plain http to a non-loopback host ({}:{}); reach the remote llmux through \
-         an ssh tunnel (`ssh -L {port}:localhost:{port} <host>`, then `llmux --remote \
-         127.0.0.1:{port} run --agy`) or point agy at an https endpoint yourself \
-         (`llmux env --agy` shows the variables)",
-        endpoint.host,
-        endpoint.port,
+        "agy refuses plain http to a non-loopback host ({host}:{port}); reach the remote llmux \
+         through an ssh tunnel: `ssh -L {port}:127.0.0.1:{port} {host}`, then \
+         `llmux --remote 127.0.0.1:{port} run --agy`",
+        host = endpoint.host,
         port = endpoint.port,
     )))
 }
@@ -128,6 +128,23 @@ pub(crate) fn gateway_env(
     GatewayEnv { set, remove }
 }
 
+/// The model the session starts on, as [`model_id`] resolves it: the agy
+/// arguments' `--model` (`--model x` or `--model=x`) when they name one,
+/// else `default_model`. The subagent tiers follow it.
+pub(crate) fn session_model(args: &[String], default_model: &str) -> String {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--model" {
+            if let Some(model) = args.next() {
+                return model_id(model);
+            }
+        } else if let Some(model) = arg.strip_prefix("--model=") {
+            return model_id(model);
+        }
+    }
+    model_id(default_model)
+}
+
 /// `--model <model>` unless the agy arguments name a model or start with a
 /// subcommand (`agy models`, `agy mcp …`), where a root flag does not belong.
 pub(crate) fn model_args(args: &[String], model: &str) -> Vec<String> {
@@ -142,7 +159,8 @@ pub(crate) fn model_args(args: &[String], model: &str) -> Vec<String> {
     }
 }
 
-/// Spawn `agy` against `endpoint` with the gateway environment, `--model`
+/// Spawn `agy` against `endpoint` with the gateway environment (subagent
+/// tiers on the session's model, [`session_model`]), `--model <default>`
 /// when the arguments name none, and the user's arguments.
 pub(super) async fn launch(
     endpoint: &Endpoint,
@@ -159,7 +177,11 @@ pub(super) async fn launch(
         }
     }
     let model = model_id(default_model);
-    let env = gateway_env(endpoint, &model, std::env::vars_os().map(|(name, _)| name));
+    let env = gateway_env(
+        endpoint,
+        &session_model(args, default_model),
+        std::env::vars_os().map(|(name, _)| name),
+    );
     let mut command = tokio::process::Command::new(Frontend::Agy.binary());
     for name in &env.remove {
         command.env_remove(name);
@@ -258,8 +280,15 @@ mod tests {
             else {
                 panic!("{host} must be refused");
             };
-            assert!(message.contains("ssh -L 3456:localhost:3456"), "{message}");
-            assert!(message.contains(host), "{message}");
+            assert!(
+                message.contains(&format!("ssh -L 3456:127.0.0.1:3456 {host}")),
+                "{message}"
+            );
+            assert!(
+                message.contains("llmux --remote 127.0.0.1:3456 run --agy"),
+                "{message}"
+            );
+            assert!(!message.contains("env --agy"), "{message}");
         }
     }
 
@@ -274,6 +303,29 @@ mod tests {
         assert!(model_args(&args(&["--model", "x", "-p", "hi"]), "m").is_empty());
         assert!(model_args(&args(&["--model=x"]), "m").is_empty());
         assert!(model_args(&args(&["models"]), "m").is_empty());
+    }
+
+    /// The subagent tiers follow the model the session starts on: the
+    /// user's `--model` when given, else the default.
+    #[test]
+    fn the_session_model_is_the_users_model_or_the_default() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            session_model(&args(&["-p", "hi"]), "opus"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            session_model(&args(&["--model", "gpt-6.2-sol[1m]", "-p", "hi"]), "opus"),
+            "gpt-6.2-sol"
+        );
+        assert_eq!(
+            session_model(&args(&["--model=sol"]), "opus"),
+            "gpt-6.2-sol"
+        );
+        assert_eq!(
+            session_model(&args(&["--model"]), "opus"),
+            "claude-opus-5-5"
+        );
     }
 
     #[test]

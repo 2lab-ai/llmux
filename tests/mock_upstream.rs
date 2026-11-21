@@ -123,6 +123,8 @@ pub struct SeenRequest {
     /// Raw query string (`alt=sse` on the gemini stream path); `path` alone
     /// drops it.
     pub query: Option<String>,
+    /// `anthropic-version` (Messages-header assertions on translated legs).
+    pub anthropic_version: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -294,6 +296,7 @@ async fn catch_all(
         launch_model_hint: header("x-llmux-claude-launch-model"),
         user_agent: header("user-agent"),
         query: parts.uri.query().map(str::to_string),
+        anthropic_version: header("anthropic-version"),
         body: body.to_vec(),
     });
 
@@ -424,6 +427,7 @@ async fn token_endpoint(
             launch_model_hint: header("x-llmux-claude-launch-model"),
             user_agent: header("user-agent"),
             query: parts.uri.query().map(str::to_string),
+            anthropic_version: header("anthropic-version"),
             body: body.to_vec(),
         });
     shared.token_hits.fetch_add(1, Ordering::SeqCst);

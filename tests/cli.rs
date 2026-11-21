@@ -1505,10 +1505,15 @@ fn run_agy_sets_the_gateway_env_and_the_default_model() {
         );
     }
 
+    // A user `--model` wins, and the subagent tiers follow it.
     let output = run(&["--model", "gpt-6.2-sol", "-p", "hi"]);
     let out = String::from_utf8(output.stdout).unwrap();
     assert!(out.starts_with("--model\ngpt-6.2-sol\n-p\nhi\n"), "{out}");
     assert_eq!(out.matches("--model").count(), 1, "{out}");
+    for tier in ["PRO", "FLASH", "FLASH_LITE"] {
+        let line = format!("AGY_LLM_GATEWAY_TIER_{tier}=gpt-6.2-sol");
+        assert!(out.lines().any(|l| l == line), "{line}: {out}");
+    }
 }
 
 /// agy refuses plain http to a non-loopback host, so `run --agy` and
@@ -1532,7 +1537,15 @@ fn agy_refuses_a_plain_http_remote_up_front() {
             "{args:?}: {}",
             out.stderr
         );
-        assert!(out.stderr.contains("4567:localhost:4567"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains("4567:127.0.0.1:4567 gateway.example"),
+            "{}",
+            out.stderr
+        );
+        assert!(out
+            .stderr
+            .contains("llmux --remote 127.0.0.1:4567 run --agy"));
+        assert!(!out.stderr.contains("env --agy"), "{}", out.stderr);
         assert!(!out.stderr.contains("lmk-remote"));
     }
 }

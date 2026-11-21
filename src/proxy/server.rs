@@ -2073,15 +2073,25 @@ pub fn router(state: AppState) -> Router {
         // locally from the catalog, `:countTokens` is a local estimate, and
         // the generate methods enter the shared forward path. A doubled
         // `/v1beta` prefix is tolerated.
-        .route("/v1beta/models", get(genai_models_endpoint))
-        .route("/v1beta/v1beta/models", get(genai_models_endpoint))
+        .route(
+            "/v1beta/models",
+            get(genai_models_endpoint).fallback(genai_method_not_allowed),
+        )
+        .route(
+            "/v1beta/v1beta/models",
+            get(genai_models_endpoint).fallback(genai_method_not_allowed),
+        )
         .route(
             "/v1beta/models/{*target}",
-            get(genai_model_endpoint).post(genai_post),
+            get(genai_model_endpoint)
+                .post(genai_post)
+                .fallback(genai_method_not_allowed),
         )
         .route(
             "/v1beta/v1beta/models/{*target}",
-            get(genai_model_endpoint).post(genai_post),
+            get(genai_model_endpoint)
+                .post(genai_post)
+                .fallback(genai_method_not_allowed),
         )
         // Root reachability ping, answered LOCALLY (Z 2026-07-15, startup-set
         // bug): Claude Code fires `HEAD /` against its base URL as a
@@ -2304,6 +2314,14 @@ async fn genai_model_endpoint(
         Some(model) => axum::Json(model).into_response(),
         None => super::genai::error(StatusCode::NOT_FOUND, &format!("{name} is not served")),
     }
+}
+
+/// Any other method on a Gemini API route: a Google-shaped 405.
+async fn genai_method_not_allowed(method: http::Method, uri: http::Uri) -> Response {
+    super::genai::error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &format!("{method} is not served at {}", uri.path()),
+    )
 }
 
 /// `POST /v1beta/models/{model}:{method}` — `countTokens` answered locally

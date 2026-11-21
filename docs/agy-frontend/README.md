@@ -45,7 +45,7 @@ agy (gateway mode, no Google login)
 | Wire | `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai` |
 | Auth | `Authorization: Bearer <AGY_LLM_GATEWAY_API_KEY>`, or none (keyless loopback) |
 | Models | `GET /v1beta/models` from the llmux catalog |
-| Subagent tiers | `AGY_LLM_GATEWAY_TIER_PRO` / `_FLASH` / `_FLASH_LITE` = the start model |
+| Subagent tiers | `AGY_LLM_GATEWAY_TIER_PRO` / `_FLASH` / `_FLASH_LITE` = the model the session starts on |
 | Activity | rows carry the Google endpoint origin (own tint) |
 
 ## Endpoints
@@ -73,7 +73,7 @@ All environment, all session-scoped; `run --agy` edits no file **[binary][docs]*
 | `AGY_LLM_GATEWAY_URL` | set to the endpoint base URL |
 | `AGY_LLM_GATEWAY_WIRE_PROTOCOL` | set to `genai` |
 | `AGY_LLM_GATEWAY_API_KEY` | set only when the endpoint has a key, removed otherwise |
-| `AGY_LLM_GATEWAY_TIER_PRO` / `_FLASH` / `_FLASH_LITE` | set to the start model |
+| `AGY_LLM_GATEWAY_TIER_PRO` / `_FLASH` / `_FLASH_LITE` | set to the model the session starts on: the agy arguments' `--model`, else the start model |
 | `AGY_LLM_GATEWAY_MODELS` | removed — it would replace discovery and its metadata |
 | other `AGY_LLM_GATEWAY_*` (`_HEADERS`, …) | removed, except `_CA_CERT`, `_CLIENT_CERT`, `_CLIENT_KEY`, `_PROXY_URL` (how to reach llmux itself) |
 | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GEMINI_BASE_URL`, `CLOUD_CODE_URL`, `AGY_ADC_AUTH` | removed — they select other agy backends |
@@ -85,7 +85,10 @@ The admin (MDM) settings file wins over the environment **[docs]**:
 `--model <start model>` is passed unless the agy arguments name `--model` or start
 with a subcommand (`agy models`). The start model is `agy.default_model`, which
 defaults to `codex.default_model` — the model `llmux run --codex` starts on
-([configuration](../configuration.md)). An alias resolves to its catalog row's id.
+([configuration](../configuration.md)). An alias resolves to its catalog row's id. The
+subagent tiers follow the model the session starts on: a user `--model x` (or
+`--model=x`), resolved the same way, else the start model. `llmux env --agy` has no
+agy arguments, so its tiers are the start model.
 
 ## Auth
 
@@ -123,10 +126,12 @@ and the rest are dropped **[binary]**. Hence:
    **served as the `[1m]` row**, so its window holds.
 2. **At most 32 entries.** Over the cap: the start model, then every model a catalog
    alias points at (each family's current pick), then the rest; within each tier the
-   groups take turns, so no group crowds another out. Today's catalog has 33
-   candidates; `or-gemma-4-31b` is the one left out.
+   groups take turns, so no group crowds another out. The 2026-11-21 catalog (after
+   the Gemini 4 sweep) has 36 candidates; four are left out: `gpt-5.6-luna`,
+   `or-dots-3-note`, `or-north-mini-code`, `or-gemma-4-31b`.
 3. **The start model first**, the rest in catalog order.
-4. **`thinking`** is true when the row has an effort menu, and for a gemini id that
+4. **`thinking`** is true when the row has an effort menu (every Gemini 4 family row,
+   whose menu comes from the provider's family table), and for a gemini id that
    names its level (`gemini-3.8-flash-low`). agy strips that suffix from the URL
    (`…/models/gemini-3.8-flash:…`) and sends `thinkingLevel: LOW` only when the entry
    says `thinking: true`; with `false` it sends `thinkingBudget: 0` and the level is
@@ -185,7 +190,7 @@ openrouter at `/v1/messages`.
 | `toolConfig.functionCallingConfig` AUTO/ANY/NONE + `allowedFunctionNames` | `tool_choice` auto / any (one name → that tool) / none |
 | `maxOutputTokens` | `max_tokens` |
 | `temperature` / `topP` / `topK` / `stopSequences` | carried to openrouter; **dropped** on claude (the SDK refuses them), codex and grok (refused there) — agy users cannot set them |
-| `thinkingLevel` MINIMAL/LOW/MEDIUM/HIGH | `output_config.effort` |
+| `thinkingLevel` MINIMAL/LOW/MEDIUM/HIGH/XHIGH/MAX (bare or `THINKING_LEVEL_…`) | `output_config.effort` (`UNSPECIFIED` / `MODEL_DEFAULT` → none) |
 | `includeThoughts: true` (budget ≠ 0) | `thinking: {type: adaptive}` — thinking on and shown |
 | `thinkingBudget: 0` | no thinking |
 | other `thinkingBudget` values (agy's default 1024) | not carried; the model's default effort applies |
@@ -208,10 +213,17 @@ The gemini group serves the Gemini API natively
 `thoughtSignature`s, Google's call ids and the OpenAPI schemas untouched. What changes:
 
 - The model resolves by the provider's rules — alias, `[1m]`, and the effort from
-  `thinkingLevel` picking the level variant (`gemini-3.8-flash` + `LOW` →
-  `gemini-3.8-flash-low`). The level rides in the id, so `thinkingConfig` becomes
-  `{"includeThoughts": true}` (the Messages path sends the same).
+  `thinkingLevel` picking the level variant through the provider's family table:
+  `gemini-3.8-flash` + `LOW` → `gemini-3.8-flash-low`, `gemini-4-neon` + `HIGH` →
+  `gemini-4-neon-high`, capped at the family's top level (`gemini-4-argon` + `XHIGH` →
+  `gemini-4-argon-high`; neon and hydrogen serve `-xhigh`); no level → `-high`. The
+  level rides in the id, so `thinkingConfig` becomes `{"includeThoughts": true}` (the
+  Messages path sends the same).
 - `labels` are dropped; `sessionId` is derived from the first user text.
+- agy's one `functionDeclarations` entry per tool is merged into **one** `tools` entry
+  (Cloud Code and Vertex have refused several function-declaration entries; the
+  Messages path's single merged entry is the proven shape); other tool kinds stay
+  entries of their own.
 - A model turn's first `functionCall` without a signature (a call another model made
   in a mixed session) gets the `skip_thought_signature_validator` placeholder.
 
@@ -225,7 +237,9 @@ handling (ToS benching on a suspension 403, quota parks) is the gemini group's o
 - Every non-2xx answer becomes `{"error":{"code","message","status"}}` with the same
   HTTP status (`INVALID_ARGUMENT`, `UNAUTHENTICATED`, `PERMISSION_DENIED`,
   `NOT_FOUND`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `INTERNAL`); `retry-after` is
-  kept. A stream that fails mid-way ends in one such `{"error":…}` frame.
+  kept. A stream that fails mid-way ends in one such `{"error":…}` frame. The same
+  envelope answers before the body is decoded: a method a Gemini route does not serve
+  (405), a body over `proxy.max_request_bytes` (413), a body that cannot be read (400).
 - `:generateContent` folds the stream into one `GenerateContentResponse` (adjacent
   text parts merged).
 - Raw-io captures the exchange at the client boundary; activity rows carry the
@@ -242,9 +256,11 @@ handling (ToS benching on a suspension 403, quota parks) is the gemini group's o
 - **Lost in translation** (non-gemini groups): thought text and signatures, file
   references, non-image/PDF inline media, non-function tools, a forced tool choice on
   claude, sampling knobs on claude / codex / grok.
-- **Gemini group:** `maxOutputTokens` is forwarded (the Messages path omits its cap);
-  the level of a Gemini 4 id resolves only once the provider maps efforts to Gemini 4
-  level ids.
+- **Gemini group:** `maxOutputTokens` is forwarded (the Messages path omits its cap).
+- **No `xhigh` / `max` from agy 1.5.13:** in gateway mode it accepts `--effort` only
+  `low|medium|high` for every discovered model, Gemini 4 Neon included, and refuses
+  `xhigh` / `max` client-side **[live, 2026-11-21]**; its enum has `XHIGH` and `MAX`
+  **[binary]**, which llmux maps should a later agy send them.
 - **Version churn:** the gateway knobs changed between 1.3 and 1.5. Minimum agy
   1.5.4 (no `sessionId`); re-check each release.
 - **agy's own state** (conversations, logs, caches) stays in its home
@@ -257,15 +273,23 @@ handling (ToS benching on a suspension 403, quota parks) is the gemini group's o
 - Unit: `src/proxy/genai/{mod,request,response,discovery}.rs`, the native builder in
   `src/provider/gemini.rs`, `src/cli/run/agy.rs`, `src/cli/env.rs`.
 - e2e (`tests/e2e.rs`, `agy_*`): discovery / countTokens / 404 local; Bearer and
-  `x-goog-api-key` auth; gemini native round trip (envelope, unwrapped frames,
-  signatures, skip validator), level via `thinkingLevel`, `generateContent`, upstream
-  400; codex both ways; openrouter at `/v1/messages`; claude through an SDK fixture.
-- CLI (`tests/cli.rs`): `run --agy` environment and `--model` with a stub `agy`;
-  remote http refused; `env --agy`.
+  `x-goog-api-key` auth; Google-shaped 405 / 413 before decode; gemini native round
+  trip (envelope, one merged declaration entry, unwrapped frames, signatures, skip
+  validator), the level via `thinkingLevel` on Gemini 3.8 Flash and Gemini 4 families,
+  `generateContent`, upstream 400; codex both ways; openrouter at `/v1/messages` with
+  Messages headers (and its Responses-ingress twin `responses_openrouter_posts_messages`);
+  claude through an SDK fixture.
+- CLI (`tests/cli.rs`): `run --agy` environment, `--model`, and the subagent tiers
+  following a user `--model`, with a stub `agy`; remote http refused with the tunnel
+  hint; `env --agy`.
 - Live: agy 1.5.13 → a dev daemon on an isolated config and port → mock upstreams
   (Cloud Code, Codex Responses, a Claude Agent SDK stand-in): a text turn and a tool
   turn (`run_command` executed, result sent back) on gemini, codex and claude, all
   `SUCCESS`, activity rows `google`. Real-backend proof is not part of this record.
+- Live effort probe: against a recording gateway, `--effort low|medium|high` reached it
+  as `thinkingLevel: LOW|MEDIUM|HIGH` on `gemini-4-neon`, `gemini-4-argon`,
+  `claude-opus-5-5`, `gpt-6.2-sol` and `grok-4.7`; `xhigh`, `max` and `minimal` were
+  refused by agy itself.
 
 Sources (fetched 2026-11-21): antigravity.google docs (`/docs/install.md`,
 `/docs/cli/headless.md`, `/docs/enterprise.md`, `/docs/changelog.md`); Google Cloud

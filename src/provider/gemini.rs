@@ -453,6 +453,10 @@ impl GeminiProvider {
     ///   `{"includeThoughts": true}` (no `thinkingLevel` / `thinkingBudget`
     ///   next to a level-suffixed id — the Messages path sends the same).
     /// - `labels` (client metadata) and any `model` member are dropped.
+    /// - Every `functionDeclarations` entry is merged into ONE `tools` entry
+    ///   (agy sends one per tool; Cloud Code / Vertex have refused several
+    ///   function-declaration entries, and the Messages path's single merged
+    ///   entry is the proven shape); other tool kinds stay as they came.
     /// - A model turn's first `functionCall` part without a signature gets
     ///   [`SKIP_THOUGHT_SIGNATURE`] (a call another model made in a mixed
     ///   session), like a replay the signature cache missed.
@@ -475,6 +479,9 @@ impl GeminiProvider {
         request.remove("model");
         if let Some(contents) = request.get_mut("contents").and_then(Value::as_array_mut) {
             sign_unsigned_calls(contents);
+        }
+        if let Some(tools) = request.get_mut("tools") {
+            merge_function_declarations(tools);
         }
         let config = request
             .entry("generationConfig")
@@ -599,6 +606,36 @@ fn sign_unsigned_calls(contents: &mut [Value]) {
             }
         }
     }
+}
+
+/// A public-API `tools` array with every `functionDeclarations` list merged
+/// into one leading entry, declarations in order; whatever else an entry
+/// carries (`googleSearch`, `codeExecution`, …) stays in an entry of its own.
+fn merge_function_declarations(tools: &mut Value) {
+    let Some(entries) = tools.as_array() else {
+        return;
+    };
+    let mut declarations = Vec::new();
+    let mut others = Vec::new();
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            others.push(entry.clone());
+            continue;
+        };
+        let mut rest = object.clone();
+        if let Some(Value::Array(list)) = rest.remove("functionDeclarations") {
+            declarations.extend(list);
+        }
+        if !rest.is_empty() {
+            others.push(Value::Object(rest));
+        }
+    }
+    let mut merged = Vec::with_capacity(others.len() + 1);
+    if !declarations.is_empty() {
+        merged.push(json!({"functionDeclarations": declarations}));
+    }
+    merged.extend(others);
+    *tools = Value::Array(merged);
 }
 
 /// The first user content's text parts (thoughts left out), joined by `\n`.
@@ -2571,7 +2608,11 @@ mod tests {
                 {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}, "thoughtSignature": "REAL"}]},
             ],
             "systemInstruction": {"role": "user", "parts": [{"text": "sys"}]},
-            "tools": [{"functionDeclarations": [{"name": "run_command", "parameters": {"type": "OBJECT"}}]}],
+            "tools": [
+                {"functionDeclarations": [{"name": "run_command", "parameters": {"type": "OBJECT"}}]},
+                {"functionDeclarations": [{"name": "read_file", "parameters": {"type": "OBJECT", "properties": {"Path": {"type": "STRING"}}}}]},
+                {"googleSearch": {}},
+            ],
             "generationConfig": {"maxOutputTokens": 65536, "thinkingConfig": {"includeThoughts": false, "thinkingBudget": 1024, "thinkingLevel": "LOW"}},
             "labels": {"cascade_id": "c"},
         });
@@ -2595,7 +2636,17 @@ mod tests {
         let inner = &envelope["request"];
         assert!(inner.get("labels").is_none());
         assert_eq!(inner["systemInstruction"], body["systemInstruction"]);
-        assert_eq!(inner["tools"], body["tools"], "OpenAPI schemas untouched");
+        assert_eq!(
+            inner["tools"],
+            json!([
+                {"functionDeclarations": [
+                    {"name": "run_command", "parameters": {"type": "OBJECT"}},
+                    {"name": "read_file", "parameters": {"type": "OBJECT", "properties": {"Path": {"type": "STRING"}}}},
+                ]},
+                {"googleSearch": {}},
+            ]),
+            "one merged declaration entry, OpenAPI schemas untouched"
+        );
         assert_eq!(
             inner["generationConfig"],
             json!({"maxOutputTokens": 65536, "thinkingConfig": {"includeThoughts": true}})
@@ -2613,6 +2664,26 @@ mod tests {
         assert_eq!(inner["contents"][3]["parts"][0]["thoughtSignature"], "REAL");
         assert_eq!(inner["contents"][2], body["contents"][2]);
         assert_eq!(inner["sessionId"], format!("-{}", session_hash("first")));
+
+        // Gemini 4 families: agy sends the bare family id plus a
+        // `thinkingLevel` (live 2026-11-21); the family table picks the
+        // level id, capped at the family's top level.
+        for (model, effort, upstream) in [
+            ("gemini-4-neon", Some("low"), "gemini-4-neon-low"),
+            ("gemini-4-neon", Some("medium"), "gemini-4-neon-medium"),
+            ("gemini-4-neon", Some("high"), "gemini-4-neon-high"),
+            ("gemini-4-neon", Some("xhigh"), "gemini-4-neon-xhigh"),
+            ("gemini-4-hydrogen", Some("max"), "gemini-4-hydrogen-xhigh"),
+            ("gemini-4-argon", Some("xhigh"), "gemini-4-argon-high"),
+            ("gemini-4-carbon", Some("minimal"), "gemini-4-carbon-low"),
+            ("gemini-4-argon", None, "gemini-4-argon-high"),
+        ] {
+            let request = provider
+                .build_native_request(model, effort, &body, &credential("p"))
+                .unwrap();
+            let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(envelope["model"], upstream, "{model} {effort:?}");
+        }
 
         // An id that already names its level passes verbatim.
         let request = provider

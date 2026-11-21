@@ -1453,6 +1453,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 sub_usage: Vec::new(),
                 price_class: crate::pricing::PriceClass::STANDARD,
             });
+            // The Gemini API answers in its own envelope; Messages and
+            // Responses keep the Anthropic shape they always had here.
+            if endpoint_origin == crate::tui::Endpoint::Google {
+                return ingress::error(endpoint_origin, status, &message);
+            }
             return error_response(status, error_type, &message);
         }
     };

@@ -8270,6 +8270,60 @@ async fn agy_discovery_and_count_tokens_are_local() {
     assert!(gemini_requests(&mock).is_empty(), "nothing went upstream");
 }
 
+/// Errors raised before the ingress decodes the body keep the Google
+/// envelope on the Gemini paths: a method the route does not serve (405) and
+/// a body over `proxy.max_request_bytes` (413). Messages keeps its Anthropic
+/// shape for the same 413.
+#[tokio::test]
+async fn agy_pre_decode_errors_are_google_shaped() {
+    let mock = MockUpstream::spawn().await;
+    let mut config = gemini_only_config(&mock);
+    config.proxy.max_request_bytes = 256;
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    for (method, path) in [
+        (reqwest::Method::PUT, "/v1beta/models"),
+        (
+            reqwest::Method::DELETE,
+            "/v1beta/models/gemini-3.8-flash-high",
+        ),
+    ] {
+        let response = client
+            .request(method.clone(), proxy.url(path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 405, "{method} {path}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], 405, "{method} {path}");
+        assert!(body["error"]["status"].is_string(), "{body}");
+    }
+    let big = agy_body(serde_json::json!([agy_user(&"x".repeat(1024))]));
+    let response = post_agy(
+        &proxy,
+        "gemini-3.8-flash-high",
+        "streamGenerateContent",
+        &big,
+    )
+    .await;
+    assert_eq!(response.status(), 413);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], 413, "{body}");
+    assert_eq!(body["error"]["status"], "INVALID_ARGUMENT");
+    let messages = format!(
+        r#"{{"model":"claude-opus-5-5","max_tokens":8,"messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(1024)
+    );
+    let response = post_messages(&client, &proxy, &messages).await;
+    assert_eq!(response.status(), 413);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["type"], "error",
+        "Messages keeps the Anthropic shape: {body}"
+    );
+    assert!(gemini_requests(&mock).is_empty());
+}
+
 /// agy sends `Authorization: Bearer <key>` (or nothing): the Gemini paths
 /// read it like the OpenAI paths, `x-goog-api-key` too, with Google-shaped
 /// refusals. A keyless loopback client is `local`.
@@ -8336,7 +8390,15 @@ async fn agy_gemini_native_round_trip_keeps_signatures() {
         ]),
         11,
     ));
-    let turn1 = agy_body(serde_json::json!([agy_user("list files")]));
+    let mut turn1 = agy_body(serde_json::json!([agy_user("list files")]));
+    // agy sends one `functionDeclarations` entry per tool (14 live).
+    turn1["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "functionDeclarations": [{"name": "read_file",
+                "parameters": {"type": "OBJECT", "properties": {"Path": {"type": "STRING"}}}}]
+        }));
     let response = post_agy(
         &proxy,
         "gemini-3.8-flash-high",
@@ -8376,9 +8438,16 @@ async fn agy_gemini_native_round_trip_keeps_signatures() {
     let inner = &envelope["request"];
     assert!(inner.get("labels").is_none(), "labels never go upstream");
     assert_eq!(inner["contents"], turn1["contents"]);
+    let declarations: Vec<serde_json::Value> = turn1["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| entry["functionDeclarations"].as_array().cloned().unwrap())
+        .collect();
     assert_eq!(
-        inner["tools"], turn1["tools"],
-        "the native body keeps its schemas"
+        inner["tools"],
+        serde_json::json!([{"functionDeclarations": declarations}]),
+        "one merged declaration entry; the native body keeps its schemas"
     );
     assert_eq!(inner["systemInstruction"], turn1["systemInstruction"]);
     assert_eq!(
@@ -8465,10 +8534,17 @@ async fn agy_gemini_generate_content_aggregates() {
 /// that level reaches Cloud Code as the level's own id.
 #[tokio::test]
 async fn agy_gemini_level_rides_in_thinking_level() {
-    for (level, upstream) in [
-        ("LOW", "gemini-3.8-flash-low"),
-        ("MEDIUM", "gemini-3.8-flash-medium"),
-        ("HIGH", "gemini-3.8-flash-high"),
+    for (model, level, upstream) in [
+        ("gemini-3.8-flash", "LOW", "gemini-3.8-flash-low"),
+        ("gemini-3.8-flash", "MEDIUM", "gemini-3.8-flash-medium"),
+        ("gemini-3.8-flash", "HIGH", "gemini-3.8-flash-high"),
+        // Gemini 4 discovery rows are bare families with an effort menu:
+        // agy sends the family id and the level (live 2026-11-21).
+        ("gemini-4-neon", "LOW", "gemini-4-neon-low"),
+        ("gemini-4-neon", "HIGH", "gemini-4-neon-high"),
+        ("gemini-4-neon", "XHIGH", "gemini-4-neon-xhigh"),
+        ("gemini-4-argon", "MEDIUM", "gemini-4-argon-medium"),
+        ("gemini-4-argon", "XHIGH", "gemini-4-argon-high"),
     ] {
         let mock = MockUpstream::spawn().await;
         let proxy = Proxy::spawn_config(gemini_only_config(&mock)).await;
@@ -8476,8 +8552,8 @@ async fn agy_gemini_level_rides_in_thinking_level() {
         let mut body = agy_body(serde_json::json!([agy_user("hi")]));
         body["generationConfig"]["thinkingConfig"] =
             serde_json::json!({"includeThoughts": true, "thinkingLevel": level});
-        let response = post_agy(&proxy, "gemini-3.8-flash", "streamGenerateContent", &body).await;
-        assert_eq!(response.status(), 200, "{level}");
+        let response = post_agy(&proxy, model, "streamGenerateContent", &body).await;
+        assert_eq!(response.status(), 200, "{model} {level}");
         let seen = gemini_requests(&mock);
         let envelope = assert_gemini_stream_call(&seen[0], upstream, "proj-1", "Bearer at-gemini");
         assert_eq!(
@@ -8608,6 +8684,7 @@ async fn agy_openrouter_posts_messages() {
         seen[0].authorization.as_deref(),
         Some("Bearer sk-or-v1-test")
     );
+    assert_eq!(seen[0].anthropic_version.as_deref(), Some("2023-06-01"));
     let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
     assert_eq!(upstream["model"], "nvidia/nemotron-3-ultra-550b-a55b:free");
     assert_eq!(upstream["max_tokens"], 64000);
@@ -8615,6 +8692,43 @@ async fn agy_openrouter_posts_messages() {
         upstream["messages"][0]["content"][0]["text"],
         "<USER_REQUEST>\nhi\n</USER_REQUEST>"
     );
+}
+
+/// The Responses ingress takes the same native-ingress OpenRouter arm: its
+/// Messages translation goes to `/v1/messages` with Messages headers — not
+/// to the client's `/v1/responses` path with the client's headers, which is
+/// where that arm sent it before the Gemini API ingress fixed it.
+#[tokio::test]
+async fn responses_openrouter_posts_messages() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(SSE_BODY, 13));
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model": "or-nemotron-3-ultra", "input": "hi", "stream": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "completed", "{body}");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/v1/messages");
+    assert_eq!(
+        seen[0].authorization.as_deref(),
+        Some("Bearer sk-or-v1-test")
+    );
+    assert_eq!(seen[0].anthropic_version.as_deref(), Some("2023-06-01"));
+    assert_eq!(seen[0].x_api_key, None, "the client key never leaks");
+    let upstream: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(upstream["model"], "nvidia/nemotron-3-ultra-550b-a55b:free");
+    assert_eq!(upstream["messages"][0]["content"][0]["text"], "hi");
 }
 
 /// The claude group serves the Gemini API through the Agent SDK bridge, like

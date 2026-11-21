@@ -356,11 +356,6 @@ enum ClientNameLabel {
     }
 }
 
-/// The ONE composed row model for both recent-activity lists (activity
-/// client-name). The views (`UsageActivityList` / the canonical receipt
-/// list in UsageAnalyticsViews.swift) render these fields VERBATIM — there
-/// is no per-view label/trailing expression left at the call sites, so the
-/// factory tests cover exactly what renders.
 /// Incoming API protocol of an activity row (the daemon's `endpoint` wire
 /// value): `anthropic` (or absent), `open_ai`, `google`. Provider/model never
 /// decide it. Each origin has its own row background, so this is a three-way
@@ -379,6 +374,11 @@ enum ActivityEndpointOrigin: Equatable {
     }
 }
 
+/// The ONE composed row model for both recent-activity lists (activity
+/// client-name). The views (`UsageActivityList` / the canonical receipt
+/// list in UsageAnalyticsViews.swift) render these fields VERBATIM — there
+/// is no per-view label/trailing expression left at the call sites, so the
+/// factory tests cover exactly what renders.
 struct ActivityRowModel: Equatable {
     /// Incoming API protocol; provider/model do not decide row background.
     let endpointOrigin: ActivityEndpointOrigin

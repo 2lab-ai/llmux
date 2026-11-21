@@ -614,7 +614,8 @@ llmux run --agy -- -p 'Explain this repository' --model claude-opus-5-5
 ```
 
 It sets `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, the endpoint's
-key (`AGY_LLM_GATEWAY_API_KEY`, only when it has one) and the subagent tiers, removes
+key (`AGY_LLM_GATEWAY_API_KEY`, only when it has one) and the subagent tiers (on the
+model the session starts on: your `--model`, else `agy.default_model`), removes
 the variables that select another agy backend (`GEMINI_API_KEY`, `CLOUD_CODE_URL`, …)
 or replace discovery (`AGY_LLM_GATEWAY_MODELS`), and passes `--model <agy.default_model>`
 unless the arguments name a model or a subcommand. agy reads its model picker from the
