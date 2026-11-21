@@ -138,7 +138,7 @@ pub async fn ensure_installed() -> Result<PathBuf, String> {
         Ok(child) => child,
         Err(_) => {
             let _ = tokio::fs::remove_dir_all(&staging).await;
-            return Err("Claude Agent SDK requires Node.js 18+ and npm on the llmux daemon host; install them and retry".into());
+            return Err("Claude Agent SDK requires Node.js 18.14+ and npm on the llmux daemon host; install them and retry".into());
         }
     };
     let mut guard = ProcessGuard {
@@ -152,7 +152,7 @@ pub async fn ensure_installed() -> Result<PathBuf, String> {
         })?
         .map_err(|_| "Cannot wait for Claude Agent SDK installation")?;
     if !status.success() {
-        return Err("Claude Agent SDK installation failed; check Node.js 18+, npm registry access and retry".into());
+        return Err("Claude Agent SDK installation failed; check Node.js 18.14+, npm registry access and retry".into());
     }
     tokio::fs::write(staging.join(".llmux-ready"), SDK_VERSION)
         .await
@@ -227,7 +227,7 @@ pub async fn send(
         Ok(child) => child,
         Err(_) => {
             let _ = tokio::fs::remove_dir_all(&directory).await;
-            return Err("Claude Agent SDK requires Node.js 18+ on the llmux daemon host; install Node or set LLMUX_NODE".into());
+            return Err("Claude Agent SDK requires Node.js 18.14+ on the llmux daemon host; install Node or set LLMUX_NODE".into());
         }
     };
     let mut guard = ProcessGuard {

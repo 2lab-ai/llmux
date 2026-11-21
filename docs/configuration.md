@@ -220,7 +220,7 @@ Model selection is the `or-` prefix: `or-nemotron-3-ultra` and the other curated
 
 ## Gemini backend
 
-Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` and no `reasoning_effort` knob: the thinking level is part of the model id (`gemini-3.8-flash-high` / `-medium` / `-low`). A Gemini 4 model (`gemini-4-neon`, `-carbon`, `-hydrogen`, `-argon`, or its alias) is the exception that takes the client's effort: llmux sends it as the thinking-level id (`gemini-4-neon-high`); see [models.md](models.md#gemini). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
+Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` knob. The thinking level is part of the upstream model id (`gemini-3.8-flash-high` / `-medium` / `-low`, `gemini-4-neon-high`). A bare family id takes the client's effort and llmux sends the matching level id: bare `gemini-3.8-flash` and every Gemini 4 model (`gemini-4-neon`, `-carbon`, `-hydrogen`, `-argon`, or its alias); see [models.md](models.md#gemini). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
 
 | Key | Default | Meaning |
 |---|---|---|
