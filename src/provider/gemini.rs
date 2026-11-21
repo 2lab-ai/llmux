@@ -47,7 +47,9 @@ const LEVELS_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// Model families the Antigravity backend serves ONLY under thinking-level
 /// ids `<family>-<level>` — the one table behind every bare-family
-/// resolution (docs/gemini/spec.md §R3). `(bare family id, levels low→high)`.
+/// resolution (docs/gemini/spec.md §R3), and the level rows the catalog lists
+/// for each family (one per level, locked by a catalog test).
+/// `(bare family id, levels low→high)`.
 ///
 /// - `gemini-3.8-flash`: `-high` / `-medium` / `-low` (live
 ///   `fetchAvailableModels`, 2026-10-15).
@@ -59,9 +61,9 @@ const LEVELS_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
 ///   #310). Neon and Hydrogen serve `xhigh`; Carbon and Argon top out at
 ///   `high` (API model pages, read 2026-11-21).
 ///
-/// The catalog derives each Gemini 4 row's effort menu from this table
-/// (`crate::catalog::gemini_efforts`), so a client is offered exactly the
-/// levels its effort can map onto.
+/// The catalog lists exactly one `<family>-<level>` row per level here, so
+/// a client picks the level by picking the row; a bare family id stays
+/// accepted (not advertised) and takes the client effort.
 const FAMILIES: &[(&str, &[&str])] = &[
     ("gemini-3.8-flash", LEVELS),
     ("gemini-4-neon", LEVELS_XHIGH),
@@ -80,7 +82,7 @@ pub(crate) fn family_levels(id: &str) -> Option<&'static [&'static str]> {
         .map(|&(_, levels)| levels)
 }
 
-/// The client-side context-window suffix (`gemini-4-argon[1m]`), the same
+/// The client-side context-window suffix (`gemini-3.8-flash-high[1m]`), the same
 /// display metadata grok and codex strip; upstream never sees it.
 const CLIENT_CONTEXT_SUFFIX: &str = "[1m]";
 
@@ -403,10 +405,11 @@ impl GeminiProvider {
     /// The model NAME to stamp into the client-facing response for this
     /// request (pass it to [`Self::converter`]): an alias becomes the catalog
     /// row that owns it (`gemini` → `gemini-3.8-flash-high[1m]`, `argon` →
-    /// `gemini-4-argon[1m]`, `neon` → `gemini-4-neon`), bare
-    /// `gemini-3.8-flash` its effort variant's `[1m]` row, any other id is
-    /// the client's own spelling (so the client keeps its `[1m]` window), and
-    /// a model-less request gets `shape.client_model`, else the upstream id.
+    /// `gemini-4-argon-high`), a bare family id its effort variant's row
+    /// (`gemini-3.8-flash` → `gemini-3.8-flash-<level>[1m]`, `gemini-4-neon`
+    /// → `gemini-4-neon-<level>`), any other id is the client's own spelling
+    /// (so the client keeps its `[1m]` window), and a model-less request gets
+    /// `shape.client_model`, else the upstream id.
     pub fn client_model_stamp(&self, anthropic_body: &Value) -> String {
         client_facing_model(
             requested_model(anthropic_body).unwrap_or(""),
@@ -751,30 +754,30 @@ fn family_variant(base: &str, effort: Option<&str>) -> Option<String> {
 }
 
 /// The upstream id for a gemini-shaped name, or `None` for anything else.
-/// In order: a bare family id → its variant for `effort`; a catalog alias
-/// (`gemini`, `argon`, `neon`, …) → the row that owns it, which resolves the
-/// same way (`argon` → `gemini-4-argon` → `gemini-4-argon-<level>`, while
-/// `gemini` → `gemini-3.8-flash-high`, a row that already names its level);
-/// any other `gemini-*` id — one that already carries a level suffix
-/// included — verbatim.
+/// In order: a bare family id (`gemini-3.8-flash`, `gemini-4-neon`, old
+/// configs, agy after it strips a level suffix) → its variant for `effort`;
+/// a catalog alias (`gemini`, `neon`, `argon`, …) → the row that owns it, a
+/// fixed id that already names its level (`neon` → `gemini-4-neon-high`
+/// whatever the effort); any other `gemini-*` id — one that carries a level
+/// suffix included — verbatim, never changed by an effort.
 fn gemini_upstream_id(name: &str, effort: Option<&str>) -> Option<String> {
     let base = strip_client_context_suffix(name).to_ascii_lowercase();
     if let Some(variant) = family_variant(&base, effort) {
         return Some(variant);
     }
     if let Some(row) = crate::catalog::gemini_alias_owner(&base) {
-        let row = strip_client_context_suffix(row);
-        return Some(family_variant(row, effort).unwrap_or_else(|| row.to_string()));
+        return Some(strip_client_context_suffix(row).to_string());
     }
     base.starts_with("gemini-").then_some(base)
 }
 
 /// Model resolution (spec §R3): trim, strip one `[1m]`, then a bare family id
-/// or an alias whose row is one (`gemini-3.8-flash`, `gemini-4-neon`, `argon`,
-/// …) + effort → its thinking-level variant, the `gemini` alias →
-/// `gemini-3.8-flash-high`, other `gemini-*` ids verbatim; non-gemini names
-/// and model-less requests use the pin (which gets the same treatment, so a
-/// config may carry the picker's spelling).
+/// (`gemini-3.8-flash`, `gemini-4-neon`, …) + effort → its thinking-level
+/// variant, an alias → the fixed row it names (`gemini` →
+/// `gemini-3.8-flash-high`, `argon` → `gemini-4-argon-high`), other
+/// `gemini-*` ids verbatim; non-gemini names and model-less requests use the
+/// pin (which gets the same treatment, so a config may carry the picker's
+/// spelling).
 fn resolve_model(requested: Option<&str>, effort: Option<&str>, pinned: &str) -> String {
     requested
         .and_then(|name| gemini_upstream_id(name, effort))
@@ -783,11 +786,12 @@ fn resolve_model(requested: Option<&str>, effort: Option<&str>, pinned: &str) ->
 }
 
 /// The client-facing model stamp (see [`GeminiProvider::client_model_stamp`]):
-/// the catalog row that serves the request. A bare family with no row of its
-/// own (`gemini-3.8-flash`, whose rows carry the level in the id) stamps its
-/// variant's `[1m]` row; an alias stamps the row that owns it (`argon` →
-/// `gemini-4-argon[1m]`, `neon` → `gemini-4-neon`); anything else — a catalog
-/// id such as `gemini-4-neon[1m]` included — is the client's own spelling.
+/// the catalog row that serves the request. A bare family id (no row of its
+/// own — every row carries its level) stamps its variant's row, the `[1m]`
+/// twin where one exists (`gemini-3.8-flash` → `gemini-3.8-flash-low[1m]`,
+/// `gemini-4-neon[1m]` → `gemini-4-neon-xhigh`); an alias stamps the row that
+/// owns it (`argon` → `gemini-4-argon-high`); anything else — a catalog id
+/// such as `gemini-4-neon-low` included — is the client's own spelling.
 /// Idempotent: a stamp it produced maps to itself.
 fn client_facing_model(requested: &str, effort: Option<&str>, shape: &GeminiShape) -> String {
     let requested = requested.trim();
@@ -800,7 +804,12 @@ fn client_facing_model(requested: &str, effort: Option<&str>, shape: &GeminiShap
     let base = strip_client_context_suffix(requested).to_ascii_lowercase();
     if !crate::catalog::is_gemini_row(&base) {
         if let Some(variant) = family_variant(&base, effort) {
-            return format!("{variant}{CLIENT_CONTEXT_SUFFIX}");
+            let twin = format!("{variant}{CLIENT_CONTEXT_SUFFIX}");
+            return if crate::catalog::is_gemini_row(&twin) {
+                twin
+            } else {
+                variant
+            };
         }
     }
     if let Some(row) = crate::catalog::gemini_alias_owner(&base) {
@@ -2260,8 +2269,8 @@ mod tests {
     #[test]
     fn g2_resolve_model_aliases_suffix_variants_and_fallback() {
         let pin = "gemini-3.8-flash-high";
-        // Argon is a Gemini 4 family since 2026-11-21: the alias and the bare
-        // id both resolve to a thinking-level id (#244), `-high` by default.
+        // Argon is a Gemini 4 family since 2026-11-21: the alias names the
+        // `-high` row, the bare id resolves to a thinking-level id (#244).
         assert_eq!(
             resolve_model(Some("argon"), None, pin),
             "gemini-4-argon-high"
@@ -2323,16 +2332,22 @@ mod tests {
         assert_eq!(resolve_model(None, None, "argon"), "gemini-4-argon-high");
         assert_eq!(
             resolve_model(None, Some("low"), "neon"),
+            "gemini-4-neon-high",
+            "a pinned alias is a fixed id: the effort does not move it"
+        );
+        assert_eq!(
+            resolve_model(None, Some("low"), "gemini-4-neon"),
             "gemini-4-neon-low",
-            "a pinned alias takes the client effort too"
+            "a pinned bare family takes the client effort"
         );
     }
 
-    /// The Gemini 4 effort → suffix rule (decisions 2026-11-21), on every
-    /// family, every alias and every id spelling: `none|minimal|low` →
-    /// `-low`, `medium` → `-medium`, unset / `high` → `-high`,
-    /// `xhigh|max|ultra` → `-xhigh` on Neon and Hydrogen, `-high` on Carbon
-    /// and Argon.
+    /// The Gemini 4 effort → suffix rule (decisions 2026-11-21) for a BARE
+    /// family id in every spelling: `none|minimal|low` → `-low`, `medium` →
+    /// `-medium`, unset / `high` → `-high`, `xhigh|max|ultra` → `-xhigh` on
+    /// Neon and Hydrogen, `-high` on Carbon and Argon. An alias is a fixed
+    /// id (its family's `-high` row) and a level id is verbatim: neither
+    /// moves with the effort (owner instruction 2026-11-21).
     #[test]
     fn g2_gemini_4_families_take_the_level_from_the_client_effort() {
         let pin = "gemini-3.8-flash-high";
@@ -2359,13 +2374,18 @@ mod tests {
                     family.to_string(),
                     format!("{family}[1m]"),
                     family.to_ascii_uppercase(),
-                    alias.to_string(),
-                    format!("{alias}[1m]"),
                 ] {
                     assert_eq!(
                         resolve_model(Some(&name), effort, pin),
                         want,
                         "{name} at {effort:?}"
+                    );
+                }
+                for name in [alias.to_string(), format!("{alias}[1m]")] {
+                    assert_eq!(
+                        resolve_model(Some(&name), effort, pin),
+                        format!("{family}-high"),
+                        "{name} at {effort:?}: the alias is a fixed id"
                     );
                 }
             }
@@ -2428,26 +2448,35 @@ mod tests {
     fn g2_client_stamp_maps_aliases_to_their_rows_and_keeps_ids() {
         let provider = GeminiProvider::new("https://x");
         let stamp = |body: Value| provider.client_model_stamp(&body);
-        assert_eq!(stamp(json!({"model": "argon"})), "gemini-4-argon[1m]");
+        // A Gemini 4 alias is its family's High row, whatever the effort.
+        assert_eq!(stamp(json!({"model": "argon"})), "gemini-4-argon-high");
         assert_eq!(
             stamp(json!({"model": "argon", "output_config": {"effort": "low"}})),
-            "gemini-4-argon[1m]",
-            "the row, not the level: Gemini 4 rows carry the level as effort"
+            "gemini-4-argon-high",
+            "an alias is a fixed id"
         );
-        assert_eq!(stamp(json!({"model": "carbon"})), "gemini-4-carbon[1m]");
+        assert_eq!(stamp(json!({"model": "carbon"})), "gemini-4-carbon-high");
         assert_eq!(
             stamp(json!({"model": "hydrogen[1m]"})),
-            "gemini-4-hydrogen[1m]"
+            "gemini-4-hydrogen-high"
         );
-        // `neon` is owned by the 512K base row.
-        assert_eq!(stamp(json!({"model": "neon"})), "gemini-4-neon");
-        assert_eq!(stamp(json!({"model": "NEON[1m]"})), "gemini-4-neon");
-        // A Gemini 4 catalog id is the client's own spelling.
+        assert_eq!(stamp(json!({"model": "neon"})), "gemini-4-neon-high");
+        assert_eq!(stamp(json!({"model": "NEON[1m]"})), "gemini-4-neon-high");
+        // A Gemini 4 level id is the client's own spelling.
+        assert_eq!(
+            stamp(json!({"model": "gemini-4-neon-low", "output_config": {"effort": "xhigh"}})),
+            "gemini-4-neon-low"
+        );
+        // A bare Gemini 4 family (accepted, not advertised) stamps the level
+        // row its effort picks; there is no `[1m]` twin to prefer.
         assert_eq!(
             stamp(json!({"model": "gemini-4-neon[1m]", "output_config": {"effort": "xhigh"}})),
-            "gemini-4-neon[1m]"
+            "gemini-4-neon-xhigh"
         );
-        assert_eq!(stamp(json!({"model": "gemini-4-argon"})), "gemini-4-argon");
+        assert_eq!(
+            stamp(json!({"model": "gemini-4-argon"})),
+            "gemini-4-argon-high"
+        );
         assert_eq!(
             stamp(json!({"model": "gemini"})),
             "gemini-3.8-flash-high[1m]"
@@ -2485,6 +2514,7 @@ mod tests {
             "gemini-3.8-flash-low",
             "gemini-4-argon[1m]",
             "gemini-4-neon",
+            "gemini-4-neon-xhigh",
         ] {
             let once = client_facing_model(raw, None, &shape);
             assert_eq!(client_facing_model(&once, None, &shape), once, "{raw}");
@@ -2494,16 +2524,22 @@ mod tests {
     #[test]
     fn g2_request_meta_and_converter_stamp() {
         let provider = GeminiProvider::new("https://x");
-        let body = json!({"model": "argon", "output_config": {"effort": "max"}});
+        let body = json!({"model": "gemini-4-argon", "output_config": {"effort": "max"}});
         assert_eq!(
             provider.request_meta(body.to_string().as_bytes()),
             ("gemini-4-argon-high".to_string(), None),
-            "max clamps to argon's top level"
+            "max clamps a bare family to argon's top level"
+        );
+        let body = json!({"model": "gemini-4-neon", "output_config": {"effort": "medium"}});
+        assert_eq!(
+            provider.request_meta(body.to_string().as_bytes()),
+            ("gemini-4-neon-medium".to_string(), None)
         );
         let body = json!({"model": "neon", "output_config": {"effort": "medium"}});
         assert_eq!(
             provider.request_meta(body.to_string().as_bytes()),
-            ("gemini-4-neon-medium".to_string(), None)
+            ("gemini-4-neon-high".to_string(), None),
+            "the alias is a fixed id"
         );
         assert_eq!(
             provider.request_meta(b"not json"),
@@ -2516,7 +2552,7 @@ mod tests {
             &mut converter,
             &[chunk(json!([{"text": "hi"}]), Some("STOP"), None)],
         );
-        assert_eq!(events[0].1["message"]["model"], "gemini-4-argon[1m]");
+        assert_eq!(events[0].1["message"]["model"], "gemini-4-argon-high");
         assert_eq!(events[0].1["message"]["id"], "msg_resp-abc");
     }
 

@@ -7,18 +7,21 @@
 //! `outputTokenLimit` becomes every request's `maxOutputTokens`; `--effort`
 //! is refused unless `thinking` is true; with no `--model` agy picks the FIRST
 //! entry; ids it does not know take one of 32 placeholder slots and the rest
-//! are dropped. Hence the list's rules:
+//! are dropped ("custom gateway model(s) exceeded the maximum placeholder
+//! limit (32)"), while ids it knows — every Gemini level id
+//! (`gemini-4-neon-xhigh`, `gemini-3.8-flash-low`) — take no slot and show
+//! with agy's own labels. Hence the list's rules:
 //!
 //! 1. One entry per model: a `[1m]` twin and its base row are ONE entry under
 //!    the base id (brackets never reach a URL path); a `[1m]`-only row is
 //!    listed under its base id too and served as the `[1m]` row
 //!    ([`super::served_model`]). The base row's metadata wins when both exist.
-//! 2. At most [`MAX_MODELS`] entries. Over the cap the default model is
-//!    kept first, then every model a catalog alias points at (each family's
-//!    current pick: `opus`, `haiku`, `sol`, `grok`, `argon`, …), then the
-//!    rest; within each of those tiers the groups take turns in catalog group
-//!    order (each group's rows in catalog order), so no group crowds another
-//!    out.
+//! 2. Every id agy knows is listed ([`agy_knows`]); of the others at most
+//!    [`MAX_MODELS`]. Over that cap the default model is kept first, then
+//!    every model a catalog alias points at (each family's current pick:
+//!    `opus`, `haiku`, `sol`, `grok`, …), then the rest; within each of those
+//!    tiers the groups take turns in catalog group order (each group's rows
+//!    in catalog order), so no group crowds another out.
 //! 3. The default model for agy comes first; the rest keep catalog order.
 
 use http::StatusCode;
@@ -26,8 +29,9 @@ use serde_json::{json, Value};
 
 use crate::catalog::ModelEntry;
 
-/// The most entries the list carries: agy keeps at most 32 ids it does not
-/// know (`buildResponseFromAdminModelList`, 32 placeholder slots).
+/// The most entries the list carries that agy does not know: agy keeps at
+/// most 32 of them (`buildResponseFromAdminModelList`, 32 placeholder
+/// slots). Ids it knows ([`agy_knows`]) are not counted.
 pub(crate) const MAX_MODELS: usize = 32;
 
 /// Gemini API default page size for `models.list`.
@@ -121,28 +125,50 @@ pub(crate) fn models(rows: &[ModelEntry], default_model: &str) -> Vec<Value> {
     out.into_iter().map(render).collect()
 }
 
-/// Which entries survive the [`MAX_MODELS`] cap: all when under it; else the
-/// pinned one, then the aliased ones, then the rest — each tier filled by
-/// [`take_turns`].
+/// Whether agy 1.5.13 knows `id` and so lists it without spending one of its
+/// 32 placeholder slots: a Gemini level id, `<family>-<level>` for a family
+/// and level of the provider's family table. Live probe 2026-11-21: with 40
+/// unknown ids served, agy listed 32 of them plus all 14 Gemini 4 level ids
+/// and the 3 Gemini 3.8 Flash ones (under its own labels), while
+/// `claude-opus-5-5` / `claude-sonnet-5-5` counted as custom ids.
+pub(crate) fn agy_knows(id: &str) -> bool {
+    id.rsplit_once('-').is_some_and(|(family, level)| {
+        crate::provider::gemini::family_levels(family).is_some_and(|levels| levels.contains(&level))
+    })
+}
+
+/// Which entries survive: every entry agy knows, and of the others all when
+/// at most [`MAX_MODELS`]; else the pinned one, then the aliased ones, then
+/// the rest — each tier filled by [`take_turns`].
 fn capped(entries: &[Entry], pinned: Option<&str>) -> Vec<bool> {
-    if entries.len() <= MAX_MODELS {
+    let known: Vec<bool> = entries.iter().map(|entry| agy_knows(&entry.id)).collect();
+    if known.iter().filter(|known| !**known).count() <= MAX_MODELS {
         return vec![true; entries.len()];
     }
-    let mut keep = vec![false; entries.len()];
+    let mut keep = known.clone();
     if let Some(index) = pinned.and_then(|id| entries.iter().position(|entry| entry.id == id)) {
         keep[index] = true;
     }
     for aliased in [true, false] {
-        take_turns(entries, &mut keep, |entry| entry.aliased == aliased);
+        take_turns(entries, &mut keep, &known, |entry| entry.aliased == aliased);
     }
     keep
 }
 
 /// Keep the not-yet-kept entries `in_tier` admits, the groups taking turns
 /// (group order of first appearance, catalog order within a group), until
-/// [`MAX_MODELS`] are kept.
-fn take_turns(entries: &[Entry], keep: &mut [bool], in_tier: impl Fn(&Entry) -> bool) {
-    let mut kept = keep.iter().filter(|kept| **kept).count();
+/// [`MAX_MODELS`] entries agy does not know (`known`) are kept.
+fn take_turns(
+    entries: &[Entry],
+    keep: &mut [bool],
+    known: &[bool],
+    in_tier: impl Fn(&Entry) -> bool,
+) {
+    let mut kept = keep
+        .iter()
+        .zip(known)
+        .filter(|(kept, known)| **kept && !**known)
+        .count();
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if keep[index] || !in_tier(entry) {
@@ -289,7 +315,8 @@ mod tests {
         let rows = live_catalog();
         let models = models(&rows, "gpt-5.6-sol");
         let ids = ids(&models);
-        assert!(ids.len() <= MAX_MODELS, "{} entries", ids.len());
+        let unknown = ids.iter().filter(|id| !agy_knows(id)).count();
+        assert!(unknown <= MAX_MODELS, "{unknown} ids agy does not know");
         assert_eq!(ids[0], "gpt-5.6-sol", "the default comes first");
         assert!(ids.iter().all(|id| !id.contains('[')), "{ids:?}");
         let mut unique = ids.clone();
@@ -302,22 +329,22 @@ mod tests {
         assert!(position("claude-opus-5-5") < position("gpt-6.2-sol"));
         assert!(position("gpt-6.2-sol") < position("grok-4.7"));
         assert!(position("grok-4.7") < position("gemini-3.8-flash-high"));
-        // Over the cap, every family's current pick (an alias owner) stays.
-        for current in [
-            "claude-fable-5-2",
-            "claude-opus-5-5",
-            "claude-sonnet-5-5",
-            "claude-haiku-5-5",
-            "gpt-6.2-sol",
-            "gpt-6.2-astra",
-            "gpt-6.1-terra",
-            "gpt-6-luna",
-            "grok-4.7",
-            "or-nemotron-3-ultra",
-            "gemini-3.8-flash-high",
-            "gemini-4-argon",
+        // The 2026-11-21 catalog fits: 29 ids agy does not know plus the 17
+        // Gemini level ids it does, so no model is left out.
+        let mut bases: Vec<&str> = rows.iter().map(|row| base_id(&row.id)).collect::<Vec<_>>();
+        bases.dedup();
+        for base in &bases {
+            assert!(ids.iter().any(|id| id == base), "{base} listed: {ids:?}");
+        }
+        assert_eq!(ids.len(), 46);
+        assert_eq!(unknown, 29);
+        // Every Gemini 4 level row is listed, as agy's own picker shows them.
+        for level in [
+            "gemini-4-neon-xhigh",
+            "gemini-4-hydrogen-low",
+            "gemini-4-carbon-medium",
         ] {
-            assert!(ids.iter().any(|id| id == current), "{current}: {ids:?}");
+            assert!(ids.iter().any(|id| id == level), "{level}");
         }
         // Every group is represented.
         for group in ["claude", "codex", "grok", "openrouter", "gemini"] {
@@ -355,19 +382,22 @@ mod tests {
         let opus48 = find("claude-opus-4-8");
         assert_eq!(opus48["inputTokenLimit"], 1_000_000);
         // A gemini id that names its level says `thinking`, so agy carries
-        // the level it strips from the URL; a Gemini 4 family row has an
-        // effort menu (from the provider's family table), so it says it too.
+        // the level it strips from the URL (`…/models/gemini-4-neon:…` +
+        // `thinkingLevel: XHIGH`, live 2026-11-21) and the ingress recombines
+        // it; every gemini row names its level.
         let flash = find("gemini-3.8-flash-low");
         assert_eq!(flash["thinking"], true);
         assert_eq!(flash["outputTokenLimit"], 65_536);
-        for family in [
-            "gemini-4-argon",
-            "gemini-4-neon",
-            "gemini-4-carbon",
-            "gemini-4-hydrogen",
+        for level in [
+            "gemini-4-neon-high",
+            "gemini-4-neon-xhigh",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-argon-low",
+            "gemini-4-carbon-high",
         ] {
-            assert_eq!(find(family)["thinking"], true, "{family}");
+            assert_eq!(find(level)["thinking"], true, "{level}");
         }
+        assert_eq!(find("gemini-4-neon-low")["inputTokenLimit"], 524_288);
         // A row with neither an effort menu nor a level in its name does not.
         assert_eq!(find("or-free")["thinking"], false);
         assert_eq!(find("gpt-6.2-sol")["outputTokenLimit"], 128_000);
@@ -377,7 +407,11 @@ mod tests {
     fn a_default_alias_resolves_to_its_row() {
         let rows = live_catalog();
         assert_eq!(ids(&models(&rows, "opus"))[0], "claude-opus-5-5");
-        assert_eq!(ids(&models(&rows, "argon"))[0], "gemini-4-argon");
+        assert_eq!(ids(&models(&rows, "argon"))[0], "gemini-4-argon-high");
+        assert_eq!(
+            ids(&models(&rows, "gemini-4-neon-xhigh"))[0],
+            "gemini-4-neon-xhigh"
+        );
         assert_eq!(ids(&models(&rows, "gpt-6.2-sol[1m]"))[0], "gpt-6.2-sol");
         // An unknown default pins nothing: plain catalog order.
         assert_eq!(ids(&models(&rows, "nope"))[0], "claude-fable-5-2");
@@ -413,6 +447,42 @@ mod tests {
         assert!(claude.abs_diff(codex) <= 2, "{claude} vs {codex}");
         assert!(ids.contains(&"claude-x-0".to_string()));
         assert!(!ids.contains(&"claude-x-29".to_string()));
+    }
+
+    /// Ids agy knows (Gemini level ids) take none of its 32 slots: over the
+    /// cap they are all kept, and the cap applies to the others alone.
+    #[test]
+    fn ids_agy_knows_are_listed_beyond_the_cap() {
+        assert!(agy_knows("gemini-4-neon-xhigh"));
+        assert!(agy_knows("gemini-3.8-flash-low"));
+        assert!(
+            !agy_knows("gemini-4-argon-xhigh"),
+            "argon has no xhigh level"
+        );
+        assert!(!agy_knows("gemini-4-neon"), "a bare family is no level id");
+        assert!(!agy_knows("claude-opus-5-5"));
+        let menu: &'static [&'static str] = &[];
+        let row = |group: &'static str, id: String| ModelEntry {
+            id: id.clone().into(),
+            aliases: Vec::new(),
+            name: id.into(),
+            efforts: menu,
+            max_context: Some(1),
+            group,
+        };
+        let mut rows: Vec<ModelEntry> = (0..40)
+            .map(|i| row("codex", format!("gpt-x-{i}")))
+            .collect();
+        for level in ["high", "xhigh", "medium", "low"] {
+            rows.push(row("gemini", format!("gemini-4-neon-{level}")));
+        }
+        let ids = ids(&models(&rows, "gpt-x-0"));
+        assert_eq!(ids.len(), MAX_MODELS + 4);
+        assert_eq!(
+            ids.iter().filter(|id| id.starts_with("gpt-x-")).count(),
+            MAX_MODELS
+        );
+        assert!(ids.contains(&"gemini-4-neon-xhigh".to_string()));
     }
 
     #[test]
