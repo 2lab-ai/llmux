@@ -532,7 +532,7 @@ mod tests {
         let quota = fetch_quota(
             &client,
             &format!("http://{addr}/"),
-            "antigravity/hub/2.23.1 darwin/arm64",
+            "antigravity/hub/2.34.0 darwin/arm64",
             "at-1",
             "proj-1",
         )
@@ -544,7 +544,7 @@ mod tests {
         let (path, auth, agent, body) = &seen[0];
         assert_eq!(path, "/v1internal:fetchAvailableModels");
         assert_eq!(auth, "Bearer at-1");
-        assert_eq!(agent, "antigravity/hub/2.23.1 darwin/arm64");
+        assert_eq!(agent, "antigravity/hub/2.34.0 darwin/arm64");
         let body: Value = serde_json::from_str(body).expect("json body");
         assert_eq!(body, json!({"project":"proj-1"}));
     }

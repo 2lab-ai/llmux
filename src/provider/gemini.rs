@@ -2192,7 +2192,7 @@ mod tests {
         assert_eq!(request.headers[ACCEPT], "text/event-stream");
         assert_eq!(
             request.headers[USER_AGENT],
-            "antigravity/hub/2.23.1 darwin/arm64"
+            "antigravity/hub/2.34.0 darwin/arm64"
         );
 
         assert_eq!(upstream["model"], "gemini-3.8-flash-high");

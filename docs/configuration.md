@@ -227,7 +227,7 @@ Gemini models are served by Google's **Antigravity subscription backend** (Cloud
 | `gemini.upstream` | `https://daily-cloudcode-pa.googleapis.com` | Cloud Code base URL; chat requests go to `{upstream}/v1internal:streamGenerateContent?alt=sse`. |
 | `gemini.default_model` | `gemini-3.8-flash-high` | The model requested when a name that is not gemini-shaped (or a request that names no model) lands on the gemini group, e.g. through the empty-group fallback. It does not move the `gemini` / `argon` aliases. |
 | `gemini.client_model` | unset | When set, llmux reports this model name to the client instead of the real gemini model. |
-| `gemini.user_agent` | `antigravity/hub/2.23.1 darwin/arm64` | `User-Agent` sent upstream. Cloud Code rejects newer models for hub versions below 2.23.0. |
+| `gemini.user_agent` | `antigravity/hub/2.34.0 darwin/arm64` | `User-Agent` sent upstream. Cloud Code rejects newer models for hub versions below 2.23.0, and third parties report the Gemini 4 ids hidden or 404 below 2.29. The default was `antigravity/hub/2.23.1 darwin/arm64` until 2026-11-21 (Antigravity hub manifest 2.34.0, read that day). A config that still holds exactly that old default is moved to the new default when it loads; any other value you set is kept. |
 | `gemini.token_url` | `https://oauth2.googleapis.com/token` | Google OAuth token endpoint for refresh-token grants. |
 | `gemini.client_id` | unset | Client id of Antigravity's Google OAuth client. The `LLMUX_GEMINI_CLIENT_ID` environment variable overrides it. |
 | `gemini.client_secret` | unset | That client's secret. The `LLMUX_GEMINI_CLIENT_SECRET` environment variable overrides it. The TUI never shows it. |

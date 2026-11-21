@@ -229,6 +229,16 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
     if crate::catalog::is_retired_openrouter_pin(&config.openrouter.default_model) {
         config.openrouter.default_model = crate::catalog::OPENROUTER_DEFAULT_PIN.to_string();
     }
+    // Gemini User-Agent migration (sweep 2026-11-21, #244). Every config
+    // written before the bump serialized the old default hub identity
+    // (`antigravity/hub/2.23.1`), so a persisted value EXACTLY equal to it
+    // reads as "unset" — and Cloud Code reportedly hides the Gemini 4 ids
+    // from hub versions below 2.29. Adopt the current default. Any other
+    // value is an operator's choice and is kept verbatim (same rule as the
+    // OpenRouter pin migration above).
+    if config.gemini.user_agent == schema::LEGACY_GEMINI_USER_AGENT {
+        config.gemini.user_agent = schema::DEFAULT_GEMINI_USER_AGENT.to_string();
+    }
     // Demo mode: swap account identities for stable fakes at the source so every
     // surface (dashboard, logs, status) shows the alias. Credentials are keyed
     // by token/uuid, not name, so they keep working.
@@ -666,7 +676,7 @@ mod tests {
         assert_eq!(config.gemini.client_model, None);
         assert_eq!(
             config.gemini.user_agent,
-            "antigravity/hub/2.23.1 darwin/arm64"
+            "antigravity/hub/2.34.0 darwin/arm64"
         );
         assert_eq!(
             config.gemini.token_url,
@@ -893,6 +903,51 @@ mod tests {
         assert_eq!(
             Config::default().openrouter.default_model,
             crate::catalog::OPENROUTER_DEFAULT_PIN
+        );
+    }
+
+    /// The gemini User-Agent bump (2.23.1 → 2.34.0, sweep 2026-11-21): a
+    /// persisted value EXACTLY equal to the old default moves to the new one
+    /// at load; any other value, a near miss included, is the operator's and
+    /// is kept; a config without the key takes the new default.
+    #[test]
+    fn gemini_user_agent_migrates_only_the_exact_old_default() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let load_ua = |user_agent: Option<&str>| {
+            let gemini = match user_agent {
+                Some(ua) => format!(r#""gemini": {{ "user_agent": "{ua}" }},"#),
+                None => String::new(),
+            };
+            fs::write(
+                &path,
+                format!(r#"{{ "version": 1, {gemini} "accounts": [] }}"#),
+            )
+            .expect("write config");
+            load_path(&path).expect("load").gemini.user_agent
+        };
+        assert_eq!(
+            schema::LEGACY_GEMINI_USER_AGENT,
+            "antigravity/hub/2.23.1 darwin/arm64"
+        );
+        assert_eq!(
+            load_ua(Some("antigravity/hub/2.23.1 darwin/arm64")),
+            "antigravity/hub/2.34.0 darwin/arm64",
+            "the persisted old default moves to the new default"
+        );
+        assert_eq!(load_ua(None), schema::DEFAULT_GEMINI_USER_AGENT);
+        for kept in [
+            "antigravity/hub/2.29.0 darwin/arm64",
+            "antigravity/hub/2.23.1 linux/amd64",
+            "Antigravity/Hub/2.23.1 darwin/arm64",
+            " antigravity/hub/2.23.1 darwin/arm64",
+            "antigravity/hub/2.40.0 (aidev_client; os_type=darwin; arch=arm64)",
+        ] {
+            assert_eq!(load_ua(Some(kept)), kept, "an operator's value is kept");
+        }
+        assert_eq!(
+            Config::default().gemini.user_agent,
+            schema::DEFAULT_GEMINI_USER_AGENT
         );
     }
 
