@@ -654,7 +654,9 @@ pub(crate) fn normalize_model(model: &str) -> String {
 
 /// Classify a request path into an endpoint bucket for the per-model breakdown
 /// (req20). `count_tokens` is checked first because its path also contains
-/// `/messages`.
+/// `/messages`. A Gemini API path names its model in the last segment
+/// (`/v1beta/models/<id>:streamGenerateContent`), so its bucket is the method
+/// after the `:` — one bucket per method, not one per model.
 fn endpoint_class(path: &str) -> String {
     let p = path.split('?').next().unwrap_or(path);
     if p.contains("count_tokens") {
@@ -662,10 +664,11 @@ fn endpoint_class(path: &str) -> String {
     } else if p.contains("/messages") {
         "messages".to_string()
     } else {
-        p.rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or("other")
-            .to_string()
+        let last = p.rsplit('/').find(|s| !s.is_empty()).unwrap_or("other");
+        match last.rsplit_once(':') {
+            Some((_, method)) if !method.is_empty() => method.to_string(),
+            _ => last.to_string(),
+        }
     }
 }
 
@@ -3187,6 +3190,14 @@ mod tests {
         assert_eq!(endpoint_class("/v1/messages?beta=true"), "messages");
         assert_eq!(endpoint_class("/v1/messages/count_tokens"), "count_tokens");
         assert_eq!(endpoint_class("/v1/models"), "models");
+        assert_eq!(
+            endpoint_class("/v1beta/models/gpt-6.2-sol:streamGenerateContent?alt=sse"),
+            "streamGenerateContent"
+        );
+        assert_eq!(
+            endpoint_class("/v1beta/models/claude-opus-5-5:generateContent"),
+            "generateContent"
+        );
     }
 
     #[test]
@@ -5483,5 +5494,15 @@ mod tests {
             assert_eq!(legacy.endpoint, Endpoint::Anthropic);
         }
         assert!(log.in_flight().is_empty());
+        // The Google Gemini API origin persists as `google` and replays as itself.
+        let mut event = finished(44, Some("codex-account"), None);
+        if let ActivityEvent::RequestFinished { endpoint, .. } = &mut event {
+            *endpoint = Endpoint::Google;
+        }
+        let record = PersistedRequest::from_event(&event, at(12)).expect("record");
+        let json = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(json["endpoint"], "google");
+        let replay: PersistedRequest = serde_json::from_value(json).expect("parse");
+        assert_eq!(replay.into_event().0, event);
     }
 }

@@ -361,9 +361,29 @@ enum ClientNameLabel {
 /// list in UsageAnalyticsViews.swift) render these fields VERBATIM — there
 /// is no per-view label/trailing expression left at the call sites, so the
 /// factory tests cover exactly what renders.
+/// Incoming API protocol of an activity row (the daemon's `endpoint` wire
+/// value): `anthropic` (or absent), `open_ai`, `google`. Provider/model never
+/// decide it. Each origin has its own row background, so this is a three-way
+/// choice, never an "is it OpenAI" boolean.
+enum ActivityEndpointOrigin: Equatable {
+    case anthropic
+    case openAI
+    case google
+
+    init(wire: String?) {
+        switch wire {
+        case "open_ai": self = .openAI
+        case "google": self = .google
+        default: self = .anthropic
+        }
+    }
+}
+
 struct ActivityRowModel: Equatable {
     /// Incoming API protocol; provider/model do not decide row background.
-    let isOpenAIEndpoint: Bool
+    let endpointOrigin: ActivityEndpointOrigin
+    var isOpenAIEndpoint: Bool { endpointOrigin == .openAI }
+    var isGoogleEndpoint: Bool { endpointOrigin == .google }
     /// Relative age ("5m").
     let time: String
     /// Raw HTTP status for the view's color mapping; `nil` renders blank.
@@ -378,7 +398,7 @@ struct ActivityRowModel: Equatable {
 
     static func completed(_ entry: LlmuxDashboardCompleted, now: Date) -> ActivityRowModel {
         ActivityRowModel(
-            isOpenAIEndpoint: entry.endpoint == "open_ai",
+            endpointOrigin: ActivityEndpointOrigin(wire: entry.endpoint),
             time: DashFormat.ago(ms: entry.atMs, now: now),
             status: entry.status,
             marker: nil,
@@ -395,7 +415,7 @@ struct ActivityRowModel: Equatable {
 
     static func receipt(_ receipt: SharedActivityReceipt, now: Date) -> ActivityRowModel {
         ActivityRowModel(
-            isOpenAIEndpoint: receipt.kind != "note" && receipt.endpoint == "open_ai",
+            endpointOrigin: receipt.kind == "note" ? .anthropic : ActivityEndpointOrigin(wire: receipt.endpoint),
             time: DashFormat.ago(ms: receipt.occurredAtMs, now: now),
             status: receipt.status,
             marker: receipt.kind == "in_flight" ? "···" : receipt.kind == "note" ? "note" : nil,

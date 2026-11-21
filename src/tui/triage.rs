@@ -1257,5 +1257,17 @@ mod tests {
                 ActivityRow::Single(2)
             ]
         );
+        // A Google-origin row never folds into its Anthropic neighbours either.
+        if let CompletedBody::Request { endpoint, .. } = &mut entries[1].body {
+            *endpoint = crate::tui::Endpoint::Google;
+        }
+        assert_eq!(
+            collapse_completed(&entries),
+            vec![
+                ActivityRow::Single(0),
+                ActivityRow::Single(1),
+                ActivityRow::Single(2)
+            ]
+        );
     }
 }

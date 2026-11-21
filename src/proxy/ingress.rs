@@ -99,6 +99,12 @@ pub(crate) fn decode(
                 Some(NativeInput::Responses(input)),
             ))
         }
+        // No path maps to the Google origin yet (the Gemini API ingress
+        // lands next); refuse rather than guess a body shape.
+        Endpoint::Google => Err((
+            StatusCode::NOT_FOUND,
+            "the Gemini API ingress is not served".to_string(),
+        )),
     }
 }
 
@@ -112,7 +118,7 @@ pub(crate) fn decode(
 pub(crate) fn error(origin: Endpoint, status: StatusCode, detail: &str) -> Response {
     match origin {
         Endpoint::OpenAi => responses::error(status, detail),
-        Endpoint::Anthropic => {
+        Endpoint::Anthropic | Endpoint::Google => {
             super::forward::error_response(status, "invalid_request_error", detail)
         }
     }

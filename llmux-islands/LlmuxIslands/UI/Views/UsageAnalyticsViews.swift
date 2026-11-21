@@ -218,6 +218,17 @@ struct StatsSectionContent: View {
 /// Rust-owned activity receipts. Paths, account labels and notes have already
 /// passed the shared privacy filter before reaching this renderer.
 private let openAIActivityBackground = Color(red: 40 / 255, green: 40 / 255, blue: 40 / 255)
+/// Google Gemini API endpoint rows (`llmux run --agy`): a subtle dark slate,
+/// distinct from the OpenAI gray and the untinted Anthropic rows.
+private let googleActivityBackground = Color(red: 28 / 255, green: 36 / 255, blue: 52 / 255)
+
+private func activityBackground(_ origin: ActivityEndpointOrigin) -> Color {
+    switch origin {
+    case .openAI: return openAIActivityBackground
+    case .google: return googleActivityBackground
+    case .anthropic: return Color.clear
+    }
+}
 
 struct UsageCanonicalActivityReceiptList: View {
     let receipts: [SharedActivityReceipt]
@@ -251,7 +262,7 @@ struct UsageCanonicalActivityReceiptList: View {
                         .foregroundColor(.white.opacity(0.45))
                         .lineLimit(1)
                 }
-                .background(model.isOpenAIEndpoint ? openAIActivityBackground : Color.clear)
+                .background(activityBackground(model.endpointOrigin))
             }
         }
         .padding(8)
@@ -573,7 +584,7 @@ struct UsageActivityList: View {
                     status: Text("···").foregroundColor(TerminalColors.amber),
                     label: flight.model ?? flight.path,
                     trailing: "in flight",
-                    isOpenAIEndpoint: flight.endpoint == "open_ai"
+                    endpointOrigin: ActivityEndpointOrigin(wire: flight.endpoint)
                 )
             }
             ForEach(Array(activity.completed.prefix(completedLimit).enumerated()), id: \.offset) { _, entry in
@@ -616,11 +627,11 @@ struct UsageActivityList: View {
                 ?? statusText(model.status),
             label: model.label,
             trailing: model.trailing,
-            isOpenAIEndpoint: model.isOpenAIEndpoint
+            endpointOrigin: model.endpointOrigin
         )
     }
 
-    private func row(time: String, status: Text, label: String, trailing: String, isOpenAIEndpoint: Bool) -> some View {
+    private func row(time: String, status: Text, label: String, trailing: String, endpointOrigin: ActivityEndpointOrigin) -> some View {
         HStack(spacing: 6) {
             timeText(time)
             status.font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -636,7 +647,7 @@ struct UsageActivityList: View {
                 .foregroundColor(.white.opacity(0.45))
                 .lineLimit(1)
         }
-        .background(isOpenAIEndpoint ? openAIActivityBackground : Color.clear)
+        .background(activityBackground(endpointOrigin))
     }
 
     private func timeText(_ value: String) -> some View {
