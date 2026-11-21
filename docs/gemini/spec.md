@@ -40,7 +40,7 @@ Out of scope: an Antigravity (`agy`) **frontend** (`llmux run --agy`). The Antig
 - **Policy (owner decision, 2026-10-15).** llmux does not forward Claude Code traffic to the
   gemini group:
   - `llmux run` leaves gemini rows out of the Claude Code `/model` picker
-    (`model_picker_settings` in `src/cli/run.rs`). The Codex catalog injected by
+    (`model_picker_settings` in `src/cli/run/claude.rs`). The Codex catalog injected by
     `llmux run --codex` keeps them.
   - A request whose `User-Agent` starts with `claude-cli/` (Claude Code and its subagents)
     and that routes to the gemini group gets a local `400 invalid_request_error` from the

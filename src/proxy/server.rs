@@ -2145,12 +2145,17 @@ async fn client_auth(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
     let loopback = peer.is_some_and(|ip| ip.is_loopback());
-    let openai =
-        super::responses::is_responses_path(req.uri().path()) || req.uri().path() == "/v1/models";
+    let openai = super::ingress::accepts_bearer_client_key(req.uri().path());
     let presented = if openai {
         match openai_client_key(req.headers()) {
             Ok(key) => key,
-            Err(detail) => return super::responses::error(StatusCode::UNAUTHORIZED, detail),
+            Err(detail) => {
+                return super::ingress::error(
+                    crate::tui::Endpoint::OpenAi,
+                    StatusCode::UNAUTHORIZED,
+                    detail,
+                )
+            }
         }
     } else {
         req.headers().get("x-api-key").and_then(|v| v.to_str().ok())

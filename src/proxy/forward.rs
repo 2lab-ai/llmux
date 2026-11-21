@@ -29,6 +29,7 @@ use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 
 use super::auto_classifier::{Route, Target};
 use super::gemini_project::{self, GeminiProject};
+use super::ingress;
 use super::logging::BODY_LOG_LIMIT;
 use super::server::AppState;
 use super::sse::{self, SseTransform as _};
@@ -366,10 +367,15 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// request-log accumulator and the activity-event correlation handle.
 struct ForwardContext {
     endpoint_origin: crate::tui::Endpoint,
-    responses_input: Option<serde_json::Value>,
+    /// The client's own body on a non-Messages ingress
+    /// ([`ingress::NativeInput`]); `None` on Messages. When set, `body` is
+    /// only the metadata summary [`ingress::decode`] derived from it.
+    native: Option<ingress::NativeInput>,
     ingress_body: Bytes,
-    responses_account: Option<String>,
-    responses_upstream: Option<crate::proxy::raw_io::UpstreamRaw>,
+    /// The account and upstream leg of a native-ingress exchange, for the
+    /// raw-io capture [`ingress::adapt`] takes at the client boundary.
+    native_account: Option<String>,
+    native_upstream: Option<crate::proxy::raw_io::UpstreamRaw>,
     method: Method,
     path_query: String,
     headers: HeaderMap,
@@ -437,6 +443,13 @@ struct ForwardContext {
 }
 
 impl ForwardContext {
+    /// The Responses request body, on the Responses ingress only.
+    fn responses_input(&self) -> Option<&serde_json::Value> {
+        self.native
+            .as_ref()
+            .and_then(ingress::NativeInput::responses)
+    }
+
     fn codex_meta(&self, state: &AppState) -> (String, Option<String>, bool) {
         self.auto_classifier
             .as_ref()
@@ -627,8 +640,9 @@ impl ForwardContext {
     /// (`state.raw_io_path == None`). When `None`, [`capture_raw_io`] is a no-op
     /// and no record is built — so capture is genuinely off the hot path.
     fn raw_io_path<'a>(&self, state: &'a AppState) -> Option<&'a std::path::Path> {
-        // Responses boundary captures both sides after the return transform.
-        if self.responses_input.is_some() {
+        // A native ingress captures both sides at the client boundary, after
+        // the return transform (`ingress::adapt`).
+        if self.native.is_some() {
             return None;
         }
         if state
@@ -842,10 +856,7 @@ impl ForwardContext {
             sub_usage: Vec::new(),
             price_class: crate::pricing::PriceClass::STANDARD,
         });
-        if self.endpoint_origin == crate::tui::Endpoint::OpenAi {
-            return super::responses::error(StatusCode::BAD_REQUEST, &message);
-        }
-        error_response(StatusCode::BAD_REQUEST, "invalid_request_error", &message)
+        ingress::error(self.endpoint_origin, StatusCode::BAD_REQUEST, &message)
     }
 }
 
@@ -1072,7 +1083,7 @@ pub(crate) fn is_length_limit_error(err: &axum::Error) -> bool {
 }
 
 /// Anthropic-style JSON error response.
-fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+pub(super) fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
         "error": { "type": error_type, "message": message },
@@ -1373,11 +1384,7 @@ fn transient_response(detail: &str) -> Response {
 /// streaming back, the account is pinned and errors propagate to the client
 /// (never switch mid-stream).
 pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response {
-    let endpoint_origin = if super::responses::is_responses_path(req.uri().path()) {
-        crate::tui::Endpoint::OpenAi
-    } else {
-        crate::tui::Endpoint::Anthropic
-    };
+    let endpoint_origin = ingress::origin(req.uri().path());
     let started = std::time::Instant::now();
     let activity_id = state.next_request_id();
     // Tenant attribution id resolved by the auth gate (multi-tenant #22),
@@ -1474,24 +1481,16 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             sub_usage: Vec::new(),
             price_class: crate::pricing::PriceClass::STANDARD,
         });
-        super::responses::error(status, detail)
+        ingress::error(endpoint_origin, status, detail)
     };
     let ingress_body = body.clone();
-    let responses_input = if endpoint_origin == crate::tui::Endpoint::OpenAi {
-        if parts.method != Method::POST {
-            return early_error(StatusCode::METHOD_NOT_ALLOWED, "Responses requires POST");
-        }
-        match super::responses::validate(&body) {
-            Ok(value) => Some(value),
-            Err(detail) => return early_error(StatusCode::BAD_REQUEST, &detail),
-        }
-    } else {
-        None
+    // From here on `body` is the Messages-shaped body the shared routing,
+    // metering and activity paths read; a non-Messages client's own body
+    // rides along as its native input.
+    let (body, native) = match ingress::decode(endpoint_origin, &parts.method, &body) {
+        Ok(decoded) => decoded,
+        Err((status, detail)) => return early_error(status, &detail),
     };
-    let body = responses_input
-        .as_ref()
-        .map(super::responses::metadata_request)
-        .unwrap_or(body);
     let log_enabled = state.logger.is_some();
     // Parse the model once (body is buffered) and classify to a backend group.
     // Routing disabled ⇒ group = None (legacy single-slot path); the
@@ -1514,7 +1513,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     let superseded_float = model
         .as_deref()
         .is_some_and(|m| crate::catalog::resolve_superseded_claude_id(m).is_some())
-        && responses_input.is_none()
+        && native.is_none()
         && crate::provider::anthropic::body_floats_superseded_ids(&body);
     let mut group = if state
         .settings_live
@@ -1634,10 +1633,10 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     });
     let mut ctx = ForwardContext {
         endpoint_origin,
-        responses_input: responses_input.clone(),
+        native: native.clone(),
         ingress_body,
-        responses_account: None,
-        responses_upstream: None,
+        native_account: None,
+        native_upstream: None,
         method: parts.method,
         path_query,
         headers: parts.headers,
@@ -1701,32 +1700,29 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         run_taxonomy_loop(state, &mut ctx).await
     };
     apply_compatibility_headers(response.headers_mut(), ctx.compatibility.as_ref());
-    if let Some(input) = responses_input {
+    if let Some(native) = native {
         let meta = ctx.finished_meta(state);
         let capture = if state
             .settings_live
             .raw_io_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            state
-                .raw_io_path
-                .clone()
-                .map(|path| super::responses::Capture {
-                    path,
-                    id: ctx.activity_id,
-                    group: meta.group,
-                    model: meta.model,
-                    account: ctx.responses_account.clone(),
-                    started: ctx.started,
-                    request: ctx.ingress_body.clone(),
-                    request_headers: redacted_header_pairs(&ctx.headers),
-                    max_body: state.config.raw_io.max_body_bytes,
-                    upstream: ctx.responses_upstream.clone(),
-                })
+            state.raw_io_path.clone().map(|path| ingress::Capture {
+                path,
+                id: ctx.activity_id,
+                group: meta.group,
+                model: meta.model,
+                account: ctx.native_account.clone(),
+                started: ctx.started,
+                request: ctx.ingress_body.clone(),
+                request_headers: redacted_header_pairs(&ctx.headers),
+                max_body: state.config.raw_io.max_body_bytes,
+                upstream: ctx.native_upstream.clone(),
+            })
         } else {
             None
         };
-        super::responses::adapt(response, input, capture).await
+        ingress::adapt(response, native, capture).await
     } else {
         response
     }
@@ -1748,6 +1744,22 @@ async fn wait_for_first_main(state: &AppState, tenant: Option<&str>, body: &serd
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The upstream request for a native-ingress body on the backend that serves
+/// it natively ([`ingress::native_group`]), with the endpoint it goes to:
+/// Responses goes to the Codex subscription gateway as Responses.
+fn native_request(
+    state: &AppState,
+    native: &ingress::NativeInput,
+    credential: &AccountCredential,
+) -> Result<(ProviderRequest, String), ProviderError> {
+    match native {
+        ingress::NativeInput::Responses(input) => state
+            .codex
+            .build_responses_request(input, credential)
+            .map(|req| (req, state.codex.endpoint().to_string())),
     }
 }
 
@@ -2030,7 +2042,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
-        if let Some(input) = &ctx.responses_input {
+        if let Some(input) = ctx.responses_input() {
             let mode = match compatibility_mode(&ctx.headers) {
                 Ok(mode) => mode,
                 Err(detail) => return invalid_request_response(state, ctx, &account, &detail),
@@ -2256,7 +2268,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // one via `loadCodeAssist`. Runs AFTER the refresh so the lookup
         // carries a live access token, and only for a request that goes
         // upstream (count_tokens is a local estimate, other paths are 501s).
-        let goes_upstream = ctx.responses_input.is_some() || request_path == "/v1/messages";
+        let goes_upstream = ctx.native.is_some() || request_path == "/v1/messages";
         let project = if goes_upstream {
             let lookup = gemini_project::ProjectLookup {
                 client: &state.client,
@@ -2332,7 +2344,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
-        if messages_only && ctx.responses_input.is_none() {
+        if messages_only && ctx.native.is_none() {
             let path = request_path.as_str();
             if path == "/v1/messages/count_tokens" {
                 // OpenRouter and gemini: the Responses flavors already
@@ -2371,10 +2383,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // `Some(client_stream)` marks the translate (codex/grok) transform
         // path; `None` is the untouched byte-identity passthrough.
         let mut translate_stream: Option<bool> = None;
-        let (upstream_req, endpoint) = if let Some(input) = &ctx.responses_input {
-            if served == BackendGroup::Codex {
-                match state.codex.build_responses_request(input, &credential) {
-                    Ok(req) => (req, state.codex.endpoint().to_string()),
+        // A native-ingress body goes to its native backend as it is
+        // ([`ingress::native_group`]); every other backend is handed its
+        // Messages translation and takes the same arm a Messages client would.
+        let serves_native = ctx.native.as_ref().and_then(ingress::native_group) == Some(served);
+        let (upstream_req, endpoint) = if let Some(native) = &ctx.native {
+            if serves_native {
+                match native_request(state, native, &credential) {
+                    Ok(built) => built,
                     Err(err) => {
                         ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
                         return error_response(
@@ -2385,7 +2401,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     }
                 }
             } else {
-                let body = match super::responses::messages_request(input) {
+                let body = match ingress::messages_request(native) {
                     Ok(body) => body,
                     Err(err) => {
                         ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
@@ -2571,9 +2587,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 format_headers(&upstream_req.headers)
             ));
         }
-        if ctx.responses_input.is_some() {
-            ctx.responses_account = Some(account.0.clone());
-            ctx.responses_upstream = Some(crate::proxy::raw_io::UpstreamRaw {
+        if ctx.native.is_some() {
+            ctx.native_account = Some(account.0.clone());
+            ctx.native_upstream = Some(crate::proxy::raw_io::UpstreamRaw {
                 url: Some(format!(
                     "{}{}",
                     endpoint.trim_end_matches('/'),
@@ -2656,18 +2672,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             },
         };
 
-        if ctx.responses_input.is_some()
-            && served == BackendGroup::Codex
-            && response.status().is_success()
-        {
-            // Subscription gateway streams Responses even when content-type is absent.
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream"),
-            );
-            response
-                .headers_mut()
-                .insert("x-llmux-native-responses", HeaderValue::from_static("1"));
+        if serves_native && response.status().is_success() {
+            if let Some(native) = &ctx.native {
+                ingress::mark_native_response(native, response.headers_mut());
+            }
         }
         // 4. Feed rate-limit evidence to the scheduler. If this evidence
         // just pushed the CURRENT account over a threshold, re-evaluate NOW
@@ -5361,10 +5369,10 @@ mod tests {
     fn ctx_for_group(model: &str, group: BackendGroup) -> ForwardContext {
         ForwardContext {
             endpoint_origin: crate::tui::Endpoint::Anthropic,
-            responses_input: None,
+            native: None,
             ingress_body: Bytes::new(),
-            responses_account: None,
-            responses_upstream: None,
+            native_account: None,
+            native_upstream: None,
             method: Method::POST,
             path_query: "/v1/messages".to_string(),
             headers: HeaderMap::new(),

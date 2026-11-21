@@ -1,27 +1,36 @@
 //! `llmux env` — shell exports for the selected proxy endpoint.
 
+use super::run::Frontend;
 use super::{resolve_endpoint, CliError, Endpoint, EnvArgs};
 
 /// Emit eval-safe exports without launching a client or changing its settings.
 pub async fn run(args: EnvArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
-    print!("{}", render(&endpoint, args.codex)?);
+    print!("{}", render(&endpoint, Frontend::from_env_args(&args))?);
     Ok(())
 }
 
-fn render(endpoint: &Endpoint, codex: bool) -> Result<String, CliError> {
-    if !codex {
-        let mut output = format!(
-            "export ANTHROPIC_BASE_URL={}\n",
-            shell_quote(&endpoint.base_url)
-        );
-        if let Some(key) = &endpoint.api_key {
-            output.push_str(&format!("export ANTHROPIC_API_KEY={}\n", shell_quote(key)));
-        }
-        return Ok(output);
+/// The exports for `frontend`, one renderer per client frontend.
+fn render(endpoint: &Endpoint, frontend: Frontend) -> Result<String, CliError> {
+    match frontend {
+        Frontend::ClaudeCode => Ok(render_claude(endpoint)),
+        Frontend::Codex => render_codex(endpoint),
     }
+}
 
+fn render_claude(endpoint: &Endpoint) -> String {
+    let mut output = format!(
+        "export ANTHROPIC_BASE_URL={}\n",
+        shell_quote(&endpoint.base_url)
+    );
+    if let Some(key) = &endpoint.api_key {
+        output.push_str(&format!("export ANTHROPIC_API_KEY={}\n", shell_quote(key)));
+    }
+    output
+}
+
+fn render_codex(endpoint: &Endpoint) -> Result<String, CliError> {
     // Never accidentally reuse a caller's unrelated OpenAI credential. Both
     // exports are emitted together, or the command fails before printing any.
     let key = endpoint.api_key.as_deref().filter(|key| !key.trim().is_empty()).ok_or_else(|| {
@@ -94,7 +103,7 @@ mod tests {
     #[test]
     fn render_prints_only_the_endpoint_exports() {
         assert_eq!(
-            render(&endpoint(), false).expect("render"),
+            render(&endpoint(), Frontend::ClaudeCode).expect("render"),
             "export ANTHROPIC_BASE_URL=http://127.0.0.1:3456\n\
              export ANTHROPIC_API_KEY=lmk-test\n"
         );
@@ -102,7 +111,7 @@ mod tests {
 
     #[test]
     fn render_codex_branch_prints_openai_exports_only() {
-        let output = render(&endpoint(), true).expect("render");
+        let output = render(&endpoint(), Frontend::Codex).expect("render");
         assert!(!output.contains("ANTHROPIC_"), "{output}");
         assert!(
             output.starts_with(

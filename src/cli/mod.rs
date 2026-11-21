@@ -157,10 +157,15 @@ pub struct ServerArgs {
     pub log_to: Option<PathBuf>,
 }
 
+// The client-frontend flags (`--codex`; none means Claude Code) share the
+// `frontend` group, so a later frontend flag only joins the group (at most one
+// may be given) and adds its arm to `run::Frontend::from_run_args`. Plain
+// comments, not doc comments: clap would read those as the command's help.
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("frontend").multiple(false)))]
 pub struct RunArgs {
     /// Launch Codex against llmux Responses instead of Claude Code.
-    #[arg(long)]
+    #[arg(long, group = "frontend")]
     pub codex: bool,
     /// Restart the daemon even when it already runs this binary's version
     /// (by default a same-version daemon is reused; a different version is

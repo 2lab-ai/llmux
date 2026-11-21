@@ -11,7 +11,7 @@ start RED.
 > step 4 ([spec](spec.md#claude-code-2026-10-15)). Kept as the design record; steps 1–7 still
 > describe other Anthropic-Messages clients.
 
-0. **Client surface** — `llmux run` injects the catalog picker (`src/cli/run.rs`
+0. **Client surface** — `llmux run` injects the catalog picker (`src/cli/run/claude.rs`
    `model_picker_settings`); the user types `/model argon` (or picks
    `gemini-4-argon[1m]`). Claude Code submits `model: "argon"` verbatim (not a native
    alias, so no `ANTHROPIC_DEFAULT_*` export applies).

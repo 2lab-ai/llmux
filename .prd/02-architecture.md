@@ -13,7 +13,10 @@ src/
   cli/                 # clap commands + command impls
     mod.rs             # server/dashboard/run/stop dispatch, daemon attach decision
     daemon.rs          # probe/spawn/wait/stop helpers (herdr-style client/server)
-    login.rs import.rs run.rs status.rs accounts.rs api.rs env.rs
+    run/               # `llmux run` launcher, see "Frontends" below
+      mod.rs           # shared launch: endpoint, daemon, catalog fetch, Frontend, spawn
+      claude.rs codex.rs # one module per client frontend
+    login.rs import.rs status.rs accounts.rs api.rs env.rs
   config/              # ~/.config/llmux.json load/save, atomic read-merge-write
     mod.rs schema.rs migrate.rs
   auth/
@@ -30,6 +33,7 @@ src/
   proxy/
     server.rs          # axum listener, /llmux/* control endpoints, background tasks
     forward.rs         # request rewrite, provider dispatch, retry taxonomy, refresh choke point
+    ingress.rs         # client protocol per request: origin, decode, error envelope, native backend, return adapt
     auto_classifier.rs # bounded main-session context + monitor verdict adapter
     internal_requests.rs # scoped utility/subagent signatures and alias mapping
     responses.rs       # OpenAI ingress validation, transcript/tool conversion, SSE/JSON output
@@ -344,6 +348,50 @@ derives an isolated sibling directory, which is also what keeps tests off the re
 - TTY detection: bind/probe happens before TUI init so bind errors never corrupt the terminal.
 - Config writes must preserve concurrently refreshed tokens.
 
+
+## Frontends
+
+A frontend is a client llmux launches plus the ingress protocol it speaks; it is
+separate from the backend group that serves a request. Two ship: Claude Code (`llmux run`,
+Anthropic Messages on `/v1/messages`) and Codex (`llmux run --codex`, OpenAI Responses on
+`/v1/responses`). Each half has one shared shape, so a further frontend is an added case:
+
+- **Launcher** (`src/cli/run/`). `mod.rs` owns what every client shares: config and
+  endpoint resolution, the remote warning or the local `ensure_server_running`, the leading
+  `--` strip, the one `GET /llmux/models` fetch (`fetch_catalog`, `CatalogRow`,
+  `row_description`), private session files (`SessionFile`: `create_new`, mode 0600,
+  removed after the child exits) and `spawn` (child exit code passthrough; a missing binary
+  reads `<bin> not found in PATH — install <product> first`). `Frontend { ClaudeCode,
+  Codex }` comes from the run flags (`Frontend::from_run_args`; `--codex` sits in the clap
+  `frontend` group) and names the binary and product. Each client's `launch` lives in its
+  own module: `claude.rs` (picker `--settings`, `ANTHROPIC_DEFAULT_*_MODEL` exports,
+  endpoint env, custom headers) and `codex.rs` (session `-c` provider flags, model catalog
+  file). `llmux env` renders its exports through the same `Frontend` value.
+- **Ingress** (`src/proxy/ingress.rs`). One module answers what a request's client
+  protocol needs; `forward.rs` and the `client_auth` gate ask it instead of matching
+  Responses paths. `origin(path)` is the `tui::Endpoint` recorded on activity rows.
+  `decode` turns the buffered body into the Messages-shaped metadata body (routing,
+  metering, activity) plus an optional `NativeInput` (today only `Responses`, the client
+  body as sent). `error` is the one place that picks the OpenAI or the Anthropic error
+  envelope; the key registry's denied/suspended/revoked answers keep the Anthropic
+  `authentication_error` shape on every path. `native_group` names the backend that serves
+  the input as it is (Responses → Codex); every other backend gets `messages_request` and
+  then the native-ingress arms: Claude through the Agent SDK, Grok and Gemini through
+  their translate builders, anything else through OpenRouter (there is no Codex arm,
+  because Codex is native here). A Messages client takes different paths for the same
+  groups (Claude passthrough, the `is_translate` builders).
+  `adapt` converts the response back at the client boundary, where a native request takes
+  its raw-io capture. `accepts_bearer_client_key` tells the auth gate which paths read
+  `Authorization: Bearer`.
+
+A new frontend plugs in at both halves: a `Frontend` case, a `launch` module and a flag in
+the `frontend` group; an `Endpoint` case in `ingress::origin`, a `NativeInput` variant and
+an arm in each ingress function. The compiler points at those arms and at the
+native-backend builder in `forward.rs`; it does not point at the sites listed in the
+`ingress.rs` module comment (translated-backend arms without a Codex arm, the Responses-only
+checks, the relay's native-stream header, the auth gate's key extraction, the count-tokens
+path test, `translate_converter`'s body), which a new protocol checks by hand. The persisted
+`Endpoint` names (`anthropic`, `open_ai`) do not change.
 
 ## Codex frontend
 
