@@ -166,11 +166,12 @@ pub(crate) fn validate(body: &[u8]) -> Result<Value, String> {
 /// The effort a genai body asks for: `generationConfig.thinkingConfig.thinkingLevel`
 /// → `minimal|low|medium|high|xhigh|max`, bare (`HIGH`) or with the enum
 /// prefix (`THINKING_LEVEL_HIGH`). agy's `ThinkingLevel` enum (1.5.13 binary)
-/// is `UNSPECIFIED, MINIMAL, LOW, MEDIUM, HIGH, XHIGH, MAX, MODEL_DEFAULT`;
-/// in gateway mode it sent only `LOW|MEDIUM|HIGH` and refused `--effort
-/// xhigh|max` client-side (live probe 2026-11-21), so `XHIGH`/`MAX` are
-/// mapped for a future build rather than seen. `UNSPECIFIED`, `MODEL_DEFAULT`
-/// and a `thinkingBudget` (agy sends 1024 by default) are no effort.
+/// is `UNSPECIFIED, MINIMAL, LOW, MEDIUM, HIGH, XHIGH, MAX, MODEL_DEFAULT`.
+/// Live (2026-11-21): `--effort` stops at `high` (`xhigh` / `max` refused
+/// client-side), but picking a level-named model sends its level — a
+/// `gemini-4-neon-xhigh` entry arrives as `gemini-4-neon` + `XHIGH`. `MAX` is
+/// mapped for a later build. `UNSPECIFIED`, `MODEL_DEFAULT` and a
+/// `thinkingBudget` (agy sends 1024 by default) are no effort.
 pub(crate) fn effort(body: &Value) -> Option<&'static str> {
     let level = body
         .pointer("/generationConfig/thinkingConfig/thinkingLevel")

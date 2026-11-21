@@ -431,9 +431,9 @@ mod tests {
             row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
             row("gpt-5.5", "GPT-5.5", &[], None, "codex"),
             row(
-                "gemini-4-argon",
-                "Gemini 4 Argon",
-                &["low", "medium", "high"],
+                "gemini-4-argon-high",
+                "Gemini 4 Argon (High)",
+                &[],
                 Some(1_048_576),
                 "gemini",
             ),
@@ -458,9 +458,9 @@ mod tests {
         let models = [
             row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
             row(
-                "gemini-4-argon",
-                "Gemini 4 Argon",
-                &["low", "medium", "high"],
+                "gemini-4-argon-high",
+                "Gemini 4 Argon (High)",
+                &[],
                 Some(1_048_576),
                 "gemini",
             ),

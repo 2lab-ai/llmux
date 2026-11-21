@@ -4050,26 +4050,34 @@ fn assert_gemini_stream_call(
     body
 }
 
-/// S1 (G1-G4 through the real HTTP boundary): an alias (`argon`, `neon`),
-/// a bare Gemini 4 id with a client effort and the `[1m]` flash id all reach
-/// Cloud Code as their resolved upstream ids — a Gemini 4 family as its
-/// thinking-level id, the level from `output_config.effort` (2026-11-21) —
-/// and the client gets Anthropic SSE stamped with the catalog row.
+/// S1 (G1-G4 through the real HTTP boundary): an alias (`argon`, `neon`), a
+/// Gemini 4 level id, a bare Gemini 4 id with a client effort and the `[1m]`
+/// flash id all reach Cloud Code as their resolved upstream ids, and the
+/// client gets Anthropic SSE stamped with the catalog row. An alias and a
+/// level id are fixed ids — the effort never moves them; only a bare family
+/// (accepted, not advertised) takes its level from `output_config.effort`
+/// (owner instruction 2026-11-21).
 #[tokio::test]
 async fn gemini_messages_ingress_streams_text_for_alias_and_window_ids() {
     for (model, effort, upstream, stamp) in [
-        ("argon", None, "gemini-4-argon-high", "gemini-4-argon[1m]"),
+        ("argon", None, "gemini-4-argon-high", "gemini-4-argon-high"),
         (
             "neon",
             Some("xhigh"),
+            "gemini-4-neon-high",
+            "gemini-4-neon-high",
+        ),
+        (
             "gemini-4-neon-xhigh",
-            "gemini-4-neon",
+            Some("low"),
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-xhigh",
         ),
         (
             "gemini-4-hydrogen[1m]",
             Some("low"),
             "gemini-4-hydrogen-low",
-            "gemini-4-hydrogen[1m]",
+            "gemini-4-hydrogen-low",
         ),
         (
             "gemini-3.8-flash-high[1m]",
@@ -4467,7 +4475,7 @@ async fn gemini_responses_ingress_reaches_the_gemini_adapter() {
         .post(proxy.url("/v1/responses"))
         .bearer_auth(E2E_ADMIN_KEY)
         .json(&serde_json::json!({
-            "model": "argon", "input": "hi", "stream": false,
+            "model": "gemini-4-argon", "input": "hi", "stream": false,
             "reasoning": {"effort": "medium"},
         }))
         .send()
@@ -4479,7 +4487,8 @@ async fn gemini_responses_ingress_reaches_the_gemini_adapter() {
 
     let seen = gemini_requests(&mock);
     assert_eq!(seen.len(), 1, "one upstream call: {seen:?}");
-    // Codex's `reasoning.effort` picks the Gemini 4 thinking level.
+    // Codex's `reasoning.effort` picks the thinking level of a bare Gemini 4
+    // family id (an alias or a level id would keep its own level).
     let body = assert_gemini_stream_call(
         &seen[0],
         "gemini-4-argon-medium",
@@ -8198,7 +8207,19 @@ async fn agy_discovery_and_count_tokens_are_local() {
         .await
         .unwrap();
     let models = list["models"].as_array().expect("models");
-    assert!(!models.is_empty() && models.len() <= 32, "{}", models.len());
+    // At most 32 ids agy does not know; the Gemini level ids it knows (every
+    // gemini row) are listed on top.
+    let unknown = models
+        .iter()
+        .filter(|m| {
+            let id = m["name"].as_str().unwrap().trim_start_matches("models/");
+            !(id.starts_with("gemini-3.8-flash-") || id.starts_with("gemini-4-"))
+        })
+        .count();
+    assert!(!models.is_empty() && unknown <= 32, "{unknown}");
+    assert!(models
+        .iter()
+        .any(|m| m["name"] == "models/gemini-4-neon-xhigh"));
     assert!(list.get("nextPageToken").is_none());
     assert_eq!(
         models[0]["name"],
@@ -8538,8 +8559,9 @@ async fn agy_gemini_level_rides_in_thinking_level() {
         ("gemini-3.8-flash", "LOW", "gemini-3.8-flash-low"),
         ("gemini-3.8-flash", "MEDIUM", "gemini-3.8-flash-medium"),
         ("gemini-3.8-flash", "HIGH", "gemini-3.8-flash-high"),
-        // Gemini 4 discovery rows are bare families with an effort menu:
-        // agy sends the family id and the level (live 2026-11-21).
+        // Gemini 4 discovery rows are level ids (`gemini-4-neon-xhigh`): agy
+        // strips the suffix and sends the family id plus the level
+        // (live 2026-11-21), which the ingress folds back into that id.
         ("gemini-4-neon", "LOW", "gemini-4-neon-low"),
         ("gemini-4-neon", "HIGH", "gemini-4-neon-high"),
         ("gemini-4-neon", "XHIGH", "gemini-4-neon-xhigh"),

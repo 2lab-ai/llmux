@@ -87,18 +87,18 @@
 //!   response of 2026-10-15 (`gemini-3.8-flash-{high,medium,low}`, ctx
 //!   1,048,576; this account lists Argon only as `gemini-4-argon-disabled`,
 //!   a paid-plan model — docs/gemini/spec.md). Context 1,048,576 on every
-//!   row but bare `gemini-4-neon`: ai.google.dev model pages, Gemini 3.8 Flash
+//!   row but the Neon rows: ai.google.dev model pages, Gemini 3.8 Flash
 //!   (updated 2026-09-02) and Gemini 4 Argon (updated 2026-10-14), and
 //!   aistudio.google.com's Carbon, Hydrogen and Neon pages (read 2026-11-21).
-//!   Bare `gemini-4-neon` carries 524,288: the Antigravity models page (read
+//!   The Neon rows carry 524,288: the Antigravity models page (read
 //!   2026-11-21) gives Neon "Up to 512K tokens". The Gemini 4 rows (Neon,
-//!   Carbon, Hydrogen and Argon, one row pair per model) landed 2026-11-21;
-//!   Antigravity serves those models only under thinking-level ids
-//!   (`gemini-4-<name>-low|-medium|-high[|-xhigh]`; Google publishes
-//!   `gemini-4-neon-xhigh`, third parties the rest), so their effort menu is
-//!   the model's levels and the provider turns the client effort into the
-//!   id suffix. A 3.8 Flash row carries its level in the id and has an empty
-//!   effort menu.
+//!   Hydrogen, Argon and Carbon) landed 2026-11-21 as one row per model with
+//!   an effort menu and were reshaped the same day, on the owner's
+//!   instruction, into one row per thinking-level id
+//!   (`gemini-4-<name>-high|-xhigh|-medium|-low`, XHigh on Neon and Hydrogen
+//!   only), the way Antigravity serves and lists them (Google publishes
+//!   `gemini-4-neon-xhigh`, third parties the rest). Like the 3.8 Flash rows
+//!   they carry the level in the id and have an empty effort menu.
 
 use std::borrow::Cow;
 
@@ -366,33 +366,35 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
 /// Hydrogen and Neon 1,048,576 unified).
 const GEMINI_CONTEXT: u64 = 1_048_576;
 
-/// Context window of the bare `gemini-4-neon` row: the Antigravity models page
-/// (https://antigravity.google/docs/models, read 2026-11-21) gives Neon "Up to
-/// 512K tokens" on that backend, while the API page says 1,048,576. The base
-/// row — which owns the `neon` alias — carries the window the serving backend
-/// publishes; its `[1m]` twin keeps 1,048,576 as an explicit opt-in.
+/// Context window of every `gemini-4-neon-<level>` row: the Antigravity models
+/// page (https://antigravity.google/docs/models, read 2026-11-21) gives Neon
+/// "Up to 512K tokens" on that backend, while the API page says 1,048,576.
+/// The rows carry the window the serving backend publishes.
 const GEMINI_4_NEON_CONTEXT: u64 = 524_288;
 
 /// The curated gemini catalog (docs/gemini/spec.md §R7). Tuple = (id,
 /// aliases, display name, context window). Every row is group `gemini`.
 ///
-/// Effort menus are not listed here: [`gemini_efforts`] derives each row's
-/// from the provider's family table ([`crate::provider::gemini::family_levels`]),
-/// the same table that turns a client effort into the upstream id. A Gemini 4
-/// row is ONE row per model and its menu is the model's thinking levels
-/// (Antigravity serves it only as `<id>-<level>`); a 3.8 Flash row carries
-/// its level in the id (`gemini-3.8-flash-high`), so its menu is empty.
+/// Every gemini row names its thinking level in its id, the way the
+/// Antigravity backend serves the model and its own picker lists it
+/// (`gemini-3.8-flash-high`, `gemini-4-neon-xhigh`): the effort choice IS the
+/// row, so every gemini row has an empty effort menu ([`GEMINI_EFFORTS`]).
+/// The level rows of each family are exactly the provider's family table
+/// ([`crate::provider::gemini::family_levels`], locked by a test). A bare
+/// family id (`gemini-4-neon`, `gemini-3.8-flash`) is not a row; the provider
+/// still accepts it and picks the level from the client effort.
 ///
-/// The family aliases live on the `[1m]` rows (operator rule 2026-09-10, the
-/// astra arrangement): `gemini` / `gemini-3.8-flash` → the high-thinking
-/// Flash twin, `argon` / `carbon` / `hydrogen` → their model's twin. Unlike
-/// grok's `[1m]` twin there is no upstream-window caveat to disclose — the
-/// backend's real window IS ~1M, so the 1M-denominated id is the honest
-/// default face of the family. `neon` is the exception (2026-11-21): it sits
-/// on the 512K base row, because that is the window Antigravity publishes
-/// for Neon ([`GEMINI_4_NEON_CONTEXT`]). The provider strips one trailing
-/// `[1m]` before the request leaves llmux, so a twin and its base row reach
-/// Cloud Code as the same upstream id.
+/// `gemini` and the four Gemini 4 aliases are fixed ids, never moved by an
+/// effort: `gemini` → the high-thinking Flash `[1m]` twin (operator rule
+/// 2026-09-10, the astra arrangement — the backend's real window IS ~1M);
+/// `neon` / `hydrogen` / `argon` / `carbon` → their model's `-high` row.
+/// `gemini-3.8-flash` is also listed as an alias of the Flash twin, but it is
+/// the bare Flash family first, so a request naming it takes the client
+/// effort (`gemini-3.8-flash` + `low` → `gemini-3.8-flash-low`).
+/// Gemini 4 has no `[1m]` twins (Antigravity has none, Claude Code cannot
+/// select gemini, and Codex and agy read `max_context`). The provider strips
+/// one trailing `[1m]` before the request leaves llmux, so a Flash twin and
+/// its base row reach Cloud Code as the same upstream id.
 pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str, u64)] = &[
     (
         "gemini-3.8-flash-high[1m]",
@@ -430,44 +432,94 @@ pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str, u64)] = &[
         "Gemini 3.8 Flash (Low)",
         GEMINI_CONTEXT,
     ),
+    // Gemini 4: one row per thinking-level id, the way Antigravity's own
+    // picker lists them (owner instruction 2026-11-21: the effort choice is
+    // the model id). High first, then XHigh where the family serves it, then
+    // Medium and Low. No `[1m]` twins.
     (
-        "gemini-4-neon[1m]",
-        &[],
-        "Gemini 4 Neon [1M]",
-        GEMINI_CONTEXT,
-    ),
-    (
-        "gemini-4-neon",
+        "gemini-4-neon-high",
         &["neon"],
-        "Gemini 4 Neon",
+        "Gemini 4 Neon (High)",
         GEMINI_4_NEON_CONTEXT,
     ),
     (
-        "gemini-4-carbon[1m]",
-        &["carbon"],
-        "Gemini 4 Carbon [1M]",
-        GEMINI_CONTEXT,
-    ),
-    ("gemini-4-carbon", &[], "Gemini 4 Carbon", GEMINI_CONTEXT),
-    (
-        "gemini-4-hydrogen[1m]",
-        &["hydrogen"],
-        "Gemini 4 Hydrogen [1M]",
-        GEMINI_CONTEXT,
-    ),
-    (
-        "gemini-4-hydrogen",
+        "gemini-4-neon-xhigh",
         &[],
-        "Gemini 4 Hydrogen",
+        "Gemini 4 Neon (XHigh)",
+        GEMINI_4_NEON_CONTEXT,
+    ),
+    (
+        "gemini-4-neon-medium",
+        &[],
+        "Gemini 4 Neon (Medium)",
+        GEMINI_4_NEON_CONTEXT,
+    ),
+    (
+        "gemini-4-neon-low",
+        &[],
+        "Gemini 4 Neon (Low)",
+        GEMINI_4_NEON_CONTEXT,
+    ),
+    (
+        "gemini-4-hydrogen-high",
+        &["hydrogen"],
+        "Gemini 4 Hydrogen (High)",
         GEMINI_CONTEXT,
     ),
     (
-        "gemini-4-argon[1m]",
-        &["argon"],
-        "Gemini 4 Argon [1M]",
+        "gemini-4-hydrogen-xhigh",
+        &[],
+        "Gemini 4 Hydrogen (XHigh)",
         GEMINI_CONTEXT,
     ),
-    ("gemini-4-argon", &[], "Gemini 4 Argon", GEMINI_CONTEXT),
+    (
+        "gemini-4-hydrogen-medium",
+        &[],
+        "Gemini 4 Hydrogen (Medium)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-hydrogen-low",
+        &[],
+        "Gemini 4 Hydrogen (Low)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-argon-high",
+        &["argon"],
+        "Gemini 4 Argon (High)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-argon-medium",
+        &[],
+        "Gemini 4 Argon (Medium)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-argon-low",
+        &[],
+        "Gemini 4 Argon (Low)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-carbon-high",
+        &["carbon"],
+        "Gemini 4 Carbon (High)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-carbon-medium",
+        &[],
+        "Gemini 4 Carbon (Medium)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-carbon-low",
+        &[],
+        "Gemini 4 Carbon (Low)",
+        GEMINI_CONTEXT,
+    ),
 ];
 
 /// The [`GEMINI_MODELS`] row advertising `alias`, if any. `alias` must
@@ -479,6 +531,25 @@ pub(crate) fn gemini_alias_owner(alias: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, aliases, ..)| aliases.contains(&alias))
         .map(|&(id, ..)| id)
+}
+
+/// The catalog row a bare gemini family id stands for when no effort picks
+/// its level: `gemini-4-neon`, `gemini-4-neon[1m]`, `GEMINI-4-NEON` →
+/// `gemini-4-neon-high` — the level the provider sends for a bare family
+/// without an effort ([`crate::provider::gemini::family_levels`]). For a
+/// start / default model (`agy.default_model`, a Codex launch default)
+/// persisted before the Gemini 4 rows became level ids: matched against the
+/// catalog as it is, such a name finds no row. `None` for anything else, a
+/// level id or an alias included.
+pub(crate) fn gemini_family_default_row(id: &str) -> Option<&'static str> {
+    let base = id.trim().to_ascii_lowercase();
+    let base = base.strip_suffix("[1m]").unwrap_or(&base);
+    crate::provider::gemini::family_levels(base)?;
+    let level_row = format!("{base}-high");
+    GEMINI_MODELS
+        .iter()
+        .find(|(row, ..)| *row == level_row)
+        .map(|&(row, ..)| row)
 }
 
 /// Whether `id` (lookup form, as for [`gemini_alias_owner`]) is a curated
@@ -980,7 +1051,7 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
             id: Cow::Borrowed(id),
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
             name: Cow::Borrowed(name),
-            efforts: gemini_efforts(id),
+            efforts: GEMINI_EFFORTS,
             max_context: Some(ctx),
             group: "gemini",
         });
@@ -1020,16 +1091,9 @@ fn grok_efforts(id: &str) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
-/// Gemini effort menu for `id`: the thinking levels of the family it names
-/// ([`crate::provider::gemini::family_levels`], one trailing `[1m]`
-/// stripped first, as for [`grok_efforts`]). A Gemini 4 row is its bare
-/// family id, so it advertises the levels the provider maps a client effort
-/// onto; a 3.8 Flash row already names its level (`gemini-3.8-flash-high`)
-/// and is no family, so its menu is empty.
-fn gemini_efforts(id: &str) -> &'static [&'static str] {
-    let id = id.strip_suffix("[1m]").unwrap_or(id);
-    crate::provider::gemini::family_levels(id).unwrap_or(&[])
-}
+/// The effort menu of every gemini row: empty, because every row names its
+/// thinking level in its id (see [`GEMINI_MODELS`]).
+const GEMINI_EFFORTS: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {
@@ -1043,8 +1107,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_58_entries() {
-        // The pinned (curated) case: exactly 58 rows, claude ids in order.
+    fn catalog_matches_user_contract_64_entries() {
+        // The pinned (curated) case: exactly 64 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
@@ -1059,9 +1123,11 @@ mod tests {
         // still 53 after the gpt-6.2-sol / gpt-6.2-astra pairs landed (+4) and
         // the four dead openrouter rows were retired (-4, #243) on 2026-11-18;
         // 52 after the gpt-5.5 row was retired (2026-11-19, #309); 58 after
-        // the Gemini 4 Neon / Carbon / Hydrogen pairs landed (2026-11-21).
+        // the Gemini 4 Neon / Carbon / Hydrogen pairs landed (2026-11-21); 64
+        // after the eight Gemini 4 rows became fourteen level-id rows the same
+        // day (owner instruction: the effort choice is the model id).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 58);
+        assert_eq!(entries.len(), 64);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -1121,9 +1187,8 @@ mod tests {
             .map(|e| (e.id.as_ref(), e.name.as_ref(), e.max_context, e.efforts))
             .collect();
         const NONE: &[&str] = &[];
-        const LMH: &[&str] = &["low", "medium", "high"];
-        const LMHX: &[&str] = &["low", "medium", "high", "xhigh"];
         const M1: Option<u64> = Some(1_048_576);
+        const K512: Option<u64> = Some(524_288);
         assert_eq!(
             gemini,
             vec![
@@ -1154,48 +1219,118 @@ mod tests {
                 ),
                 ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)", M1, NONE),
                 // Antigravity models page (2026-11-21): Neon "Up to 512K" on
-                // that backend; the API's 1,048,576 stays on the opt-in twin.
-                ("gemini-4-neon[1m]", "Gemini 4 Neon [1M]", M1, LMHX),
-                ("gemini-4-neon", "Gemini 4 Neon", Some(524_288), LMHX),
-                ("gemini-4-carbon[1m]", "Gemini 4 Carbon [1M]", M1, LMH),
-                ("gemini-4-carbon", "Gemini 4 Carbon", M1, LMH),
-                ("gemini-4-hydrogen[1m]", "Gemini 4 Hydrogen [1M]", M1, LMHX),
-                ("gemini-4-hydrogen", "Gemini 4 Hydrogen", M1, LMHX),
-                ("gemini-4-argon[1m]", "Gemini 4 Argon [1M]", M1, LMH),
-                ("gemini-4-argon", "Gemini 4 Argon", M1, LMH),
+                // that backend. One row per level id, Antigravity's order.
+                ("gemini-4-neon-high", "Gemini 4 Neon (High)", K512, NONE),
+                ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", K512, NONE),
+                ("gemini-4-neon-medium", "Gemini 4 Neon (Medium)", K512, NONE),
+                ("gemini-4-neon-low", "Gemini 4 Neon (Low)", K512, NONE),
+                (
+                    "gemini-4-hydrogen-high",
+                    "Gemini 4 Hydrogen (High)",
+                    M1,
+                    NONE
+                ),
+                (
+                    "gemini-4-hydrogen-xhigh",
+                    "Gemini 4 Hydrogen (XHigh)",
+                    M1,
+                    NONE
+                ),
+                (
+                    "gemini-4-hydrogen-medium",
+                    "Gemini 4 Hydrogen (Medium)",
+                    M1,
+                    NONE
+                ),
+                ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)", M1, NONE),
+                ("gemini-4-argon-high", "Gemini 4 Argon (High)", M1, NONE),
+                ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)", M1, NONE),
+                ("gemini-4-argon-low", "Gemini 4 Argon (Low)", M1, NONE),
+                ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", M1, NONE),
+                (
+                    "gemini-4-carbon-medium",
+                    "Gemini 4 Carbon (Medium)",
+                    M1,
+                    NONE
+                ),
+                ("gemini-4-carbon-low", "Gemini 4 Carbon (Low)", M1, NONE),
             ]
         );
     }
 
-    /// One table: every Gemini 4 row's menu is exactly the thinking levels
-    /// the provider maps a client effort onto, and every family the provider
-    /// resolves with an effort has its own catalog row — except 3.8 Flash,
-    /// whose rows carry the level in the id.
+    /// One table: the level rows of every family are exactly the levels the
+    /// provider's family table maps an effort onto — `<family>-<level>` for
+    /// each level, nothing more — and no bare family id is a row. Every
+    /// gemini row carries its level in the id, so every menu is empty.
     #[test]
-    fn g16_gemini_effort_menus_are_the_provider_family_levels() {
+    fn g16_gemini_level_rows_are_the_provider_family_levels() {
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        for e in entries.iter().filter(|e| e.group == "gemini") {
-            let base = e.id.strip_suffix("[1m]").unwrap_or(&e.id);
-            match crate::provider::gemini::family_levels(base) {
-                Some(levels) => assert_eq!(e.efforts, levels, "{}", e.id),
-                None => assert!(e.efforts.is_empty(), "{}: level in the id", e.id),
-            }
-        }
+        assert!(entries
+            .iter()
+            .filter(|e| e.group == "gemini")
+            .all(|e| e.efforts.is_empty()));
         for family in [
+            "gemini-3.8-flash",
             "gemini-4-neon",
-            "gemini-4-carbon",
             "gemini-4-hydrogen",
             "gemini-4-argon",
+            "gemini-4-carbon",
         ] {
-            assert!(is_gemini_row(family), "{family} has a base row");
-            assert!(
-                is_gemini_row(&format!("{family}[1m]")),
-                "{family} has a [1m] twin"
-            );
-            assert!(crate::provider::gemini::family_levels(family).is_some());
+            let levels = crate::provider::gemini::family_levels(family)
+                .unwrap_or_else(|| panic!("{family} is a family"));
+            let mut rows: Vec<&str> = entries
+                .iter()
+                .filter(|e| e.group == "gemini")
+                .map(|e| e.id.strip_suffix("[1m]").unwrap_or(&e.id))
+                .filter_map(|id| id.strip_prefix(family)?.strip_prefix('-'))
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            let mut want: Vec<&str> = levels.to_vec();
+            want.sort_unstable();
+            assert_eq!(rows, want, "{family}: one row per level, no more");
+            assert!(!is_gemini_row(family), "{family}: the bare id is no row");
+            assert!(!is_gemini_row(&format!("{family}[1m]")));
         }
-        assert!(!is_gemini_row("gemini-3.8-flash"), "flash has no bare row");
-        assert!(crate::provider::gemini::family_levels("gemini-3.8-flash").is_some());
+        // Gemini 4 has no `[1m]` twins.
+        assert!(!entries
+            .iter()
+            .any(|e| e.id.starts_with("gemini-4-") && e.id.ends_with("[1m]")));
+    }
+
+    /// A bare family id persisted as a default before the reshape (2026-11-21
+    /// preview: `gemini-4-neon`, `gemini-4-neon[1m]`) names its `-high` row;
+    /// level ids, aliases and other names are not bare families.
+    #[test]
+    fn g16_bare_family_defaults_name_their_high_row() {
+        for (family, row) in [
+            ("gemini-4-neon", "gemini-4-neon-high"),
+            ("gemini-4-hydrogen", "gemini-4-hydrogen-high"),
+            ("gemini-4-argon", "gemini-4-argon-high"),
+            ("gemini-4-carbon", "gemini-4-carbon-high"),
+            ("gemini-3.8-flash", "gemini-3.8-flash-high"),
+        ] {
+            for spelling in [
+                family.to_string(),
+                format!("{family}[1m]"),
+                format!(" {}[1M] ", family.to_ascii_uppercase()),
+            ] {
+                assert_eq!(
+                    gemini_family_default_row(&spelling),
+                    Some(row),
+                    "{spelling:?}"
+                );
+            }
+        }
+        for not_bare in [
+            "gemini-4-neon-low",
+            "neon",
+            "gemini",
+            "gemini-4-neonx",
+            "gpt-6.2-sol",
+        ] {
+            assert_eq!(gemini_family_default_row(not_bare), None, "{not_bare}");
+        }
     }
 
     #[test]
@@ -1204,11 +1339,11 @@ mod tests {
         for (alias, owner) in [
             ("gemini", "gemini-3.8-flash-high[1m]"),
             ("gemini-3.8-flash", "gemini-3.8-flash-high[1m]"),
-            ("argon", "gemini-4-argon[1m]"),
-            ("carbon", "gemini-4-carbon[1m]"),
-            ("hydrogen", "gemini-4-hydrogen[1m]"),
-            // The 512K base row: the window Antigravity publishes for Neon.
-            ("neon", "gemini-4-neon"),
+            // A Gemini 4 alias is its model's High row: a fixed id.
+            ("argon", "gemini-4-argon-high"),
+            ("carbon", "gemini-4-carbon-high"),
+            ("hydrogen", "gemini-4-hydrogen-high"),
+            ("neon", "gemini-4-neon-high"),
         ] {
             let owners: Vec<&str> = entries
                 .iter()
@@ -1226,10 +1361,10 @@ mod tests {
         // Every other gemini row carries no alias.
         let owners = [
             "gemini-3.8-flash-high[1m]",
-            "gemini-4-neon",
-            "gemini-4-carbon[1m]",
-            "gemini-4-hydrogen[1m]",
-            "gemini-4-argon[1m]",
+            "gemini-4-neon-high",
+            "gemini-4-carbon-high",
+            "gemini-4-hydrogen-high",
+            "gemini-4-argon-high",
         ];
         for e in entries.iter().filter(|e| e.group == "gemini") {
             if !owners.contains(&e.id.as_ref()) {
@@ -1259,15 +1394,15 @@ mod tests {
     #[test]
     fn g16_gemini_entry_serializes_the_wire_contract() {
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        let json = serde_json::to_string(find(&entries, "gemini-4-argon[1m]")).unwrap();
+        let json = serde_json::to_string(find(&entries, "gemini-4-argon-high")).unwrap();
         assert_eq!(
             json,
-            r#"{"id":"gemini-4-argon[1m]","aliases":["argon"],"name":"Gemini 4 Argon [1M]","efforts":["low","medium","high"],"max_context":1048576,"group":"gemini"}"#
+            r#"{"id":"gemini-4-argon-high","aliases":["argon"],"name":"Gemini 4 Argon (High)","efforts":[],"max_context":1048576,"group":"gemini"}"#
         );
-        let json = serde_json::to_string(find(&entries, "gemini-4-neon")).unwrap();
+        let json = serde_json::to_string(find(&entries, "gemini-4-neon-xhigh")).unwrap();
         assert_eq!(
             json,
-            r#"{"id":"gemini-4-neon","aliases":["neon"],"name":"Gemini 4 Neon","efforts":["low","medium","high","xhigh"],"max_context":524288,"group":"gemini"}"#
+            r#"{"id":"gemini-4-neon-xhigh","aliases":[],"name":"Gemini 4 Neon (XHigh)","efforts":[],"max_context":524288,"group":"gemini"}"#
         );
         let json = serde_json::to_string(find(&entries, "gemini-3.8-flash-low")).unwrap();
         assert_eq!(
@@ -1686,7 +1821,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 58, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 64, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
@@ -1733,14 +1868,14 @@ mod tests {
         // A curated pin: no synthesized row, alias on the row whose id IS the
         // pin — a base-slug pin never hands it to the `[1m]` twin (the
         // suffixed-pin case is in `grok_family_alias_follows_the_pin`),
-        // count 58.
+        // count 64.
         for (pin, owner) in [
             ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-            assert_eq!(entries.len(), 58, "pin {pin}");
+            assert_eq!(entries.len(), 64, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1768,7 +1903,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 59);
+        assert_eq!(entries.len(), 65);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1795,7 +1930,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 59);
+        assert_eq!(entries.len(), 65);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));

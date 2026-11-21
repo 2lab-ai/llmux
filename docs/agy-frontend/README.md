@@ -118,24 +118,31 @@ Paginated with `pageSize` (default 50, at most 1000) and `nextPageToken`.
 What agy does with it **[live]**: `outputTokenLimit` becomes every request's
 `maxOutputTokens`; `--effort` is refused unless `thinking` is true; with no `--model`
 agy takes the **first** entry; ids it does not know take one of 32 placeholder slots
-and the rest are dropped **[binary]**. Hence:
+and the rest are dropped **[binary]** (log: `custom gateway model(s) exceeded the
+maximum placeholder limit (32)`), while ids it knows take no slot and show with agy's
+own labels **[live, 2026-11-21]**: on agy 1.5.13 exactly the 17 Gemini level ids
+(`gemini-4-neon-xhigh`, `gemini-3.8-flash-low`, …), kept in llmux as an explicit
+measured list (`AGY_KNOWN_IDS`), never derived from the provider's families;
+`claude-opus-5-5` counts as custom. Hence:
 
 1. **One entry per model, no brackets.** A `[1m]` twin and its base row are one
    entry under the base id; the base row's window wins. A `[1m]`-only row
    (`claude-fable-5-2[1m]`, `claude-opus-4-8[1m]`) is listed under its base id and
    **served as the `[1m]` row**, so its window holds.
-2. **At most 32 entries.** Over the cap: the start model, then every model a catalog
-   alias points at (each family's current pick), then the rest; within each tier the
-   groups take turns, so no group crowds another out. The 2026-11-21 catalog (after
-   the Gemini 4 sweep) has 36 candidates; four are left out: `gpt-5.6-luna`,
-   `or-dots-3-note`, `or-north-mini-code`, `or-gemma-4-31b`.
+2. **Every measured known id, and at most 32 of the other entries.** Over that cap: the
+   start model, then every model a catalog alias points at (each family's current
+   pick), then the rest; within each tier the groups take turns, so no group crowds
+   another out. The catalog after the Gemini 4 reshape (2026-11-21) gives 46 entries,
+   29 ids agy does not know and 17 Gemini level ids, so none is left out (before the
+   known-id rule, 36 candidates of the same day lost four).
 3. **The start model first**, the rest in catalog order.
-4. **`thinking`** is true when the row has an effort menu (every Gemini 4 family row,
-   whose menu comes from the provider's family table), and for a gemini id that
-   names its level (`gemini-3.8-flash-low`). agy strips that suffix from the URL
-   (`…/models/gemini-3.8-flash:…`) and sends `thinkingLevel: LOW` only when the entry
-   says `thinking: true`; with `false` it sends `thinkingBudget: 0` and the level is
-   lost **[live, 2026-11-21]**. agy still refuses `--effort` on such an id.
+4. **`thinking`** is true when the row has an effort menu, and for a gemini id that
+   names its level — every gemini row (`gemini-3.8-flash-low`, `gemini-4-neon-xhigh`).
+   agy strips that suffix from the URL (`…/models/gemini-4-neon:…`) and sends the
+   level as `thinkingLevel` (`LOW` … `XHIGH`) only when the entry says
+   `thinking: true`; with `false` it sends `thinkingBudget: 0` and the level is lost
+   **[live, 2026-11-21]**. The ingress folds the level back into the same id. agy
+   still refuses `--effort` on such an id.
 5. **`outputTokenLimit` per group** (the catalog has no output caps): claude 64,000;
    codex 128,000; gemini 65,536; grok 32,768; openrouter 16,384.
 
@@ -213,10 +220,11 @@ The gemini group serves the Gemini API natively
 `thoughtSignature`s, Google's call ids and the OpenAPI schemas untouched. What changes:
 
 - The model resolves by the provider's rules — alias, `[1m]`, and the effort from
-  `thinkingLevel` picking the level variant through the provider's family table:
-  `gemini-3.8-flash` + `LOW` → `gemini-3.8-flash-low`, `gemini-4-neon` + `HIGH` →
-  `gemini-4-neon-high`, capped at the family's top level (`gemini-4-argon` + `XHIGH` →
-  `gemini-4-argon-high`; neon and hydrogen serve `-xhigh`); no level → `-high`. The
+  `thinkingLevel` picking the level variant of the bare family agy sends through the
+  provider's family table: `gemini-3.8-flash` + `LOW` → `gemini-3.8-flash-low`,
+  `gemini-4-neon` + `XHIGH` → `gemini-4-neon-xhigh` (the row the user picked), capped
+  at the family's top level (`gemini-4-argon` + `XHIGH` → `gemini-4-argon-high`); no
+  level → `-high`. The
   level rides in the id, so `thinkingConfig` becomes `{"includeThoughts": true}` (the
   Messages path sends the same).
 - `labels` are dropped; `sessionId` is derived from the first user text.
@@ -257,10 +265,12 @@ handling (ToS benching on a suspension 403, quota parks) is the gemini group's o
   references, non-image/PDF inline media, non-function tools, a forced tool choice on
   claude, sampling knobs on claude / codex / grok.
 - **Gemini group:** `maxOutputTokens` is forwarded (the Messages path omits its cap).
-- **No `xhigh` / `max` from agy 1.5.13:** in gateway mode it accepts `--effort` only
-  `low|medium|high` for every discovered model, Gemini 4 Neon included, and refuses
-  `xhigh` / `max` client-side **[live, 2026-11-21]**; its enum has `XHIGH` and `MAX`
-  **[binary]**, which llmux maps should a later agy send them.
+- **`--effort` stops at `high` in agy 1.5.13:** in gateway mode it accepts `--effort`
+  only `low|medium|high` and refuses `xhigh` / `max` client-side **[live,
+  2026-11-21]**. Pick the level by model instead: `--model gemini-4-neon-xhigh`
+  reaches llmux as `gemini-4-neon` + `thinkingLevel: XHIGH` and is served as
+  `gemini-4-neon-xhigh` **[live]**. agy's enum also has `MAX` **[binary]**, which
+  llmux maps should a later agy send it.
 - **Version churn:** the gateway knobs changed between 1.3 and 1.5. Minimum agy
   1.5.4 (no `sessionId`); re-check each release.
 - **agy's own state** (conversations, logs, caches) stays in its home
@@ -289,7 +299,14 @@ handling (ToS benching on a suspension 403, quota parks) is the gemini group's o
 - Live effort probe: against a recording gateway, `--effort low|medium|high` reached it
   as `thinkingLevel: LOW|MEDIUM|HIGH` on `gemini-4-neon`, `gemini-4-argon`,
   `claude-opus-5-5`, `gpt-6.2-sol` and `grok-4.7`; `xhigh`, `max` and `minimal` were
-  refused by agy itself.
+  refused by agy itself. Picking a level-named id instead (`gemini-4-neon-high` /
+  `-xhigh` / `-medium` / `-low`, `gemini-4-hydrogen-xhigh`, `gemini-4-argon-medium`,
+  `gemini-4-carbon-low`, all `thinking: true`) reached it as the bare family plus
+  `thinkingLevel: HIGH|XHIGH|MEDIUM|LOW`; one served with `thinking: false` arrived as
+  `thinkingBudget: 0`.
+- Live placeholder probe: with 40 unknown ids, 14 Gemini 4 level ids, the 3 Flash level
+  ids and `claude-opus-5-5` / `claude-sonnet-5-5` served, `agy models` listed 32 unknown
+  ids plus all 17 Gemini level ids and logged 10 custom ids skipped.
 
 Sources (fetched 2026-11-21): antigravity.google docs (`/docs/install.md`,
 `/docs/cli/headless.md`, `/docs/enterprise.md`, `/docs/changelog.md`); Google Cloud
