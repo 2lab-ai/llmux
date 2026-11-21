@@ -16,14 +16,18 @@ from the same catalog-driven `/model` picker and short aliases they use today:
 | Typed | Resolves to (catalog row) | Upstream model |
 |---|---|---|
 | `gemini` | `gemini-3.8-flash-high[1m]` | `gemini-3.8-flash-high` |
-| `argon` | `gemini-4-argon[1m]` | `gemini-4-argon-<level>` (was `gemini-4-argon` until 2026-11-21) |
+| `argon` | `gemini-4-argon-high` | `gemini-4-argon-high` (was `gemini-4-argon` until 2026-11-21) |
 | `gemini-3.8-flash-high` / `-medium` / `-low` (± `[1m]`) | same id | id without `[1m]` |
-| `gemini-4-argon` (± `[1m]`) | same id | `gemini-4-argon-<level>` (was `gemini-4-argon` until 2026-11-21) |
+| `gemini-4-argon-high` / `-medium` / `-low` | same id | same id |
+| `gemini-4-argon` (± `[1m]`, bare family, not a row) | its level row | `gemini-4-argon-<level>`, the level from the client effort |
 
-> **Updated 2026-11-21 (Gemini 4 rows).** Neon, Carbon and Hydrogen joined Argon, one row
-> pair per model, with the aliases `neon` (on the 512K base row), `carbon` and `hydrogen`.
-> A Gemini 4 name reaches Cloud Code as `<family>-<level>`, the level taken from the client
-> effort — see [R3](#r3-provider-messages--antigravity) and [R7](#r7-catalog-pricing-surfaces).
+> **Updated 2026-11-21 (Gemini 4 rows).** Neon, Carbon and Hydrogen joined Argon, with the
+> aliases `neon`, `carbon` and `hydrogen`. Reshaped the same day on the owner's instruction
+> (the effort choice is the model id): one row per thinking-level id, as Antigravity's
+> own picker lists them (`gemini-4-neon-high` / `-xhigh` / `-medium` / `-low`), empty effort
+> menus, no `[1m]` twins; each alias is its model's `-high` row. A bare family id is still
+> accepted and takes the client effort — see [R3](#r3-provider-messages--antigravity) and
+> [R7](#r7-catalog-pricing-surfaces).
 
 > **Superseded 2026-10-15 for Claude Code.** Only Codex selects Gemini models. Claude Code
 > gets no gemini rows in its picker and a local 400 for a gemini request; see
@@ -160,10 +164,10 @@ client_model, user_agent }`.
     `output_config.effort`: `none|minimal|low` → `low`, `medium` → `medium`,
     `xhigh|max|ultra` → `xhigh` where the family serves it (Neon, Hydrogen), else `high`;
     unset, `high` or anything else → `high`;
-  - an alias resolves through the catalog (`GEMINI_MODELS`) to the row that owns it, which
-    then resolves the same way: `argon` / `neon` / `carbon` / `hydrogen` → their family +
-    level; `gemini` → `gemini-3.8-flash-high` (a row that already names its level, so the
-    effort does not move it);
+  - an alias resolves through the catalog (`GEMINI_MODELS`) to the row that owns it, a
+    fixed id that already names its level: `gemini` → `gemini-3.8-flash-high`, `argon` /
+    `neon` / `carbon` / `hydrogen` → their model's `-high` row; the effort does not move
+    it;
   - any other `gemini-*` id passes verbatim — one that already carries a level suffix
     (`gemini-4-neon-xhigh`) included; non-gemini names (empty-group fallback) use
     `shape.model`, which gets the same treatment.
@@ -171,9 +175,11 @@ client_model, user_agent }`.
   Client effort is NOT sent as a field upstream: the level lives in the id. The native
   client and CLIProxyAPI also send `generationConfig.thinkingConfig.thinkingLevel` matching
   the suffix; llmux does not, and whether Gemini 4 needs it is unverified (it is not needed
-  for Flash). The client-facing stamp is the catalog row that serves the request: an alias
-  stamps its owning row (`argon` → `gemini-4-argon[1m]`, `neon` → `gemini-4-neon`), bare
-  `gemini-3.8-flash` its variant's `[1m]` row, any other id the client's own spelling.
+  for Flash; the agy ingress drops agy's `thinkingLevel` after folding it into the id). The
+  client-facing stamp is the catalog row that serves the request: an alias stamps its
+  owning row (`argon` → `gemini-4-argon-high`), a bare family id its variant's row (the
+  `[1m]` twin where one exists: `gemini-3.8-flash` → `gemini-3.8-flash-<level>[1m]`,
+  `gemini-4-neon` → `gemini-4-neon-<level>`), any other id the client's own spelling.
 - **Request** (`translate_request`): system (string or text blocks) →
   `systemInstruction {role:"user", parts}`, a leading `x-anthropic-billing-header:` line
   left out; a mid-conversation `role:"system"` message (text only, else 400) → a user text
@@ -298,20 +304,20 @@ Implements `SseTransform` plus the accessor set `relay_translate` uses
 
 ### R7. Catalog, pricing, surfaces
 
-- Catalog rows (group `gemini`; 14 since 2026-11-21):
+- Catalog rows (group `gemini`; 20 since the 2026-11-21 reshape):
   - 3.8 Flash, empty effort menu — the level is in the id: `gemini-3.8-flash-high[1m]`
     (aliases `gemini`, `gemini-3.8-flash`), `gemini-3.8-flash-high`,
     `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-medium`, `gemini-3.8-flash-low[1m]`,
     `gemini-3.8-flash-low`.
-  - Gemini 4, one row pair per model, the level in the effort menu (derived from
-    `FAMILIES`, so the menu is exactly what the provider maps): `gemini-4-neon[1m]`,
-    `gemini-4-neon` (alias `neon`), `gemini-4-carbon[1m]` (alias `carbon`),
-    `gemini-4-carbon`, `gemini-4-hydrogen[1m]` (alias `hydrogen`), `gemini-4-hydrogen`,
-    `gemini-4-argon[1m]` (alias `argon`), `gemini-4-argon`. Menus: Neon and Hydrogen
-    low, medium, high, xhigh; Carbon and Argon low, medium, high.
-  - Context 1,048,576 on every row except bare `gemini-4-neon`, 524,288 (Antigravity:
-    "Up to 512K tokens"). Aliases live on the `[1m]` rows (operator rule 2026-09-10),
-    except `neon`, which sits on that 512K base row (decision 2026-11-21).
+  - Gemini 4, one row per thinking-level id, empty effort menu — the level is in the id,
+    as in Antigravity's picker (owner instruction 2026-11-21): `gemini-4-neon-high` (alias
+    `neon`), `-xhigh`, `-medium`, `-low`; `gemini-4-hydrogen-high` (alias `hydrogen`),
+    `-xhigh`, `-medium`, `-low`; `gemini-4-argon-high` (alias `argon`), `-medium`, `-low`;
+    `gemini-4-carbon-high` (alias `carbon`), `-medium`, `-low`. Each family's rows are
+    exactly its `FAMILIES` levels (catalog test). No `[1m]` twins.
+  - Context 1,048,576 on every row except the Neon rows, 524,288 (Antigravity: "Up to
+    512K tokens"). The Flash aliases live on the `[1m]` row (operator rule 2026-09-10);
+    a Gemini 4 alias is its model's `-high` row.
 - Pricing: `GEMINI_3_8_FLASH {0.75, 3.75, 0.075, 0}`, `GEMINI_4_ARGON {2.0, 10.0, 0.10,
   0}`, `GEMINI_4_CARBON` (Argon's card), `GEMINI_4_HYDROGEN {1.50, 7.50, 0.075, 0}`,
   `GEMINI_4_NEON {3.0, 15.0, 0.15, 0}` — each on its bare id, its bare alias and its

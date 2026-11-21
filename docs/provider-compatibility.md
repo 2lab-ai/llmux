@@ -322,12 +322,13 @@ Gemini is the Antigravity subscription backend, translated Messages ↔ Cloud Co
   Claude and OpenRouter paths strip after a model switch (footnote ¹ above).
 - **Sampling is forwarded, effort is the model id.** `temperature`, `top_p`, `top_k` and
   `stop_sequences` become `generationConfig.temperature` / `topP` / `topK` / `stopSequences`.
-  The thinking level is chosen by the id. A 3.8 Flash row names it (`-high` / `-medium` /
-  `-low`) and the client effort is ignored. A bare Gemini 4 id or alias (`gemini-4-neon`,
-  `argon`, …) and bare `gemini-3.8-flash` take the level from the client effort
-  (`output_config.effort`, or Codex's `reasoning.effort`) and go upstream as
-  `<family>-<level>`; `xhigh` / `max` / `ultra` become `-xhigh` on Neon and Hydrogen and
-  `-high` elsewhere (since 2026-11-21, `src/provider/gemini.rs` `FAMILIES`; tests
+  The thinking level is chosen by the id. Every gemini row names it (`gemini-3.8-flash-low`,
+  `gemini-4-neon-xhigh`; one row per level since 2026-11-21) and an alias is a fixed row
+  (`neon` → `gemini-4-neon-high`), so the client effort is ignored for them. Only a bare
+  family id (`gemini-4-neon`, `gemini-3.8-flash`; accepted, not advertised) takes the
+  level from the client effort (`output_config.effort`, or Codex's `reasoning.effort`) and
+  goes upstream as `<family>-<level>`; `xhigh` / `max` / `ultra` become `-xhigh` on Neon
+  and Hydrogen and `-high` elsewhere (`src/provider/gemini.rs` `FAMILIES`; tests
   `g2_gemini_4_families_take_the_level_from_the_client_effort` and the e2e
   `gemini_messages_ingress_streams_text_for_alias_and_window_ids`). No effort field and no
   `thinkingLevel` reach the backend; whether Gemini 4 also needs `thinkingLevel` is

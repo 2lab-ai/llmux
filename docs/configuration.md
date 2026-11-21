@@ -226,7 +226,7 @@ Model selection is the `or-` prefix: `or-nemotron-3-ultra` and the other curated
 
 ## Gemini backend
 
-Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` knob. The thinking level is part of the upstream model id (`gemini-3.8-flash-high` / `-medium` / `-low`, `gemini-4-neon-high`). A bare family id takes the client's effort and llmux sends the matching level id: bare `gemini-3.8-flash` and every Gemini 4 model (`gemini-4-neon`, `-carbon`, `-hydrogen`, `-argon`, or its alias); see [models.md](models.md#gemini). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
+Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` knob. The thinking level is part of the model id: every gemini catalog row names it (`gemini-3.8-flash-high` / `-medium` / `-low`, `gemini-4-neon-high` / `-xhigh` / `-medium` / `-low`, …), and an alias is a fixed row (`neon` → `gemini-4-neon-high`). A bare family id (`gemini-3.8-flash`, `gemini-4-neon`, `-carbon`, `-hydrogen`, `-argon`; accepted, not listed) takes the client's effort and llmux sends the matching level id; see [models.md](models.md#gemini). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -241,7 +241,7 @@ Gemini models are served by Google's **Antigravity subscription backend** (Cloud
 
 llmux does not ship Antigravity's OAuth client: you configure it, with the two `gemini.client_*` keys or the two environment variables (a non-empty environment value wins over the file). Google login and token refresh need both values. Without them, `llmux login --gemini`, the dashboard's Google login and the daemon's login API stop before opening a browser, with `gemini OAuth client not configured: set gemini.client_id and gemini.client_secret in llmux.json (or LLMUX_GEMINI_CLIENT_ID / LLMUX_GEMINI_CLIENT_SECRET) — the daemon reads them at startup, so restart llmux after setting them`. A gemini account whose token needs a refresh gets that same message as a `502` and in the activity log; the account is not marked for re-login, and the background refresh skips gemini accounts until the client is configured. The daemon reads these settings at startup, so restart llmux after setting them. `llmux import` still imports an Antigravity CLI login without them, but warns that the account will stop working when its current token expires (about an hour).
 
-The GCP project is stored per account, not here (see [Gemini accounts](#gemini-accounts)). Model ids, aliases, the Gemini 4 effort rule and which plan serves which model: [models.md](models.md#gemini).
+The GCP project is stored per account, not here (see [Gemini accounts](#gemini-accounts)). Model ids, aliases, the bare-family effort rule and which plan serves which model: [models.md](models.md#gemini).
 
 ## Reference price overrides (`pricing`)
 

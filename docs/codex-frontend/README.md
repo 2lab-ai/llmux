@@ -53,10 +53,10 @@ continuation reminders are additional to the caller's conversation.
 Grok, OpenRouter and Gemini models use Responses-to-Messages conversion followed by their
 existing provider adapters; they do not use the Claude SDK. These are bounded
 translated paths, not full native Responses parity. The installed native-Codex/Claude
-release smoke receipts do not establish live Grok/OpenRouter/Gemini parity. The Gemini 3.8 Flash rows
-have an empty effort menu (the thinking level is the `-high` / `-medium` / `-low` id); the
-Gemini 4 rows (Neon, Carbon, Hydrogen, Argon) offer their thinking levels as reasoning
-efforts, which llmux sends as the `-<level>` id suffix, and the Gemini adapter replays each tool call's thought signature on the next turn.
+release smoke receipts do not establish live Grok/OpenRouter/Gemini parity. Every Gemini
+row has an empty effort menu: the thinking level is the id (`gemini-3.8-flash-low`,
+`gemini-4-neon-xhigh`, one row per level, as in Antigravity's picker), and the Gemini
+adapter replays each tool call's thought signature on the next turn.
 Known limit: a Responses request served by Gemini carries no compatibility headers, and
 `X-Llmux-Compatibility: strict` does not refuse it, although `max_output_tokens`, a
 structured `text.format` and web_search tools are left out on that path. See the
