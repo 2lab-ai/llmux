@@ -334,5 +334,18 @@ mod tests {
         assert_eq!(model_id("opus"), "claude-opus-5-5");
         assert_eq!(model_id("gpt-6.2-sol[1m]"), "gpt-6.2-sol");
         assert_eq!(model_id("not-in-catalog"), "not-in-catalog");
+        // A bare Gemini 4 family persisted as `agy.default_model` (2026-11-21
+        // preview) starts agy, and its subagent tiers, on the `-high` row.
+        assert_eq!(model_id("gemini-4-neon"), "gemini-4-neon-high");
+        assert_eq!(model_id("gemini-4-neon[1m]"), "gemini-4-neon-high");
+        assert_eq!(model_id("gemini-4-hydrogen"), "gemini-4-hydrogen-high");
+        assert_eq!(
+            session_model(&["-p".to_string(), "hi".to_string()], "gemini-4-carbon[1m]"),
+            "gemini-4-carbon-high"
+        );
+        assert_eq!(
+            session_model(&["--model=gemini-4-argon".to_string()], "opus"),
+            "gemini-4-argon-high"
+        );
     }
 }

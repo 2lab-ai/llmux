@@ -176,13 +176,15 @@ not that it is zero.
   Matching is trimmed and case-insensitive, and one trailing `[1m]` is stripped
   first, exactly as on the claude and codex paths.
 - **gemini aliases** — static, not a pin (the `GEMINI_MODELS` const in
-  `src/catalog.rs`): `gemini` and `gemini-3.8-flash` resolve to
-  `gemini-3.8-flash-high[1m]`; the Gemini 4 element aliases `neon` →
-  `gemini-4-neon-high`, `hydrogen` → `gemini-4-hydrogen-high`, `argon` →
-  `gemini-4-argon-high` and `carbon` → `gemini-4-carbon-high` (`neon`,
-  `carbon` and `hydrogen` since 2026-11-21; all four on the `-high` row since
-  the same day's reshape). An alias is a fixed id: a client effort never moves
-  it. Unlike `grok` and `or`, no config key moves them:
+  `src/catalog.rs`): `gemini` resolves to `gemini-3.8-flash-high[1m]`; the
+  Gemini 4 element aliases `neon` → `gemini-4-neon-high`, `hydrogen` →
+  `gemini-4-hydrogen-high`, `argon` → `gemini-4-argon-high` and `carbon` →
+  `gemini-4-carbon-high` (`neon`, `carbon` and `hydrogen` since 2026-11-21; all
+  four on the `-high` row since the same day's reshape). These five are fixed
+  ids: a client effort never moves them. `gemini-3.8-flash` is listed on the
+  same Flash row but is the bare Flash family, so it takes the client effort
+  (`-high` without one; the rule below). Unlike `grok` and `or`, no config key
+  moves them:
   `gemini.default_model` only names the model used when a non-gemini name (or a
   request that names no model) lands on the gemini group. One trailing `[1m]` is
   stripped (case-insensitively) before the request leaves llmux, so `-m gemini`
@@ -502,12 +504,13 @@ row picks the level. The twenty gemini rows:
   ([#244](https://github.com/2lab-ai/llmux/issues/244),
   [#310](https://github.com/2lab-ai/llmux/issues/310)).
 
-The aliases are fixed ids: `gemini` / `gemini-3.8-flash` → the Flash High `[1m]`
-twin (as on astra, and unlike [the grok twin](#the-grok-1m-twin): the backend's
-window is 1,048,576 tokens, so the 1M the suffix advertises is honest there);
-`neon`, `hydrogen`, `argon` and `carbon` → their model's `-high` row. A bare
-family id (`gemini-4-neon`) is not a row but is still accepted and takes the
-client effort ([the rule](#alias-semantics)). **Neon's window:** the API gives
+The aliases `gemini`, `neon`, `hydrogen`, `argon` and `carbon` are fixed ids:
+`gemini` → the Flash High `[1m]` twin (as on astra, and unlike [the grok
+twin](#the-grok-1m-twin): the backend's window is 1,048,576 tokens, so the 1M the
+suffix advertises is honest there); the other four → their model's `-high` row. A
+bare family id (`gemini-3.8-flash`, which is also listed on the Flash twin, or
+`gemini-4-neon`) is not a row of its own but is accepted and takes the client
+effort ([the rule](#alias-semantics)). **Neon's window:** the API gives
 1,048,576, but the Antigravity models page (read 2026-11-21) says "Up to 512K
 tokens", so the Neon rows advertise 524,288. The Flash `[1m]` suffix is display
 metadata only; a twin and its base row reach the backend as the same id.
@@ -614,8 +617,9 @@ file is edited. See [Codex frontend](codex-frontend/README.md) for supported con
 `GET /v1beta/models` (the llmux catalog as the Gemini model list — no client-side
 catalog file). One entry per model under its base id (`[1m]` twins merged; a
 `[1m]`-only row such as `claude-opus-4-8` is served as its `[1m]` row), at most 32
-ids agy does not know (its placeholder slots) plus every Gemini level id, which agy
-knows (live probe 2026-11-21), the start model first.
+ids agy does not know (its placeholder slots) plus the 17 Gemini level ids agy 1.5.13
+was measured to know (live probe 2026-11-21, an explicit list), the start model first
+(a bare family start model such as `gemini-4-neon` names its `-high` row).
 `outputTokenLimit` is a per-group default agy sends back as `maxOutputTokens`: claude
 64,000, codex 128,000, gemini 65,536, grok 32,768, openrouter 16,384. `thinking` is true
 for rows with an effort menu (agy refuses `--effort` otherwise) and for every gemini
@@ -746,16 +750,17 @@ Checked all four providers against their current primary sources for 2026-11-18 
 (all fetched 2026-11-21). One new text model shipped, Gemini 4 Neon. The Gemini 4 rows grew from
 Argon alone to Neon, Carbon, Hydrogen and Argon, one row pair per model, with the new aliases
 `neon`, `carbon` and `hydrogen`; the thinking level is now the Gemini 4 rows' effort menu, and
-llmux sends a bare Gemini 4 id or alias upstream as its thinking-level id.
+llmux sends a bare Gemini 4 id or alias upstream as its thinking-level id. The default Gemini
+User-Agent moved to hub 2.34.0, the Agent SDK bridge to 0.3.321, and `grok-4.7-build` /
+`grok-4.7-build-fast` got price rows. Catalog size: 58 curated rows (6 gemini rows added).
 
 > **Reshaped the same day (owner instruction, 2026-11-21: the effort choice must change the
 > model id itself).** The eight Gemini 4 rows (one per model plus `[1m]` twins, with effort
 > menus) became fourteen rows, one per thinking-level id as Antigravity's own picker lists
 > them (`gemini-4-neon-high`, `-xhigh`, `-medium`, `-low`; XHigh on Neon and Hydrogen only),
-> with empty effort menus and no `[1m]` twins. The aliases moved to the `-high` rows and no
-> longer follow the effort; a bare family id keeps the effort rule. Catalog size: 64 rows. The default Gemini
-User-Agent moved to hub 2.34.0, the Agent SDK bridge to 0.3.321, and `grok-4.7-build` /
-`grok-4.7-build-fast` got price rows. Catalog size: 58 curated rows (6 gemini rows added).
+> with empty effort menus and no `[1m]` twins. The Gemini 4 aliases moved to the `-high` rows
+> and no longer follow the effort; a bare family id keeps the effort rule. Catalog size: 64
+> rows.
 
 | Provider | Result | Sources checked |
 | --- | --- | --- |

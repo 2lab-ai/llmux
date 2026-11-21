@@ -8559,8 +8559,9 @@ async fn agy_gemini_level_rides_in_thinking_level() {
         ("gemini-3.8-flash", "LOW", "gemini-3.8-flash-low"),
         ("gemini-3.8-flash", "MEDIUM", "gemini-3.8-flash-medium"),
         ("gemini-3.8-flash", "HIGH", "gemini-3.8-flash-high"),
-        // Gemini 4 discovery rows are bare families with an effort menu:
-        // agy sends the family id and the level (live 2026-11-21).
+        // Gemini 4 discovery rows are level ids (`gemini-4-neon-xhigh`): agy
+        // strips the suffix and sends the family id plus the level
+        // (live 2026-11-21), which the ingress folds back into that id.
         ("gemini-4-neon", "LOW", "gemini-4-neon-low"),
         ("gemini-4-neon", "HIGH", "gemini-4-neon-high"),
         ("gemini-4-neon", "XHIGH", "gemini-4-neon-xhigh"),

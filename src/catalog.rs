@@ -384,10 +384,13 @@ const GEMINI_4_NEON_CONTEXT: u64 = 524_288;
 /// family id (`gemini-4-neon`, `gemini-3.8-flash`) is not a row; the provider
 /// still accepts it and picks the level from the client effort.
 ///
-/// Aliases are fixed ids, never moved by an effort: `gemini` /
-/// `gemini-3.8-flash` → the high-thinking Flash `[1m]` twin (operator rule
+/// `gemini` and the four Gemini 4 aliases are fixed ids, never moved by an
+/// effort: `gemini` → the high-thinking Flash `[1m]` twin (operator rule
 /// 2026-09-10, the astra arrangement — the backend's real window IS ~1M);
 /// `neon` / `hydrogen` / `argon` / `carbon` → their model's `-high` row.
+/// `gemini-3.8-flash` is also listed as an alias of the Flash twin, but it is
+/// the bare Flash family first, so a request naming it takes the client
+/// effort (`gemini-3.8-flash` + `low` → `gemini-3.8-flash-low`).
 /// Gemini 4 has no `[1m]` twins (Antigravity has none, Claude Code cannot
 /// select gemini, and Codex and agy read `max_context`). The provider strips
 /// one trailing `[1m]` before the request leaves llmux, so a Flash twin and
@@ -528,6 +531,25 @@ pub(crate) fn gemini_alias_owner(alias: &str) -> Option<&'static str> {
         .iter()
         .find(|(_, aliases, ..)| aliases.contains(&alias))
         .map(|&(id, ..)| id)
+}
+
+/// The catalog row a bare gemini family id stands for when no effort picks
+/// its level: `gemini-4-neon`, `gemini-4-neon[1m]`, `GEMINI-4-NEON` →
+/// `gemini-4-neon-high` — the level the provider sends for a bare family
+/// without an effort ([`crate::provider::gemini::family_levels`]). For a
+/// start / default model (`agy.default_model`, a Codex launch default)
+/// persisted before the Gemini 4 rows became level ids: matched against the
+/// catalog as it is, such a name finds no row. `None` for anything else, a
+/// level id or an alias included.
+pub(crate) fn gemini_family_default_row(id: &str) -> Option<&'static str> {
+    let base = id.trim().to_ascii_lowercase();
+    let base = base.strip_suffix("[1m]").unwrap_or(&base);
+    crate::provider::gemini::family_levels(base)?;
+    let level_row = format!("{base}-high");
+    GEMINI_MODELS
+        .iter()
+        .find(|(row, ..)| *row == level_row)
+        .map(|&(row, ..)| row)
 }
 
 /// Whether `id` (lookup form, as for [`gemini_alias_owner`]) is a curated
@@ -1274,6 +1296,41 @@ mod tests {
         assert!(!entries
             .iter()
             .any(|e| e.id.starts_with("gemini-4-") && e.id.ends_with("[1m]")));
+    }
+
+    /// A bare family id persisted as a default before the reshape (2026-11-21
+    /// preview: `gemini-4-neon`, `gemini-4-neon[1m]`) names its `-high` row;
+    /// level ids, aliases and other names are not bare families.
+    #[test]
+    fn g16_bare_family_defaults_name_their_high_row() {
+        for (family, row) in [
+            ("gemini-4-neon", "gemini-4-neon-high"),
+            ("gemini-4-hydrogen", "gemini-4-hydrogen-high"),
+            ("gemini-4-argon", "gemini-4-argon-high"),
+            ("gemini-4-carbon", "gemini-4-carbon-high"),
+            ("gemini-3.8-flash", "gemini-3.8-flash-high"),
+        ] {
+            for spelling in [
+                family.to_string(),
+                format!("{family}[1m]"),
+                format!(" {}[1M] ", family.to_ascii_uppercase()),
+            ] {
+                assert_eq!(
+                    gemini_family_default_row(&spelling),
+                    Some(row),
+                    "{spelling:?}"
+                );
+            }
+        }
+        for not_bare in [
+            "gemini-4-neon-low",
+            "neon",
+            "gemini",
+            "gemini-4-neonx",
+            "gpt-6.2-sol",
+        ] {
+            assert_eq!(gemini_family_default_row(not_bare), None, "{not_bare}");
+        }
     }
 
     #[test]

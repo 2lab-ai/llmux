@@ -73,15 +73,22 @@ fn base_id(id: &str) -> &str {
 }
 
 /// The discovery entry id `default_model` names: a row id (with or without
-/// `[1m]`) or one of a row's aliases.
+/// `[1m]`), one of a row's aliases, or a bare gemini family id, which stands
+/// for its `-high` row ([`crate::catalog::gemini_family_default_row`]).
 pub(crate) fn default_id(rows: &[ModelEntry], default_model: &str) -> Option<String> {
     let wanted = default_model.trim().to_ascii_lowercase();
     let wanted = base_id(&wanted);
+    let bare_family = crate::catalog::gemini_family_default_row(wanted);
     rows.iter()
         .find(|row| base_id(&row.id) == wanted)
         .or_else(|| {
             rows.iter()
                 .find(|row| row.aliases.iter().any(|alias| alias == wanted))
+        })
+        .or_else(|| {
+            // A bare gemini family persisted as a default (`gemini-4-neon`,
+            // ± `[1m]`) is no row: it stands for its `-high` row.
+            bare_family.and_then(|level| rows.iter().find(|row| base_id(&row.id) == level))
         })
         .map(|row| base_id(&row.id).to_string())
 }
@@ -125,16 +132,41 @@ pub(crate) fn models(rows: &[ModelEntry], default_model: &str) -> Vec<Value> {
     out.into_iter().map(render).collect()
 }
 
-/// Whether agy 1.5.13 knows `id` and so lists it without spending one of its
-/// 32 placeholder slots: a Gemini level id, `<family>-<level>` for a family
-/// and level of the provider's family table. Live probe 2026-11-21: with 40
-/// unknown ids served, agy listed 32 of them plus all 14 Gemini 4 level ids
-/// and the 3 Gemini 3.8 Flash ones (under its own labels), while
-/// `claude-opus-5-5` / `claude-sonnet-5-5` counted as custom ids.
+/// The ids agy's built-in catalog knows, measured on **agy 1.5.13**: it lists
+/// them without spending one of its 32 placeholder slots, under its own
+/// labels. Live probe 2026-11-21 (recording gateway): with 40 unknown ids, the
+/// 17 ids below and `claude-opus-5-5` / `claude-sonnet-5-5` served, `agy
+/// models` listed 32 unknown ids plus exactly these 17, and logged 10 custom
+/// ids over the limit — the two claude ids counted as custom.
+///
+/// An explicit list, not derived from the provider's family table: a family
+/// llmux's backend serves but an agy build does not know would otherwise be
+/// counted as known, overflow agy's slots and silently drop models. Re-measure
+/// before adding an id (or when agy changes its catalog).
+const AGY_KNOWN_IDS: &[&str] = &[
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
+    "gemini-4-neon-high",
+    "gemini-4-neon-xhigh",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-low",
+];
+
+/// Whether agy (1.5.13) knows `id` and so lists it without spending one of
+/// its 32 placeholder slots ([`AGY_KNOWN_IDS`]).
 pub(crate) fn agy_knows(id: &str) -> bool {
-    id.rsplit_once('-').is_some_and(|(family, level)| {
-        crate::provider::gemini::family_levels(family).is_some_and(|levels| levels.contains(&level))
-    })
+    AGY_KNOWN_IDS.contains(&id)
 }
 
 /// Which entries survive: every entry agy knows, and of the others all when
@@ -338,14 +370,6 @@ mod tests {
         }
         assert_eq!(ids.len(), 46);
         assert_eq!(unknown, 29);
-        // Every Gemini 4 level row is listed, as agy's own picker shows them.
-        for level in [
-            "gemini-4-neon-xhigh",
-            "gemini-4-hydrogen-low",
-            "gemini-4-carbon-medium",
-        ] {
-            assert!(ids.iter().any(|id| id == level), "{level}");
-        }
         // Every group is represented.
         for group in ["claude", "codex", "grok", "openrouter", "gemini"] {
             assert!(
@@ -403,6 +427,54 @@ mod tests {
         assert_eq!(find("gpt-6.2-sol")["outputTokenLimit"], 128_000);
     }
 
+    /// The known-id set is exactly what agy 1.5.13 was measured to know —
+    /// not whatever the provider's family table grows into.
+    #[test]
+    fn the_agy_known_ids_are_the_measured_set() {
+        let mut known = AGY_KNOWN_IDS.to_vec();
+        known.sort_unstable();
+        let mut measured = vec![
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-medium",
+            "gemini-4-argon-high",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-low",
+            "gemini-4-carbon-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-xhigh",
+            "gemini-4-neon-high",
+            "gemini-4-neon-low",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-xhigh",
+        ];
+        measured.sort_unstable();
+        assert_eq!(known, measured);
+    }
+
+    /// A bare Gemini 4 family persisted as the agy default (2026-11-21
+    /// preview) starts agy on its `-high` row, never on the first entry.
+    #[test]
+    fn a_bare_family_default_starts_on_its_high_row() {
+        let rows = live_catalog();
+        for default in ["gemini-4-neon", "gemini-4-neon[1m]", "GEMINI-4-ARGON"] {
+            let family = default.trim_end_matches("[1m]").to_ascii_lowercase();
+            assert_eq!(
+                ids(&models(&rows, default))[0],
+                format!("{family}-high"),
+                "{default}"
+            );
+        }
+        assert_eq!(
+            default_id(&rows, "gemini-4-carbon[1m]").as_deref(),
+            Some("gemini-4-carbon-high")
+        );
+    }
+
     #[test]
     fn a_default_alias_resolves_to_its_row() {
         let rows = live_catalog();
@@ -455,12 +527,9 @@ mod tests {
     fn ids_agy_knows_are_listed_beyond_the_cap() {
         assert!(agy_knows("gemini-4-neon-xhigh"));
         assert!(agy_knows("gemini-3.8-flash-low"));
-        assert!(
-            !agy_knows("gemini-4-argon-xhigh"),
-            "argon has no xhigh level"
-        );
+        assert!(!agy_knows("gemini-4-argon-xhigh"), "never measured");
         assert!(!agy_knows("gemini-4-neon"), "a bare family is no level id");
-        assert!(!agy_knows("claude-opus-5-5"));
+        assert!(!agy_knows("claude-opus-5-5"), "measured as a custom id");
         let menu: &'static [&'static str] = &[];
         let row = |group: &'static str, id: String| ModelEntry {
             id: id.clone().into(),

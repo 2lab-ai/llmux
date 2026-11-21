@@ -112,6 +112,14 @@ async fn codex_catalog_file(
     }
 }
 
+/// The model Codex starts on: `default_model`, except that a bare gemini
+/// family id (`gemini-4-neon`, ± `[1m]`, persisted before the Gemini 4 rows
+/// became level ids) is its `-high` row, so it names a slug of the injected
+/// catalog.
+fn start_model(default_model: &str) -> &str {
+    crate::catalog::gemini_family_default_row(default_model).unwrap_or(default_model)
+}
+
 /// Session-scoped provider flags keep the user's Codex config/auth untouched.
 pub(super) async fn launch(
     endpoint: &Endpoint,
@@ -137,7 +145,7 @@ pub(super) async fn launch(
     let q = |value: &str| serde_json::Value::String(value.to_string()).to_string();
     let settings = [
         "model_provider=\"llmux\"".to_string(),
-        format!("model={}", q(default_model)),
+        format!("model={}", q(start_model(default_model))),
         "model_providers.llmux.name=\"llmux\"".into(),
         format!(
             "model_providers.llmux.base_url={}",
@@ -199,6 +207,14 @@ mod tests {
         assert_eq!(out["models"][0]["base_instructions"], "first");
     }
 
+    #[test]
+    fn a_bare_gemini_family_start_model_is_its_high_row() {
+        assert_eq!(start_model("gemini-4-neon"), "gemini-4-neon-high");
+        assert_eq!(start_model("gemini-4-argon[1m]"), "gemini-4-argon-high");
+        assert_eq!(start_model("gemini-4-neon-low"), "gemini-4-neon-low");
+        assert_eq!(start_model("gpt-5.6-sol"), "gpt-5.6-sol");
+    }
+
     /// The Codex picker over the REAL catalog (2026-11-21): every Gemini 4
     /// thinking level is its own slug (`gemini-4-neon-xhigh`, Antigravity's
     /// own picker shape) with an empty reasoning menu, like the 3.8 Flash
@@ -231,33 +247,22 @@ mod tests {
                 .map(|l| l["effort"].as_str().expect("effort").to_string())
                 .collect()
         };
-        // One slug per level id, in Antigravity's order, each with an empty
-        // menu: the level is the model, as on the 3.8 Flash rows.
+        // One listed slug per catalog level row, in catalog order (the
+        // catalog test locks those rows to the family table), each with an
+        // empty menu: the level is the model, as on the 3.8 Flash rows.
         let gemini_4: Vec<&str> = models
             .iter()
             .filter(|m| m["visibility"] == "list")
             .filter_map(|m| m["slug"].as_str())
             .filter(|slug| slug.starts_with("gemini-4-"))
             .collect();
-        assert_eq!(
-            gemini_4,
-            [
-                "gemini-4-neon-high",
-                "gemini-4-neon-xhigh",
-                "gemini-4-neon-medium",
-                "gemini-4-neon-low",
-                "gemini-4-hydrogen-high",
-                "gemini-4-hydrogen-xhigh",
-                "gemini-4-hydrogen-medium",
-                "gemini-4-hydrogen-low",
-                "gemini-4-argon-high",
-                "gemini-4-argon-medium",
-                "gemini-4-argon-low",
-                "gemini-4-carbon-high",
-                "gemini-4-carbon-medium",
-                "gemini-4-carbon-low",
-            ]
-        );
+        let catalog_rows: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.group == "gemini" && e.id.starts_with("gemini-4-"))
+            .map(|e| e.id.as_ref())
+            .collect();
+        assert!(!catalog_rows.is_empty());
+        assert_eq!(gemini_4, catalog_rows);
         for slug in &gemini_4 {
             assert!(levels(slug).is_empty(), "{slug}: the level is in the id");
         }

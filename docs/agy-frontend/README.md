@@ -119,15 +119,17 @@ What agy does with it **[live]**: `outputTokenLimit` becomes every request's
 `maxOutputTokens`; `--effort` is refused unless `thinking` is true; with no `--model`
 agy takes the **first** entry; ids it does not know take one of 32 placeholder slots
 and the rest are dropped **[binary]** (log: `custom gateway model(s) exceeded the
-maximum placeholder limit (32)`), while ids it knows — every Gemini level id,
-`gemini-4-neon-xhigh`, `gemini-3.8-flash-low` — take no slot and show with agy's own
-labels **[live, 2026-11-21]**; `claude-opus-5-5` counts as custom. Hence:
+maximum placeholder limit (32)`), while ids it knows take no slot and show with agy's
+own labels **[live, 2026-11-21]**: on agy 1.5.13 exactly the 17 Gemini level ids
+(`gemini-4-neon-xhigh`, `gemini-3.8-flash-low`, …), kept in llmux as an explicit
+measured list (`AGY_KNOWN_IDS`), never derived from the provider's families;
+`claude-opus-5-5` counts as custom. Hence:
 
 1. **One entry per model, no brackets.** A `[1m]` twin and its base row are one
    entry under the base id; the base row's window wins. A `[1m]`-only row
    (`claude-fable-5-2[1m]`, `claude-opus-4-8[1m]`) is listed under its base id and
    **served as the `[1m]` row**, so its window holds.
-2. **Every Gemini level id, and at most 32 of the other entries.** Over that cap: the
+2. **Every measured known id, and at most 32 of the other entries.** Over that cap: the
    start model, then every model a catalog alias points at (each family's current
    pick), then the rest; within each tier the groups take turns, so no group crowds
    another out. The catalog after the Gemini 4 reshape (2026-11-21) gives 46 entries,
