@@ -113,7 +113,7 @@ private HTTP request. Capture is enabled by default (`raw_io.enabled`); disable 
 needed. Existing size/redaction rules apply, and raw bodies may contain private
 prompt content. The SDK transport leg is not a replayable vendor HTTP request.
 
-Sources: `src/cli/run.rs`, `src/proxy/responses.rs`, `src/proxy/forward.rs`,
+Sources: `src/cli/run/codex.rs`, `src/proxy/ingress.rs`, `src/proxy/responses.rs`, `src/proxy/forward.rs`,
 `src/provider/claude_sdk.rs` and [bridge contracts](../../bridge/README.md),
 verified 2026-10-07. Native model schema and provider configuration were checked
 against Codex CLI 0.160.1; SDK is pinned to 0.3.321 (Claude Code 2.1.321, the
