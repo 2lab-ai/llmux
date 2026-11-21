@@ -426,7 +426,7 @@ Codex sends Responses and the following additional contracts apply:
 
 | Axis | Codex subscription backend | Claude Agent SDK backend |
 |---|---|---|
-| Endpoint/auth | Native gateway Responses, leased Codex token; ingress Bearer is a llmux key | Official SDK 0.3.292, isolated leased Claude OAuth/API key; no direct HTTP fallback |
+| Endpoint/auth | Native gateway Responses, leased Codex token; ingress Bearer is a llmux key | Official SDK 0.3.321 (Claude Code 2.1.321, pinned 2026-11-21), isolated leased Claude OAuth/API key; no direct HTTP fallback |
 | Output cap | `max_output_tokens` omitted + headers; strict policy rejects | Mapped to SDK `CLAUDE_CODE_MAX_OUTPUT_TOKENS` |
 | Reasoning | Native items/encrypted content preserved; existing model effort policy applies | SDK effort mapped; foreign reasoning history omitted + headers; private signatures are not fabricated |
 | Structured output | Native `text.format` reaches the gateway | SDK outputFormat validates the supplied JSON Schema; object and scalar/array/null results return as JSON text |

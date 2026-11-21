@@ -6947,7 +6947,7 @@ impl SdkProcessFixture {
             .path()
             .join("node_modules/@anthropic-ai/claude-agent-sdk");
         std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("package.json"), r#"{"version":"0.3.292"}"#).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"version":"0.3.321"}"#).unwrap();
         std::fs::write(package.join("sdk.mjs"), "// fixture only").unwrap();
         let node = dir.path().join("fixture-node");
         std::fs::write(

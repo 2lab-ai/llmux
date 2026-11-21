@@ -16,7 +16,7 @@ use crate::config::AccountCredential;
 const SCRIPT: &str = include_str!("../../bridge/claude-agent.mjs");
 const PACKAGE: &str = include_str!("../../bridge/package.json");
 const LOCK: &str = include_str!("../../bridge/package-lock.json");
-const SDK_VERSION: &str = "0.3.292";
+const SDK_VERSION: &str = "0.3.321";
 static INSTALL: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Kill the entire SDK process group when the HTTP body is abandoned, including
