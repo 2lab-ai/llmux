@@ -86,9 +86,11 @@ not that it is zero.
   6-luna pairs follow the 5.6 convention instead (aliases on the base row; the `[1m]`
   twin is an explicit opt-in). That is catalog resolution, **not** a client-side
   window: Claude Code sizes its readout off the id you submit, and a bare alias
-  — an id it does not know — gets its 200k assumption. Type `sol[1m]` /
-  `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
-  denominator too. These are advertised statically on the corresponding entries. The provider always
+  is an id it does not know. Claude Code 2.1.323 and later assume 1M for such an
+  id (measured 2026-11-21 with 2.1.330 through the daemon: `astra` reports
+  `modelUsage.contextWindow` 1000000); older clients assumed 200k, and only a
+  `sol[1m]` / `astra[1m]` id (or the `[1M]` picker row) moved the client-side
+  denominator. These are advertised statically on the corresponding entries. The provider always
   strips a trailing `[1m]` before the request leaves llmux
   (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
   `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
@@ -173,21 +175,32 @@ not that it is zero.
 
   Matching is trimmed and case-insensitive, and one trailing `[1m]` is stripped
   first, exactly as on the claude and codex paths.
-- **gemini aliases** — static, not a pin: `gemini` and `gemini-3.8-flash`
-  resolve to `gemini-3.8-flash-high[1m]`, and `argon` to `gemini-4-argon[1m]`
-  (the `GEMINI_MODELS` const in `src/catalog.rs`). Unlike `grok` and `or`, no
-  config key moves them: `gemini.default_model` only names the model used when a
-  non-gemini name (or a request that names no model) lands on the gemini group. One
-  trailing `[1m]` is stripped (case-insensitively) before the request leaves
-  llmux, so `-m gemini` and `-m gemini-3.8-flash-high[1m]` both reach the
-  backend as `gemini-3.8-flash-high`, and `-m argon` as `gemini-4-argon`. Any
-  other `gemini-*` id passes through verbatim. Claude Code is the exception:
-  its request is refused locally (see [Gemini](#gemini)). The
-  thinking level is part of the id, so every gemini name ignores the client's
-  effort, with one exception: a bare `gemini-3.8-flash` sent by the client
-  picks its variant from `output_config.effort` (`none` / `minimal` / `low` →
-  `-low`, `medium` → `-medium`, anything else or no effort → `-high`). Source:
-  [`gemini/spec.md`](gemini/spec.md) §R3.
+- **gemini aliases** — static, not a pin (the `GEMINI_MODELS` const in
+  `src/catalog.rs`): `gemini` and `gemini-3.8-flash` resolve to
+  `gemini-3.8-flash-high[1m]`; the Gemini 4 element aliases `argon` →
+  `gemini-4-argon[1m]`, `carbon` → `gemini-4-carbon[1m]`, `hydrogen` →
+  `gemini-4-hydrogen[1m]` and `neon` → `gemini-4-neon` (the 512K base row, the
+  window Antigravity publishes for Neon; `neon`, `carbon` and `hydrogen` since
+  2026-11-21). Unlike `grok` and `or`, no config key moves them:
+  `gemini.default_model` only names the model used when a non-gemini name (or a
+  request that names no model) lands on the gemini group. One trailing `[1m]` is
+  stripped (case-insensitively) before the request leaves llmux, so `-m gemini`
+  and `-m gemini-3.8-flash-high[1m]` both reach the backend as
+  `gemini-3.8-flash-high`. Claude Code is the exception: its request is refused
+  locally (see [Gemini](#gemini)). The thinking level is part of the upstream id.
+  A 3.8 Flash row names it (`-high` / `-medium` / `-low`) and ignores the
+  client's effort. A bare family id — `gemini-3.8-flash`, or a Gemini 4 id
+  `gemini-4-neon` / `-carbon` / `-hydrogen` / `-argon`, or an alias of one, with or
+  without `[1m]` — takes its level from `output_config.effort` (Codex:
+  `reasoning.effort`) and reaches the backend as `<family>-<level>`:
+  `none` / `minimal` / `low` → `-low`, `medium` → `-medium`, no effort or
+  `high` → `-high`, and `xhigh` / `max` / `ultra` → `-xhigh` on Neon and
+  Hydrogen, `-high` on Carbon, Argon and Flash. So `-m argon` reaches the backend
+  as `gemini-4-argon-high` (it went out as the bare `gemini-4-argon`, which
+  Antigravity does not serve, until 2026-11-21;
+  [#244](https://github.com/2lab-ai/llmux/issues/244)). An id that already names
+  its level (`gemini-4-neon-xhigh`) and any other `gemini-*` id pass through
+  verbatim. Source: [`gemini/spec.md`](gemini/spec.md) §R3.
 - **alias stability** — aliases float to the current generation, ids do not.
   `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
   `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
@@ -200,7 +213,9 @@ not that it is zero.
   `claude-fable-5-2[1m]` (Fable 5.2 released 2026-11-09) and `terra` from
   `gpt-5.6-terra` to `gpt-6.1-terra`. On 2026-11-18 `sol` moved from
   `gpt-6.1-sol` to `gpt-6.2-sol` and `astra` from `gpt-6-astra[1m]` to
-  `gpt-6.2-astra[1m]` (both released 2026-11-17). The version
+  `gpt-6.2-astra[1m]` (both released 2026-11-17). On 2026-11-21 the
+  new `neon`, `carbon` and `hydrogen` aliases joined `argon` (no alias moved).
+  The version
   aliases `opus-5` / `sonnet-5` / `fable-5-1` and the bare generation ids
   `gpt-5.6` / `gpt-6` / `gpt-6.1` did NOT move — they stay on their generation, because floating a version-pinned
   alias onto a new model would be silent substitution. Anyone who needs one specific model must send
@@ -313,8 +328,14 @@ model it does not curate.
 | gemini-3.8-flash-medium | —        | Gemini 3.8 Flash (Medium) | —                              | 1048576     | gemini |
 | gemini-3.8-flash-low[1m] | —       | Gemini 3.8 Flash (Low) [1M] | —                            | 1048576     | gemini |
 | gemini-3.8-flash-low | —           | Gemini 3.8 Flash (Low) | —                                 | 1048576     | gemini |
-| gemini-4-argon[1m]  | argon        | Gemini 4 Argon [1M] | —                                    | 1048576     | gemini |
-| gemini-4-argon      | —            | Gemini 4 Argon      | —                                    | 1048576     | gemini |
+| gemini-4-neon[1m]   | —            | Gemini 4 Neon [1M]  | low, medium, high, xhigh             | 1048576     | gemini |
+| gemini-4-neon       | neon         | Gemini 4 Neon       | low, medium, high, xhigh             | 524288      | gemini |
+| gemini-4-carbon[1m] | carbon       | Gemini 4 Carbon [1M] | low, medium, high                   | 1048576     | gemini |
+| gemini-4-carbon     | —            | Gemini 4 Carbon     | low, medium, high                    | 1048576     | gemini |
+| gemini-4-hydrogen[1m] | hydrogen   | Gemini 4 Hydrogen [1M] | low, medium, high, xhigh          | 1048576     | gemini |
+| gemini-4-hydrogen   | —            | Gemini 4 Hydrogen   | low, medium, high, xhigh             | 1048576     | gemini |
+| gemini-4-argon[1m]  | argon        | Gemini 4 Argon [1M] | low, medium, high                    | 1048576     | gemini |
+| gemini-4-argon      | —            | Gemini 4 Argon      | low, medium, high                    | 1048576     | gemini |
 
 "grok (pinned)" means the `grok` alias appears on that row only while
 `grok-4.7` is the live grok pin; any other pinned `grok-*` id takes the alias
@@ -330,7 +351,8 @@ sends — the slug that reaches OpenRouter is the one in the
 [alias table](#alias-semantics), and every curated openrouter row is a free
 model (priced `$0` in and out; an UNCURATED openrouter model has no known
 rate and is reported unpriced, never as a free `$0`). The gemini aliases carry
-no "(pinned)": they are fixed on their `[1m]` rows (see [Gemini](#gemini)).
+no "(pinned)": they are fixed on their `[1m]` rows, except `neon`, which is
+fixed on the 512K base row (see [Gemini](#gemini)).
 
 ### The grok `[1m]` twin
 
@@ -343,10 +365,16 @@ still reported 500000) that endpoint publishes `context_window: 256000` next to
 306,103-input-token `grok-4.7` request through the daemon was still accepted
 that day, so the rows keep the 500000 upper entry — the ceiling itself was not
 re-probed (see [Model sweep: 2026-10-12](#model-sweep-2026-10-12)). The
-twin exists only because of how Claude Code sizes its own readout: for an id it
-does not know it assumes 200k, unless the id ends in `[1m]`, which it reads as a
+twin exists only because of how Claude Code sized its own readout: for an id it
+did not know it assumed 200k, unless the id ended in `[1m]`, which it read as a
 1M window (800k usable). Measured 2026-09-28 with Claude Code 2.1.283:
-`--model grok[1m]` → `/context` 143.1k/800k, `--model grok` → 200k.
+`--model grok[1m]` → `/context` 143.1k/800k, `--model grok` → 200k. **Since
+Claude Code 2.1.323 an unknown id gets 1M too** (its changelog: "Changed the
+context window assumed for a model ID that Claude Code doesn't recognize from
+200K to 1M"; `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` keeps 200K). Measured 2026-11-21
+with Claude Code 2.1.330 through the daemon: `grok` and `grok[1m]` both report
+`modelUsage.contextWindow` 1000000. On a current client the bare `grok` therefore
+carries the same 500k caveat as the twin; llmux has no guard for it yet.
 
 That 800k readout is **wrong about the backend**: xAI still cuts the request off
 at 500,000, so a session driven past 500k is rejected upstream while the client
@@ -355,9 +383,9 @@ face llmux puts on the family:
 
 - with the default pin `grok-4.7` the `grok` alias stays on the BASE row, so
   `/llmux/models` and the picker present the conservative id as the family
-  default (the client window is unaffected either way — a bare `grok` is a
-  200k session in Claude Code regardless of who owns the alias, because the
-  client sizes off the id you submit);
+  default (the client window is unaffected either way, because the client
+  sizes off the id you submit: a bare `grok` was a 200k session before Claude
+  Code 2.1.323 and is a 1M one since);
 - the twin is listed after it, named `Grok 4.7 [1M] (500k upstream)` so the
   picker itself discloses the gap;
 - to use the bigger denominator, pick that row in `/model` or type
@@ -407,9 +435,10 @@ opposite the 5.6 convention, so the ergonomic name resolves to the 1M row's
 slug and advertised window; the explicit base ids `gpt-6-astra` /
 `gpt-6.2-astra` keep the openai/codex catalog's 272000 and advertise no
 aliases. Note this is the
-CATALOG window, not Claude Code's: a bare `astra` is still a 200k session in
-the client, which sizes off the submitted id — type `astra[1m]` or pick the
-`[1M]` picker row for the 1M denominator. The catalog
+CATALOG window, not Claude Code's: the client sizes off the submitted id, so a
+bare `astra` was a 200k session before Claude Code 2.1.323 (type `astra[1m]` or
+pick the `[1M]` picker row for the 1M denominator) and is a 1M one since
+(measured 2026-11-21 with 2.1.330: `modelUsage.contextWindow` 1000000). The catalog
 also lists an 872,000 `max_context_window` for astra, which llmux does not
 advertise.
 
@@ -446,30 +475,55 @@ a passthrough slug through the daemon yet; before they were passthrough slugs, a
 
 ### Gemini
 
-Added 2026-10-15. The eight gemini rows are four upstream models, each with a
-`[1m]` twin: Gemini 3.8 Flash at three thinking levels and Gemini 4 Argon. The
-thinking level is part of the id (`-high` / `-medium` / `-low`), so every row
-has an empty effort menu. As on astra, and unlike
-[the grok twin](#the-grok-1m-twin), the family aliases sit on the `[1m]` rows:
-the backend's real window is 1,048,576 tokens, so the 1M the suffix advertises
-is honest here. The suffix is display metadata only; a twin and its base row
-reach the backend as the same id.
+Added 2026-10-15; the Gemini 4 rows grew from Argon to four models on
+2026-11-21. The fourteen gemini rows are seven row pairs, each a base row and a
+`[1m]` twin:
+
+- **Gemini 3.8 Flash**, one pair per thinking level. The level is part of the
+  id (`gemini-3.8-flash-high` / `-medium` / `-low`), so these rows have an empty
+  effort menu.
+- **Gemini 4 Neon, Carbon, Hydrogen and Argon**, one pair per model. The level
+  is the row's effort menu: low, medium, high and xhigh on Neon and Hydrogen;
+  low, medium and high on Carbon and Argon. Antigravity serves these models
+  only under thinking-level ids (`gemini-4-neon-xhigh`, `gemini-4-argon-high`),
+  so llmux sends `<id>-<level>` with the level taken from the client's effort,
+  `-high` when none is sent (see [the rule](#alias-semantics) under gemini
+  aliases). Google publishes the `gemini-4-neon-xhigh` form; the other suffixed
+  ids come from third parties and are not yet verified by llmux
+  ([#244](https://github.com/2lab-ai/llmux/issues/244),
+  [#310](https://github.com/2lab-ai/llmux/issues/310)).
+
+As on astra, and unlike [the grok twin](#the-grok-1m-twin), the family aliases
+sit on the `[1m]` rows (`gemini`, `gemini-3.8-flash`, `argon`, `carbon`,
+`hydrogen`): the backend's window is 1,048,576 tokens, so the 1M the suffix
+advertises is honest there. **Neon is the exception.** The API gives it
+1,048,576, but the Antigravity models page (read 2026-11-21) says "Up to 512K
+tokens", so the bare `gemini-4-neon` row advertises 524,288 and owns `neon`;
+`gemini-4-neon[1m]` keeps 1,048,576 as an explicit opt-in. The suffix is display
+metadata only; a twin and its base row reach the backend as the same id.
 
 These ids are served by the **Antigravity subscription backend** (Google Cloud
 Code `v1internal`, reached with an account added by `llmux login --gemini`),
 not by the public Gemini API. Google decides per account which ids it may use:
 
-- **Argon needs paid Google AI Pro, Ultra or Enterprise.** Google lists Argon
-  for paid Google AI Pro plans (or a trial on eligible premium devices), Ultra
-  and Enterprise, and not for Free or Google AI Plus
-  ([Antigravity models](https://antigravity.google/docs/models/), fetched
-  2026-11-10; the 2026-10-15 read listed Ultra and Enterprise only). On a
-  Google AI Plus account `gemini-4-argon` returns 404 NOT_FOUND, and llmux
+- **Every Gemini 4 model needs a paid plan** ([Antigravity models](https://antigravity.google/docs/models),
+  read 2026-11-21):
+
+  | Model | Free | Plus | Pro | Ultra | Enterprise |
+  | --- | --- | --- | --- | --- | --- |
+  | Gemini 3.8 Flash | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | Gemini 4 Hydrogen | ✗ | ✗ | ✓ (non-trial Pro only) | ✓ | ✓ |
+  | Gemini 4 Neon | ✗ | ✗ | ✓ (paid Pro, or a trial on eligible premium devices) | ✓ | ✓ |
+  | Gemini 4 Argon | ✗ | ✗ | ✓ (paid Pro, or a trial on eligible premium devices) | ✓ | ✓ |
+  | Gemini 4 Carbon | ✗ | ✗ | ✗ | ✓ | ✓ |
+
+  On an account without the model Cloud Code answers 404 NOT_FOUND (measured
+  for Argon on Google AI Plus, 2026-10-15 and again 2026-11-21), and llmux
   relays that to the client as an Anthropic error with status 404. It does not
-  substitute Flash. The row exists so that a Pro, Ultra or Enterprise account
-  can serve it. Third-party reports say Antigravity serves Argon as
-  `gemini-4-argon-high` / `-medium` / `-low` rather than the bare id llmux
-  sends; llmux has not verified that ([#244](https://github.com/2lab-ai/llmux/issues/244)).
+  substitute Flash. The rows exist so that an account on the right plan can
+  serve them. Third parties also report that Cloud Code hides the Gemini 4 ids
+  from clients older than hub 2.29, so the default `gemini.user_agent` moved
+  to 2.34.0 on 2026-11-21 (see [configuration](configuration.md#gemini-backend)).
 - **Flash** — the live `fetchAvailableModels` read on 2026-10-15 listed
   `gemini-3.8-flash-high`, `-medium` and `-low` with a 1,048,576-token context
   and 65,536 output tokens.
@@ -495,13 +549,13 @@ Costs shown for gemini rows use the public API list prices (see
 [Sources](#sources)) for display only; subscription traffic is not billed per
 token.
 
-Gemini 4 Carbon (GA 2026-11-10) and Gemini 4 Hydrogen (GA 2026-11-12) have no
-rows yet: the daemon's Google AI Free/Plus account cannot use either, and Google
-publishes no Antigravity id form for them beyond `gemini-4-hydrogen-xhigh`
-([#310](https://github.com/2lab-ai/llmux/issues/310)). A request naming
-`gemini-4-carbon…` or `gemini-4-hydrogen…` still passes through like any
-`gemini-*` id, and is priced at its own list rate rather than at Flash (see
-[price classes](#per-request-price-classes)).
+Gemini 4 Carbon (GA 2026-11-10), Hydrogen (GA 2026-11-12) and Neon (GA
+2026-11-18) got rows on 2026-11-21. None of the Gemini 4 rows has been served
+through the daemon yet: its Google AI Free/Plus account can use none of them
+([#244](https://github.com/2lab-ai/llmux/issues/244),
+[#310](https://github.com/2lab-ai/llmux/issues/310) stay open until a Pro or
+Ultra probe). Google names no Helium, Krypton or Oxygen model id, so there are
+no such aliases.
 
 ## Selecting a model
 
@@ -522,10 +576,11 @@ Code logs an `unrecognized_model` warning for non-Claude ids and still sends the
 request.
 
 Gemini is the exception: it is selectable from Codex only. In Codex,
-`-m gemini` selects `gemini-3.8-flash-high[1m]` and `-m argon` selects
-`gemini-4-argon[1m]` (`llmux run --codex -- exec -m gemini '…'`). Claude Code,
-including a per-agent `model:` line, gets a local 400 for a gemini model (see
-[Gemini](#gemini)).
+`-m gemini` selects `gemini-3.8-flash-high[1m]`, `-m argon` / `-m carbon` /
+`-m hydrogen` select their model's `[1m]` row and `-m neon` selects
+`gemini-4-neon` (`llmux run --codex -- exec -m neon '…'`); Codex's reasoning
+effort picks the Gemini 4 thinking level. Claude Code, including a per-agent
+`model:` line, gets a local 400 for a gemini model (see [Gemini](#gemini)).
 
 Channel note: `haiku` → `claude-haiku-5-5[1m]` is on stable since v0.2.25
 (2026-10-08; [release availability](operational-reference.md#release-availability)).
@@ -533,8 +588,10 @@ Channel note: `haiku` → `claude-haiku-5-5[1m]` is on stable since v0.2.25
 ## Codex model picker
 
 `llmux run --codex` fetches `/llmux/models` and supplies a temporary Codex catalog
-with backend groups, effort menus and context windows (gemini rows have an empty
-effort menu: pick the `-high`, `-medium` or `-low` id instead). Native coding instructions
+with backend groups, effort menus and context windows (the 3.8 Flash rows have an
+empty effort menu: pick the `-high`, `-medium` or `-low` id instead; a Gemini 4
+row offers its thinking levels, and like every row whose menu has it, starts at
+`medium` — `src/cli/run.rs` `codex_catalog`). Native coding instructions
 come from the local Codex model cache when available; the fallback is an embedded
 coding prompt. Claude and other translated models use direct client tools.
 `--no-model-picker`, or an explicit `-c model_catalog_json=...`, preserves your
@@ -643,13 +700,65 @@ the same as for `claude-fable-5-1[1m]`.
 **These four vars are the only mechanism that changes what a bare native alias
 means, and they do not generalize.** An id Claude Code does not know (`astra`,
 `gpt-6`, `grok`, `or-nemotron-3-ultra`, …) has no such var: it is submitted verbatim
-and gets the client's 200k assumption. Catalog alias ownership decides the
-UPSTREAM slug, never the client's window — bare `astra` resolves to
-`gpt-6.2-astra[1m]`'s slug upstream and is still a 200k session in Claude Code.
-To move the client-side denominator for those, the SUBMITTED id has to end in
-`[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
-`/model grok[1m]` (and for grok, mind the
-[500k upstream ceiling](#the-grok-1m-twin)).
+and gets the client's assumption for an unknown id. That assumption was 200k
+until Claude Code 2.1.323 and is 1M since (measured 2026-11-21 with Claude Code
+2.1.330 through the daemon: `grok`, `astra` and `grok[1m]` all report
+`modelUsage.contextWindow` 1000000; `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` restores
+200k). Catalog alias ownership decides the UPSTREAM slug, never the client's
+window — bare `astra` resolves to `gpt-6.2-astra[1m]`'s slug upstream either
+way. On an older client the SUBMITTED id has to end in `[1m]` to move the
+client-side denominator: pick the `[1M]` row in the picker, or type
+`/model astra[1m]` / `/model grok[1m]`. On a current one, mind the upstream
+ceiling a 1M session can overrun: xAI cuts grok off at
+[500k](#the-grok-1m-twin).
+
+## Model sweep: 2026-11-21
+
+Checked all four providers against their current primary sources for 2026-11-18 → 2026-11-21
+(all fetched 2026-11-21). One new text model shipped, Gemini 4 Neon. The Gemini 4 rows grew from
+Argon alone to Neon, Carbon, Hydrogen and Argon, one row pair per model, with the new aliases
+`neon`, `carbon` and `hydrogen`; the thinking level is now the Gemini 4 rows' effort menu, and
+llmux sends a bare Gemini 4 id or alias upstream as its thinking-level id. The default Gemini
+User-Agent moved to hub 2.34.0, the Agent SDK bridge to 0.3.321, and `grok-4.7-build` /
+`grok-4.7-build-fast` got price rows. Catalog size: 58 curated rows (6 gemini rows added).
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | No new model id, and no price, context, max-output or effort change on any of the 15 rows. The newest model entry in the release notes is still 2026-11-09 (Fable 5.2, Mythos 5.2). Claude Code 2.1.328, 2.1.329 and 2.1.330 (npm `latest`, 2026-11-20) add no model, and their aliases are unchanged: `fable` → `claude-fable-5-2`, `opus` → `claude-opus-5-5`, `sonnet` → `claude-sonnet-5-5`, `haiku` → `claude-haiku-5-5`. The Agent SDK the Codex frontend's Claude route runs moved from 0.3.292 to **0.3.321** (Claude Code 2.1.321): the model-config page says Fable 5.2 "requires Claude Code v2.1.321 or later" and Haiku 5.5 "Use v2.1.293 or later", so the old pin was below both. 0.3.321's `SDKAssistantMessageError` union is the same as 0.3.292's, and the bridge's actual-SDK tests pass on it. Claude Code 2.1.323 (2026-11-12, before this window) changed the window it assumes for an id it does not recognize from 200K to 1M. Measured 2026-11-21 with Claude Code 2.1.330 through the daemon, `grok`, `astra` and `grok[1m]` all report `modelUsage.contextWindow` 1000000. This page's 200k statements are corrected (see [Alias exports](#alias-exports) and [the grok twin](#the-grok-1m-twin)). | [models overview](https://platform.claude.com/docs/en/models/overview), [pricing](https://platform.claude.com/docs/en/about-claude/pricing), [release notes](https://platform.claude.com/docs/en/release-notes/overview), [deprecations](https://platform.claude.com/docs/en/about-claude/model-deprecations), [news](https://www.anthropic.com/news), [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md), [Claude Code model config](https://code.claude.com/docs/en/model-config), npm `@anthropic-ai/claude-code-darwin-arm64@2.1.330`, npm `@anthropic-ai/claude-agent-sdk@0.3.321` (`claudeCodeVersion` 2.1.321) |
+| Codex / OpenAI | No new picker model and no drift. `models.json` has had no commit since `6c0cee5` (2026-11-17), and every row's context, efforts and Standard / long-context / Fast price still matches. The only new id is `gpt-reserve` ("Luna Reserve"): a hidden fallback in the live server list that the Codex TUI switches to when ordinary usage is exhausted. It is not in `models.json`, has no published price and is not a row. The Codex docs moved: `developers.openai.com/codex/changelog` and `/codex/models` now redirect (308) to `learn.chatgpt.com/docs/changelog` and `/docs/models`. | [models.json @ 6c0cee5](https://github.com/openai/codex/blob/6c0cee502d215e5df2dd9a303cf2e252229c9e12/codex-rs/models-manager/models.json), [ChatGPT & Codex changelog](https://learn.chatgpt.com/docs/changelog), [Codex models](https://learn.chatgpt.com/docs/models), [pricing](https://developers.openai.com/api/docs/pricing), [API changelog](https://developers.openai.com/api/docs/changelog), model pages ([gpt-6.2-sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol), [gpt-6.2-astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra), [gpt-6.1-sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [gpt-6.1-terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra), [gpt-5.6-sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)) |
+| Grok / xAI | No new text model id; `grok-4.7`, `grok-4.6` and `grok-4.5` keep the same prices, 500k context and efforts. `grok-build-0.1` reached end of life on 2026-11-19 (not a curated row). A `grok` request through the daemon on 2026-11-21 was served as `grok-4.7-build`, an id docs.x.ai does not document (it appears in fixtures of xai-org/grok-build, apparently Grok Build's name for standard Grok 4.7 traffic). llmux books grok usage under the requested id (`grok-4.7`), but a pin or client naming `grok-4.7-build` or `grok-4.7-build-fast` used to take the `grok-4.5` group fallback. Added price rows: `grok-4.7-build` at `grok-4.7`'s rates, and `grok-4.7-build-fast` ("Grok 4.7 Fast") at $4.00 in / $1.00 cached / $12.00 out, $6.00 / $1.50 / $18.00 at 200k prompt tokens or more (the fallback was about half that). | [release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models), [pricing](https://docs.x.ai/developers/pricing), [grok-4.7](https://docs.x.ai/developers/models/grok-4.7), [grok-4.6](https://docs.x.ai/developers/models/grok-4.6), [grok-4.5](https://docs.x.ai/developers/models/grok-4.5), [grok-build-0.1](https://docs.x.ai/developers/models/grok-build-0.1) |
+| Gemini / Google (Antigravity) | New: **Gemini 4 Neon** (`gemini-4-neon`, GA 2026-11-18): $3.00 in / $15.00 out / $0.15 cached, flat; 1,048,576 unified on the API but "Up to 512K tokens" on Antigravity; thinking levels low, medium, high and xhigh; paid Pro, Ultra and Enterprise. Rows, one pair per Gemini 4 model, the level in the effort menu: `gemini-4-neon` (524,288, alias `neon`) and `gemini-4-neon[1m]` (1,048,576); `gemini-4-carbon[1m]` (alias `carbon`) and `gemini-4-carbon`; `gemini-4-hydrogen[1m]` (alias `hydrogen`) and `gemini-4-hydrogen`; Argon's pair gains the menu low, medium, high. Antigravity serves Gemini 4 only under thinking-level ids (Google publishes `gemini-4-neon-xhigh`; third parties report the rest and a 400 on bare `gemini-4-neon`), so a bare Gemini 4 id or alias now leaves llmux as `<id>-<level>`, the level from the client's effort (`-high` when none). Before, `argon` went out as the bare `gemini-4-argon`, which most likely failed on every plan ([#244](https://github.com/2lab-ai/llmux/issues/244)). The default `gemini.user_agent` moved from `antigravity/hub/2.23.1` to `2.34.0` (hub manifest, read 2026-11-21); third parties report the Gemini 4 ids hidden or 404 below 2.29. A config that still holds exactly the old default is moved at load; any other value is kept. Pricing: `gemini-4-neon`, `gemini-4-neon-*` and `neon` at Neon's rate, and bare `carbon` / `hydrogen` at their families' (before, the Flash fallback priced Neon 4× too low). Google names no Helium, Krypton or Oxygen model id. The Flash, Argon, Carbon and Hydrogen ids, context and prices are unchanged. | [Gemini API changelog](https://aistudio.google.com/docs/changelog), [models](https://aistudio.google.com/docs/models), [pricing](https://aistudio.google.com/docs/pricing), [Gemini 4 Neon](https://aistudio.google.com/docs/models/gemini-4-neon), [Gemini 4 Carbon](https://aistudio.google.com/docs/models/gemini-4-carbon), [Gemini 4 Argon](https://aistudio.google.com/docs/models/gemini-4-argon), [Gemini 4 Hydrogen](https://aistudio.google.com/docs/models/gemini-4-hydrogen), [Neon announcement](https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-neon/), [Neon model card](https://deepmind.google/models/model-cards/gemini-4-neon/), [Antigravity models](https://antigravity.google/docs/models), [Antigravity changelog](https://antigravity.google/docs/changelog), [Neon in Antigravity](https://antigravity.google/blog/gemini-4-neon-in-google-antigravity/), Antigravity hub manifest (`latest-arm64-mac.yml`, `version: 2.34.0`); third-party id evidence: router-for-me/CLIProxyAPI `internal/registry/models/models.json` @ c1040cc0d9, cheaper-inference/OmniRoute PR #20666, YukieMiona/dsh-antigravity-oauth#13 |
+| OpenRouter | Not re-checked in this sweep; no row changed. | — |
+
+Not changed, recorded:
+
+- **Gemini 4 ids are not yet verified by llmux.** The daemon's Google AI Free/Plus account lists
+  none of Neon, Carbon, Argon or plain Hydrogen, so no suffixed id has been served through llmux.
+  [#244](https://github.com/2lab-ai/llmux/issues/244) and
+  [#310](https://github.com/2lab-ai/llmux/issues/310) stay open until a Pro or Ultra account
+  probes `fetchAvailableModels` and one stream each on a bare and a suffixed id, at the new
+  User-Agent. The native client also sends `generationConfig.thinkingConfig.thinkingLevel`
+  matching the suffix; llmux does not, and whether Gemini 4 needs it is unknown.
+- **Claude Code's 1M assumption against grok's 500k.** On Claude Code 2.1.323 and later a bare
+  `grok` session sizes itself at 1M while xAI cuts requests off at 500,000, so a long session can
+  be rejected upstream before the client compacts. Recorded; llmux does not guard it yet.
+- **Codex `gpt-reserve`** is hidden and unpriced, and has no passthrough: a request naming it gets
+  the codex pin.
+- **Codex Ultrafast** is not modelled: llmux sends only `service_tier: "priority"` (Fast), so it
+  can neither request nor price Ultrafast (3× Standard on 6.2 through 2027-02-28, 6× from
+  2027-03-01; 6× on `gpt-6.1-sol` and `gpt-6-astra`).
+- **`gpt-5.6-sol` promotional price** still ends 2026-11-30, and OpenAI still publishes no later
+  price.
+- **`grok-build-0.1`** reached end of life on 2026-11-19. It was never a curated row; a config
+  that pins it now fails upstream.
+- **Sonnet 4.5 retirement.** `claude-sonnet-4-5-20250929` / `claude-sonnet-4-5` retire on
+  2026-11-30 (replacement `claude-sonnet-5-5`). Neither is a row; the price row stays for history.
+- **Gemini 4 Helium** was only teased (2026-11-19): no model id, no docs page, so no alias.
+- **Evidence from before the change** (llmux 0.2.26 preview, the owner's Mac daemon, 2026-11-21):
+  `argon` → 404 (Cloud Code NOT_FOUND, Google AI Plus account); `grok` → 200, served
+  `grok-4.7-build`; `gemini` → 502 (transient upstream rate limit); `sonnet`, `haiku`, `fable`,
+  `opus`, `terra`, `luna`, `sol`, `astra`, `gpt-6`, `gpt-6.1` and `gpt-6.2` → 200 on their
+  catalog ids. Probes after this change follow the deploy.
 
 ## Model sweep: 2026-11-18
 
@@ -914,7 +1023,7 @@ served speed.
 
 | Fact | When | Rates |
 | --- | --- | --- |
-| Long context | The prompt (input + cache reads + cache writes) is over 272,000 tokens on a listed GPT row, 200,000 or more on `grok-4.5` / `grok-4.6` / `grok-4.7` (and the grok fallback), over 100,000 on `claude-haiku-5-5`. Built-in data, not configurable. | The whole request at the long rates below. |
+| Long context | The prompt (input + cache reads + cache writes) is over 272,000 tokens on a listed GPT row, 200,000 or more on `grok-4.5` / `grok-4.6` / `grok-4.7` / `grok-4.7-build` / `grok-4.7-build-fast` (and the grok fallback), over 100,000 on `claude-haiku-5-5`. Built-in data, not configurable. | The whole request at the long rates below. |
 | Fast | The request was served at the Fast tier: codex Fast mode (the requested `service_tier: "priority"`: the codex backend does not report the tier that served a request — it answered `"default"` to every priority request in llmux's raw-io capture) or Claude fast mode (the response's `usage.speed: "fast"`). | The Fast rates below; Claude fast mode is 2× every standard rate on Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5 and Opus 4.8 ($16 / $80, $16 / $80, $8 / $40, $10 / $50, $10 / $50, cache rates doubled too). Rows with no fast price stay standard. |
 | US-only inference | The response's `usage.inference_geo` is `"us"` (claude group). | 1.1× every rate the other facts select (on top of fast mode, and of Haiku 5.5's long tier), on Claude 4.6 and later rows. |
 | Dated rates | The request's UTC day is on or after a built-in rate change (the pricing page names no time zone, so the change is at 00:00 UTC). | That change's rates. |
@@ -941,7 +1050,8 @@ pages:
 | gpt-5.6-luna | > 272,000 | $0.40 / $0.04 / $0.50 / $1 / $1.80 | 2× Standard | 2× long |
 | gpt-5.5 | > 272,000 | $10 / $1 / $10 (input rate) / $10 / $45 | $12.50 / $1.25 / $75 (2.5×) | long rates (none published) |
 | grok-4.5 | ≥ 200,000 | $4 / $0.60 / $4 (input rate) / — / $12 | — | — |
-| grok-4.6, grok-4.7 | ≥ 200,000 | $4 / $1.00 / $4 (input rate) / — / $12 | — | — |
+| grok-4.6, grok-4.7, grok-4.7-build | ≥ 200,000 | $4 / $1.00 / $4 (input rate) / — / $12 | — | — |
+| grok-4.7-build-fast (Grok 4.7 Fast, read 2026-11-21; below 200,000: $4 / $1.00 / $4 / — / $12) | ≥ 200,000 | $6 / $1.50 / $6 (input rate) / — / $18 | — | — |
 | claude-haiku-5-5 | > 100,000 | $0.50 / $0.05 / $0.625 / $1.00 / $2.50 | — | — |
 
 Dated rate changes ([Google pricing](https://aistudio.google.com/docs/pricing),
@@ -952,8 +1062,11 @@ $3.75 / $0.075 through 2026-12-31, $1.50 / $7.50 / $0.15 from 2027-01-01.
 Read 2026-11-18: `gemini-4-carbon` (and `gemini-4-carbon-*`) carries Argon's
 card, $2.00 / $10.00 / $0.10 through 2026-11-30 and $4.00 / $20.00 / $0.20 from
 2026-12-01; `gemini-4-hydrogen` (and `gemini-4-hydrogen-*`) is a flat $1.50 /
-$7.50 / $0.075. Neither has a catalog row; both are priced because any
-`gemini-*` id passes through.
+$7.50 / $0.075. Read 2026-11-21: `gemini-4-neon` (and `neon`,
+`gemini-4-neon-*`) is a flat $3.00 / $15.00 / $0.15, no dated change. Since
+2026-11-21 `carbon` and `hydrogen` price like their families too, and every
+Gemini 4 thinking-level id the provider sends (`gemini-4-neon-high`, …) takes
+its family's rate.
 
 Claude fast mode ([fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode),
 read 2026-11-12) "is priced at a multiplier on standard rates across the full
@@ -1115,7 +1228,11 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   also LISTS grok-4.6's $0.50 cached input, which llmux had carried from
   grok-4.5). Rates double for prompts ≥200k tokens; llmux prices that
   long-context tier per request since 2026-11-12 (see
-  [price classes](#per-request-price-classes)).
+  [price classes](#per-request-price-classes)). Read 2026-11-21: "Grok 4.7
+  Fast" — the `grok-4.7-build-fast` id — is $4.00 / $12.00 / $1.00 cached
+  below 200k and $6.00 / $18.00 / $1.50 at or above it, and `grok-4.7-build`
+  (no docs.x.ai page; the id the proxy reported serving a `grok` request) is
+  priced as `grok-4.7`.
 - **Gemini rows** — added 2026-10-15 as the `GEMINI_MODELS` const in
   `src/catalog.rs`. Ids, context and output: the live `fetchAvailableModels`
   read on 2026-10-15 (`gemini-3.8-flash-high`, `-medium`, `-low`; ctx
@@ -1125,7 +1242,15 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   [Gemini 4 Argon page](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon)
   (updated 2026-10-14). Argon's tier: the
   [Antigravity models page](https://antigravity.google/docs/models/) (fetched
-  2026-10-15). Design record, including the live wire probes:
+  2026-10-15). The Neon, Carbon and Hydrogen rows (2026-11-21): the
+  [Neon](https://aistudio.google.com/docs/models/gemini-4-neon),
+  [Carbon](https://aistudio.google.com/docs/models/gemini-4-carbon) and
+  [Hydrogen](https://aistudio.google.com/docs/models/gemini-4-hydrogen) model
+  pages (1,048,576 unified, thinking levels) and the
+  [Antigravity models page](https://antigravity.google/docs/models) (plans,
+  Neon "Up to 512K tokens", `gemini-4-neon-xhigh`), all read 2026-11-21; the
+  per-model effort menus are the provider's `FAMILIES` table in
+  `src/provider/gemini.rs`. Design record, including the live wire probes:
   [`gemini/spec.md`](gemini/spec.md).
 - **Gemini pricing** — [ai.google.dev pricing](https://ai.google.dev/gemini-api/docs/pricing),
   updated 2026-10-14: 3.8 Flash $0.75 in / $3.75 out / $0.075 cached input per
@@ -1137,5 +1262,8 @@ rows were re-probed 2026-08-26 (unchanged) and again 2026-09-23 (the new
   [pricing](https://aistudio.google.com/docs/pricing),
   [Gemini 4 Carbon](https://aistudio.google.com/docs/models/gemini-4-carbon) and
   [Gemini 4 Hydrogen](https://aistudio.google.com/docs/models/gemini-4-hydrogen),
-  read 2026-11-18 (see the dated rates above). llmux uses these for cost display only;
+  read 2026-11-18 (see the dated rates above). Gemini 4 Neon:
+  [pricing](https://aistudio.google.com/docs/pricing) and
+  [Gemini 4 Neon](https://aistudio.google.com/docs/models/gemini-4-neon), read
+  2026-11-21. llmux uses these for cost display only;
   Antigravity subscription traffic is not billed per token.

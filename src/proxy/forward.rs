@@ -544,10 +544,11 @@ impl ForwardContext {
                 fast: false,
             },
             // The provider-resolved UPSTREAM id for every alias form
-            // (`argon`, `gemini-4-argon[1m]` → `gemini-4-argon`) — codex
+            // (`argon`, `gemini-4-argon[1m]` → `gemini-4-argon-high`) — codex
             // parity; pricing keys off this string. No effort: the thinking
-            // level is baked into the gemini model id and client effort is
-            // not sent upstream (docs/gemini/spec.md §R3).
+            // level is baked into the gemini model id (a Gemini 4 family's
+            // client effort has become its `-<level>` suffix) and no effort
+            // field goes upstream (docs/gemini/spec.md §R3).
             Some(BackendGroup::Gemini) => FinishedMeta {
                 group: Some("gemini".to_string()),
                 model: Some(state.gemini.request_meta(&self.body).0),
@@ -5430,8 +5431,11 @@ mod tests {
     fn gemini_finished_meta_records_the_upstream_id_for_every_alias_form() {
         let state = test_state("http://127.0.0.1:9", vec![oauth_account("a", "at-a")]);
         for (model, upstream) in [
-            ("argon", "gemini-4-argon"),
-            ("gemini-4-argon[1m]", "gemini-4-argon"),
+            ("argon", "gemini-4-argon-high"),
+            ("gemini-4-argon[1m]", "gemini-4-argon-high"),
+            ("neon", "gemini-4-neon-high"),
+            ("hydrogen[1m]", "gemini-4-hydrogen-high"),
+            ("gemini-4-carbon-low", "gemini-4-carbon-low"),
             ("gemini", "gemini-3.8-flash-high"),
             ("gemini-3.8-flash-low[1m]", "gemini-3.8-flash-low"),
         ] {
@@ -8294,8 +8298,9 @@ mod tests {
         let error = serde_json::json!({"error": {"code": 404, "status": "NOT_FOUND",
                                                  "message": "model not found"}});
         for (label, events) in [("text", vec![text]), ("error", vec![error])] {
-            let mut bare = gemini::GeminiSseConverter::with_model("gemini-4-argon".to_string())
-                .with_safeguards_requested(true);
+            let mut bare =
+                gemini::GeminiSseConverter::with_model("gemini-4-argon-high".to_string())
+                    .with_safeguards_requested(true);
             let bytes = feed(&mut bare, &events);
             let expected: ConverterReadout = (
                 bytes,
@@ -8306,7 +8311,7 @@ mod tests {
                 bare.into_message_json(),
             );
             let wrapped = TranslateConverter::from(gemini::GeminiSseConverter::with_model(
-                "gemini-4-argon".to_string(),
+                "gemini-4-argon-high".to_string(),
             ));
             let actual = wrapped_readout(wrapped, &events);
             assert!(
@@ -8319,7 +8324,7 @@ mod tests {
         // The error stream surfaces through the wrapper's accessor (the relay
         // reads it for provider-health accounting).
         let wrapped = TranslateConverter::from(gemini::GeminiSseConverter::with_model(
-            "gemini-4-argon".to_string(),
+            "gemini-4-argon-high".to_string(),
         ));
         let (.., error, _) = wrapped_readout(
             wrapped,

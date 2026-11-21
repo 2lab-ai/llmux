@@ -696,6 +696,60 @@ mod tests {
         assert_eq!(out["models"][0]["base_instructions"], "first");
     }
 
+    /// The Codex picker over the REAL catalog (2026-11-21): a Gemini 4 row
+    /// offers its thinking levels as reasoning levels (the provider turns the
+    /// chosen one into the `-<level>` id), defaults to `medium` like every
+    /// row whose menu has it, and its alias (`neon`, …) rides as a hidden
+    /// entry; a 3.8 Flash row keeps an empty menu.
+    #[test]
+    fn codex_catalog_offers_gemini_4_levels_from_the_real_catalog() {
+        let entries = crate::catalog::catalog(
+            "grok-4.7",
+            "gpt-6.2-sol",
+            crate::catalog::OPENROUTER_DEFAULT_PIN,
+        );
+        let doc = serde_json::json!({ "models": entries }).to_string();
+        let rows = serde_json::from_str::<CatalogResponse>(&doc)
+            .expect("the served catalog parses as CLI catalog rows")
+            .models;
+        let out = codex_catalog(&rows, None);
+        let models = out["models"].as_array().expect("models");
+        let by_slug = |slug: &str| {
+            models
+                .iter()
+                .find(|m| m["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} in the codex catalog"))
+        };
+        let levels = |slug: &str| -> Vec<String> {
+            by_slug(slug)["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .iter()
+                .map(|l| l["effort"].as_str().expect("effort").to_string())
+                .collect()
+        };
+        assert_eq!(levels("gemini-4-neon"), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(by_slug("gemini-4-neon")["context_window"], 524_288);
+        assert_eq!(by_slug("gemini-4-neon[1m]")["context_window"], 1_048_576);
+        assert_eq!(levels("gemini-4-argon[1m]"), ["low", "medium", "high"]);
+        assert_eq!(
+            by_slug("gemini-4-carbon")["default_reasoning_level"],
+            "medium"
+        );
+        assert!(levels("gemini-3.8-flash-high[1m]").is_empty());
+        for (alias, owner) in [
+            ("neon", "gemini-4-neon"),
+            ("argon", "gemini-4-argon[1m]"),
+            ("carbon", "gemini-4-carbon[1m]"),
+            ("hydrogen", "gemini-4-hydrogen[1m]"),
+        ] {
+            let entry = by_slug(alias);
+            assert_eq!(entry["visibility"], "hide", "{alias}");
+            assert_eq!(entry["display_name"], by_slug(owner)["display_name"]);
+            assert_eq!(levels(alias), levels(owner), "{alias}");
+        }
+    }
+
     fn row(
         id: &str,
         name: &str,
@@ -827,7 +881,13 @@ mod tests {
             row("claude-opus-5-5", "Claude Opus 5.5", &[], None, "claude"),
             row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
             row("gpt-5.5", "GPT-5.5", &[], None, "codex"),
-            row("gemini-4-argon", "Gemini 4 Argon", &[], None, "gemini"),
+            row(
+                "gemini-4-argon",
+                "Gemini 4 Argon",
+                &["low", "medium", "high"],
+                Some(1_048_576),
+                "gemini",
+            ),
             row("grok-4.6", "Grok 4.6", &[], None, "grok"),
         ];
         let json = model_picker_settings(&models).unwrap();
@@ -848,7 +908,13 @@ mod tests {
     fn model_picker_settings_is_none_for_a_gemini_only_catalog() {
         let models = [
             row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
-            row("gemini-4-argon", "Gemini 4 Argon", &[], None, "gemini"),
+            row(
+                "gemini-4-argon",
+                "Gemini 4 Argon",
+                &["low", "medium", "high"],
+                Some(1_048_576),
+                "gemini",
+            ),
         ];
         assert!(model_picker_settings(&models).is_none());
     }

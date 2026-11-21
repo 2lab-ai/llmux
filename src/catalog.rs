@@ -18,7 +18,9 @@
 //! fable alias rolled to 5.2 and `terra` to `gpt-6.1-terra` on 2026-11-10;
 //! `sol` rolled to `gpt-6.2-sol` and `astra` to `gpt-6.2-astra[1m]`, Opus
 //! 4.6's effort menu corrected and the dead OpenRouter rows retired on
-//! 2026-11-18):
+//! 2026-11-18; the Gemini 4 Neon / Carbon / Hydrogen rows and their
+//! `neon` / `carbon` / `hydrogen` aliases added, and Argon given an effort
+//! menu, on 2026-11-21):
 //! - Fable 5.2: platform.claude.com/docs/en/models/fable-5-2/overview and
 //!   the pricing page, read 2026-11-10: `claude-fable-5-2` released
 //!   2026-11-09, 1,000,000 context (the default and the maximum; no 200K
@@ -84,10 +86,19 @@
 //! - Gemini ids: the live Antigravity `v1internal:fetchAvailableModels`
 //!   response of 2026-10-15 (`gemini-3.8-flash-{high,medium,low}`, ctx
 //!   1,048,576; this account lists Argon only as `gemini-4-argon-disabled`,
-//!   an Ultra/Enterprise model — docs/gemini/spec.md). Context 1,048,576 on
-//!   every row: ai.google.dev model pages, Gemini 3.8 Flash (updated
-//!   2026-09-02) and Gemini 4 Argon (updated 2026-10-14). The thinking level
-//!   is part of the id, so every gemini row has an empty effort menu.
+//!   a paid-plan model — docs/gemini/spec.md). Context 1,048,576 on every
+//!   row but bare `gemini-4-neon`: ai.google.dev model pages, Gemini 3.8 Flash
+//!   (updated 2026-09-02) and Gemini 4 Argon (updated 2026-10-14), and
+//!   aistudio.google.com's Carbon, Hydrogen and Neon pages (read 2026-11-21).
+//!   Bare `gemini-4-neon` carries 524,288: the Antigravity models page (read
+//!   2026-11-21) gives Neon "Up to 512K tokens". The Gemini 4 rows (Neon,
+//!   Carbon, Hydrogen and Argon, one row pair per model) landed 2026-11-21;
+//!   Antigravity serves those models only under thinking-level ids
+//!   (`gemini-4-<name>-low|-medium|-high[|-xhigh]`; Google publishes
+//!   `gemini-4-neon-xhigh`, third parties the rest), so their effort menu is
+//!   the model's levels and the provider turns the client effort into the
+//!   id suffix. A 3.8 Flash row carries its level in the id and has an empty
+//!   effort menu.
 
 use std::borrow::Cow;
 
@@ -350,49 +361,131 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str, &str, u64, &[&str])] = &[
     ),
 ];
 
-/// Gemini effort menu: empty on every row. The Antigravity backend bakes the
-/// thinking level into the model id (`gemini-3.8-flash-high` / `-medium` /
-/// `-low`), and no `thinkingLevel` wire form is verified for Argon on that
-/// backend (docs/gemini/spec.md §R3), so llmux advertises no effort knob.
-const GEMINI_EFFORTS: &[&str] = &[];
-
-/// Context window of every curated gemini row (ai.google.dev model pages:
-/// 3.8 Flash 1,048,576 in; Argon 1,048,576 unified).
+/// Context window of every curated gemini row but one (ai.google.dev /
+/// aistudio.google.com model pages: 3.8 Flash 1,048,576 in; Argon, Carbon,
+/// Hydrogen and Neon 1,048,576 unified).
 const GEMINI_CONTEXT: u64 = 1_048_576;
 
+/// Context window of the bare `gemini-4-neon` row: the Antigravity models page
+/// (https://antigravity.google/docs/models, read 2026-11-21) gives Neon "Up to
+/// 512K tokens" on that backend, while the API page says 1,048,576. The base
+/// row — which owns the `neon` alias — carries the window the serving backend
+/// publishes; its `[1m]` twin keeps 1,048,576 as an explicit opt-in.
+const GEMINI_4_NEON_CONTEXT: u64 = 524_288;
+
 /// The curated gemini catalog (docs/gemini/spec.md §R7). Tuple = (id,
-/// aliases, display name). Every row is group `gemini`, [`GEMINI_EFFORTS`],
-/// [`GEMINI_CONTEXT`].
+/// aliases, display name, context window). Every row is group `gemini`.
+///
+/// Effort menus are not listed here: [`gemini_efforts`] derives each row's
+/// from the provider's family table ([`crate::provider::gemini::family_levels`]),
+/// the same table that turns a client effort into the upstream id. A Gemini 4
+/// row is ONE row per model and its menu is the model's thinking levels
+/// (Antigravity serves it only as `<id>-<level>`); a 3.8 Flash row carries
+/// its level in the id (`gemini-3.8-flash-high`), so its menu is empty.
 ///
 /// The family aliases live on the `[1m]` rows (operator rule 2026-09-10, the
 /// astra arrangement): `gemini` / `gemini-3.8-flash` → the high-thinking
-/// Flash twin, `argon` → the Argon twin. Unlike grok's `[1m]` twin there is no
-/// upstream-window caveat to disclose — the backend's real window IS ~1M, so
-/// the 1M-denominated id is the honest default face of the family. The
-/// provider strips one trailing `[1m]` before the request leaves llmux, so a
-/// twin and its base row reach Cloud Code as the same upstream id.
-pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str)] = &[
+/// Flash twin, `argon` / `carbon` / `hydrogen` → their model's twin. Unlike
+/// grok's `[1m]` twin there is no upstream-window caveat to disclose — the
+/// backend's real window IS ~1M, so the 1M-denominated id is the honest
+/// default face of the family. `neon` is the exception (2026-11-21): it sits
+/// on the 512K base row, because that is the window Antigravity publishes
+/// for Neon ([`GEMINI_4_NEON_CONTEXT`]). The provider strips one trailing
+/// `[1m]` before the request leaves llmux, so a twin and its base row reach
+/// Cloud Code as the same upstream id.
+pub(crate) const GEMINI_MODELS: &[(&str, &[&str], &str, u64)] = &[
     (
         "gemini-3.8-flash-high[1m]",
         &["gemini", "gemini-3.8-flash"],
         "Gemini 3.8 Flash (High) [1M]",
+        GEMINI_CONTEXT,
     ),
-    ("gemini-3.8-flash-high", &[], "Gemini 3.8 Flash (High)"),
+    (
+        "gemini-3.8-flash-high",
+        &[],
+        "Gemini 3.8 Flash (High)",
+        GEMINI_CONTEXT,
+    ),
     (
         "gemini-3.8-flash-medium[1m]",
         &[],
         "Gemini 3.8 Flash (Medium) [1M]",
+        GEMINI_CONTEXT,
     ),
-    ("gemini-3.8-flash-medium", &[], "Gemini 3.8 Flash (Medium)"),
+    (
+        "gemini-3.8-flash-medium",
+        &[],
+        "Gemini 3.8 Flash (Medium)",
+        GEMINI_CONTEXT,
+    ),
     (
         "gemini-3.8-flash-low[1m]",
         &[],
         "Gemini 3.8 Flash (Low) [1M]",
+        GEMINI_CONTEXT,
     ),
-    ("gemini-3.8-flash-low", &[], "Gemini 3.8 Flash (Low)"),
-    ("gemini-4-argon[1m]", &["argon"], "Gemini 4 Argon [1M]"),
-    ("gemini-4-argon", &[], "Gemini 4 Argon"),
+    (
+        "gemini-3.8-flash-low",
+        &[],
+        "Gemini 3.8 Flash (Low)",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-neon[1m]",
+        &[],
+        "Gemini 4 Neon [1M]",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-neon",
+        &["neon"],
+        "Gemini 4 Neon",
+        GEMINI_4_NEON_CONTEXT,
+    ),
+    (
+        "gemini-4-carbon[1m]",
+        &["carbon"],
+        "Gemini 4 Carbon [1M]",
+        GEMINI_CONTEXT,
+    ),
+    ("gemini-4-carbon", &[], "Gemini 4 Carbon", GEMINI_CONTEXT),
+    (
+        "gemini-4-hydrogen[1m]",
+        &["hydrogen"],
+        "Gemini 4 Hydrogen [1M]",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-hydrogen",
+        &[],
+        "Gemini 4 Hydrogen",
+        GEMINI_CONTEXT,
+    ),
+    (
+        "gemini-4-argon[1m]",
+        &["argon"],
+        "Gemini 4 Argon [1M]",
+        GEMINI_CONTEXT,
+    ),
+    ("gemini-4-argon", &[], "Gemini 4 Argon", GEMINI_CONTEXT),
 ];
+
+/// The [`GEMINI_MODELS`] row advertising `alias`, if any. `alias` must
+/// already be the lookup form (trimmed, ASCII-lowercased, no `[1m]`); the
+/// gemini provider resolves its aliases here, so a row added to the table
+/// carries its aliases automatically.
+pub(crate) fn gemini_alias_owner(alias: &str) -> Option<&'static str> {
+    GEMINI_MODELS
+        .iter()
+        .find(|(_, aliases, ..)| aliases.contains(&alias))
+        .map(|&(id, ..)| id)
+}
+
+/// Whether `id` (lookup form, as for [`gemini_alias_owner`]) is a curated
+/// gemini row id.
+pub(crate) fn is_gemini_row(id: &str) -> bool {
+    GEMINI_MODELS.iter().any(|(row, ..)| *row == id)
+}
 
 /// The default OpenRouter pin — the wire slug the bare `or` alias resolves to.
 /// SSOT for BOTH `config::schema::default_openrouter_model` (what a fresh
@@ -877,16 +970,18 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         });
     }
 
-    // ---- gemini (live fetchAvailableModels 2026-10-15) ----
-    // Static aliases, no pin: the bare `gemini` / `argon` aliases are fixed
-    // catalog facts (spec §R7), not a live config pin like `grok` / `or`.
-    for &(id, aliases, name) in GEMINI_MODELS {
+    // ---- gemini (live fetchAvailableModels 2026-10-15; Gemini 4 rows
+    //      2026-11-21) ----
+    // Static aliases, no pin: the bare `gemini` / `argon` / `neon` / `carbon`
+    // / `hydrogen` aliases are fixed catalog facts (spec §R7), not a live
+    // config pin like `grok` / `or`.
+    for &(id, aliases, name, ctx) in GEMINI_MODELS {
         entries.push(ModelEntry {
             id: Cow::Borrowed(id),
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
             name: Cow::Borrowed(name),
-            efforts: GEMINI_EFFORTS,
-            max_context: Some(GEMINI_CONTEXT),
+            efforts: gemini_efforts(id),
+            max_context: Some(ctx),
             group: "gemini",
         });
     }
@@ -925,6 +1020,17 @@ fn grok_efforts(id: &str) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
+/// Gemini effort menu for `id`: the thinking levels of the family it names
+/// ([`crate::provider::gemini::family_levels`], one trailing `[1m]`
+/// stripped first, as for [`grok_efforts`]). A Gemini 4 row is its bare
+/// family id, so it advertises the levels the provider maps a client effort
+/// onto; a 3.8 Flash row already names its level (`gemini-3.8-flash-high`)
+/// and is no family, so its menu is empty.
+fn gemini_efforts(id: &str) -> &'static [&'static str] {
+    let id = id.strip_suffix("[1m]").unwrap_or(id);
+    crate::provider::gemini::family_levels(id).unwrap_or(&[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,8 +1043,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_matches_user_contract_52_entries() {
-        // The pinned (curated) case: exactly 52 rows, claude ids in order.
+    fn catalog_matches_user_contract_58_entries() {
+        // The pinned (curated) case: exactly 58 rows, claude ids in order.
         // 14 before the codex `[1m]` pair landed (2026-08-21); 16 before the
         // 10 curated openrouter free rows landed (2026-08-21); 26 before the
         // fable-5.1 row landed (2026-09-02); 27 before the gpt-6-astra pair
@@ -952,9 +1058,10 @@ mod tests {
         // claude-fable-5-2 row and the gpt-6.1-terra pair landed (2026-11-10);
         // still 53 after the gpt-6.2-sol / gpt-6.2-astra pairs landed (+4) and
         // the four dead openrouter rows were retired (-4, #243) on 2026-11-18;
-        // 52 after the gpt-5.5 row was retired (2026-11-19, #309).
+        // 52 after the gpt-5.5 row was retired (2026-11-19, #309); 58 after
+        // the Gemini 4 Neon / Carbon / Hydrogen pairs landed (2026-11-21).
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 52);
+        assert_eq!(entries.len(), 58);
         let claude_ids: Vec<&str> = entries
             .iter()
             .filter(|e| e.group == "claude")
@@ -1006,44 +1113,102 @@ mod tests {
     // ---- G16: gemini rows (docs/gemini/spec.md §R7) ----
 
     #[test]
-    fn g16_gemini_rows_ids_names_context_and_empty_efforts() {
+    fn g16_gemini_rows_ids_names_context_and_efforts() {
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        let gemini: Vec<(&str, &str)> = entries
+        let gemini: Vec<(&str, &str, Option<u64>, &[&str])> = entries
             .iter()
             .filter(|e| e.group == "gemini")
-            .map(|e| (e.id.as_ref(), e.name.as_ref()))
+            .map(|e| (e.id.as_ref(), e.name.as_ref(), e.max_context, e.efforts))
             .collect();
+        const NONE: &[&str] = &[];
+        const LMH: &[&str] = &["low", "medium", "high"];
+        const LMHX: &[&str] = &["low", "medium", "high", "xhigh"];
+        const M1: Option<u64> = Some(1_048_576);
         assert_eq!(
             gemini,
             vec![
-                ("gemini-3.8-flash-high[1m]", "Gemini 3.8 Flash (High) [1M]"),
-                ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+                (
+                    "gemini-3.8-flash-high[1m]",
+                    "Gemini 3.8 Flash (High) [1M]",
+                    M1,
+                    NONE
+                ),
+                ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", M1, NONE),
                 (
                     "gemini-3.8-flash-medium[1m]",
-                    "Gemini 3.8 Flash (Medium) [1M]"
+                    "Gemini 3.8 Flash (Medium) [1M]",
+                    M1,
+                    NONE
                 ),
-                ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
-                ("gemini-3.8-flash-low[1m]", "Gemini 3.8 Flash (Low) [1M]"),
-                ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
-                ("gemini-4-argon[1m]", "Gemini 4 Argon [1M]"),
-                ("gemini-4-argon", "Gemini 4 Argon"),
+                (
+                    "gemini-3.8-flash-medium",
+                    "Gemini 3.8 Flash (Medium)",
+                    M1,
+                    NONE
+                ),
+                (
+                    "gemini-3.8-flash-low[1m]",
+                    "Gemini 3.8 Flash (Low) [1M]",
+                    M1,
+                    NONE
+                ),
+                ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)", M1, NONE),
+                // Antigravity models page (2026-11-21): Neon "Up to 512K" on
+                // that backend; the API's 1,048,576 stays on the opt-in twin.
+                ("gemini-4-neon[1m]", "Gemini 4 Neon [1M]", M1, LMHX),
+                ("gemini-4-neon", "Gemini 4 Neon", Some(524_288), LMHX),
+                ("gemini-4-carbon[1m]", "Gemini 4 Carbon [1M]", M1, LMH),
+                ("gemini-4-carbon", "Gemini 4 Carbon", M1, LMH),
+                ("gemini-4-hydrogen[1m]", "Gemini 4 Hydrogen [1M]", M1, LMHX),
+                ("gemini-4-hydrogen", "Gemini 4 Hydrogen", M1, LMHX),
+                ("gemini-4-argon[1m]", "Gemini 4 Argon [1M]", M1, LMH),
+                ("gemini-4-argon", "Gemini 4 Argon", M1, LMH),
             ]
         );
+    }
+
+    /// One table: every Gemini 4 row's menu is exactly the thinking levels
+    /// the provider maps a client effort onto, and every family the provider
+    /// resolves with an effort has its own catalog row — except 3.8 Flash,
+    /// whose rows carry the level in the id.
+    #[test]
+    fn g16_gemini_effort_menus_are_the_provider_family_levels() {
+        let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for e in entries.iter().filter(|e| e.group == "gemini") {
-            // ai.google.dev: 1,048,576 for both 3.8 Flash and Argon.
-            assert_eq!(e.max_context, Some(1_048_576), "{}", e.id);
-            // The thinking level is in the id; no effort knob.
-            assert!(e.efforts.is_empty(), "{}: no effort menu", e.id);
+            let base = e.id.strip_suffix("[1m]").unwrap_or(&e.id);
+            match crate::provider::gemini::family_levels(base) {
+                Some(levels) => assert_eq!(e.efforts, levels, "{}", e.id),
+                None => assert!(e.efforts.is_empty(), "{}: level in the id", e.id),
+            }
         }
+        for family in [
+            "gemini-4-neon",
+            "gemini-4-carbon",
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+        ] {
+            assert!(is_gemini_row(family), "{family} has a base row");
+            assert!(
+                is_gemini_row(&format!("{family}[1m]")),
+                "{family} has a [1m] twin"
+            );
+            assert!(crate::provider::gemini::family_levels(family).is_some());
+        }
+        assert!(!is_gemini_row("gemini-3.8-flash"), "flash has no bare row");
+        assert!(crate::provider::gemini::family_levels("gemini-3.8-flash").is_some());
     }
 
     #[test]
-    fn g16_gemini_aliases_are_owned_once_by_the_1m_rows() {
+    fn g16_gemini_aliases_are_owned_once() {
         let entries = catalog("grok-4.7", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
         for (alias, owner) in [
             ("gemini", "gemini-3.8-flash-high[1m]"),
             ("gemini-3.8-flash", "gemini-3.8-flash-high[1m]"),
             ("argon", "gemini-4-argon[1m]"),
+            ("carbon", "gemini-4-carbon[1m]"),
+            ("hydrogen", "gemini-4-hydrogen[1m]"),
+            // The 512K base row: the window Antigravity publishes for Neon.
+            ("neon", "gemini-4-neon"),
         ] {
             let owners: Vec<&str> = entries
                 .iter()
@@ -1055,20 +1220,37 @@ mod tests {
                 vec![owner],
                 "alias {alias:?} must be owned solely by {owner}"
             );
+            assert_eq!(gemini_alias_owner(alias), Some(owner), "{alias}");
         }
+        assert_eq!(gemini_alias_owner("helium"), None, "no id, no alias");
         // Every other gemini row carries no alias.
+        let owners = [
+            "gemini-3.8-flash-high[1m]",
+            "gemini-4-neon",
+            "gemini-4-carbon[1m]",
+            "gemini-4-hydrogen[1m]",
+            "gemini-4-argon[1m]",
+        ];
         for e in entries.iter().filter(|e| e.group == "gemini") {
-            if !e.id.ends_with("[1m]") {
+            if !owners.contains(&e.id.as_ref()) {
                 assert!(e.aliases.is_empty(), "{} carries no alias", e.id);
             }
         }
-        // No gemini alias is also a curated id (that would silently rewrite
-        // an explicitly chosen model).
-        for &(_, aliases, _) in GEMINI_MODELS {
+        // No gemini alias is also a curated id or another row's alias (that
+        // would silently rewrite an explicitly chosen model).
+        for &(_, aliases, ..) in GEMINI_MODELS {
             for alias in aliases {
                 assert!(
                     !entries.iter().any(|e| e.id == *alias),
                     "gemini alias {alias:?} collides with a curated id"
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|e| e.aliases.iter().any(|a| a == alias))
+                        .count(),
+                    1,
+                    "gemini alias {alias:?} has one owner across the catalog"
                 );
             }
         }
@@ -1080,7 +1262,17 @@ mod tests {
         let json = serde_json::to_string(find(&entries, "gemini-4-argon[1m]")).unwrap();
         assert_eq!(
             json,
-            r#"{"id":"gemini-4-argon[1m]","aliases":["argon"],"name":"Gemini 4 Argon [1M]","efforts":[],"max_context":1048576,"group":"gemini"}"#
+            r#"{"id":"gemini-4-argon[1m]","aliases":["argon"],"name":"Gemini 4 Argon [1M]","efforts":["low","medium","high"],"max_context":1048576,"group":"gemini"}"#
+        );
+        let json = serde_json::to_string(find(&entries, "gemini-4-neon")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"gemini-4-neon","aliases":["neon"],"name":"Gemini 4 Neon","efforts":["low","medium","high","xhigh"],"max_context":524288,"group":"gemini"}"#
+        );
+        let json = serde_json::to_string(find(&entries, "gemini-3.8-flash-low")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"gemini-3.8-flash-low","aliases":[],"name":"Gemini 3.8 Flash (Low)","efforts":[],"max_context":1048576,"group":"gemini"}"#
         );
     }
 
@@ -1494,7 +1686,7 @@ mod tests {
             "an operator who pins the suffixed id gets the alias there"
         );
         assert!(find(&pinned, "grok-4.7").aliases.is_empty());
-        assert_eq!(pinned.len(), 52, "a curated pin synthesizes no row");
+        assert_eq!(pinned.len(), 58, "a curated pin synthesizes no row");
 
         // An older curated row can be pinned too — the alias moves to it.
         let pinned = catalog("grok-4.6", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
@@ -1541,14 +1733,14 @@ mod tests {
         // A curated pin: no synthesized row, alias on the row whose id IS the
         // pin — a base-slug pin never hands it to the `[1m]` twin (the
         // suffixed-pin case is in `grok_family_alias_follows_the_pin`),
-        // count 52.
+        // count 58.
         for (pin, owner) in [
             ("grok-4.7", "grok-4.7"),
             ("grok-4.6", "grok-4.6"),
             ("grok-4.5", "grok-4.5"),
         ] {
             let entries = catalog(pin, "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-            assert_eq!(entries.len(), 52, "pin {pin}");
+            assert_eq!(entries.len(), 58, "pin {pin}");
             let owners: Vec<&str> = entries
                 .iter()
                 .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1576,7 +1768,7 @@ mod tests {
         // A pin outside the curated set (routable via provider passthrough)
         // gets exactly one synthesized owner of the "grok" alias.
         let entries = catalog("grok-code-fast-1", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 53);
+        assert_eq!(entries.len(), 59);
         let owners: Vec<&ModelEntry> = entries
             .iter()
             .filter(|e| e.aliases.iter().any(|a| a == "grok"))
@@ -1603,7 +1795,7 @@ mod tests {
         // A known reasoner pinned outside the curated set still gets its effort
         // menu from the thinking-level lookup, even though metadata is null.
         let entries = catalog("grok-4.3", "gpt-5.6-sol", OPENROUTER_DEFAULT_PIN);
-        assert_eq!(entries.len(), 53);
+        assert_eq!(entries.len(), 59);
         // All four curated rows survive an out-of-catalog pin.
         assert_eq!(find(&entries, "grok-4.7[1m]").max_context, Some(500_000));
         assert_eq!(find(&entries, "grok-4.7").max_context, Some(500_000));

@@ -572,8 +572,8 @@ pub struct RoutingConfig {
     #[serde(default)]
     pub openrouter_models: Vec<String>,
     /// Models routed to the gemini group (empty → builtin `gemini` prefix +
-    /// exact `argon` rules). Additive: pre-gemini configs load with those
-    /// builtins (docs/gemini/spec.md §R1).
+    /// exact `argon` / `neon` / `carbon` / `hydrogen` rules). Additive:
+    /// pre-gemini configs load with those builtins (docs/gemini/spec.md §R1).
     #[serde(default)]
     pub gemini_models: Vec<String>,
     /// Group an unmatched / model-less request routes to. Default `"claude"`.

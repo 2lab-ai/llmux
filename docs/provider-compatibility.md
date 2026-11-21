@@ -41,7 +41,7 @@ with the same drops and refusals: `max_tokens` is not sent to Codex at all;
 non-null `temperature`/`top_p`/`top_k` and non-empty `stop_sequences` are refused
 with a local 400; prior `thinking` blocks are dropped and there is no reasoning
 continuity across turns. The parent (Claude) keeps the native Messages path.
-An agent on `gemini` / `argon` gets a local 400 instead: since 2026-10-15 llmux does not
+An agent on `gemini` / a Gemini 4 alias (`argon`, `neon`, `carbon`, `hydrogen`) gets a local 400 instead: since 2026-10-15 llmux does not
 forward Claude Code traffic, subagents included, to the gemini group
 ([Gemini](#gemini-no-cap-sent-thought-signatures-replayed)).
 
@@ -154,7 +154,7 @@ recorded model agree for a bare and a Claude Code-shaped request).
 | OpenRouter (`or-*`) | `https://openrouter.ai/api/v1/messages` — a native Anthropic Messages endpoint (`src/config/schema.rs:1191-1205`) | **native Messages, no translation**, but the body IS rewritten: `model` → wire slug, and the SAME unsigned-`thinking` strip as the Claude path (`src/provider/openrouter.rs:143-167`, which calls `anthropic::strip_foreign_thinking` at `:147`); the `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers are dropped (`:300-314`) |
 | Codex (`gpt-*`, `sol`, `terra`, `luna`) | `https://chatgpt.com/backend-api/codex/responses` — the **ChatGPT subscription gateway**, not the public OpenAI API | **translation** Messages → Responses (`src/provider/responses_request.rs`) |
 | Grok (`grok-*`) | `https://cli-chat-proxy.grok.com/v1/responses` — the **Grok subscription gateway**, not api.x.ai | **translation** Messages → Responses |
-| Gemini (`gemini*`, `argon`) | `https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` (config `gemini.upstream`) — the **Antigravity subscription backend** (Google Cloud Code), not the public Gemini API | **translation** Messages → Cloud Code `contents` envelope carrying the account's GCP project (`src/provider/gemini.rs`, [`gemini/spec.md`](gemini/spec.md) §R3) |
+| Gemini (`gemini*`, `argon`, `neon`, `carbon`, `hydrogen`) | `https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` (config `gemini.upstream`) — the **Antigravity subscription backend** (Google Cloud Code), not the public Gemini API | **translation** Messages → Cloud Code `contents` envelope carrying the account's GCP project (`src/provider/gemini.rs`, [`gemini/spec.md`](gemini/spec.md) §R3) |
 
 The two gateways share Responses *syntax* with the vendors' public APIs; that does not make
 their *capabilities* the same. Public API docs are a hypothesis about them, not a receipt.
@@ -316,8 +316,16 @@ Gemini is the Antigravity subscription backend, translated Messages ↔ Cloud Co
   Claude and OpenRouter paths strip after a model switch (footnote ¹ above).
 - **Sampling is forwarded, effort is the model id.** `temperature`, `top_p`, `top_k` and
   `stop_sequences` become `generationConfig.temperature` / `topP` / `topK` / `stopSequences`.
-  The thinking level is chosen by the id (`-high` / `-medium` / `-low`); client effort does
-  not reach the backend ([models](models.md#gemini)).
+  The thinking level is chosen by the id. A 3.8 Flash row names it (`-high` / `-medium` /
+  `-low`) and the client effort is ignored. A bare Gemini 4 id or alias (`gemini-4-neon`,
+  `argon`, …) and bare `gemini-3.8-flash` take the level from the client effort
+  (`output_config.effort`, or Codex's `reasoning.effort`) and go upstream as
+  `<family>-<level>`; `xhigh` / `max` / `ultra` become `-xhigh` on Neon and Hydrogen and
+  `-high` elsewhere (since 2026-11-21, `src/provider/gemini.rs` `FAMILIES`; tests
+  `g2_gemini_4_families_take_the_level_from_the_client_effort` and the e2e
+  `gemini_messages_ingress_streams_text_for_alias_and_window_ids`). No effort field and no
+  `thinkingLevel` reach the backend; whether Gemini 4 also needs `thinkingLevel` is
+  **untested** ([models](models.md#gemini)).
 - **Content.** Base64 images (PNG, JPEG, WebP, HEIC, HEIF) and base64 PDFs become
   `inlineData`, including images inside `tool_result` content. URL sources, other media types
   and unknown content blocks are a local 400 that names the JSON path, before any credential
@@ -329,9 +337,11 @@ Gemini is the Antigravity subscription backend, translated Messages ↔ Cloud Co
   `QUOTA_EXHAUSTED` without a delay parks it until the known quota reset, else for an
   estimated hour. A 403 that names the Terms of Service or a suspension benches the account
   with an explicit message instead of rotating past it as a transient error.
-- **Argon tier.** On a Google AI Plus account `gemini-4-argon` returns 404 NOT_FOUND (live
-  probe 2026-10-15), relayed to the client as an Anthropic error with status 404. Argon needs
-  Ultra or Enterprise ([models](models.md#gemini)).
+- **Gemini 4 tiers.** On a Google AI Plus account `gemini-4-argon` returns 404 NOT_FOUND (live
+  probes 2026-10-15 and 2026-11-21 through `argon`), relayed to the client as an Anthropic
+  error with status 404. Every Gemini 4 model needs a paid plan: Neon and Argon paid Pro,
+  Ultra or Enterprise, Hydrogen non-trial Pro, Ultra or Enterprise, Carbon Ultra or
+  Enterprise ([models](models.md#gemini), Antigravity models page read 2026-11-21).
 - **Terms of service.** Google states that using Antigravity through third-party tools or
   proxies violates the Antigravity ToS, and it has suspended accounts for it; see
   [account types](configuration.md#account-types) before you add one.
@@ -406,8 +416,10 @@ Stated so nobody reads a gap as a guarantee:
 - Whether the Antigravity backend honors any output-cap field — **untested**; llmux sends none.
 - Whether the Antigravity backend applies the forwarded `temperature` / `top_p` / `top_k` /
   `stop_sequences` as the public Gemini API documents — **untested**.
-- Argon on a Google AI Ultra or Enterprise account — **untested**; the only probe is the Plus
-  account's 404 (2026-10-15).
+- Any Gemini 4 model (Neon, Carbon, Hydrogen, Argon) on a paid account, and the
+  `gemini-4-<name>-<level>` ids llmux sends for them since 2026-11-21 — **untested**; the only
+  probes are the Plus account's 404s (2026-10-15, 2026-11-21) ([#244](https://github.com/2lab-ai/llmux/issues/244),
+  [#310](https://github.com/2lab-ai/llmux/issues/310)).
 - Billing: none of the probes above establish what a subscription is charged.
 - Every probe is a single fixture on a single model on a dated snapshot of a gateway that can
   change without notice.

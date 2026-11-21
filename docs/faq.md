@@ -14,7 +14,7 @@ The TUI (`llmux dashboard`) shows the same windows. See [llmux-islands.md](llmux
 
 Yes. Set `model: gpt-6-astra[1m]` (or `model: grok-4.7`) in a `.claude/agents/<name>.md` file. When Claude Code runs under `llmux run`, that agent's requests are routed by the model id to your Codex or Grok account, and the result returns to the parent. Measured 2026-10-08.
 
-Gemini ids (`gemini-*`, or the `gemini` / `argon` aliases) do not work for a Claude Code agent. Google's Antigravity backend refused Claude Code requests (2026-10-15), so llmux answers them with a local 400 and forwards nothing. Use gemini from Codex: `llmux run --codex -- -m gemini`. See [models.md](models.md#gemini).
+Gemini ids (`gemini-*`, or the `gemini` / `argon` / `neon` / `carbon` / `hydrogen` aliases) do not work for a Claude Code agent. Google's Antigravity backend refused Claude Code requests (2026-10-15), so llmux answers them with a local 400 and forwards nothing. Use gemini from Codex: `llmux run --codex -- -m gemini`. See [models.md](models.md#gemini).
 
 Claude Code prints an `unrecognized_model` warning for non-Claude ids. The request is still sent.
 
