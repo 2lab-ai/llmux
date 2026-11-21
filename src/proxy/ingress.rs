@@ -12,11 +12,15 @@
 //! [`adapt`] converts the shared loop's response back to the client protocol.
 //!
 //! A new client protocol is one more [`Endpoint`] case in [`origin`], one more
-//! [`NativeInput`] variant, and one more arm in each function here. The
-//! forward path asks these questions instead of comparing protocols; what
-//! stays protocol-specific there (the native-backend builder, the Responses
-//! compatibility checks) is reached through a `NativeInput` match, so a new
-//! variant is a compile error at each such place until it is handled.
+//! [`NativeInput`] variant, and one more arm in each function here; the
+//! compiler flags those arms and the native-backend builder in `forward.rs`.
+//! It does NOT flag these, which a new protocol must check by hand: the
+//! translated-backend arms in `forward.rs` (they chain `if served == …` and
+//! fall through to OpenRouter, with no Codex arm, because Codex is native on
+//! Responses), the Responses-only checks behind `responses_input()`, the relay's
+//! native-stream handling (keyed on the `x-llmux-native-responses` header in
+//! `sse.rs`), the `client_auth` key extraction (Bearer or `x-api-key` only),
+//! the count-tokens path test, and `translate_converter` reading `ctx.body`.
 
 use axum::response::Response;
 use bytes::Bytes;

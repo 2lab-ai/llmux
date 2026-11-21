@@ -376,16 +376,22 @@ Anthropic Messages on `/v1/messages`) and Codex (`llmux run --codex`, OpenAI Res
   envelope; the key registry's denied/suspended/revoked answers keep the Anthropic
   `authentication_error` shape on every path. `native_group` names the backend that serves
   the input as it is (Responses → Codex); every other backend gets `messages_request` and
-  then the same Claude SDK / Grok / Gemini / OpenRouter build a Messages client gets.
+  then the native-ingress arms: Claude through the Agent SDK, Grok and Gemini through
+  their translate builders, anything else through OpenRouter (there is no Codex arm,
+  because Codex is native here). A Messages client takes different paths for the same
+  groups (Claude passthrough, the `is_translate` builders).
   `adapt` converts the response back at the client boundary, where a native request takes
   its raw-io capture. `accepts_bearer_client_key` tells the auth gate which paths read
   `Authorization: Bearer`.
 
 A new frontend plugs in at both halves: a `Frontend` case, a `launch` module and a flag in
 the `frontend` group; an `Endpoint` case in `ingress::origin`, a `NativeInput` variant and
-an arm in each ingress function. The compiler then points at every remaining
-protocol-specific match in `forward.rs` (the native-backend builder, the Responses
-compatibility checks). The persisted `Endpoint` names (`anthropic`, `open_ai`) do not change.
+an arm in each ingress function. The compiler points at those arms and at the
+native-backend builder in `forward.rs`; it does not point at the sites listed in the
+`ingress.rs` module comment (translated-backend arms without a Codex arm, the Responses-only
+checks, the relay's native-stream header, the auth gate's key extraction, the count-tokens
+path test, `translate_converter`'s body), which a new protocol checks by hand. The persisted
+`Endpoint` names (`anthropic`, `open_ai`) do not change.
 
 ## Codex frontend
 
