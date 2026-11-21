@@ -1,32 +1,113 @@
-//! `llmux run [-- args]` — ensure the proxy is running (auto-starting a
-//! background daemon when needed), then spawn `claude` with the proxy env
-//! injected and (unless opted out) the llmux model catalog injected into
-//! Claude Code: the `/model` picker lineup as a `--settings` document, and the
-//! catalog's alias owners as `ANTHROPIC_DEFAULT_*_MODEL` exports (the only way
-//! the aliases Claude Code resolves NATIVELY — `opus`, `fable`, `sonnet`,
-//! `haiku` — can mean what the llmux catalog says they mean).
+//! `llmux run [--codex] [-- args]` — ensure the proxy is running
+//! (auto-starting a background daemon when needed), then launch the selected
+//! client frontend pointed at it and propagate its exit code.
+//!
+//! The shared launcher lives here: endpoint resolution, the daemon lifecycle,
+//! the `--` strip, the one catalog fetch (`GET /llmux/models`), the private
+//! session-file helper and the spawn/exit-code plumbing. Each client keeps
+//! only what differs in its own module and is selected by one [`Frontend`]
+//! value:
+//!
+//! - [`claude`] — Claude Code (`claude`, Anthropic Messages ingress): the
+//!   `/model` picker lineup as a `--settings` document, the catalog's alias
+//!   owners as `ANTHROPIC_DEFAULT_*_MODEL` exports, the endpoint env and the
+//!   llmux custom headers.
+//! - [`codex`] — Codex CLI (`codex`, OpenAI Responses ingress): the
+//!   session-scoped `-c` provider flags and the Codex model catalog file.
+//!
+//! A new client frontend is one more [`Frontend`] case, one more module with
+//! a `launch`, and one more arm in [`run`].
 
+mod claude;
+mod codex;
+
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::daemon::{ensure_server_running, EnsureOutcome};
-use super::{resolve_endpoint, CliError, Endpoint, RunArgs};
+use super::{resolve_endpoint, CliError, EnvArgs, RunArgs};
 
-/// Budget for the catalog fetch that feeds the `/model` picker. Deliberately
-/// short and hard-capped: the picker is a convenience, so it must never delay
-/// (let alone block) the `claude` launch.
+/// The client frontend a `run` (or an `env`) targets. What differs per client
+/// at the launcher level is answered here; each client's launch lives in its
+/// own module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Frontend {
+    /// Claude Code over the Anthropic Messages ingress (`/v1/messages`).
+    ClaudeCode,
+    /// Codex CLI over the OpenAI Responses ingress (`/v1/responses`).
+    Codex,
+}
+
+impl Frontend {
+    /// The frontend `llmux run` launches: `--codex` selects Codex, no flag
+    /// Claude Code. The flags share one clap group in [`RunArgs`], so at most
+    /// one is ever set.
+    pub(crate) fn from_run_args(args: &RunArgs) -> Frontend {
+        if args.codex {
+            Frontend::Codex
+        } else {
+            Frontend::ClaudeCode
+        }
+    }
+
+    /// The frontend whose exports `llmux env` prints.
+    pub(crate) fn from_env_args(args: &EnvArgs) -> Frontend {
+        if args.codex {
+            Frontend::Codex
+        } else {
+            Frontend::ClaudeCode
+        }
+    }
+
+    /// The client binary looked up in `PATH`.
+    pub(crate) fn binary(self) -> &'static str {
+        match self {
+            Frontend::ClaudeCode => "claude",
+            Frontend::Codex => "codex",
+        }
+    }
+
+    /// The product named in the "not found in PATH" message.
+    pub(crate) fn product(self) -> &'static str {
+        match self {
+            Frontend::ClaudeCode => "Claude Code",
+            Frontend::Codex => "Codex CLI",
+        }
+    }
+
+    /// The launch failure for `err`: a missing binary names the product to
+    /// install, anything else is reported as a failed start.
+    fn spawn_error(self, err: &std::io::Error) -> CliError {
+        let binary = self.binary();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            CliError::Message(format!(
+                "{binary} not found in PATH — install {} first",
+                self.product()
+            ))
+        } else {
+            CliError::Message(format!("failed to start {binary}: {err}"))
+        }
+    }
+}
+
+/// Budget for the catalog fetch that feeds the client's model picker.
+/// Deliberately short and hard-capped: the picker is a convenience, so it must
+/// never delay (let alone block) the client launch.
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One catalog row as the CLI consumes it — the CLI-side mirror of
 /// [`crate::catalog::ModelEntry`] (which is `Serialize`-only, its `efforts`
-/// being `&'static [&'static str]`). Only the fields the picker needs; unknown
+/// being `&'static [&'static str]`). Only the fields the pickers need; unknown
 /// keys are ignored so a newer daemon's richer rows still parse.
 #[derive(Debug, Clone, Deserialize)]
 struct CatalogRow {
     id: String,
     /// Extra request slugs that resolve to this id — the source of the
-    /// `ANTHROPIC_DEFAULT_*_MODEL` exports (see [`alias_env`]).
+    /// `ANTHROPIC_DEFAULT_*_MODEL` exports (see [`claude::alias_env`]) and of
+    /// the hidden Codex alias entries.
     #[serde(default)]
     aliases: Vec<String>,
     name: String,
@@ -44,70 +125,7 @@ struct CatalogResponse {
     models: Vec<CatalogRow>,
 }
 
-/// One `modelPicker` row of the Claude Code `--settings` document. Field order
-/// is the serialized key order (`model, label, description`) — `serde` writes
-/// struct fields in declaration order, which keeps the emitted JSON stable
-/// enough to assert on.
-#[derive(Debug, Serialize)]
-struct PickerOption {
-    /// Taken verbatim by Claude Code — the string llmux routes on.
-    model: String,
-    label: String,
-    description: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PickerLineup {
-    options: Vec<PickerOption>,
-}
-
-/// The whole `--settings` document. `replaceBuiltInOptions` is deliberately NOT
-/// emitted: the built-in Anthropic rows stay, and Claude Code drops a listed
-/// model the built-in lineup already covers.
-#[derive(Debug, Serialize)]
-struct PickerSettings {
-    #[serde(rename = "modelPicker")]
-    model_picker: PickerLineup,
-}
-
-/// Build the `claude --settings` JSON that lists the llmux catalog in the
-/// `/model` picker, PURELY from the fetched rows (so the whole shape is
-/// unit-testable without a daemon or a child process):
-///
-/// - `model` = the catalog `id` verbatim (`[1m]` suffixes included — the
-///   provider strips them upstream).
-/// - `label` = the catalog `name`.
-/// - `description` = `"<group> · efforts <first…last> · ctx <max_context>"`,
-///   dropping the efforts part when the menu is empty and the ctx part when the
-///   window is unpublished. A single-entry menu renders as that one value.
-///
-/// Gemini rows (group `gemini`) are left out: Google's Antigravity backend
-/// refuses Claude Code requests, so gemini is Codex-only (`run --codex`).
-///
-/// Catalog order is preserved. `None` when no row remains (an empty or
-/// gemini-only catalog) — there is no lineup to inject, and an empty
-/// `options` array would only add noise.
-fn model_picker_settings(models: &[CatalogRow]) -> Option<String> {
-    let options: Vec<PickerOption> = models
-        .iter()
-        .filter(|row| row.group != "gemini")
-        .map(|row| PickerOption {
-            model: row.id.clone(),
-            label: row.name.clone(),
-            description: row_description(row),
-        })
-        .collect();
-    if options.is_empty() {
-        return None;
-    }
-    let settings = PickerSettings {
-        model_picker: PickerLineup { options },
-    };
-    // A document of owned strings cannot fail to serialize.
-    serde_json::to_string(&settings).ok()
-}
-
-/// The picker row's one-line description: backend group, the effort menu as a
+/// A picker row's one-line description: backend group, the effort menu as a
 /// `first…last` range, and the context window as a plain integer (no thousands
 /// separators — the catalog's own figures read the same way in `docs/models.md`).
 fn row_description(row: &CatalogRow) -> String {
@@ -126,83 +144,8 @@ fn row_description(row: &CatalogRow) -> String {
     parts.join(" · ")
 }
 
-/// The Claude Code aliases that never reach llmux, paired with the env var
-/// that redirects each one. Measured 2026-09-28 with Claude Code 2.1.283:
-/// `sonnet` / `opus` / `haiku` / `fable` (and their `[1m]` spellings) are
-/// NATIVE picker entries the client resolves against its OWN model records
-/// before a request is built, so `/model opus` sends `claude-opus-5-5` and the
-/// client sizes the session at 200k — llmux's catalog promise that the alias
-/// `opus` means `claude-opus-5-5[1m]` never gets a chance to apply. Exporting
-/// `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5[1m]` re-points the native
-/// record at the catalog's own id (measured: status line "Claude Opus 5.5
-/// [1M]", `/context` 221.2k/800k, versus 200k without it).
-///
-/// Only the `_MODEL` variants are set. Claude Code also reads `_NAME`,
-/// `_DESCRIPTION` and `_SUPPORTED_CAPABILITIES` for these families; llmux
-/// leaves them alone so the client keeps its own labels.
-///
-/// These four vars are the ONLY mechanism that changes what a bare NATIVE
-/// alias means. They do not generalize: for an id Claude Code does not know
-/// (`astra`, `grok`, `or-…`) there is no such var, the id is submitted
-/// verbatim, and the client applies its 200k assumption unless the SUBMITTED
-/// id ends in `[1m]` — catalog alias ownership decides the upstream slug, not
-/// the client's window.
-const ALIAS_ENV: &[(&str, &str)] = &[
-    ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
-    ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
-    ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
-    ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-];
-
-/// The `ANTHROPIC_DEFAULT_*_MODEL` exports for this catalog, PURELY from the
-/// fetched rows (so the mapping is unit-testable without a daemon or a child
-/// process): for each pair in [`ALIAS_ENV`], the FIRST row that advertises the
-/// alias contributes `(var, row.id)`.
-///
-/// Two rows are deliberately dropped:
-/// - an alias no catalog row owns exports nothing (a family llmux does not
-///   curate keeps Claude Code's own default);
-/// - a var `already_set` in the environment is left alone — the user's own
-///   export outranks the catalog, exactly as their `--settings` outranks the
-///   picker lineup. The caller passes `|var| std::env::var_os(var).is_some()`;
-///   the predicate is a parameter so tests need no process-global mutation.
-fn alias_env(
-    models: &[CatalogRow],
-    already_set: impl Fn(&str) -> bool,
-) -> Vec<(&'static str, String)> {
-    ALIAS_ENV
-        .iter()
-        .filter(|(_, var)| !already_set(var))
-        .filter_map(|&(alias, var)| {
-            models
-                .iter()
-                .find(|row| row.aliases.iter().any(|a| a == alias))
-                .map(|row| (var, row.id.clone()))
-        })
-        .collect()
-}
-
-/// Does the user's pass-through arg list already carry `--settings`? Claude
-/// Code takes ONE settings document, and the user's lineup wins — llmux never
-/// merges into it.
-///
-/// `--settings` is long-only in Claude Code 2.1.274 (`--settings
-/// <file-or-json>`; no short alias), so only the two spellings the flag has are
-/// matched: the bare token and `--settings=<value>`.
-fn has_user_settings(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
-}
-
-/// Should `run` inject the picker lineup? `args` is the pass-through list with
-/// the leading `--` ALREADY STRIPPED (as `run` does before spawning), so a
-/// user's `--settings` is visible here as its own token.
-fn injects_model_picker(args: &[String], no_model_picker: bool) -> bool {
-    !no_model_picker && !has_user_settings(args)
-}
-
-/// Fetch the catalog from the proxy `claude` is about to be pointed at, with
-/// the same client/header discipline as [`super::daemon::probe_server`]
+/// Fetch the catalog from the proxy the client is about to be pointed at,
+/// with the same client/header discipline as [`super::daemon::probe_server`]
 /// (`x-api-key` when one is configured, both timeouts capped).
 ///
 /// The error is a SANITIZED reason for a warning line: never the api key, never
@@ -247,100 +190,102 @@ fn catalog_transport_reason(err: &reqwest::Error) -> String {
     }
 }
 
-/// Everything ONE catalog fetch feeds into the `claude` launch: the
-/// `--settings <json>` argv pair to PREPEND to the user's pass-through args
-/// (empty when no lineup is injected), and the `ANTHROPIC_DEFAULT_*_MODEL`
-/// exports (empty when nothing is to be exported).
-///
-/// The two opt-outs are deliberately asymmetric:
-/// - `--no-model-picker` skips BOTH (and the fetch) — it is the "leave my
-///   Claude Code alone" switch;
-/// - the user's own `--settings` skips only the picker DOCUMENT. The alias
-///   exports are env vars, not a settings document, so they cannot collide
-///   with the user's lineup and still apply.
-///
-/// Every failure mode is non-fatal: one warning line, then the launch
-/// continues unchanged.
-async fn catalog_args(
-    endpoint: &Endpoint,
-    claude_args: &[String],
-    no_picker: bool,
-) -> (Vec<String>, Vec<(&'static str, String)>) {
-    if no_picker {
-        return (Vec::new(), Vec::new());
-    }
-    let models = match fetch_catalog(&endpoint.base_url, endpoint.api_key.as_deref()).await {
-        Ok(models) => models,
-        Err(reason) => {
-            eprintln!("warning: model picker not injected: {reason}");
-            return (Vec::new(), Vec::new());
+/// A private file handed to the client for one session: created with
+/// `create_new` (never follows or reuses an existing path) and mode `0600`
+/// under the temp dir, and removed again when dropped — [`spawn`] drops it
+/// right after the child exits, before the process exit that would skip
+/// destructors.
+struct SessionFile {
+    path: PathBuf,
+}
+
+impl SessionFile {
+    /// Create `<temp>/<prefix>-<ulid>.json` holding `contents`. A failed write
+    /// removes the half-written file before the error is returned.
+    fn create(prefix: &str, contents: &[u8]) -> std::io::Result<SessionFile> {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}.json", ulid::Ulid::new()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-    };
-    let env = alias_env(&models, |var| std::env::var_os(var).is_some());
-    if !injects_model_picker(claude_args, no_picker) {
-        eprintln!("warning: --settings given, llmux model picker lineup not injected");
-        return (Vec::new(), env);
-    }
-    match model_picker_settings(&models) {
-        Some(json) => (vec!["--settings".into(), json], env),
-        None => {
-            eprintln!(
-                "warning: model picker not injected: catalog has no Claude Code-selectable models"
-            );
-            (Vec::new(), env)
+        let result = (|| {
+            use std::io::Write as _;
+            let mut f = options.open(&path)?;
+            f.write_all(contents)
+        })();
+        match result {
+            Ok(()) => Ok(SessionFile { path }),
+            Err(err) => {
+                let _ = std::fs::remove_file(&path);
+                Err(err)
+            }
         }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
-/// Decide the Claude Code environment for `run`, PURELY from the resolved
-/// endpoint (so it is unit-testable without spawning a child): the
-/// `ANTHROPIC_BASE_URL` to export, an optional `ANTHROPIC_API_KEY` to set, and
-/// whether to REMOVE an inherited `ANTHROPIC_API_KEY`.
-///
-/// - remote + key    → export the remote's key (overrides any inherited one).
-/// - remote + no key → remove `ANTHROPIC_API_KEY` so a parent shell's unrelated
-///   upstream key cannot leak to the remote proxy over plain HTTP.
-/// - local           → neither set nor remove: Claude Code keeps its own OAuth
-///   token (accepted from localhost), which keeps it in subscription mode.
-fn claude_env(endpoint: &Endpoint) -> (String, Option<String>, bool) {
-    if endpoint.remote {
-        match &endpoint.api_key {
-            Some(key) => (endpoint.base_url.clone(), Some(key.clone()), false),
-            None => (endpoint.base_url.clone(), None, true),
-        }
-    } else {
-        (endpoint.base_url.clone(), None, false)
+impl Drop for SessionFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Run the client to completion, remove its session files, and exit with its
+/// exit code. Only a failed start returns (as the frontend's launch error).
+async fn spawn(
+    mut command: tokio::process::Command,
+    frontend: Frontend,
+    session_files: Vec<SessionFile>,
+) -> Result<Infallible, CliError> {
+    let status = command.status().await;
+    drop(session_files);
+    let status = status.map_err(|err| frontend.spawn_error(&err))?;
+    std::process::exit(exit_code(&status));
+}
+
+/// Child exit code; signal terminations map to the conventional 128+N.
+fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
 }
 
 /// Local mode: ensure a server is listening (herdr-style auto-start: detached
-/// daemon + readiness wait — see `cli::daemon`), then spawn `claude` with
-/// `ANTHROPIC_BASE_URL=http://localhost:<port>` and pass-through args, and
-/// propagate its exit code. Only `ANTHROPIC_BASE_URL` is set — Claude Code
-/// keeps its own OAuth token (which the proxy accepts from localhost); not
-/// setting `ANTHROPIC_API_KEY` keeps it in subscription mode.
+/// daemon + readiness wait — see `cli::daemon`), then launch the selected
+/// client against `http://localhost:<port>` with the pass-through args, and
+/// propagate its exit code.
 ///
-/// Remote mode (`--remote` / `remote.host`): no local daemon is started;
-/// `claude` is pointed at the remote proxy and `ANTHROPIC_API_KEY` is exported
-/// with the remote's `x-api-key` so the off-loopback client-auth gate passes.
-/// The proxy still replaces the client credential with the real upstream
-/// account, so subscription mode is preserved at the account layer.
+/// Remote mode (`--remote` / `remote.host`): no local daemon is started; the
+/// client is pointed at the remote proxy with the remote's key so the
+/// off-loopback client-auth gate passes. The proxy still replaces the client
+/// credential with the real upstream account, so subscription mode is
+/// preserved at the account layer.
 ///
-/// In both modes the catalog of the proxy being pointed at is fetched ONCE and
-/// feeds two things: it is passed as `claude --settings '<modelPicker
-/// lineup>'` so `/model` lists the llmux models (see
-/// [`model_picker_settings`]), and its alias owners are exported as
-/// `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` so Claude Code's NATIVE
-/// aliases resolve to the catalog ids instead of its own (see [`alias_env`]).
-/// `--no-model-picker` suppresses both; the user's own `--settings` suppresses
-/// only the lineup; a failed fetch is a warning line, never a failed launch.
+/// What each client is handed lives in its module ([`claude::launch`],
+/// [`codex::launch`]); in both the catalog of the proxy being pointed at is
+/// fetched at most ONCE, `--no-model-picker` suppresses it, and a failed fetch
+/// is a warning line, never a failed launch.
 pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> {
     let config = crate::config::load_or_init()?;
     let endpoint = resolve_endpoint(remote.as_deref(), &config)?;
 
-    // Remote mode: never auto-start a local daemon — point `claude` straight
+    // Remote mode: never auto-start a local daemon — point the client straight
     // at the remote proxy. Off-loopback the proxy enforces its `x-api-key`, so
-    // we MUST export `ANTHROPIC_API_KEY` (the analogue of llmux-islands'
+    // the client MUST present the remote's key (the analogue of llmux-islands'
     // `x-api-key` header); the proxy still swaps in the real upstream account
     // credential, so the client key only unlocks the proxy's own gate.
     if endpoint.remote {
@@ -372,385 +317,31 @@ pub async fn run(args: RunArgs, remote: Option<String>) -> Result<(), CliError> 
         }
     }
 
-    let mut claude_args = args.args.as_slice();
-    if claude_args.first().map(String::as_str) == Some("--") {
-        claude_args = &claude_args[1..];
+    let mut client_args = args.args.as_slice();
+    if client_args.first().map(String::as_str) == Some("--") {
+        client_args = &client_args[1..];
     }
 
-    if args.codex {
-        return run_codex(
-            &endpoint,
-            claude_args,
-            args.no_model_picker,
-            &config.codex.default_model,
-        )
-        .await;
-    }
-
-    // The picker lineup goes FIRST so the user's pass-through args still have
-    // the last word on every other flag.
-    let (picker, alias_exports) = catalog_args(&endpoint, claude_args, args.no_model_picker).await;
-
-    let (base_url, api_key, remove_key) = claude_env(&endpoint);
-    let mut command = tokio::process::Command::new("claude");
-    let launch_model = super::claude_context::launch_model(claude_args, &alias_exports);
-    if launch_model.is_none() {
-        tracing::debug!(
-            "initial quota/title has no proven launch model; waiting for main-session context"
-        );
-    }
-    let headers = super::claude_context::custom_headers(
-        std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok().as_deref(),
-        launch_model.as_deref(),
-        crate::proxy::raw_io::now_ms(),
-    );
-    if headers.is_empty() {
-        command.env_remove("ANTHROPIC_CUSTOM_HEADERS");
-    } else {
-        command.env("ANTHROPIC_CUSTOM_HEADERS", headers);
-    }
-
-    command
-        .args(&picker)
-        .args(claude_args)
-        .env("ANTHROPIC_BASE_URL", &base_url);
-    for (var, model) in &alias_exports {
-        command.env(var, model);
-    }
-    if let Some(key) = &api_key {
-        command.env("ANTHROPIC_API_KEY", key);
-    } else if remove_key {
-        // Block a parent shell's unrelated upstream ANTHROPIC_API_KEY from
-        // being inherited and leaking to the remote proxy over plain HTTP.
-        command.env_remove("ANTHROPIC_API_KEY");
-    }
-    let status = command.status().await.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CliError::Message("claude not found in PATH — install Claude Code first".into())
-        } else {
-            CliError::Message(format!("failed to start claude: {err}"))
-        }
-    })?;
-
-    std::process::exit(exit_code(&status));
-}
-
-/// Codex owns its model-specific coding prompts. Reuse its local catalog
-/// metadata when available and overlay only llmux's model identity/capacity.
-/// Only the models array is read; cache identity/account fields never leave it.
-fn codex_catalog(models: &[CatalogRow], cached: Option<&serde_json::Value>) -> serde_json::Value {
-    use serde_json::json;
-    let native = cached.and_then(|v| v["models"].as_array());
-    // The template for rows Codex has no entry for (claude, grok, …): a
-    // current codex model's, else the first entry. It was keyed on `gpt-5.5`
-    // until 2026-11-19, which the live Codex list stopped carrying when the
-    // ChatGPT backend retired it (#309), so every such row lost its template.
-    let fallback = native.and_then(|a| {
-        a.iter()
-            .find(|m| m["slug"] == crate::provider::codex::CODEX_MODEL)
-            .or_else(|| a.first())
-    });
-    let mut entries = Vec::new();
-    for (priority, row) in models.iter().enumerate() {
-        let base_id = row.id.strip_suffix("[1m]").unwrap_or(&row.id);
-        let template = native
-            .and_then(|a| a.iter().find(|m| m["slug"] == base_id))
-            .or(fallback);
-        let mut entry=template.cloned().unwrap_or(json!({
-            "shell_type":"unified_exec","visibility":"list","supported_in_api":true,"upgrade":null,
-            "model_messages":{"instructions_template":"You are Codex, a coding assistant working with the user in their workspace. Read repository instructions before changes. Use the provided tools to inspect the actual state, make focused changes, and verify results. Preserve unrelated user work. Keep tool execution in the client sandbox and obey its permission decisions. Explain outcomes and remaining limitations clearly."},
-            "support_verbosity":false,"default_verbosity":null,"apply_patch_tool_type":"freeform",
-            "truncation_policy":{"mode":"bytes","limit":10000},"experimental_supported_tools":[],
-            "tool_mode":"direct","supports_search_tool":false,"use_responses_lite":false
-        }));
-        entry["slug"] = json!(row.id);
-        entry["display_name"] = json!(row.name);
-        entry["description"] = json!(row_description(row));
-        entry["priority"] = json!(priority);
-        entry["visibility"] = json!("list");
-        entry["supported_in_api"] = json!(true);
-        entry["context_window"] = json!(row.max_context);
-        entry["max_context_window"] = json!(row.max_context);
-        entry["supported_reasoning_levels"] = json!(row
-            .efforts
-            .iter()
-            .map(|effort| json!({"effort":effort,"description":effort}))
-            .collect::<Vec<_>>());
-        entry["default_reasoning_level"] = json!(row
-            .efforts
-            .iter()
-            .find(|e| e.as_str() == "medium")
-            .or(row.efforts.first()));
-        if row.group != "codex" {
-            entry["additional_speed_tiers"] = json!([]);
-            entry["service_tiers"] = json!([]);
-            entry["default_service_tier"] = serde_json::Value::Null;
-            entry["tool_mode"] = json!("direct");
-            entry["supports_search_tool"] = json!(false);
-            entry["use_responses_lite"] = json!(false);
-            entry["supports_reasoning_effort_updates"] = json!(false);
-            entry["supports_experimental_context"] = json!(false);
-        }
-        entries.push(entry.clone());
-        for alias in &row.aliases {
-            let mut alias_entry = entry.clone();
-            alias_entry["slug"] = json!(alias);
-            alias_entry["visibility"] = json!("hide");
-            entries.push(alias_entry);
-        }
-    }
-    json!({"models":entries})
-}
-
-fn user_codex_catalog(args: &[String]) -> bool {
-    args.iter().any(|a| a.contains("model_catalog_json="))
-}
-
-async fn codex_catalog_file(
-    endpoint: &Endpoint,
-    args: &[String],
-    no_picker: bool,
-) -> Option<std::path::PathBuf> {
-    if no_picker || user_codex_catalog(args) {
-        return None;
-    }
-    let rows = match fetch_catalog(&endpoint.base_url, endpoint.api_key.as_deref()).await {
-        Ok(rows) if !rows.is_empty() => rows,
-        Ok(_) => return None,
-        Err(reason) => {
-            eprintln!("warning: model picker not injected: {reason}");
-            return None;
+    let launched = match Frontend::from_run_args(&args) {
+        Frontend::ClaudeCode => claude::launch(&endpoint, client_args, args.no_model_picker).await,
+        Frontend::Codex => {
+            codex::launch(
+                &endpoint,
+                client_args,
+                args.no_model_picker,
+                &config.codex.default_model,
+            )
+            .await
         }
     };
-    let cache_path = std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|p| p.join(".codex")))
-        .map(|p| p.join("models_cache.json"));
-    let cached = cache_path
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-    let path = std::env::temp_dir().join(format!("llmux-codex-models-{}.json", ulid::Ulid::new()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        use std::io::Write as _;
-        let mut f = options.open(&path)?;
-        f.write_all(codex_catalog(&rows, cached.as_ref()).to_string().as_bytes())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&path);
-        eprintln!("warning: could not create Codex model catalog");
-        return None;
-    }
-    Some(path)
-}
-
-/// Session-scoped provider flags keep the user's Codex config/auth untouched.
-async fn run_codex(
-    endpoint: &Endpoint,
-    args: &[String],
-    no_picker: bool,
-    default_model: &str,
-) -> Result<(), CliError> {
-    let mut command = tokio::process::Command::new("codex");
-    // clap's subcommand config list replaces its parent's list. Put the
-    // provider flags in the actual client command's argument scope.
-    let args = if args.first().is_some_and(|a| {
-        matches!(
-            a.as_str(),
-            "exec" | "e" | "review" | "resume" | "fork" | "app-server" | "mcp-server"
-        )
-    }) {
-        command.arg(&args[0]);
-        &args[1..]
-    } else {
-        args
-    };
-
-    let q = |value: &str| serde_json::Value::String(value.to_string()).to_string();
-    let settings = [
-        "model_provider=\"llmux\"".to_string(),
-        format!("model={}", q(default_model)),
-        "model_providers.llmux.name=\"llmux\"".into(),
-        format!(
-            "model_providers.llmux.base_url={}",
-            q(&format!("{}/v1", endpoint.base_url.trim_end_matches('/')))
-        ),
-        "model_providers.llmux.wire_api=\"responses\"".into(),
-        "model_providers.llmux.requires_openai_auth=false".into(),
-        "model_providers.llmux.supports_websockets=false".into(),
-    ];
-    for setting in settings {
-        command.arg("-c").arg(setting);
-    }
-    let catalog = codex_catalog_file(endpoint, args, no_picker).await;
-    if let Some(path) = &catalog {
-        command
-            .arg("-c")
-            .arg(format!("model_catalog_json={}", q(&path.to_string_lossy())));
-    }
-    // This key belongs only to the selected llmux endpoint.
-    if let Some(key) = &endpoint.api_key {
-        command.env("LLMUX_CODEX_API_KEY", key);
-        command
-            .arg("-c")
-            .arg("model_providers.llmux.env_key=\"LLMUX_CODEX_API_KEY\"");
-    } else {
-        command.env_remove("LLMUX_CODEX_API_KEY");
-    }
-    command.args(args);
-    let status = command.status().await;
-    if let Some(path) = catalog {
-        let _ = std::fs::remove_file(path);
-    }
-    let status = status.map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CliError::Message("codex not found in PATH — install Codex CLI first".into())
-        } else {
-            CliError::Message(format!("failed to start codex: {err}"))
-        }
-    })?;
-    std::process::exit(exit_code(&status));
-}
-
-/// Child exit code; signal terminations map to the conventional 128+N.
-fn exit_code(status: &std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt as _;
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-    1
+    match launched? {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn endpoint(remote: bool, api_key: Option<&str>) -> Endpoint {
-        Endpoint {
-            base_url: "http://llmux-host:3456".into(),
-            api_key: api_key.map(Into::into),
-            remote,
-            host: "llmux-host".into(),
-            port: 3456,
-        }
-    }
-
-    #[test]
-    fn claude_env_remote_with_key_exports_it() {
-        let (base_url, key, remove) = claude_env(&endpoint(true, Some("lm-remote")));
-        assert_eq!(base_url, "http://llmux-host:3456");
-        assert_eq!(key.as_deref(), Some("lm-remote"));
-        assert!(!remove);
-    }
-
-    #[test]
-    fn claude_env_remote_without_key_removes_inherited() {
-        // The leak guard: no remote key → REMOVE any inherited ANTHROPIC_API_KEY
-        // so a parent shell's unrelated upstream key can't hit the remote proxy.
-        let (_base_url, key, remove) = claude_env(&endpoint(true, None));
-        assert!(key.is_none());
-        assert!(remove);
-    }
-
-    #[test]
-    fn claude_env_local_neither_sets_nor_removes() {
-        // Unchanged local behavior: keep Claude Code's own OAuth token.
-        let (_base_url, key, remove) = claude_env(&endpoint(false, Some("lm-local")));
-        assert!(key.is_none());
-        assert!(!remove);
-    }
-
-    /// #309: rows Codex has no entry for take a CURRENT codex model's
-    /// template (the default pin's), not the retired `gpt-5.5`'s, and fall back
-    /// to the first entry when the pin is missing too.
-    #[test]
-    fn codex_catalog_template_follows_a_live_codex_model() {
-        let rows = vec![row(
-            "claude-opus-5-5[1m]",
-            "Opus",
-            &[],
-            Some(1_000_000),
-            "claude",
-        )];
-        let cached = serde_json::json!({"models": [
-            {"slug": "gpt-6.2-sol", "base_instructions": "first"},
-            {"slug": crate::provider::codex::CODEX_MODEL, "base_instructions": "pin"}
-        ]});
-        let out = codex_catalog(&rows, Some(&cached));
-        assert_eq!(out["models"][0]["base_instructions"], "pin");
-        let cached =
-            serde_json::json!({"models": [{"slug": "gpt-6.2-sol", "base_instructions": "first"}]});
-        let out = codex_catalog(&rows, Some(&cached));
-        assert_eq!(out["models"][0]["base_instructions"], "first");
-    }
-
-    /// The Codex picker over the REAL catalog (2026-11-21): a Gemini 4 row
-    /// offers its thinking levels as reasoning levels (the provider turns the
-    /// chosen one into the `-<level>` id), defaults to `medium` like every
-    /// row whose menu has it, and its alias (`neon`, …) rides as a hidden
-    /// entry; a 3.8 Flash row keeps an empty menu.
-    #[test]
-    fn codex_catalog_offers_gemini_4_levels_from_the_real_catalog() {
-        let entries = crate::catalog::catalog(
-            "grok-4.7",
-            "gpt-6.2-sol",
-            crate::catalog::OPENROUTER_DEFAULT_PIN,
-        );
-        let doc = serde_json::json!({ "models": entries }).to_string();
-        let rows = serde_json::from_str::<CatalogResponse>(&doc)
-            .expect("the served catalog parses as CLI catalog rows")
-            .models;
-        let out = codex_catalog(&rows, None);
-        let models = out["models"].as_array().expect("models");
-        let by_slug = |slug: &str| {
-            models
-                .iter()
-                .find(|m| m["slug"] == slug)
-                .unwrap_or_else(|| panic!("{slug} in the codex catalog"))
-        };
-        let levels = |slug: &str| -> Vec<String> {
-            by_slug(slug)["supported_reasoning_levels"]
-                .as_array()
-                .expect("levels")
-                .iter()
-                .map(|l| l["effort"].as_str().expect("effort").to_string())
-                .collect()
-        };
-        assert_eq!(levels("gemini-4-neon"), ["low", "medium", "high", "xhigh"]);
-        assert_eq!(by_slug("gemini-4-neon")["context_window"], 524_288);
-        assert_eq!(by_slug("gemini-4-neon[1m]")["context_window"], 1_048_576);
-        assert_eq!(levels("gemini-4-argon[1m]"), ["low", "medium", "high"]);
-        assert_eq!(
-            by_slug("gemini-4-carbon")["default_reasoning_level"],
-            "medium"
-        );
-        assert!(levels("gemini-3.8-flash-high[1m]").is_empty());
-        for (alias, owner) in [
-            ("neon", "gemini-4-neon"),
-            ("argon", "gemini-4-argon[1m]"),
-            ("carbon", "gemini-4-carbon[1m]"),
-            ("hydrogen", "gemini-4-hydrogen[1m]"),
-        ] {
-            let entry = by_slug(alias);
-            assert_eq!(entry["visibility"], "hide", "{alias}");
-            assert_eq!(entry["display_name"], by_slug(owner)["display_name"]);
-            assert_eq!(levels(alias), levels(owner), "{alias}");
-        }
-    }
-
-    fn row(
+    pub(super) fn row(
         id: &str,
         name: &str,
         efforts: &[&str],
@@ -767,300 +358,8 @@ mod tests {
         }
     }
 
-    /// A claude row that owns `aliases` — the shape [`alias_env`] reads.
-    fn aliased(id: &str, aliases: &[&str]) -> CatalogRow {
-        CatalogRow {
-            aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
-            ..row(id, id, &[], None, "claude")
-        }
-    }
-
-    /// Three catalog shapes in one document: a full claude row, a codex row
-    /// with NO effort menu, and a grok row with an UNPUBLISHED context window.
-    /// Asserted as an exact string — the argv llmux hands `claude` is the
-    /// contract, key order included.
-    #[test]
-    fn model_picker_settings_emits_the_expected_document() {
-        let models = [
-            row(
-                "claude-fable-5-1[1m]",
-                "Claude Fable 5.1",
-                &["low", "medium", "high", "xhigh", "max"],
-                Some(1_000_000),
-                "claude",
-            ),
-            row("gpt-5.5", "GPT-5.5", &[], Some(272_000), "codex"),
-            row("grok-4.6", "Grok 4.6", &["low", "high"], None, "grok"),
-        ];
-        let json = model_picker_settings(&models).expect("non-empty catalog yields a document");
-        assert_eq!(
-            json,
-            concat!(
-                r#"{"modelPicker":{"options":["#,
-                r#"{"model":"claude-fable-5-1[1m]","label":"Claude Fable 5.1","#,
-                r#""description":"claude · efforts low…max · ctx 1000000"},"#,
-                r#"{"model":"gpt-5.5","label":"GPT-5.5","description":"codex · ctx 272000"},"#,
-                r#"{"model":"grok-4.6","label":"Grok 4.6","description":"grok · efforts low…high"}"#,
-                r#"]}}"#,
-            )
-        );
-        // `replaceBuiltInOptions` must stay unset: the built-in rows remain.
-        assert!(!json.contains("replaceBuiltInOptions"), "{json}");
-    }
-
-    /// A single-value effort menu renders as that one value, not `low…low`.
-    #[test]
-    fn model_picker_settings_collapses_a_single_effort() {
-        let models = [row("or-x", "X", &["high"], None, "openrouter")];
-        let json = model_picker_settings(&models).unwrap();
-        assert!(
-            json.contains(r#""description":"openrouter · efforts high""#),
-            "{json}"
-        );
-    }
-
-    #[test]
-    fn model_picker_settings_is_none_for_an_empty_catalog() {
-        assert!(model_picker_settings(&[]).is_none());
-    }
-
-    /// End-to-end over the REAL catalog module: the document the daemon serves
-    /// must parse into [`CatalogRow`] (this is the CLI-side mirror's only
-    /// guard against a field rename in `src/catalog.rs`) and yield one picker
-    /// row per catalog entry, in catalog order.
-    #[test]
-    fn model_picker_settings_round_trips_the_real_catalog() {
-        let entries = crate::catalog::catalog(
-            "grok-4.6",
-            "gpt-5.6-sol",
-            crate::catalog::OPENROUTER_DEFAULT_PIN,
-        );
-        let doc = serde_json::json!({ "models": entries }).to_string();
-        let rows = serde_json::from_str::<CatalogResponse>(&doc)
-            .expect("the served catalog parses as CLI catalog rows")
-            .models;
-        assert_eq!(rows.len(), entries.len());
-        let json = model_picker_settings(&rows).unwrap();
-        // Fable 5.2 (2026-11-10) rides the picker exactly as Fable 5.1 does:
-        // its single `[1m]` id verbatim, first in catalog order.
-        assert!(
-            json.contains(r#"{"modelPicker":{"options":[{"model":"claude-fable-5-2[1m]","label":"Claude Fable 5.2","description":"claude · efforts low…max · ctx 1000000"},"#),
-            "{json}"
-        );
-        assert!(
-            json.contains(r#"{"model":"claude-fable-5-1[1m]","label":"Claude Fable 5.1","description":"claude · efforts low…max · ctx 1000000"}"#),
-            "{json}"
-        );
-        // The gpt-6.2 rows (2026-11-18) lead the codex block, each id verbatim.
-        for option in [
-            r#"{"model":"gpt-6.2-sol[1m]","label":"GPT-6.2-Sol [1M]","description":"codex · efforts low…ultra · ctx 1000000"}"#,
-            r#"{"model":"gpt-6.2-sol","label":"GPT-6.2-Sol","description":"codex · efforts low…ultra · ctx 500000"}"#,
-            r#"{"model":"gpt-6.2-astra[1m]","label":"GPT-6.2-Astra [1M]","description":"codex · efforts low…ultra · ctx 1000000"}"#,
-            r#"{"model":"gpt-6.2-astra","label":"GPT-6.2-Astra","description":"codex · efforts low…ultra · ctx 272000"}"#,
-            r#"{"model":"gpt-6.1-sol","label":"GPT-6.1-Sol","description":"codex · efforts low…ultra · ctx 500000"}"#,
-        ] {
-            assert!(json.contains(option), "{option} in {json}");
-        }
-        // The retired openrouter rows (#243) are gone from the picker.
-        assert!(!json.contains("or-ox-alpha"), "{json}");
-        let gemini_rows = rows.iter().filter(|row| row.group == "gemini").count();
-        assert!(gemini_rows > 0, "the real catalog carries gemini rows");
-        assert_eq!(
-            json.matches(r#"{"model":"#).count(),
-            entries.len() - gemini_rows,
-            "one picker row per non-gemini catalog entry"
-        );
-        assert!(!json.contains("gemini"), "{json}");
-    }
-
-    /// Gemini rows never reach Claude Code's picker (Google refuses Claude
-    /// Code traffic); every other row keeps its catalog order.
-    #[test]
-    fn model_picker_settings_drops_gemini_rows() {
-        let models = [
-            row("claude-opus-5-5", "Claude Opus 5.5", &[], None, "claude"),
-            row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
-            row("gpt-5.5", "GPT-5.5", &[], None, "codex"),
-            row(
-                "gemini-4-argon",
-                "Gemini 4 Argon",
-                &["low", "medium", "high"],
-                Some(1_048_576),
-                "gemini",
-            ),
-            row("grok-4.6", "Grok 4.6", &[], None, "grok"),
-        ];
-        let json = model_picker_settings(&models).unwrap();
-        assert_eq!(
-            json,
-            concat!(
-                r#"{"modelPicker":{"options":["#,
-                r#"{"model":"claude-opus-5-5","label":"Claude Opus 5.5","description":"claude"},"#,
-                r#"{"model":"gpt-5.5","label":"GPT-5.5","description":"codex"},"#,
-                r#"{"model":"grok-4.6","label":"Grok 4.6","description":"grok"}"#,
-                r#"]}}"#,
-            )
-        );
-    }
-
-    /// A gemini-only catalog leaves nothing to inject — same as empty.
-    #[test]
-    fn model_picker_settings_is_none_for_a_gemini_only_catalog() {
-        let models = [
-            row("gemini-3.8-flash-high[1m]", "Gemini", &[], None, "gemini"),
-            row(
-                "gemini-4-argon",
-                "Gemini 4 Argon",
-                &["low", "medium", "high"],
-                Some(1_048_576),
-                "gemini",
-            ),
-        ];
-        assert!(model_picker_settings(&models).is_none());
-    }
-
-    /// A fixture mirroring the real claude block: the `[1m]` twins own the
-    /// bare aliases, the plain rows own none, and `haiku` has no twin at all.
-    fn claude_rows() -> Vec<CatalogRow> {
-        vec![
-            aliased("claude-fable-5-2[1m]", &["fable", "fable-5-2"]),
-            aliased("claude-fable-5-1[1m]", &["fable-5-1"]),
-            aliased("claude-fable-5[1m]", &[]),
-            aliased("claude-opus-5-5[1m]", &["opus", "opus-5-5"]),
-            aliased("claude-opus-5-5", &[]),
-            aliased("claude-sonnet-5-5[1m]", &["sonnet", "sonnet-5-5"]),
-            aliased("claude-sonnet-5-5", &[]),
-            aliased("claude-sonnet-5[1m]", &["sonnet-5"]),
-            aliased("claude-sonnet-5", &[]),
-            aliased("claude-haiku-4-5", &["haiku"]),
-        ]
-    }
-
-    /// The whole point of the export: each Claude Code family var gets the
-    /// catalog's OWN id for that alias — the `[1m]` row where one exists, so
-    /// `/model opus` stops resolving to the client's 200k `claude-opus-5-5`.
-    /// Order follows `ALIAS_ENV`, not catalog order.
-    #[test]
-    fn alias_env_exports_the_catalog_alias_owners() {
-        let env = alias_env(&claude_rows(), |_| false);
-        assert_eq!(
-            env,
-            vec![
-                ("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-5-5[1m]".into()),
-                (
-                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
-                    "claude-fable-5-2[1m]".into()
-                ),
-                (
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                    "claude-sonnet-5-5[1m]".into()
-                ),
-                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5".into()),
-            ]
-        );
-    }
-
-    /// The user's own export wins: a var already in the environment is left
-    /// alone, and the other three still go out.
-    #[test]
-    fn alias_env_leaves_an_already_set_var_alone() {
-        let env = alias_env(&claude_rows(), |var| var == "ANTHROPIC_DEFAULT_OPUS_MODEL");
-        let vars: Vec<&str> = env.iter().map(|(var, _)| *var).collect();
-        assert_eq!(
-            vars,
-            vec![
-                "ANTHROPIC_DEFAULT_FABLE_MODEL",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            ]
-        );
-    }
-
-    /// An alias no row owns exports nothing — that family keeps Claude Code's
-    /// own default rather than being pointed at a guess. An empty catalog is
-    /// the degenerate case of the same rule.
-    #[test]
-    fn alias_env_skips_an_unowned_alias() {
-        let rows = vec![aliased("claude-haiku-4-5", &["haiku"])];
-        assert_eq!(
-            alias_env(&rows, |_| false),
-            vec![(
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-                "claude-haiku-4-5".to_string()
-            )]
-        );
-        assert!(alias_env(&[], |_| false).is_empty());
-    }
-
-    /// End-to-end over the REAL catalog module, like
-    /// [`model_picker_settings_round_trips_the_real_catalog`]: the served
-    /// document must parse into [`CatalogRow`] *with its aliases* and yield all
-    /// four exports. This is what fails if a future re-curation moves an alias
-    /// off a `[1m]` row (or drops one), which would silently restore Claude
-    /// Code's 200k denominator.
-    #[test]
-    fn alias_env_covers_every_family_of_the_real_catalog() {
-        let entries = crate::catalog::catalog(
-            "grok-4.7",
-            "gpt-5.6-sol",
-            crate::catalog::OPENROUTER_DEFAULT_PIN,
-        );
-        let doc = serde_json::json!({ "models": entries }).to_string();
-        let rows = serde_json::from_str::<CatalogResponse>(&doc)
-            .expect("the served catalog parses as CLI catalog rows")
-            .models;
-        assert_eq!(
-            alias_env(&rows, |_| false),
-            vec![
-                ("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-5-5[1m]".into()),
-                (
-                    "ANTHROPIC_DEFAULT_FABLE_MODEL",
-                    "claude-fable-5-2[1m]".into()
-                ),
-                (
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                    "claude-sonnet-5-5[1m]".into()
-                ),
-                (
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-                    "claude-haiku-5-5[1m]".into()
-                ),
-            ]
-        );
-    }
-
-    /// The injection decision. `args` here is always the list with a leading
-    /// `--` already stripped (what `run` passes), so a user `--settings` is a
-    /// token of its own.
-    #[test]
-    fn injects_model_picker_matrix() {
-        let plain: Vec<String> = vec!["--model".into(), "opus".into(), "-p".into()];
-        assert!(injects_model_picker(&plain, false), "plain args inject");
-        assert!(injects_model_picker(&[], false), "no args inject");
-
-        assert!(
-            !injects_model_picker(&plain, true),
-            "--no-model-picker opts out"
-        );
-
-        let separate: Vec<String> = vec!["--settings".into(), "x.json".into()];
-        assert!(
-            !injects_model_picker(&separate, false),
-            "user --settings wins"
-        );
-        let inline: Vec<String> = vec!["--settings=x.json".into()];
-        assert!(
-            !injects_model_picker(&inline, false),
-            "user --settings=<v> wins"
-        );
-
-        // Not a false positive: a value that merely mentions the flag name.
-        let lookalike: Vec<String> = vec!["--model".into(), "settings".into()];
-        assert!(injects_model_picker(&lookalike, false), "{lookalike:?}");
-    }
-
     /// Serve `body` with `status` at `/llmux/models` on 127.0.0.1:0.
-    async fn spawn_models_mock(status: http::StatusCode, body: String) -> String {
+    pub(super) async fn spawn_models_mock(status: http::StatusCode, body: String) -> String {
         let app = axum::Router::new().route(
             "/llmux/models",
             axum::routing::get(move || async move { (status, body) }),
@@ -1098,142 +397,6 @@ mod tests {
         assert_eq!(models[0].aliases, vec!["grok".to_string()]);
     }
 
-    /// Serve a one-row claude catalog and drive [`catalog_args`] end to end.
-    /// `--no-model-picker` opts out of BOTH products; the user's own
-    /// `--settings` drops only the lineup and keeps the env exports (they are
-    /// env vars, not a settings document, so they cannot collide with it).
-    #[tokio::test]
-    async fn catalog_args_opt_outs_are_asymmetric() {
-        let base_url = spawn_models_mock(
-            http::StatusCode::OK,
-            serde_json::json!({
-                "models": [{
-                    "id": "claude-opus-5-5[1m]",
-                    "aliases": ["opus", "opus-5-5"],
-                    "name": "Claude Opus 5.5 [1M]",
-                    "efforts": ["low", "max"],
-                    "max_context": 1_000_000u64,
-                    "group": "claude",
-                }]
-            })
-            .to_string(),
-        )
-        .await;
-        let endpoint = Endpoint {
-            base_url: base_url.clone(),
-            api_key: None,
-            remote: false,
-            host: "127.0.0.1".into(),
-            port: 0,
-        };
-        // The env half is asserted against the process environment rather than
-        // a fixed list, so a shell that already exports one of the four vars
-        // cannot make this flaky — that var is simply left alone.
-        let opus_expected = std::env::var_os("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none();
-
-        let (picker, env) = catalog_args(&endpoint, &[], false).await;
-        assert_eq!(picker.first().map(String::as_str), Some("--settings"));
-        assert!(
-            picker[1].contains(r#""model":"claude-opus-5-5[1m]""#),
-            "{picker:?}"
-        );
-        assert_eq!(
-            env.iter()
-                .any(|(var, _)| *var == "ANTHROPIC_DEFAULT_OPUS_MODEL"),
-            opus_expected
-        );
-        // Only the owned alias is exported: the fixture has no fable/sonnet/
-        // haiku row, so those three families keep Claude Code's defaults.
-        assert!(env.len() <= 1, "{env:?}");
-
-        let user_settings: Vec<String> = vec!["--settings".into(), "mine.json".into()];
-        let (picker, env_with_settings) = catalog_args(&endpoint, &user_settings, false).await;
-        assert!(picker.is_empty(), "user --settings wins the lineup");
-        assert_eq!(env_with_settings, env, "alias exports still apply");
-
-        let (picker, env) = catalog_args(&endpoint, &[], true).await;
-        assert!(picker.is_empty(), "--no-model-picker skips the lineup");
-        assert!(env.is_empty(), "--no-model-picker skips the exports too");
-    }
-
-    /// `--no-model-picker` must skip the FETCH, not just its products: it is
-    /// the "leave my Claude Code alone" switch, so the launch must not touch
-    /// the daemon for a catalog it will not use. Observed on the server side
-    /// with a request counter — the second call proves the counter is wired,
-    /// so a broken mock cannot make the first assertion pass vacuously.
-    #[tokio::test]
-    async fn catalog_args_with_no_picker_never_fetches_the_catalog() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let seen = hits.clone();
-        let app = axum::Router::new().route(
-            "/llmux/models",
-            axum::routing::get(move || {
-                let seen = seen.clone();
-                async move {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                    (http::StatusCode::OK, r#"{"models":[]}"#.to_string())
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        let endpoint = Endpoint {
-            base_url: format!("http://127.0.0.1:{port}"),
-            api_key: None,
-            remote: false,
-            host: "127.0.0.1".into(),
-            port,
-        };
-
-        let (picker, env) = catalog_args(&endpoint, &[], true).await;
-        assert!(picker.is_empty());
-        assert!(env.is_empty());
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "no catalog fetch was made");
-
-        // Same endpoint, picker enabled: the counter moves, so the zero above
-        // is a real observation and not a dead route.
-        let _ = catalog_args(&endpoint, &[], false).await;
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-    }
-
-    /// A failed fetch yields NEITHER product — no lineup and no alias exports
-    /// (an export built from a catalog llmux could not read would be a guess).
-    /// The launch continues; only a warning line is printed.
-    #[tokio::test]
-    async fn catalog_args_yields_nothing_when_the_fetch_fails() {
-        // Bind then drop to reserve-and-free a port nobody listens on.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let endpoint = Endpoint {
-            base_url: format!("http://127.0.0.1:{port}"),
-            api_key: None,
-            remote: false,
-            host: "127.0.0.1".into(),
-            port,
-        };
-        let (picker, env) = catalog_args(&endpoint, &[], false).await;
-        assert!(picker.is_empty(), "{picker:?}");
-        assert!(env.is_empty(), "{env:?}");
-
-        // An empty catalog is the same shape of non-event: no lineup, and no
-        // exports either (no row owns any alias).
-        let base_url = spawn_models_mock(http::StatusCode::OK, r#"{"models":[]}"#.into()).await;
-        let endpoint = Endpoint {
-            base_url,
-            ..endpoint
-        };
-        let (picker, env) = catalog_args(&endpoint, &[], false).await;
-        assert!(picker.is_empty(), "{picker:?}");
-        assert!(env.is_empty(), "{env:?}");
-    }
-
     /// A non-200 (or a body that is not a catalog) must return a sanitized
     /// Err — the warning path — and never panic, so the launch continues.
     #[tokio::test]
@@ -1267,5 +430,79 @@ mod tests {
             .await
             .expect_err("nothing listening must be an error");
         assert!(err.contains("not reachable"), "{err}");
+    }
+
+    /// The `run` flags pick the frontend; the clap surface is unchanged
+    /// (`--codex`, nothing for Claude Code).
+    #[test]
+    fn frontend_follows_the_run_and_env_flags() {
+        use clap::Parser as _;
+        let parse = |argv: &[&str]| match crate::cli::Cli::try_parse_from(argv)
+            .expect("parses")
+            .command
+        {
+            crate::cli::Command::Run(args) => Frontend::from_run_args(&args),
+            crate::cli::Command::Env(args) => Frontend::from_env_args(&args),
+            other => panic!("unexpected command {other:?}"),
+        };
+        assert_eq!(parse(&["llmux", "run"]), Frontend::ClaudeCode);
+        assert_eq!(parse(&["llmux", "run", "--codex"]), Frontend::Codex);
+        assert_eq!(
+            parse(&["llmux", "run", "--", "--codex"]),
+            Frontend::ClaudeCode,
+            "a pass-through --codex belongs to the client"
+        );
+        assert_eq!(parse(&["llmux", "env"]), Frontend::ClaudeCode);
+        assert_eq!(parse(&["llmux", "env", "--codex"]), Frontend::Codex);
+    }
+
+    /// The launch failures read exactly as the two per-client messages did.
+    #[test]
+    fn spawn_error_names_the_binary_and_the_product() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = |frontend: Frontend, err: &std::io::Error| match frontend.spawn_error(err) {
+            CliError::Message(message) => message,
+            other => panic!("unexpected error {other:?}"),
+        };
+        assert_eq!(
+            message(Frontend::ClaudeCode, &missing),
+            "claude not found in PATH — install Claude Code first"
+        );
+        assert_eq!(
+            message(Frontend::Codex, &missing),
+            "codex not found in PATH — install Codex CLI first"
+        );
+        assert_eq!(
+            message(Frontend::ClaudeCode, &denied),
+            format!("failed to start claude: {denied}")
+        );
+        assert_eq!(
+            message(Frontend::Codex, &denied),
+            format!("failed to start codex: {denied}")
+        );
+    }
+
+    /// A session file is private to the user, holds exactly its contents, and
+    /// is gone once dropped.
+    #[test]
+    fn session_file_is_private_and_removed_on_drop() {
+        let file = SessionFile::create("llmux-test-session", b"{\"models\":[]}").unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.starts_with(std::env::temp_dir()), "{path:?}");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("llmux-test-session-") && name.ends_with(".json"),
+            "{name}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"models\":[]}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(file);
+        assert!(!path.exists(), "removed on drop");
     }
 }
