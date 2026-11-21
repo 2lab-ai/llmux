@@ -40,7 +40,7 @@ llmux ships no review command. Three-model review is project configuration: two 
 
 ## Does llmux replace Claude Code?
 
-No. `llmux run` launches Claude Code; `llmux run --codex` launches Codex CLI. llmux routes each client’s model traffic while that client retains its own tool execution, permissions and settings. It does not convert one client’s configuration into the other’s.
+No. `llmux run` launches Claude Code; `llmux run --codex` launches Codex CLI; `llmux run --agy` launches the Antigravity CLI (`agy`). llmux routes each client’s model traffic while that client retains its own tool execution, permissions and settings. It does not convert one client’s configuration into another’s.
 
 ## Can I use llmux with only Claude accounts?
 
@@ -48,7 +48,7 @@ Yes, with either frontend. To use a Claude model from Codex, run `llmux run --co
 
 ## Why are some Activity rows dark gray?
 
-Dark gray (RGB(40,40,40) in the TUI) means the request arrived through an OpenAI endpoint, even if Claude served it. Anthropic requests keep their existing background, including GPT requests from Claude Code. [Endpoint origin](codex-frontend/activity.md) is separate from backend/model.
+Dark gray (RGB(40,40,40) in the TUI) means the request arrived through an OpenAI endpoint, even if Claude served it. A dark slate row (RGB(28,36,52)) arrived through the Google Gemini API endpoint (`llmux run --agy`). Anthropic requests keep their existing background, including GPT requests from Claude Code. [Endpoint origin](codex-frontend/activity.md) is separate from backend/model.
 
 ## What happens when a Claude account rejects SDK access?
 

@@ -29,8 +29,11 @@ from the same catalog-driven `/model` picker and short aliases they use today:
 > gets no gemini rows in its picker and a local 400 for a gemini request; see
 > [Claude Code (2026-10-15)](#claude-code-2026-10-15).
 
-Out of scope: an Antigravity (`agy`) **frontend** (`llmux run --agy`). The Antigravity
-*backend* is the only subscription path that serves these ids (facts below).
+The Antigravity (`agy`) **frontend** (`llmux run --agy`, #316, 2026-11-21) is specified
+in [agy-frontend](../agy-frontend/README.md): it reaches this backend natively (the
+public Gemini body in the Cloud Code envelope), not through the Messages adapter below.
+The Claude Code refusal is unchanged (agy's user agent is not `claude-cli/`). The
+Antigravity *backend* is the only subscription path that serves these ids (facts below).
 
 ## Claude Code (2026-10-15)
 
@@ -321,7 +324,8 @@ Implements `SseTransform` plus the accessor set `relay_translate` uses
 
 ## Non-goals (v1)
 
-- Antigravity frontend (`llmux run --agy`), agy config or settings sync.
+- agy config or settings sync (the agy frontend itself shipped in #316, see
+  [agy-frontend](../agy-frontend/README.md)).
 - Gemini API keys (`generativelanguage.googleapis.com`), Vertex AI, Gemini CLI OAuth.
 - Antigravity-hosted Claude / GPT-OSS models (served by their own groups in llmux).
 - A `thinkingLevel` wire field (the level rides in the id instead; see R3); Anthropic signature replay of

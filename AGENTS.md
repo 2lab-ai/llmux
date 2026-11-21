@@ -69,9 +69,12 @@ Scheduler design history (not rules): `.prd/06-scheduler-current.md`,
   preview recovery reruns the failed publish job.
   See the shared CD reference for exact verification and docs-only `[skip ci]` handling.
 - **Frontend is separate from backend.** `run` launches Claude Code; `run --codex`
-  launches Codex. Claude on Responses must use the official SDK with selected-account
-  isolation, external client-tool execution and shared scheduler/error semantics.
-  Preserve endpoint origin independently of model/provider in Activity and native views.
+  launches Codex; `run --agy` launches the Antigravity CLI (`agy`, Gemini API ingress,
+  gemini served natively). Claude on Responses and on the Gemini API must use the
+  official SDK with selected-account isolation, external client-tool execution and
+  shared scheduler/error semantics. Preserve endpoint origin independently of
+  model/provider in Activity and native views (`anthropic` / `open_ai` / `google`,
+  three-way at every site).
 - **SDK assets are build inputs.** Keep `bridge/claude-agent.mjs`, `package.json`
   and `package-lock.json` in filtered source/build contexts. Claude-through-Codex needs
   Node.js 18+ and npm on the daemon; normal binaries lazily bootstrap without a checkout.

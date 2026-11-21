@@ -127,6 +127,7 @@ This is project configuration (two agent files and a prompt), not a bundled llmu
 - **Account choice before reset.** Within one provider group, an account must pass eligibility gates first (auth, pause, 429 cooldown, 7d ≤ 0.99, fresh usage). The `default` mode then scores servable headroom × urgency (urgency rises up to 4× as the 7-day reset nears) and switches only when another account scores more than 25% higher, so it prefers quota that would otherwise expire unused. `round-robin` never switches proactively. [Schedulers](docs/schedulers.md).
 - **Keep your harness, change the model.** Claude Code keeps its own tools, permissions and project conventions. `/model fable`, `/model gpt-6-astra[1m]` or `/model grok-4.7` selects the backend. [Why llmux exists](docs/why-llmux.md).
 - **Codex CLI too.** `llmux run --codex` launches Codex against the same account pool and routing. Claude models on that path need Node.js 18+ and npm on the daemon host. llmux does not synchronize settings, hooks or skills between Claude Code and Codex. [Codex frontend](docs/codex-frontend/README.md).
+- **Antigravity CLI too (preview).** `llmux run --agy` launches Google's `agy` in its official gateway mode against llmux's Gemini API ingress: no Google sign-in, every backend group selectable, gemini served natively. [agy frontend](docs/agy-frontend/README.md).
 - **One daemon for several computers (optional).** Manage accounts on one computer and connect other computers over a trusted overlay such as Tailscale or WireGuard. Issued per-computer keys attribute usage to each computer. The CLI uses plain HTTP; the Islands app requires HTTPS for non-loopback endpoints. [Remote daemon](docs/remote.md).
 
 ## See what was actually sent to the model
@@ -229,6 +230,7 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 - [schedulers](docs/schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a mode
 - [operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, release availability, per-computer client keys
 - [Codex frontend](docs/codex-frontend/README.md) — launch, SDK requirements, tools, HTTP and endpoint activity
+- [agy frontend](docs/agy-frontend/README.md) — `llmux run --agy`, the Gemini API ingress, discovery, protocol mapping and limits
 - [configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types
 - [models](docs/models.md) — catalog, aliases, context windows, group routing
 - [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok/Gemini, diagnostic headers
