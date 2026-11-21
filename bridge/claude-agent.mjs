@@ -10,7 +10,7 @@ import { createRequire } from 'node:module';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 
-export const SDK_VERSION = '0.3.292';
+export const SDK_VERSION = '0.3.321';
 const PREFIX = 'mcp__llmux__';
 class InvalidRequest extends Error { status = 400; }
 
@@ -99,7 +99,7 @@ export function buildRequest(body, credential, upstream, directory, inherited = 
     parent_tool_use_id: null, session_id: sessionId, client_composed: true}};
 }
 
-// Complete SDKAssistantMessageError union from the pinned 0.3.292 sdk.d.ts.
+// Complete SDKAssistantMessageError union from the pinned 0.3.321 sdk.d.ts.
 // Account-policy errors are distinct from expired authentication: refreshing an
 // otherwise valid token cannot fix an organization ban, hold, or verification.
 const SDK_ERROR_STATUS = Object.freeze({

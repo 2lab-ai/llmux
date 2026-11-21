@@ -572,8 +572,8 @@ pub struct RoutingConfig {
     #[serde(default)]
     pub openrouter_models: Vec<String>,
     /// Models routed to the gemini group (empty → builtin `gemini` prefix +
-    /// exact `argon` rules). Additive: pre-gemini configs load with those
-    /// builtins (docs/gemini/spec.md §R1).
+    /// exact `argon` / `neon` / `carbon` / `hydrogen` rules). Additive:
+    /// pre-gemini configs load with those builtins (docs/gemini/spec.md §R1).
     #[serde(default)]
     pub gemini_models: Vec<String>,
     /// Group an unmatched / model-less request routes to. Default `"claude"`.
@@ -770,7 +770,9 @@ pub struct GeminiConfig {
     pub client_model: Option<String>,
     /// `User-Agent` sent upstream. Cloud Code gates newer models on the
     /// Antigravity hub version (`antigravity/hub/<version> <os>/<arch>`;
-    /// rejected below 2.23.0 per the spec's verified facts).
+    /// rejected below 2.23.0 per the spec's verified facts, and Gemini 4
+    /// reportedly below 2.29). Default [`DEFAULT_GEMINI_USER_AGENT`]; the
+    /// pre-2026-11-21 default is migrated at load.
     #[serde(default = "default_gemini_user_agent")]
     pub user_agent: String,
     /// Google OAuth token endpoint for refresh-token grants.
@@ -1510,9 +1512,20 @@ fn default_gemini_model() -> String {
 }
 
 /// Default gemini `User-Agent`: the Antigravity hub identity at the public
-/// manifest version of 2026-10-15 (`2.23.1`).
+/// manifest version read 2026-11-21 (`2.34.0`,
+/// `…/manifest/latest-arm64-mac.yml`). Third parties report Cloud Code
+/// hiding or 404ing the Gemini 4 ids for hub versions below 2.29 (#244).
+pub(crate) const DEFAULT_GEMINI_USER_AGENT: &str = "antigravity/hub/2.34.0 darwin/arm64";
+
+/// The default [`DEFAULT_GEMINI_USER_AGENT`] replaced on 2026-11-21 (hub
+/// manifest of 2026-10-15). Every config written before then serialized it as
+/// `gemini.user_agent`, so `crate::config::load_path` moves a persisted value
+/// EXACTLY equal to it to the current default; any other value is an
+/// operator's choice and is kept.
+pub(crate) const LEGACY_GEMINI_USER_AGENT: &str = "antigravity/hub/2.23.1 darwin/arm64";
+
 fn default_gemini_user_agent() -> String {
-    "antigravity/hub/2.23.1 darwin/arm64".to_string()
+    DEFAULT_GEMINI_USER_AGENT.to_string()
 }
 
 /// Default Google OAuth token endpoint for gemini refresh-token grants.

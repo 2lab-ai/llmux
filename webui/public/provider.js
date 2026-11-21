@@ -14,8 +14,9 @@
     // llmux's codex family aliases: sol / terra / luna / astra (gpt-6-astra, gpt-6.1-sol, …)
     [/^gpt|^o\d|codex|openai|chatgpt|^(sol|terra|luna|astra)\b/, 'openai'],
     [/grok|x-?ai/, 'grok'],
-    // gemini rows and the fixed `argon` alias
-    [/gemini|argon/, 'gemini'],
+    // gemini rows and the fixed `argon` alias; the `neon` / `carbon` / `hydrogen` aliases (2026-11-21)
+    // are anchored like the codex ones, since the bare words also occur in other slugs
+    [/gemini|argon|^(neon|carbon|hydrogen)\b/, 'gemini'],
   ];
   const NAMES = { claude: 'Anthropic', openai: 'OpenAI', grok: 'xAI', gemini: 'Google', model: '' };
 

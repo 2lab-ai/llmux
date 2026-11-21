@@ -16,9 +16,14 @@ from the same catalog-driven `/model` picker and short aliases they use today:
 | Typed | Resolves to (catalog row) | Upstream model |
 |---|---|---|
 | `gemini` | `gemini-3.8-flash-high[1m]` | `gemini-3.8-flash-high` |
-| `argon` | `gemini-4-argon[1m]` | `gemini-4-argon` |
+| `argon` | `gemini-4-argon[1m]` | `gemini-4-argon-<level>` (was `gemini-4-argon` until 2026-11-21) |
 | `gemini-3.8-flash-high` / `-medium` / `-low` (± `[1m]`) | same id | id without `[1m]` |
-| `gemini-4-argon` (± `[1m]`) | same id | `gemini-4-argon` |
+| `gemini-4-argon` (± `[1m]`) | same id | `gemini-4-argon-<level>` (was `gemini-4-argon` until 2026-11-21) |
+
+> **Updated 2026-11-21 (Gemini 4 rows).** Neon, Carbon and Hydrogen joined Argon, one row
+> pair per model, with the aliases `neon` (on the 512K base row), `carbon` and `hydrogen`.
+> A Gemini 4 name reaches Cloud Code as `<family>-<level>`, the level taken from the client
+> effort — see [R3](#r3-provider-messages--antigravity) and [R7](#r7-catalog-pricing-surfaces).
 
 > **Superseded 2026-10-15 for Claude Code.** Only Codex selects Gemini models. Claude Code
 > gets no gemini rows in its picker and a local 400 for a gemini request; see
@@ -72,15 +77,17 @@ predate this decision and are kept as the design record.
 | Token / userinfo | `https://oauth2.googleapis.com/token`, `https://www.googleapis.com/oauth2/v2/userinfo?alt=json` | `constants.go:21-24` |
 | Project | `POST {base}/v1internal:loadCodeAssist {"metadata":{"ideType":"ANTIGRAVITY"}}` → `cloudaicompanionProject` (string or `{id}`); absent → `onboardUser {tier_id, metadata}` poll | live 2026-10-15: 200, project present, `currentTier.id = free-tier`, `paidTier.id = g1-plus-tier` ("Google AI Plus"); `auth.go:248-330` |
 | Envelope | `{model, project, userAgent:"antigravity", requestType:"agent", requestId:"agent-<uuid>", request:{contents, systemInstruction?, tools?, toolConfig?, generationConfig, sessionId}}` | `antigravity_executor_request.go:511-553`; live 200 2026-10-15 |
-| Identity | `User-Agent: antigravity/hub/<version> darwin/arm64`; version from the public hub manifest, `2.23.1` on 2026-10-15; Cloud Code rejects newer models below `2.23.0` | `internal/misc/antigravity_version.go:18-24,116`; `GET …/manifest/latest-arm64-mac.yml` → `version: 2.23.1` |
+| Identity | `User-Agent: antigravity/hub/<version> darwin/arm64`; version from the public hub manifest, `2.23.1` on 2026-10-15, **`2.34.0` on 2026-11-21** (the default since then; a config holding exactly the old default is migrated at load). Cloud Code rejects newer models below `2.23.0`; third parties report the Gemini 4 ids hidden or 404 below `2.29` (dsh-antigravity-oauth#13; CLIProxyAPI's fallback is now 2.33.0) — not verified by llmux | `internal/misc/antigravity_version.go:18-24,116`; `GET …/manifest/latest-arm64-mac.yml` → `version: 2.23.1` (2026-10-15), `version: 2.34.0` (2026-11-21) |
 | Stream event | `data: {"response":{"candidates":[{"content":{"role":"model","parts":[…]},"finishReason":…}],"usageMetadata":{promptTokenCount,candidatesTokenCount,thoughtsTokenCount,totalTokenCount,cachedContentTokenCount?},"modelVersion","responseId"},"traceId","metadata"}` | live capture 2026-10-15 (`gemini-3.8-flash-high` → `pong`, `modelVersion gemini-3.8-flash-n`) |
 | Tool call part | `{"thoughtSignature":"<584 chars>","functionCall":{"name","args","id":"call_90071"}}` followed by `{"text":""}` | live capture 2026-10-15 (`gemini-3.8-flash-low`) |
 | Thought signature rule | turn 2 with the real signature → 200; with `"skip_thought_signature_validator"` → 200; with none → **400** `Function call is missing a thought_signature in functionCall parts…` | live 3-variant probe 2026-10-15 |
 | Tool schema | `functionDeclarations[].parametersJsonSchema` accepted a JSON Schema with `additionalProperties:false` | live probe 2026-10-15 |
 | Model catalog + quota | `POST {base}/v1internal:fetchAvailableModels {"project"}` → `models{id:{displayName,maxTokens,maxOutputTokens,quotaInfo{remainingFraction,resetTime?},…}}`, `defaultAgentModelId` | live 2026-10-15: `gemini-3.8-flash-{high,medium,low}` ctx 1,048,576 / out 65,536, `quotaInfo {remainingFraction:1, resetTime:2026-10-22T01:50:24Z}`; `defaultAgentModelId = gemini-3.8-flash-high` |
 | Argon availability | Ultra / Enterprise only (2026-10-15); this account lists `gemini-4-argon-disabled` ("Unavailable", `quotaInfo:null`); `gemini-4-argon` → **404 NOT_FOUND**. **2026-11-10:** paid Google AI Pro (or a trial on eligible premium devices), Ultra and Enterprise — not Free or Plus. Third-party reports of `gemini-4-argon-{high,medium,low}` ids and a User-Agent gate are unverified ([#244](https://github.com/2lab-ai/llmux/issues/244)) | [Antigravity models page](https://antigravity.google/docs/models/) (fetched 2026-10-15 and 2026-11-10); live probe 2026-10-15 |
-| Context / output | `gemini-3.8-flash`: 1,048,576 in / 65,536 out; `gemini-4-argon`: 1,048,576 unified, 65,536 out by default | [3.8 Flash page](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) (updated 2026-09-02); [Argon page](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon) (updated 2026-10-14) |
-| Pricing (API list, for cost display only) | 3.8 Flash $0.75 in / $3.75 out / $0.075 cached (through 2026-12-31, then doubles); Argon $2 / $10 / $0.10 (through 2026-11-30, then doubles) | [pricing page](https://ai.google.dev/gemini-api/docs/pricing) (updated 2026-10-14) |
+| Context / output | `gemini-3.8-flash`: 1,048,576 in / 65,536 out; `gemini-4-argon` / `-carbon` / `-hydrogen` / `-neon`: 1,048,576 unified on the API, 65,536 out by default. On Antigravity, Neon is "Up to 512K tokens" | [3.8 Flash page](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash) (updated 2026-09-02); [Argon page](https://ai.google.dev/gemini-api/docs/models/gemini-4-argon) (updated 2026-10-14); [Neon page](https://aistudio.google.com/docs/models/gemini-4-neon) and [Antigravity models](https://antigravity.google/docs/models) (read 2026-11-21) |
+| Gemini 4 id form on Antigravity | Served only under thinking-level ids `gemini-4-<name>-low` / `-medium` / `-high`, plus `-xhigh` on Neon and Hydrogen. Google publishes `gemini-4-neon-xhigh` (Antigravity models page and CLI `--model` example); the rest is third-party (CLIProxyAPI registry `gemini-4-neon-xhigh` / `gemini-4-carbon-high` / `gemini-4-hydrogen-xhigh`; OmniRoute live 200 on Neon low/high/xhigh and **400 on bare `gemini-4-neon`**; 200 on `gemini-4-argon-medium` at UA ≥ 2.29 in dsh-antigravity-oauth#13). Not yet probed by llmux: the daemon's Free/Plus account lists none of them ([#244](https://github.com/2lab-ai/llmux/issues/244), [#310](https://github.com/2lab-ai/llmux/issues/310)) | [Antigravity models](https://antigravity.google/docs/models) (read 2026-11-21); third-party sources (router-for-me/CLIProxyAPI `internal/registry/models/models.json` @ c1040cc0d9, cheaper-inference/OmniRoute PR #20666, YukieMiona/dsh-antigravity-oauth#13), listed in [models.md](../models.md#model-sweep-2026-11-21) |
+| Gemini 4 plans (Antigravity) | Neon and Argon: paid Google AI Pro (or a trial on eligible premium devices), Ultra, Enterprise. Hydrogen: non-trial Pro, Ultra, Enterprise. Carbon: Ultra and Enterprise. None on Free or Plus | [Antigravity models](https://antigravity.google/docs/models) (read 2026-11-21) |
+| Pricing (API list, for cost display only) | 3.8 Flash $0.75 in / $3.75 out / $0.075 cached (through 2026-12-31, then doubles); Argon $2 / $10 / $0.10 (through 2026-11-30, then doubles); Carbon as Argon; Hydrogen $1.50 / $7.50 / $0.075 flat; Neon $3 / $15 / $0.15 flat | [pricing page](https://ai.google.dev/gemini-api/docs/pricing) (updated 2026-10-14); [aistudio pricing](https://aistudio.google.com/docs/pricing) (read 2026-11-18 and 2026-11-21) |
 | 429 shapes | `error.status = RESOURCE_EXHAUSTED`; `error.details[]` carries `google.rpc.RetryInfo.retryDelay` and `google.rpc.ErrorInfo.reason` (`QUOTA_EXHAUSTED` = window spent, `RATE_LIMIT_EXCEEDED` = burst) | `antigravity_executor_credits.go:226-282` |
 | `maxOutputTokens` | removed for non-Claude Antigravity models | `antigravity_executor_request.go:90-101` |
 | ToS risk | Google states that using Antigravity resources through third-party tools/proxies violates the Antigravity ToS and suspends accounts (repeat = permanent) | [gemini-cli discussion #20632](https://github.com/google-gemini/gemini-cli/discussions/20632); forum reports 2026-02…09 |
@@ -93,10 +100,12 @@ predate this decision and are kept as the design record.
   fallback scan order and the status representative — neither moves). `from_kind("gemini")`,
   `as_str`/`from_label` `"gemini"`, `ALL` extended. `needs_body_translation = true`,
   `serves_messages_only = true` (no count_tokens sibling upstream).
-- Builtin rules: `Prefix("gemini")`, `Exact("argon")`. Config `routing.gemini_models`
+- Builtin rules: `Prefix("gemini")`, `Exact("argon")`, and since 2026-11-21 `Exact("neon")`,
+  `Exact("carbon")`, `Exact("hydrogen")`. Config `routing.gemini_models`
   (additive, `#[serde(default)]`): empty keeps builtins, non-empty replaces them.
 - Disjointness with every other builtin family is unit-tested (no other family's rule
-  matches `gemini…`/`argon`, and the gemini rules match none of theirs).
+  matches `gemini…` or an element alias, and the gemini rules match none of theirs), and
+  so is "every gemini catalog alias routes to gemini".
 
 ### R2. Credential, login, import
 
@@ -141,12 +150,27 @@ signatures: SignatureCache }`, `GeminiShape { model (default "gemini-3.8-flash-h
 client_model, user_agent }`.
 
 - **Model resolution** (`resolve_model`): trim; strip one trailing `[1m]`
-  (case-insensitive); alias `gemini` → `gemini-3.8-flash-high`, `argon` →
-  `gemini-4-argon`; bare `gemini-3.8-flash` picks the variant from `output_config.effort`
-  (`none|minimal|low` → `-low`, `medium` → `-medium`, otherwise `-high`); any other
-  `gemini-*` id passes verbatim; non-gemini names (empty-group fallback) use `shape.model`.
-  Client effort is NOT sent upstream: the level is baked into the variant id, and no
-  `thinkingLevel` wire form is verified for Argon on this backend.
+  (case-insensitive); then one table, `FAMILIES` (bare family id → thinking levels), drives
+  every bare-family case (2026-11-21; it replaced the flash/`argon` special cases):
+  - a bare family id — `gemini-3.8-flash`, `gemini-4-neon`, `gemini-4-carbon`,
+    `gemini-4-hydrogen`, `gemini-4-argon` — becomes `<family>-<level>`, the level from
+    `output_config.effort`: `none|minimal|low` → `low`, `medium` → `medium`,
+    `xhigh|max|ultra` → `xhigh` where the family serves it (Neon, Hydrogen), else `high`;
+    unset, `high` or anything else → `high`;
+  - an alias resolves through the catalog (`GEMINI_MODELS`) to the row that owns it, which
+    then resolves the same way: `argon` / `neon` / `carbon` / `hydrogen` → their family +
+    level; `gemini` → `gemini-3.8-flash-high` (a row that already names its level, so the
+    effort does not move it);
+  - any other `gemini-*` id passes verbatim — one that already carries a level suffix
+    (`gemini-4-neon-xhigh`) included; non-gemini names (empty-group fallback) use
+    `shape.model`, which gets the same treatment.
+
+  Client effort is NOT sent as a field upstream: the level lives in the id. The native
+  client and CLIProxyAPI also send `generationConfig.thinkingConfig.thinkingLevel` matching
+  the suffix; llmux does not, and whether Gemini 4 needs it is unverified (it is not needed
+  for Flash). The client-facing stamp is the catalog row that serves the request: an alias
+  stamps its owning row (`argon` → `gemini-4-argon[1m]`, `neon` → `gemini-4-neon`), bare
+  `gemini-3.8-flash` its variant's `[1m]` row, any other id the client's own spelling.
 - **Request** (`translate_request`): system (string or text blocks) →
   `systemInstruction {role:"user", parts}`, a leading `x-anthropic-billing-header:` line
   left out; a mid-conversation `role:"system"` message (text only, else 400) → a user text
@@ -271,14 +295,25 @@ Implements `SseTransform` plus the accessor set `relay_translate` uses
 
 ### R7. Catalog, pricing, surfaces
 
-- Catalog rows (group `gemini`, empty effort menu — the level is in the id):
-  `gemini-3.8-flash-high[1m]` (aliases `gemini`, `gemini-3.8-flash`),
-  `gemini-3.8-flash-high`, `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-medium`,
-  `gemini-3.8-flash-low[1m]`, `gemini-3.8-flash-low`, `gemini-4-argon[1m]` (alias
-  `argon`), `gemini-4-argon`. Context 1,048,576. Aliases live on the `[1m]` rows
-  (operator rule 2026-09-10).
+- Catalog rows (group `gemini`; 14 since 2026-11-21):
+  - 3.8 Flash, empty effort menu — the level is in the id: `gemini-3.8-flash-high[1m]`
+    (aliases `gemini`, `gemini-3.8-flash`), `gemini-3.8-flash-high`,
+    `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-medium`, `gemini-3.8-flash-low[1m]`,
+    `gemini-3.8-flash-low`.
+  - Gemini 4, one row pair per model, the level in the effort menu (derived from
+    `FAMILIES`, so the menu is exactly what the provider maps): `gemini-4-neon[1m]`,
+    `gemini-4-neon` (alias `neon`), `gemini-4-carbon[1m]` (alias `carbon`),
+    `gemini-4-carbon`, `gemini-4-hydrogen[1m]` (alias `hydrogen`), `gemini-4-hydrogen`,
+    `gemini-4-argon[1m]` (alias `argon`), `gemini-4-argon`. Menus: Neon and Hydrogen
+    low, medium, high, xhigh; Carbon and Argon low, medium, high.
+  - Context 1,048,576 on every row except bare `gemini-4-neon`, 524,288 (Antigravity:
+    "Up to 512K tokens"). Aliases live on the `[1m]` rows (operator rule 2026-09-10),
+    except `neon`, which sits on that 512K base row (decision 2026-11-21).
 - Pricing: `GEMINI_3_8_FLASH {0.75, 3.75, 0.075, 0}`, `GEMINI_4_ARGON {2.0, 10.0, 0.10,
-  0}` + `group == "gemini"` fallback → flash. API-list-price-equivalent estimates.
+  0}`, `GEMINI_4_CARBON` (Argon's card), `GEMINI_4_HYDROGEN {1.50, 7.50, 0.075, 0}`,
+  `GEMINI_4_NEON {3.0, 15.0, 0.15, 0}` — each on its bare id, its bare alias and its
+  `<family>-` prefix — + `group == "gemini"` fallback → flash. API-list-price-equivalent
+  estimates.
 - Surfaces: `/llmux/status` and `llmux status` group `gemini`, TUI group block + label,
   activity model/group, accounts list `(gemini)`, dashboard group bar. Islands render the
   `gemini` group label and in-flight count (Swift + Linux QML); provider icon falls back to
@@ -289,7 +324,7 @@ Implements `SseTransform` plus the accessor set `relay_translate` uses
 - Antigravity frontend (`llmux run --agy`), agy config or settings sync.
 - Gemini API keys (`generativelanguage.googleapis.com`), Vertex AI, Gemini CLI OAuth.
 - Antigravity-hosted Claude / GPT-OSS models (served by their own groups in llmux).
-- Thinking-level control for Argon (no verified wire form); Anthropic signature replay of
+- A `thinkingLevel` wire field (the level rides in the id instead; see R3); Anthropic signature replay of
   prior thinking; web search grounding; image generation models; `count_tokens` upstream
   (local estimate, like grok).
 - A live `POST /llmux/gemini` shape endpoint (config-file only in v1).

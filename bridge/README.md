@@ -1,9 +1,11 @@
 # Claude Agent SDK bridge
 
 The OpenAI frontend's Claude route uses the official
-`@anthropic-ai/claude-agent-sdk` **0.3.292**, including its matching native Claude
-executable. It does not invoke a user's `claude` CLI or use an Anthropic HTTP
-fallback. Node.js 18+ and npm must be available on the **daemon host**. The first
+`@anthropic-ai/claude-agent-sdk` **0.3.321**, including its matching native Claude
+executable (Claude Code 2.1.321 — the floor Fable 5.2 requires, and above Haiku
+5.5's 2.1.293; pinned 2026-11-21, was 0.3.292). It does not invoke a user's
+`claude` CLI or use an Anthropic HTTP fallback. Node.js 18+ (the pinned SDK
+declares `>=18.14.0`) and npm must be available on the **daemon host**. The first
 Claude request installs the embedded, integrity-locked dependencies using
 `npm ci --ignore-scripts` into the OS cache directory under `llmux/`.
 Codex-only requests do not install the SDK. A failed install is discarded and
@@ -80,7 +82,8 @@ and can start additional inference. Error output never includes raw SDK stderr o
 ## Error lifecycle
 
 The mapping covers the complete `SDKAssistantMessageError` union in pinned
-`0.3.292/sdk.d.ts`. Only a pre-stream error can change account selection.
+`0.3.321/sdk.d.ts` (the same 13 codes as 0.3.292's). Only a pre-stream error can
+change account selection.
 
 | SDK code | Status / meaning |
 | --- | --- |

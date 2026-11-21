@@ -94,9 +94,11 @@ const IDE_TYPE: &str = "ANTIGRAVITY";
 /// `ide_name` in the onboardUser metadata.
 const IDE_NAME: &str = "antigravity";
 
-/// `ide_version` when the configured user agent carries none (the hub
-/// version of 2026-10-15; Cloud Code rejects newer models below 2.23.0).
-const DEFAULT_IDE_VERSION: &str = "2.23.1";
+/// `ide_version` when the configured user agent carries none: the hub
+/// version of the default user agent (`DEFAULT_GEMINI_USER_AGENT`, manifest
+/// read 2026-11-21; Cloud Code rejects newer models below 2.23.0, and
+/// reportedly Gemini 4 below 2.29).
+const DEFAULT_IDE_VERSION: &str = "2.34.0";
 
 /// Last-resort onboard tier when `loadCodeAssist` names neither a default
 /// allowed tier nor a current tier (`defaultAntigravityTierID`).
@@ -802,7 +804,7 @@ mod tests {
             .collect()
     }
 
-    const UA: &str = "antigravity/hub/2.23.1 darwin/arm64";
+    const UA: &str = "antigravity/hub/2.34.0 darwin/arm64";
 
     /// Neutral client fixture: llmux ships no OAuth client, so the tests
     /// never carry one either.
@@ -1257,7 +1259,7 @@ mod tests {
             body,
             json!({
                 "tier_id": "standard-tier",
-                "metadata": {"ide_type":"ANTIGRAVITY","ide_name":"antigravity","ide_version":"2.23.1"}
+                "metadata": {"ide_type":"ANTIGRAVITY","ide_name":"antigravity","ide_version":"2.34.0"}
             })
         );
     }
@@ -1324,6 +1326,11 @@ mod tests {
         assert_eq!(ide_version("curl/8.0"), DEFAULT_IDE_VERSION);
         assert_eq!(ide_version(""), DEFAULT_IDE_VERSION);
         assert_eq!(ide_version("antigravity/hub/"), DEFAULT_IDE_VERSION);
+        // The fallback is the default user agent's own version.
+        assert_eq!(
+            ide_version(crate::config::schema::DEFAULT_GEMINI_USER_AGENT),
+            DEFAULT_IDE_VERSION
+        );
     }
 
     // ---- G11: Antigravity CLI store import ----

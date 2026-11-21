@@ -44,7 +44,8 @@
 //! gpt-6.2-astra from https://developers.openai.com/api/docs/pricing and their
 //! model pages, Gemini 4 Carbon / Hydrogen from
 //! https://aistudio.google.com/docs/pricing, all read 2026-11-18 (see the
-//! rows).
+//! rows). Gemini 4 Neon from the same page and `grok-4.7-build-fast` from
+//! https://docs.x.ai/developers/pricing, both read 2026-11-21 (see the rows).
 
 use std::collections::HashMap;
 
@@ -893,6 +894,18 @@ const GROK_4_6: ModelPrice =
 /// API-list-price equivalent for subscription traffic.
 const GROK_4_7: ModelPrice =
     ModelPrice::new(2.0, 6.0, 0.5, 2.0).with_long(XAI_LONG, tier(4.0, 12.0, 1.0, 4.0, None));
+/// Grok 4.7 Fast — the id `grok-4.7-build-fast`, which the cli-chat-proxy
+/// `/v1/models` lists next to `grok-4.7` (2026-09-23 probe). docs.x.ai
+/// pricing (read 2026-11-21) lists "Grok 4.7 Fast" at 2x standard below 200k
+/// prompt tokens — $4 in / $12 out / $1.00 cached — and 1.5x at 200k or more
+/// ([`XAI_LONG`]): $6 / $18 / $1.50, the whole request. No cache-write price
+/// (write rate = input rate, as on every grok row). Before this row a pinned
+/// or sent `grok-4.7-build-fast` took the grok-4.5 group fallback, about half
+/// its list price. (`grok-4.7-build`, the id the proxy reported serving for a
+/// `grok` request on 2026-11-21, is standard Grok 4.7 and shares
+/// [`GROK_4_7`].)
+const GROK_4_7_BUILD_FAST: ModelPrice =
+    ModelPrice::new(4.0, 12.0, 1.0, 4.0).with_long(XAI_LONG, tier(6.0, 18.0, 1.50, 6.0, None));
 /// Free — all four rates zero. Applied to the CURATED OpenRouter set, every
 /// member of which had `pricing.prompt == "0"` and `pricing.completion == "0"`
 /// on the live `GET /api/v1/models` probe of 2026-08-21
@@ -938,10 +951,11 @@ const GEMINI_4_ARGON_DEC_2026: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 0.0
 /// Argon's card — $2 in / $10 out / $0.10 cached through 2026-11-30, then $4 /
 /// $20 / $0.20 from 2026-12-01 ([`GEMINI_4_CARBON_DEC_2026`]; no time zone
 /// named, so the UTC day boundary). No >200k tier, no cache-write rate
-/// (implicit caching only). No catalog row: the daemon's Antigravity account
-/// cannot see it and the Antigravity id form is unpublished (#310), but any
-/// `gemini-*` id passes through, and without this row it fell to the Flash
-/// fallback. API-list-price-equivalent estimate, like the Flash row.
+/// (implicit caching only). Priced since 2026-11-18, when it had no catalog
+/// row and fell to the Flash fallback; its row pair (alias `carbon`) landed
+/// 2026-11-21. Antigravity serves it as `gemini-4-carbon-<level>`, which the
+/// prefix branch catches. API-list-price-equivalent estimate, like the Flash
+/// row.
 const GEMINI_4_CARBON: ModelPrice =
     ModelPrice::new(2.0, 10.0, 0.10, 0.0).with_changes(&[RateChange {
         from: RateDay::ymd(2026, 12, 1),
@@ -953,9 +967,19 @@ const GEMINI_4_CARBON_DEC_2026: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 0.
 /// and https://aistudio.google.com/docs/models/gemini-4-hydrogen, read
 /// 2026-11-18): $1.50 in / $7.50 out / $0.075 cached, flat — "flat across its
 /// entire 1 million-token context window", no dated change, no cache-write
-/// rate. No catalog row (#310), priced for the same passthrough reason as
-/// Carbon: the Flash fallback is half these rates.
+/// rate. Priced since 2026-11-18 for the same reason as Carbon (the Flash
+/// fallback is half these rates); row pair and alias `hydrogen` since
+/// 2026-11-21.
 const GEMINI_4_HYDROGEN: ModelPrice = ModelPrice::new(1.50, 7.50, 0.075, 0.0);
+/// Gemini 4 Neon (GA 2026-11-18 as `gemini-4-neon`;
+/// https://aistudio.google.com/docs/pricing and
+/// https://aistudio.google.com/docs/models/gemini-4-neon, read 2026-11-21):
+/// $3 in / $15 out / $0.15 cached, flat — no dated change, no >200k tier, no
+/// cache-write rate (implicit caching only), no API free tier. Pricier than
+/// Carbon and Argon until their 2026-12-01 rise; the Flash fallback would
+/// price it 4x too low. API-list-price-equivalent estimate, like the Flash
+/// row.
+const GEMINI_4_NEON: ModelPrice = ModelPrice::new(3.0, 15.0, 0.15, 0.0);
 
 /// Look up the built-in default price for a *normalized*, lowercased model
 /// slug. Exact matches first, then a sensible prefix fallback (so e.g.
@@ -993,7 +1017,12 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-6.2" | "gpt-6.2-sol" => Some(GPT_6_2_SOL),
         "gpt-6.2-astra" => Some(GPT_6_2_ASTRA),
         "grok-4.5" => Some(GROK_4_5),
-        "grok-4.7" => Some(GROK_4_7),
+        // `grok-4.7-build`: Grok Build's name for standard Grok 4.7 traffic,
+        // served for a `grok` request on 2026-11-21 (no docs.x.ai page; usage
+        // is booked under the requested id, so this row guards a client or
+        // pin that sends it).
+        "grok-4.7" | "grok-4.7-build" => Some(GROK_4_7),
+        "grok-4.7-build-fast" => Some(GROK_4_7_BUILD_FAST),
         "grok-4.6" => Some(GROK_4_6),
         // `[1m]` ids arrive here already stripped by `normalize_model`. The
         // bare family aliases are listed too: unlike the claude aliases they
@@ -1006,8 +1035,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         | "gemini-3.8-flash-medium"
         | "gemini-3.8-flash-low" => Some(GEMINI_3_8_FLASH),
         "argon" | "gemini-4-argon" => Some(GEMINI_4_ARGON),
-        "gemini-4-carbon" => Some(GEMINI_4_CARBON),
-        "gemini-4-hydrogen" => Some(GEMINI_4_HYDROGEN),
+        "carbon" | "gemini-4-carbon" => Some(GEMINI_4_CARBON),
+        "hydrogen" | "gemini-4-hydrogen" => Some(GEMINI_4_HYDROGEN),
+        "neon" | "gemini-4-neon" => Some(GEMINI_4_NEON),
         _ => None,
     };
     if exact.is_some() {
@@ -1136,6 +1166,11 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         Some(GEMINI_4_CARBON)
     } else if model_norm_lower.starts_with("gemini-4-hydrogen-") {
         Some(GEMINI_4_HYDROGEN)
+    } else if model_norm_lower.starts_with("gemini-4-neon-") {
+        // The Antigravity ids `gemini-4-neon-low|-medium|-high|-xhigh`, which
+        // the provider sends for every Neon request. Same `-` boundary
+        // (`gemini-4-neonx` misses).
+        Some(GEMINI_4_NEON)
     } else if model_norm_lower.starts_with("gpt-6-") {
         // Astra is generation 6's flagship, so it is the `gpt-6-` default
         // exactly as sol is for `gpt-5.6-` (sol/luna have their own exact and
@@ -1646,6 +1681,58 @@ mod tests {
         );
     }
 
+    /// The Grok 4.7 build ids (sweep 2026-11-21): `grok-4.7-build`, which the
+    /// proxy reported serving for a `grok` request, is standard Grok 4.7;
+    /// `grok-4.7-build-fast` (Grok 4.7 Fast) is $4 / $12 / $1.00 cached on
+    /// docs.x.ai, not the grok-4.5 fallback's $2 / $6 / $0.30.
+    #[test]
+    fn grok_4_7_build_ids_take_their_own_rates_not_the_fallback() {
+        let overrides = std::collections::HashMap::new();
+        assert_eq!(
+            price_for("grok", "grok-4.7-build", &overrides),
+            Some(GROK_4_7)
+        );
+        assert_eq!(
+            price_for("grok", "grok-4.7-build[1m]", &overrides),
+            Some(GROK_4_7)
+        );
+        let fast = price_for("grok", "GROK-4.7-build-fast", &overrides).expect("priced");
+        assert_eq!(fast, GROK_4_7_BUILD_FAST);
+        assert_eq!(
+            (
+                fast.input,
+                fast.output,
+                fast.cache_read,
+                fast.cache_creation
+            ),
+            (4.0, 12.0, 1.0, 4.0),
+            "2x standard; a written token bills as input"
+        );
+        assert_ne!(fast, GROK_4_5, "no longer the group fallback");
+        approx(
+            cost_usd(
+                "grok",
+                "grok-4.7-build-fast",
+                &tc(1_000_000, 1_000_000, Some(1_000_000), None),
+                &overrides,
+            ),
+            4.0 + 12.0 + 1.0,
+        );
+        // Exact rows only: look-alikes keep the group fallback.
+        for lookalike in [
+            "grok-4.7-builder",
+            "grok-4.7-build-fastest",
+            "grok-4.7-fast",
+        ] {
+            assert_eq!(builtin_price(lookalike), None, "{lookalike}");
+            assert_eq!(
+                price_for("grok", lookalike, &overrides),
+                Some(GROK_4_5),
+                "{lookalike}"
+            );
+        }
+    }
+
     // ---- G16: gemini pricing (docs/gemini/spec.md §R7) ----
     #[test]
     fn g16_gemini_flash_variants_and_1m_ids_price_at_flash() {
@@ -1768,6 +1855,73 @@ mod tests {
         }
         // Argon keeps its own row.
         assert_eq!(builtin_price("gemini-4-argon"), Some(GEMINI_4_ARGON));
+        // The bare element aliases price like their families (2026-11-21):
+        // `normalize_model` does not resolve them, so without their own rows
+        // a request booked under the client's name would price as Flash.
+        assert_eq!(builtin_price("carbon"), Some(GEMINI_4_CARBON));
+        assert_eq!(builtin_price("hydrogen"), Some(GEMINI_4_HYDROGEN));
+        assert_eq!(
+            price_for("gemini", "carbon[1m]", &empty()),
+            Some(GEMINI_4_CARBON)
+        );
+        assert_eq!(
+            price_for("gemini", "hydrogen[1m]", &empty()),
+            Some(GEMINI_4_HYDROGEN)
+        );
+    }
+
+    #[test]
+    fn gemini_4_neon_takes_its_own_flat_rate() {
+        // aistudio.google.com/docs/pricing and the Neon model page, read
+        // 2026-11-21: $3 in / $15 out / $0.15 cached, flat, no dated change.
+        for model in [
+            "gemini-4-neon",
+            "gemini-4-neon[1m]",
+            "GEMINI-4-NEON",
+            "neon",
+            "neon[1m]",
+            // The thinking-level ids the provider sends upstream.
+            "gemini-4-neon-low",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-high",
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-20261118",
+        ] {
+            let p = price_for("gemini", model, &empty()).unwrap_or_else(|| panic!("{model}"));
+            assert_eq!(p, GEMINI_4_NEON, "{model}");
+            assert_eq!(
+                (p.input, p.output, p.cache_read, p.cache_creation),
+                (3.0, 15.0, 0.15, 0.0),
+                "{model}"
+            );
+            assert!(p.rate_changes.is_empty(), "{model}: flat");
+            assert!(p.long_context.is_none(), "{model}: no long tier");
+        }
+        approx(
+            cost_usd(
+                "gemini",
+                "gemini-4-neon-high",
+                &tc(1_000_000, 1_000_000, Some(1_000_000), None),
+                &empty(),
+            ),
+            3.0 + 15.0 + 0.15,
+        );
+        // Not Flash (4x too low), and the version boundary holds.
+        assert_ne!(
+            price_for("gemini", "gemini-4-neon", &empty()),
+            Some(GEMINI_3_8_FLASH)
+        );
+        for lookalike in ["gemini-4-neonx", "gemini-40-neon", "neonx", "gemini-4-neo"] {
+            assert_eq!(builtin_price(lookalike), None, "{lookalike}");
+            assert_eq!(
+                price_for("gemini", lookalike, &empty()),
+                Some(GEMINI_3_8_FLASH),
+                "{lookalike}"
+            );
+        }
+        // Neighbouring families keep their own rows.
+        assert_eq!(builtin_price("gemini-4-argon-high"), Some(GEMINI_4_ARGON));
+        assert_eq!(builtin_price("gemini-4-carbon-low"), Some(GEMINI_4_CARBON));
     }
 
     #[test]
@@ -1791,11 +1945,22 @@ mod tests {
 
     #[test]
     fn g16_every_curated_gemini_row_is_priced_by_id() {
-        for &(id, ..) in crate::catalog::GEMINI_MODELS {
-            assert!(
-                builtin_price(&normalize_model(id).to_ascii_lowercase()).is_some(),
-                "catalog row {id} has no model-id price"
-            );
+        for &(id, aliases, ..) in crate::catalog::GEMINI_MODELS {
+            let row = builtin_price(&normalize_model(id).to_ascii_lowercase());
+            assert!(row.is_some(), "catalog row {id} has no model-id price");
+            // An alias booked under the client's name prices like its row.
+            for alias in aliases {
+                assert_eq!(builtin_price(alias), row, "alias {alias} of {id}");
+            }
+            // So does every thinking-level id the provider sends for it.
+            let base = id.strip_suffix("[1m]").unwrap_or(id);
+            for level in crate::provider::gemini::family_levels(base).unwrap_or(&[]) {
+                assert_eq!(
+                    builtin_price(&format!("{base}-{level}")),
+                    row,
+                    "{base}-{level}"
+                );
+            }
         }
     }
 
@@ -2935,8 +3100,14 @@ mod tests {
             );
         }
         // xAI: "(≥ 200k prompt tokens)" (docs.x.ai/developers/pricing, read
-        // 2026-11-11).
-        for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
+        // 2026-11-11; the 4.7 build ids 2026-11-21).
+        for model in [
+            "grok-4.5",
+            "grok-4.6",
+            "grok-4.7",
+            "grok-4.7-build",
+            "grok-4.7-build-fast",
+        ] {
             assert!(!is_long("grok", model, prompt(199_999, 0, 0)), "{model}");
             assert!(is_long("grok", model, prompt(200_000, 0, 0)), "{model}");
             assert!(
@@ -3036,6 +3207,13 @@ mod tests {
             ("grok", "grok-4.5", rates(4.0, 12.0, 0.60, 4.0, None)),
             ("grok", "grok-4.6", rates(4.0, 12.0, 1.0, 4.0, None)),
             ("grok", "grok-4.7", rates(4.0, 12.0, 1.0, 4.0, None)),
+            ("grok", "grok-4.7-build", rates(4.0, 12.0, 1.0, 4.0, None)),
+            // Grok 4.7 Fast at 200k or more: 1.5x standard (read 2026-11-21).
+            (
+                "grok",
+                "grok-4.7-build-fast",
+                rates(6.0, 18.0, 1.50, 6.0, None),
+            ),
             (
                 "claude",
                 "claude-haiku-5-5",

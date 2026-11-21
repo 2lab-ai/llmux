@@ -152,7 +152,7 @@ With `routing.enabled = true`, the inbound `model` string selects a backend grou
 - `gpt-*`, `codex`, `o1`/`o3`/`o4` route to the Codex group.
 - `grok`, `grok-*` route to the Grok group.
 - `or-*`, a bare `or`, and `openrouter/*` route to the OpenRouter group.
-- `gemini`, `gemini-*`, and a bare `argon` route to the Gemini group.
+- `gemini`, `gemini-*`, and the bare Gemini 4 aliases `argon`, `neon`, `carbon` and `hydrogen` route to the Gemini group.
 
 Each group keeps its own sticky current account. If the model does not match a known group, llmux uses `routing.default_group`.
 
@@ -176,7 +176,7 @@ Each group keeps its own sticky current account. If the model does not match a k
 | `codex_models` | `[]` | Override tokens for Codex-group models. Empty keeps builtin rules. |
 | `grok_models` | `[]` | Override tokens for Grok-group models. Empty keeps builtin rules. |
 | `openrouter_models` | `[]` | Override tokens for OpenRouter-group models. Empty keeps the builtin `or-` prefix, exact `or`, and `openrouter/` prefix rules. |
-| `gemini_models` | `[]` | Override tokens for Gemini-group models. Empty keeps the builtin `gemini` prefix and exact `argon` rules. |
+| `gemini_models` | `[]` | Override tokens for Gemini-group models. Empty keeps the builtin `gemini` prefix and the exact `argon`, `neon`, `carbon` and `hydrogen` rules. |
 | `default_group` | `"claude"` | Group for unmatched or absent model names: `"claude"`, `"codex"`, `"grok"`, `"openrouter"`, or `"gemini"`. |
 | `on_empty_group` | `"error"` | `"error"` returns a 404 if the matched group has no account; `"fallback"` tries the remaining groups in `claude → codex → grok → openrouter → gemini` order. |
 
@@ -220,14 +220,14 @@ Model selection is the `or-` prefix: `or-nemotron-3-ultra` and the other curated
 
 ## Gemini backend
 
-Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` and no `reasoning_effort` knob: the thinking level is part of the model id (`gemini-3.8-flash-high` / `-medium` / `-low`). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
+Gemini models are served by Google's **Antigravity subscription backend** (Cloud Code), not the public Gemini API. For incoming Messages, llmux translates the request to the Cloud Code envelope and the stream back; incoming Responses (Codex) is converted to Messages first. There is no `fast` knob. The thinking level is part of the upstream model id (`gemini-3.8-flash-high` / `-medium` / `-low`, `gemini-4-neon-high`). A bare family id takes the client's effort and llmux sends the matching level id: bare `gemini-3.8-flash` and every Gemini 4 model (`gemini-4-neon`, `-carbon`, `-hydrogen`, `-argon`, or its alias); see [models.md](models.md#gemini). See [provider compatibility](provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
 
 | Key | Default | Meaning |
 |---|---|---|
 | `gemini.upstream` | `https://daily-cloudcode-pa.googleapis.com` | Cloud Code base URL; chat requests go to `{upstream}/v1internal:streamGenerateContent?alt=sse`. |
-| `gemini.default_model` | `gemini-3.8-flash-high` | The model requested when a name that is not gemini-shaped (or a request that names no model) lands on the gemini group, e.g. through the empty-group fallback. It does not move the `gemini` / `argon` aliases. |
+| `gemini.default_model` | `gemini-3.8-flash-high` | The model requested when a name that is not gemini-shaped (or a request that names no model) lands on the gemini group, e.g. through the empty-group fallback. It does not move the `gemini` / `argon` / `neon` / `carbon` / `hydrogen` aliases. |
 | `gemini.client_model` | unset | When set, llmux reports this model name to the client instead of the real gemini model. |
-| `gemini.user_agent` | `antigravity/hub/2.23.1 darwin/arm64` | `User-Agent` sent upstream. Cloud Code rejects newer models for hub versions below 2.23.0. |
+| `gemini.user_agent` | `antigravity/hub/2.34.0 darwin/arm64` | `User-Agent` sent upstream. Cloud Code rejects newer models for hub versions below 2.23.0, and third parties report the Gemini 4 ids hidden or 404 below 2.29. The default was `antigravity/hub/2.23.1 darwin/arm64` until 2026-11-21 (Antigravity hub manifest 2.34.0, read that day). A config that still holds exactly that old default is moved to the new default when it loads; any other value you set is kept. |
 | `gemini.token_url` | `https://oauth2.googleapis.com/token` | Google OAuth token endpoint for refresh-token grants. |
 | `gemini.client_id` | unset | Client id of Antigravity's Google OAuth client. The `LLMUX_GEMINI_CLIENT_ID` environment variable overrides it. |
 | `gemini.client_secret` | unset | That client's secret. The `LLMUX_GEMINI_CLIENT_SECRET` environment variable overrides it. The TUI never shows it. |
@@ -235,7 +235,7 @@ Gemini models are served by Google's **Antigravity subscription backend** (Cloud
 
 llmux does not ship Antigravity's OAuth client: you configure it, with the two `gemini.client_*` keys or the two environment variables (a non-empty environment value wins over the file). Google login and token refresh need both values. Without them, `llmux login --gemini`, the dashboard's Google login and the daemon's login API stop before opening a browser, with `gemini OAuth client not configured: set gemini.client_id and gemini.client_secret in llmux.json (or LLMUX_GEMINI_CLIENT_ID / LLMUX_GEMINI_CLIENT_SECRET) — the daemon reads them at startup, so restart llmux after setting them`. A gemini account whose token needs a refresh gets that same message as a `502` and in the activity log; the account is not marked for re-login, and the background refresh skips gemini accounts until the client is configured. The daemon reads these settings at startup, so restart llmux after setting them. `llmux import` still imports an Antigravity CLI login without them, but warns that the account will stop working when its current token expires (about an hour).
 
-The GCP project is stored per account, not here (see [Gemini accounts](#gemini-accounts)). Model ids, aliases and the Argon tier: [models.md](models.md#gemini).
+The GCP project is stored per account, not here (see [Gemini accounts](#gemini-accounts)). Model ids, aliases, the Gemini 4 effort rule and which plan serves which model: [models.md](models.md#gemini).
 
 ## Reference price overrides (`pricing`)
 

@@ -4050,16 +4050,30 @@ fn assert_gemini_stream_call(
     body
 }
 
-/// S1 (G1-G4 through the real HTTP boundary): Claude Code's `/model argon`
-/// and the `[1m]` flash id both reach Cloud Code as their resolved upstream
-/// ids, and the client gets Anthropic SSE stamped with the client-facing
-/// `[1m]` model.
+/// S1 (G1-G4 through the real HTTP boundary): an alias (`argon`, `neon`),
+/// a bare Gemini 4 id with a client effort and the `[1m]` flash id all reach
+/// Cloud Code as their resolved upstream ids — a Gemini 4 family as its
+/// thinking-level id, the level from `output_config.effort` (2026-11-21) —
+/// and the client gets Anthropic SSE stamped with the catalog row.
 #[tokio::test]
 async fn gemini_messages_ingress_streams_text_for_alias_and_window_ids() {
-    for (model, upstream, stamp) in [
-        ("argon", "gemini-4-argon", "gemini-4-argon[1m]"),
+    for (model, effort, upstream, stamp) in [
+        ("argon", None, "gemini-4-argon-high", "gemini-4-argon[1m]"),
+        (
+            "neon",
+            Some("xhigh"),
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon",
+        ),
+        (
+            "gemini-4-hydrogen[1m]",
+            Some("low"),
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen[1m]",
+        ),
         (
             "gemini-3.8-flash-high[1m]",
+            None,
             "gemini-3.8-flash-high",
             "gemini-3.8-flash-high[1m]",
         ),
@@ -4071,8 +4085,11 @@ async fn gemini_messages_ingress_streams_text_for_alias_and_window_ids() {
             11,
         ));
         let client = reqwest::Client::new();
+        let output_config = effort
+            .map(|e| format!(r#","output_config":{{"effort":"{e}"}}"#))
+            .unwrap_or_default();
         let body = format!(
-            r#"{{"model":"{model}","max_tokens":64,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#
+            r#"{{"model":"{model}","max_tokens":64,"stream":true{output_config},"messages":[{{"role":"user","content":"hi"}}]}}"#
         );
         let response = post_messages(&client, &proxy, &body).await;
         assert_eq!(response.status(), 200, "{model}");
@@ -4449,7 +4466,10 @@ async fn gemini_responses_ingress_reaches_the_gemini_adapter() {
     let response = reqwest::Client::new()
         .post(proxy.url("/v1/responses"))
         .bearer_auth(E2E_ADMIN_KEY)
-        .json(&serde_json::json!({"model": "argon", "input": "hi", "stream": false}))
+        .json(&serde_json::json!({
+            "model": "argon", "input": "hi", "stream": false,
+            "reasoning": {"effort": "medium"},
+        }))
         .send()
         .await
         .expect("proxy reachable");
@@ -4459,7 +4479,13 @@ async fn gemini_responses_ingress_reaches_the_gemini_adapter() {
 
     let seen = gemini_requests(&mock);
     assert_eq!(seen.len(), 1, "one upstream call: {seen:?}");
-    let body = assert_gemini_stream_call(&seen[0], "gemini-4-argon", "proj-1", "Bearer at-gemini");
+    // Codex's `reasoning.effort` picks the Gemini 4 thinking level.
+    let body = assert_gemini_stream_call(
+        &seen[0],
+        "gemini-4-argon-medium",
+        "proj-1",
+        "Bearer at-gemini",
+    );
     assert_eq!(body["request"]["contents"][0]["parts"][0]["text"], "hi");
 }
 
@@ -6947,7 +6973,7 @@ impl SdkProcessFixture {
             .path()
             .join("node_modules/@anthropic-ai/claude-agent-sdk");
         std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("package.json"), r#"{"version":"0.3.292"}"#).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"version":"0.3.321"}"#).unwrap();
         std::fs::write(package.join("sdk.mjs"), "// fixture only").unwrap();
         let node = dir.path().join("fixture-node");
         std::fs::write(

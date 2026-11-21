@@ -237,19 +237,24 @@ fn builtin_openrouter_rules() -> Vec<Rule> {
 
 /// Builtin gemini rules (docs/gemini/spec.md §R1): the `gemini` prefix covers
 /// the bare family alias (`gemini`) and every Antigravity id
-/// (`gemini-3.8-flash-high`, `gemini-4-argon`, …); the bare `argon` alias
-/// carries no `gemini` prefix and therefore NEEDS its exact rule (same reason
-/// as codex's bare `sol` / `astra`).
+/// (`gemini-3.8-flash-high`, `gemini-4-argon`, `gemini-4-neon-xhigh`, …); the
+/// Gemini 4 element aliases `argon`, `neon`, `carbon` and `hydrogen`
+/// (`crate::catalog::GEMINI_MODELS`; the last three since 2026-11-21) carry
+/// no `gemini` prefix and therefore NEED their exact rules (same reason as
+/// codex's bare `sol` / `astra`).
 ///
 /// Disjoint from the other builtin families (pinned in the unit tests below):
-/// no codex/claude/grok/openrouter rule matches `gemini…` or `argon`, and
-/// neither gemini rule matches any of their ids. OpenRouter's own
+/// no codex/claude/grok/openrouter rule matches `gemini…` or an element
+/// alias, and no gemini rule matches any of their ids. OpenRouter's own
 /// `or-google/gemini-…` slugs stay OpenRouter's — the `or-` anchor is checked
 /// first in [`Classifier::classify`].
 fn builtin_gemini_rules() -> Vec<Rule> {
     vec![
         Rule::Prefix("gemini".to_string()),
         Rule::Exact("argon".to_string()),
+        Rule::Exact("neon".to_string()),
+        Rule::Exact("carbon".to_string()),
+        Rule::Exact("hydrogen".to_string()),
     ]
 }
 
@@ -361,7 +366,7 @@ impl Classifier {
     /// claude, grok and gemini; an unrecognized model falls back to
     /// `default_group`. (Apart from the openrouter/codex pair the rule
     /// families are disjoint by construction — `gpt-`/`o*` vs Anthropic names
-    /// vs `grok` vs `gemini`/`argon` — so the check order only decides ties a
+    /// vs `grok` vs `gemini` and its element aliases — so the check order only decides ties a
     /// user creates with overlapping config overrides. Gemini is checked LAST,
     /// appended like its group's `Ord` position, so no existing override's
     /// tie-break moves.)
@@ -921,6 +926,18 @@ mod tests {
             "ARGON",
             "argon[1m]",
             "  gemini  ",
+            "gemini-4-neon",
+            "gemini-4-neon[1m]",
+            "gemini-4-neon-xhigh",
+            "gemini-4-carbon-high",
+            "gemini-4-hydrogen[1m]",
+            "neon",
+            " NEON ",
+            "neon[1m]",
+            "carbon",
+            "carbon[1m]",
+            "hydrogen",
+            "Hydrogen[1M]",
         ] {
             assert_eq!(
                 c.classify(Some(model)),
@@ -928,9 +945,38 @@ mod tests {
                 "{model} must route to the gemini group"
             );
         }
-        // `argon` is EXACT, not a substring or prefix rule.
-        assert_eq!(c.classify(Some("argonaut")), BackendGroup::Claude);
-        assert_eq!(c.classify(Some("claude-argon")), BackendGroup::Claude);
+        // The element aliases are EXACT, not substring or prefix rules.
+        for look_alike in [
+            "argonaut",
+            "claude-argon",
+            "neon-sign",
+            "carbonara",
+            "hydrogenic",
+            "helium",
+        ] {
+            assert_eq!(
+                c.classify(Some(look_alike)),
+                BackendGroup::Claude,
+                "{look_alike} is not a gemini alias"
+            );
+        }
+    }
+
+    /// Every alias the curated gemini rows advertise routes to the gemini
+    /// group, so a catalog alias can never land on another backend.
+    #[test]
+    fn g1_every_gemini_catalog_alias_routes_to_gemini() {
+        let c = Classifier::from_config(&[], &[], &[], &[], &[], "codex");
+        for &(_, aliases, ..) in crate::catalog::GEMINI_MODELS {
+            for alias in aliases {
+                assert_eq!(c.classify(Some(alias)), BackendGroup::Gemini, "{alias}");
+                assert_eq!(
+                    c.classify(Some(&format!("{alias}[1m]"))),
+                    BackendGroup::Gemini,
+                    "{alias}[1m]"
+                );
+            }
+        }
     }
 
     #[test]
@@ -984,7 +1030,11 @@ mod tests {
             "gemini-3.8-flash-high",
             "gemini-3.8-flash-low",
             "gemini-4-argon",
+            "gemini-4-neon-xhigh",
             "argon",
+            "neon",
+            "carbon",
+            "hydrogen",
         ] {
             assert!(
                 !others.iter().any(|r| r.matches(model)),
@@ -1002,14 +1052,18 @@ mod tests {
             BackendGroup::Claude,
             "builtin gemini prefix dropped when config provides its own gemini list"
         );
-        assert_eq!(
-            c.classify(Some("argon")),
-            BackendGroup::Claude,
-            "builtin argon rule dropped too"
-        );
+        for alias in ["argon", "neon", "carbon", "hydrogen"] {
+            assert_eq!(
+                c.classify(Some(alias)),
+                BackendGroup::Claude,
+                "builtin {alias} rule dropped too"
+            );
+        }
         // An empty list keeps the builtins.
         let c = Classifier::from_config(&[], &[], &[], &[], &[], "claude");
-        assert_eq!(c.classify(Some("argon")), BackendGroup::Gemini);
+        for alias in ["argon", "neon", "carbon", "hydrogen"] {
+            assert_eq!(c.classify(Some(alias)), BackendGroup::Gemini, "{alias}");
+        }
     }
 
     #[test]

@@ -299,6 +299,8 @@ test('the provider mark follows the model name, then the backend group', () => {
     ['claude-haiku-5-5', 'codex', 'claude'],          // the name decides: the mark sits beside it
     ['gpt-6.1-sol', 'codex', 'openai'], ['gpt-6-astra', null, 'openai'], ['sol', null, 'openai'], ['o4-mini', null, 'openai'],
     ['grok-4.7[1m]', 'grok', 'grok'], ['gemini-3-pro', 'gemini', 'gemini'], ['argon', null, 'gemini'],
+    ['neon', null, 'gemini'], ['carbon[1m]', null, 'gemini'], ['hydrogen', null, 'gemini'], ['gemini-4-neon-xhigh', null, 'gemini'],
+    ['carbonara-7b', null, 'model'],                  // the alias words are anchored
     ['anthropic/claude-x', 'openrouter', 'claude'], ['x-ai/grok-5', 'openrouter', 'grok'], ['google/gemma-9', 'openrouter', 'gemini'],
     ['meta-llama/llama-5', 'openrouter', 'model'],     // unknown maker: the generic chip
     ['mystery-1', 'codex', 'openai'],                   // unknown name, known backend

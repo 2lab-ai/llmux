@@ -12,7 +12,7 @@ opens both. Only soma-work admins (`ADMIN_USERS`) get in.
 **세션 (sessions).** One card per Claude Code, Codex or soma-work conversation that went through llmux.
 
 Every model name on the page has its provider's mark on the left: Anthropic (Claude models), OpenAI (gpt, codex and
-the `sol` / `terra` / `luna` / `astra` aliases), xAI (grok) and Google (gemini, `argon`). An OpenRouter model shows its
+the `sol` / `terra` / `luna` / `astra` aliases), xAI (grok) and Google (gemini, `argon`, `neon`, `carbon`, `hydrogen`). An OpenRouter model shows its
 maker's mark, and a model of an unknown maker shows a plain chip. The marks appear on session cards, the session
 detail (model, context window, conversation answers, requests), the raw viewer, the users view and the activity
 table.
