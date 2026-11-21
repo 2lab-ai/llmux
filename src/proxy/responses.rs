@@ -684,7 +684,7 @@ pub struct Capture {
     pub upstream: Option<super::raw_io::UpstreamRaw>,
 }
 impl Capture {
-    fn finish(
+    pub(crate) fn finish(
         self,
         status: StatusCode,
         upstream: &super::sse::RawCapture,

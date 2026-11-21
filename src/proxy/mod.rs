@@ -6,6 +6,7 @@ pub mod classify;
 pub mod codex_trace;
 pub mod forward;
 pub(crate) mod gemini_project;
+pub(crate) mod genai;
 pub mod idle_probe;
 pub(crate) mod ingress;
 pub mod internal_requests;

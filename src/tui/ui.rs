@@ -3450,6 +3450,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             action: None,
         },
         CfgRow {
+            section: "agy",
+            label: "default model",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "agy.default_model in config (run --agy)",
+            action: None,
+        },
+        CfgRow {
             section: "display",
             label: "quota fill",
             value: match quota {
@@ -20391,6 +20399,7 @@ mod tests {
         config.gemini.client_id = Some("test-client-id".into());
         config.gemini.client_secret = Some("test-client-secret".into());
         config.tui_gradient.max_effort = Some("#ffffff".into());
+        config.agy.default_model = Some("gpt-6.2-sol".into());
         config.remote.host = Some("example.com".into());
         config.remote.port = Some(3456);
         config.remote.api_key = Some("lm-remote".into());
@@ -20450,6 +20459,7 @@ mod tests {
                 grok,
                 openrouter,
                 gemini,
+                agy,
                 scheduler,
                 routing,
                 claude_code,
@@ -20558,6 +20568,7 @@ mod tests {
                 port: _,
                 api_key: _,
             } = remote;
+            let crate::config::schema::AgyConfig { default_model: _ } = agy;
         }
         let config = serde_json::to_value(&config).expect("json");
         let mut paths = Vec::new();
@@ -20604,6 +20615,7 @@ mod tests {
             "gemini.client_id",
             "gemini.client_secret",
             "gemini.trace",
+            "agy.default_model",
             "scheduler.mode",
             "scheduler.seven_day_max",
             "scheduler.fable_weekly_max",

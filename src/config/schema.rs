@@ -57,6 +57,11 @@ pub struct Config {
     /// Additive: pre-gemini configs load with defaults (docs/gemini/spec.md).
     #[serde(default)]
     pub gemini: GeminiConfig,
+    /// The Antigravity CLI frontend (`llmux run --agy`, the Gemini API
+    /// ingress). Additive and omitted while at its default: configs without
+    /// it load (and save) unchanged.
+    #[serde(default, skip_serializing_if = "AgyConfig::is_default")]
+    pub agy: AgyConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// Model→backend-group routing (default: disabled — exactly today's
@@ -196,6 +201,39 @@ pub struct Config {
     pub client_keys: Vec<ClientKey>,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+/// The Antigravity CLI frontend (`llmux run --agy`, docs/agy-frontend/README.md).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgyConfig {
+    /// The model agy starts on: `run --agy` passes it as `--model` (unless the
+    /// agy arguments name one) and as the subagent tiers
+    /// (`AGY_LLM_GATEWAY_TIER_*`), and the daemon lists it FIRST in
+    /// `GET /v1beta/models` (agy picks the first entry when no model is
+    /// given). A catalog id or alias. `None` (the default) follows
+    /// `codex.default_model` — the model `run --codex` starts on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
+
+impl AgyConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Config {
+    /// The model agy starts on: `agy.default_model`, else `codex.default_model`.
+    pub fn agy_default_model(&self) -> String {
+        self.agy
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&self.codex.default_model)
+            .to_string()
+    }
 }
 
 /// Targets are catalog aliases by default, resolved anew for each request.
@@ -396,6 +434,7 @@ impl Default for Config {
             grok: GrokConfig::default(),
             openrouter: OpenRouterConfig::default(),
             gemini: GeminiConfig::default(),
+            agy: AgyConfig::default(),
             scheduler: SchedulerConfig::default(),
             routing: RoutingConfig::default(),
             pricing: HashMap::new(),

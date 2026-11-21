@@ -1487,10 +1487,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     // From here on `body` is the Messages-shaped body the shared routing,
     // metering and activity paths read; a non-Messages client's own body
     // rides along as its native input.
-    let (body, native) = match ingress::decode(endpoint_origin, &parts.method, &body) {
-        Ok(decoded) => decoded,
-        Err((status, detail)) => return early_error(status, &detail),
-    };
+    let (body, native) =
+        match ingress::decode(endpoint_origin, &parts.method, parts.uri.path(), &body) {
+            Ok(decoded) => decoded,
+            Err((status, detail)) => return early_error(status, &detail),
+        };
     let log_enabled = state.logger.is_some();
     // Parse the model once (body is buffered) and classify to a backend group.
     // Routing disabled ⇒ group = None (legacy single-slot path); the
@@ -1748,18 +1749,27 @@ async fn wait_for_first_main(state: &AppState, tenant: Option<&str>, body: &serd
 }
 
 /// The upstream request for a native-ingress body on the backend that serves
-/// it natively ([`ingress::native_group`]), with the endpoint it goes to:
-/// Responses goes to the Codex subscription gateway as Responses.
+/// it natively ([`ingress::native_group`]), with the endpoint it goes to and
+/// how its answer is relayed (`translate_stream`): Responses goes to the
+/// Codex subscription gateway as Responses and is relayed byte for byte
+/// (`None`); a Gemini API body goes to Cloud Code in its envelope and is
+/// relayed through the transform relay (`Some(true)`), whose
+/// [`TranslateConverter::GenAi`] unwraps the Cloud Code frames and reads the
+/// usage on the way.
 fn native_request(
     state: &AppState,
     native: &ingress::NativeInput,
     credential: &AccountCredential,
-) -> Result<(ProviderRequest, String), ProviderError> {
+) -> Result<(ProviderRequest, String, Option<bool>), ProviderError> {
     match native {
         ingress::NativeInput::Responses(input) => state
             .codex
             .build_responses_request(input, credential)
-            .map(|req| (req, state.codex.endpoint().to_string())),
+            .map(|req| (req, state.codex.endpoint().to_string(), None)),
+        ingress::NativeInput::GenAi { model, body, .. } => state
+            .gemini
+            .build_native_request(model, super::genai::effort(body), body, credential)
+            .map(|req| (req, state.gemini.endpoint().to_string(), Some(true))),
     }
 }
 
@@ -2390,7 +2400,10 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         let (upstream_req, endpoint) = if let Some(native) = &ctx.native {
             if serves_native {
                 match native_request(state, native, &credential) {
-                    Ok(built) => built,
+                    Ok((req, endpoint, relay)) => {
+                        translate_stream = relay;
+                        (req, endpoint)
+                    }
                     Err(err) => {
                         ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
                         return error_response(
@@ -2401,7 +2414,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     }
                 }
             } else {
-                let body = match ingress::messages_request(native) {
+                let body = match ingress::messages_request(native, served) {
                     Ok(body) => body,
                     Err(err) => {
                         ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
@@ -2444,6 +2457,27 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         },
                         "claude-agent-sdk".into(),
                     )
+                } else if served == BackendGroup::Codex {
+                    // The Gemini API on codex: its Messages translation takes
+                    // the Messages ingress's codex arm (the Responses ingress
+                    // never lands here — codex is its native backend).
+                    match state
+                        .codex
+                        .build_request(body.to_string().as_bytes(), &credential)
+                    {
+                        Ok((req, client_stream)) => {
+                            translate_stream = Some(client_stream);
+                            (req, state.codex.endpoint().to_string())
+                        }
+                        Err(err) => {
+                            return invalid_request_response(
+                                state,
+                                ctx,
+                                &account,
+                                &err.to_string(),
+                            );
+                        }
+                    }
                 } else if served == BackendGroup::Grok {
                     match state
                         .grok
@@ -2484,10 +2518,11 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         }
                     }
                 } else {
-                    let original = std::mem::replace(&mut ctx.body, Bytes::from(body.to_string()));
-                    let built = build_openrouter_request(state, ctx, &credential).await;
-                    ctx.body = original;
-                    match built {
+                    // OpenRouter's Anthropic endpoint takes the translated
+                    // Messages body at `/v1/messages` — never at the client's
+                    // own path (`/v1/responses`, `/v1beta/models/…`) — with
+                    // Messages headers instead of the client's.
+                    match build_openrouter_messages_request(state, &body, &credential).await {
                         Ok(req) => (req, state.openrouter.endpoint().to_string()),
                         Err(err) => return rewrite_error(state, ctx, err.to_string()),
                     }
@@ -3815,6 +3850,31 @@ async fn build_openrouter_request(
     Ok(upstream_req)
 }
 
+/// [`build_openrouter_request`] for a Messages body translated from a native
+/// ingress: `POST /v1/messages` with Messages headers only.
+async fn build_openrouter_messages_request(
+    state: &AppState,
+    body: &serde_json::Value,
+    credential: &AccountCredential,
+) -> Result<ProviderRequest, crate::provider::ProviderError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    let wire = AnthropicRequest {
+        method: Method::POST,
+        path: "/v1/messages".into(),
+        headers,
+        body: Bytes::from(body.to_string()),
+    };
+    let unified = state.openrouter.request_out(wire)?;
+    let mut upstream_req = state.openrouter.request_in(unified)?;
+    state.openrouter.auth(&mut upstream_req, credential).await?;
+    Ok(upstream_req)
+}
+
 async fn send_upstream(
     state: &AppState,
     endpoint: &str,
@@ -4161,6 +4221,11 @@ fn translate_count_tokens_response(
 enum TranslateConverter {
     Responses(responses::ResponsesSseConverter),
     Gemini(gemini::GeminiSseConverter),
+    /// The Gemini API ingress served natively by the gemini group: Cloud
+    /// Code frames in, public genai frames out (not Anthropic SSE — the
+    /// ingress's `adapt` relays them as they are). Always streamed, so the
+    /// aggregate path never sees it.
+    GenAi(super::genai::response::NativeStream),
 }
 
 impl From<responses::ResponsesSseConverter> for TranslateConverter {
@@ -4181,14 +4246,17 @@ impl TranslateConverter {
         match self {
             Self::Responses(c) => Self::Responses(c.with_safeguards_requested(requested)),
             Self::Gemini(c) => Self::Gemini(c.with_safeguards_requested(requested)),
+            Self::GenAi(c) => Self::GenAi(c),
         }
     }
 
-    /// The aggregated Messages JSON for a non-streaming client.
+    /// The aggregated Messages JSON for a non-streaming client. `None` for
+    /// the native genai relay, which is never aggregated here.
     fn into_message_json(self) -> Option<serde_json::Value> {
         match self {
             Self::Responses(c) => c.into_message_json(),
             Self::Gemini(c) => c.into_message_json(),
+            Self::GenAi(_) => None,
         }
     }
 
@@ -4197,6 +4265,7 @@ impl TranslateConverter {
         match self {
             Self::Responses(c) => c.error_message(),
             Self::Gemini(c) => c.error_message(),
+            Self::GenAi(c) => c.error_message(),
         }
     }
 
@@ -4205,6 +4274,7 @@ impl TranslateConverter {
         match self {
             Self::Responses(c) => c.raw_usage(),
             Self::Gemini(c) => c.raw_usage(),
+            Self::GenAi(c) => c.raw_usage(),
         }
     }
 
@@ -4213,6 +4283,7 @@ impl TranslateConverter {
         match self {
             Self::Responses(c) => c.events_seen(),
             Self::Gemini(c) => c.events_seen(),
+            Self::GenAi(c) => c.events_seen(),
         }
     }
 }
@@ -4222,6 +4293,7 @@ impl sse::SseTransform for TranslateConverter {
         match self {
             Self::Responses(c) => c.on_event(event),
             Self::Gemini(c) => c.on_event(event),
+            Self::GenAi(c) => c.on_event(event),
         }
     }
 
@@ -4229,6 +4301,7 @@ impl sse::SseTransform for TranslateConverter {
         match self {
             Self::Responses(c) => c.on_end(),
             Self::Gemini(c) => c.on_end(),
+            Self::GenAi(c) => c.on_end(),
         }
     }
 
@@ -4236,6 +4309,7 @@ impl sse::SseTransform for TranslateConverter {
         match self {
             Self::Responses(c) => c.usage(),
             Self::Gemini(c) => c.usage(),
+            Self::GenAi(c) => c.usage(),
         }
     }
 }
@@ -4249,6 +4323,13 @@ fn translate_converter(
     ctx: &ForwardContext,
     served: BackendGroup,
 ) -> TranslateConverter {
+    // The Gemini API ingress on its native backend relays Cloud Code's own
+    // frames (unwrapped), never a Messages conversion.
+    if served == BackendGroup::Gemini
+        && matches!(ctx.native, Some(ingress::NativeInput::GenAi { .. }))
+    {
+        return TranslateConverter::GenAi(Default::default());
+    }
     // Parsed once for every per-request knob below.
     let body =
         serde_json::from_slice::<serde_json::Value>(&ctx.body).unwrap_or(serde_json::Value::Null);
