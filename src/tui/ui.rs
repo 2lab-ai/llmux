@@ -191,6 +191,15 @@ mod palette {
     /// every terminal — the default foreground of a light terminal is near
     /// black and would vanish on it.
     pub(super) const OPENAI_ACTIVITY_FG: Color = Color::White;
+    /// Background of an activity row that came in on the Google Gemini API
+    /// endpoint (`llmux run --agy`): its own subtle dark slate tint, so it
+    /// reads apart from both the Anthropic rows (no tint) and the OpenAI rows
+    /// (dark gray). Same rule as the OpenAI tint: the endpoint origin, never
+    /// the backend that served it.
+    pub(super) const GOOGLE_ACTIVITY_BG: Color = Color::Rgb(28, 36, 52);
+    /// Text without a colour of its own on a Google row: light, for the same
+    /// reason as [`OPENAI_ACTIVITY_FG`].
+    pub(super) const GOOGLE_ACTIVITY_FG: Color = Color::White;
     /// The raw viewer's JSON keywords (`true`/`false`/`null`): the magenta
     /// its users know (twolab-tui's default would be `run`).
     pub(super) const JSON_KEYWORD: Color = Color::Magenta;
@@ -3438,6 +3447,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             value: "config file".into(),
             state: CfgState::ReadOnly,
             note: "gemini.* plumbing in config",
+            action: None,
+        },
+        CfgRow {
+            section: "agy",
+            label: "default model",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "agy.default_model in config (run --agy)",
             action: None,
         },
         CfgRow {
@@ -10000,30 +10017,43 @@ fn draw_activity(
     // Paragraph styles graphemes, but resets wide-glyph continuation cells.
     // Apply the row background to the final buffer so both those cells and
     // the unused trailing width share the endpoint color.
-    let openai_rows: Vec<u16> = lines
+    let tinted_rows: Vec<(u16, Color)> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.style.bg == Some(palette::OPENAI_ACTIVITY_BG))
-        .map(|(index, _)| body_top.saturating_add(index as u16))
-        .filter(|y| *y < area.bottom())
+        .filter_map(|(index, line)| {
+            line.style
+                .bg
+                .filter(|bg| {
+                    [palette::OPENAI_ACTIVITY_BG, palette::GOOGLE_ACTIVITY_BG].contains(bg)
+                })
+                .map(|bg| (body_top.saturating_add(index as u16), bg))
+        })
+        .filter(|(y, _)| *y < area.bottom())
         .collect();
     let body = section(frame, area, &title);
     frame.render_widget(Paragraph::new(lines), body);
-    for y in openai_rows {
-        frame.buffer_mut().set_style(
-            Rect::new(area.x, y, area.width, 1),
-            Style::new().bg(palette::OPENAI_ACTIVITY_BG),
-        );
+    for (y, bg) in tinted_rows {
+        frame
+            .buffer_mut()
+            .set_style(Rect::new(area.x, y, area.width, 1), Style::new().bg(bg));
     }
     hits
 }
 
+/// An activity line in its endpoint origin's tint: dark gray for the OpenAI
+/// Responses endpoint, dark slate for the Google Gemini API endpoint, none
+/// for Anthropic Messages (docs/codex-frontend/activity.md).
 fn endpoint_line(line: Line<'static>, endpoint: crate::tui::Endpoint) -> Line<'static> {
     match endpoint {
         crate::tui::Endpoint::OpenAi => line.style(
             Style::new()
                 .bg(palette::OPENAI_ACTIVITY_BG)
                 .fg(palette::OPENAI_ACTIVITY_FG),
+        ),
+        crate::tui::Endpoint::Google => line.style(
+            Style::new()
+                .bg(palette::GOOGLE_ACTIVITY_BG)
+                .fg(palette::GOOGLE_ACTIVITY_FG),
         ),
         crate::tui::Endpoint::Anthropic => line,
     }
@@ -20369,6 +20399,7 @@ mod tests {
         config.gemini.client_id = Some("test-client-id".into());
         config.gemini.client_secret = Some("test-client-secret".into());
         config.tui_gradient.max_effort = Some("#ffffff".into());
+        config.agy.default_model = Some("gpt-6.2-sol".into());
         config.remote.host = Some("example.com".into());
         config.remote.port = Some(3456);
         config.remote.api_key = Some("lm-remote".into());
@@ -20428,6 +20459,7 @@ mod tests {
                 grok,
                 openrouter,
                 gemini,
+                agy,
                 scheduler,
                 routing,
                 claude_code,
@@ -20536,6 +20568,7 @@ mod tests {
                 port: _,
                 api_key: _,
             } = remote;
+            let crate::config::schema::AgyConfig { default_model: _ } = agy;
         }
         let config = serde_json::to_value(&config).expect("json");
         let mut paths = Vec::new();
@@ -20582,6 +20615,7 @@ mod tests {
             "gemini.client_id",
             "gemini.client_secret",
             "gemini.trace",
+            "agy.default_model",
             "scheduler.mode",
             "scheduler.seven_day_max",
             "scheduler.fable_weekly_max",
@@ -22044,6 +22078,42 @@ mod tests {
                 text.trim_end()
             );
         }
+    }
+
+    /// The Google Gemini API endpoint (`run --agy`) gets its own tint across
+    /// the full width, distinct from the OpenAI gray and from an untinted
+    /// Anthropic row, whatever backend served it.
+    #[test]
+    fn google_endpoint_rows_take_their_own_tint() {
+        use crate::tui::Endpoint;
+        let mut view = view_with(Vec::new());
+        let mut google = completed_request(3000, Some("codex"), Some("gpt-6.2-sol"), 10, 5, 200);
+        if let CompletedBody::Request { endpoint, .. } = &mut google.body {
+            *endpoint = Endpoint::Google;
+        }
+        let mut openai = completed_request(2000, Some("claude"), Some("sonnet"), 10, 5, 200);
+        if let CompletedBody::Request { endpoint, .. } = &mut openai.body {
+            *endpoint = Endpoint::OpenAi;
+        }
+        let anthropic = completed_request(1000, Some("gemini"), Some("argon"), 10, 5, 200);
+        view.completed = vec![google, openai, anthropic];
+        let chrome = chrome_overlay(Overlay::None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        let rendered = terminal
+            .draw(|f| {
+                draw_activity(f, f.area(), &view, &chrome, UNIX_EPOCH);
+            })
+            .unwrap();
+        let buffer = rendered.buffer;
+        let row_bg = |y: u16| (0..120).map(|x| buffer[(x, y)].bg).collect::<Vec<_>>();
+        assert!(row_bg(1)
+            .iter()
+            .all(|bg| *bg == palette::GOOGLE_ACTIVITY_BG));
+        assert!(row_bg(2)
+            .iter()
+            .all(|bg| *bg == palette::OPENAI_ACTIVITY_BG));
+        assert_eq!(buffer[(119, 3)].bg, Color::Reset);
+        assert_ne!(palette::GOOGLE_ACTIVITY_BG, palette::OPENAI_ACTIVITY_BG);
     }
 
     #[test]

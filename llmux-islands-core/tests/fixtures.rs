@@ -301,6 +301,37 @@ fn activity_endpoint_origin_reaches_native_receipts_independently_of_provider() 
 }
 
 #[test]
+fn activity_google_endpoint_origin_reaches_native_receipts() {
+    use llmux::tui::Endpoint;
+    use llmux_islands_core::{ActivityReceipt, ReceiptKind};
+    let mut doc = read_fixture("current");
+    for row in &mut doc.activity.completed {
+        if let llmux::dashboard::CompletedDoc::Request {
+            endpoint, group, ..
+        } = row
+        {
+            *endpoint = Endpoint::Google;
+            *group = Some("codex".into());
+        }
+    }
+    let state = derive_ui_state(&doc, &options(), 1_700_000_003_000);
+    let requests: Vec<_> = state
+        .statistics
+        .activity_receipts
+        .iter()
+        .filter(|r| r.kind == ReceiptKind::Request && r.endpoint != Endpoint::OpenAi)
+        .collect();
+    assert!(!requests.is_empty());
+    for row in requests {
+        assert_eq!(row.endpoint, Endpoint::Google);
+        let wire = serde_json::to_value(row).unwrap();
+        assert_eq!(wire["endpoint"], "google");
+        let decoded: ActivityReceipt = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.endpoint, Endpoint::Google);
+    }
+}
+
+#[test]
 fn gemini_accounts_and_activity_map_to_the_gemini_provider() {
     // The daemon reports gemini accounts as `type: "gemini"` and their
     // routed requests as group `"gemini"`; both must land on their own

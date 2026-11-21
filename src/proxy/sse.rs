@@ -948,6 +948,13 @@ pub fn contains_error_event(payload: &[u8]) -> bool {
                     ) {
                         return true;
                     }
+                    // A Gemini API error frame (`{"error":{code,message,status}}`,
+                    // no `type`) — the genai ingress's native relay.
+                    if value.get("type").is_none()
+                        && value.get("error").is_some_and(serde_json::Value::is_object)
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -981,6 +988,9 @@ pub fn contains_content_delta(payload: &[u8]) -> bool {
                         )
                     ) && v["delta"].as_str().is_some_and(|s| !s.is_empty())
                     {
+                        return true;
+                    }
+                    if genai_content(&v) {
                         return true;
                     }
                 }
@@ -1019,6 +1029,24 @@ pub fn contains_content_delta(payload: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Whether a Gemini API frame (the genai ingress's native relay) carries
+/// output: a part with non-empty text or a function call.
+fn genai_content(frame: &serde_json::Value) -> bool {
+    frame.get("type").is_none()
+        && frame
+            .pointer("/candidates/0/content/parts")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("functionCall").is_some()
+                        || part
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                })
+            })
 }
 
 /// Stateful per-request SSE transformer: upstream events in, downstream SSE
@@ -1341,6 +1369,24 @@ mod tests {
     const MESSAGE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}";
     const MESSAGE_DELTA: &str =
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}";
+
+    /// The genai ingress's native relay emits Gemini API frames: content
+    /// latches TTFT, an error frame marks the stream failed, and neither
+    /// shape is mistaken for the other.
+    #[test]
+    fn genai_frames_latch_content_and_errors() {
+        let text = b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}\r\n\r\n";
+        assert!(contains_content_delta(text));
+        assert!(!contains_error_event(text));
+        let call = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"f\"}}]}}]}\r\n\r\n";
+        assert!(contains_content_delta(call));
+        let empty = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"STOP\"}]}\r\n\r\n";
+        assert!(!contains_content_delta(empty));
+        let error =
+            b"data: {\"error\":{\"code\":500,\"message\":\"x\",\"status\":\"INTERNAL\"}}\r\n\r\n";
+        assert!(contains_error_event(error));
+        assert!(!contains_content_delta(error));
+    }
 
     #[test]
     fn whole_event_in_one_chunk() {

@@ -98,7 +98,8 @@ pub enum Command {
     /// Import accounts from teamclaude config, ~/.claude/.credentials.json,
     /// ~/.codex/auth.json, the Antigravity CLI token store, or inline JSON.
     Import(ImportArgs),
-    /// Print shell exports for Claude Code (or Codex with --codex).
+    /// Print shell exports for Claude Code (or Codex with --codex, the
+    /// Antigravity CLI with --agy).
     Env(EnvArgs),
     /// Private local-control handoff for the native Islands executor.
     #[command(hide = true)]
@@ -157,7 +158,7 @@ pub struct ServerArgs {
     pub log_to: Option<PathBuf>,
 }
 
-// The client-frontend flags (`--codex`; none means Claude Code) share the
+// The client-frontend flags (`--codex`, `--agy`; none means Claude Code) share the
 // `frontend` group, so a later frontend flag only joins the group (at most one
 // may be given) and adds its arm to `run::Frontend::from_run_args`. Plain
 // comments, not doc comments: clap would read those as the command's help.
@@ -167,6 +168,10 @@ pub struct RunArgs {
     /// Launch Codex against llmux Responses instead of Claude Code.
     #[arg(long, group = "frontend")]
     pub codex: bool,
+    /// Launch the Antigravity CLI (agy) against the llmux Gemini API ingress
+    /// instead of Claude Code.
+    #[arg(long, group = "frontend")]
+    pub agy: bool,
     /// Restart the daemon even when it already runs this binary's version
     /// (by default a same-version daemon is reused; a different version is
     /// always restarted).
@@ -239,6 +244,10 @@ pub struct EnvArgs {
     /// Use `llmux run --codex` to launch directly instead.
     #[arg(long)]
     pub codex: bool,
+    /// Export the Antigravity CLI gateway variables (and print the variables
+    /// to unset). Use `llmux run --agy` to launch directly instead.
+    #[arg(long, conflicts_with = "codex")]
+    pub agy: bool,
 }
 
 #[derive(Debug, Args)]
@@ -965,7 +974,10 @@ mod tests {
             None
         );
         assert_eq!(
-            remote_refused_command(&Command::Env(EnvArgs { codex: false })),
+            remote_refused_command(&Command::Env(EnvArgs {
+                codex: false,
+                agy: false
+            })),
             None
         );
         assert_eq!(

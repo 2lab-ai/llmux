@@ -2069,6 +2069,30 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(openai_models_endpoint))
         .route("/llmux/models", get(models_endpoint))
         .route("/v1/oauth/token", post(oauth_token_relay))
+        // The Gemini API ingress (agy, #316): the model list is served
+        // locally from the catalog, `:countTokens` is a local estimate, and
+        // the generate methods enter the shared forward path. A doubled
+        // `/v1beta` prefix is tolerated.
+        .route(
+            "/v1beta/models",
+            get(genai_models_endpoint).fallback(genai_method_not_allowed),
+        )
+        .route(
+            "/v1beta/v1beta/models",
+            get(genai_models_endpoint).fallback(genai_method_not_allowed),
+        )
+        .route(
+            "/v1beta/models/{*target}",
+            get(genai_model_endpoint)
+                .post(genai_post)
+                .fallback(genai_method_not_allowed),
+        )
+        .route(
+            "/v1beta/v1beta/models/{*target}",
+            get(genai_model_endpoint)
+                .post(genai_post)
+                .fallback(genai_method_not_allowed),
+        )
         // Root reachability ping, answered LOCALLY (Z 2026-07-15, startup-set
         // bug): Claude Code fires `HEAD /` against its base URL as a
         // connectivity check on session start. The fallback used to forward
@@ -2146,12 +2170,26 @@ async fn client_auth(
         .map(|ConnectInfo(addr)| addr.ip());
     let loopback = peer.is_some_and(|ip| ip.is_loopback());
     let openai = super::ingress::accepts_bearer_client_key(req.uri().path());
+    // The Gemini API ingress answers in the Google error envelope, its key
+    // may also come as `x-goog-api-key`; every other path keeps its shapes.
+    let google = super::ingress::origin(req.uri().path()) == crate::tui::Endpoint::Google;
+    let refuse = |status: StatusCode, message: &str| {
+        if google {
+            super::ingress::error(crate::tui::Endpoint::Google, status, message)
+        } else {
+            auth_error(status, message)
+        }
+    };
     let presented = if openai {
-        match openai_client_key(req.headers()) {
+        match openai_client_key(req.headers(), google) {
             Ok(key) => key,
             Err(detail) => {
                 return super::ingress::error(
-                    crate::tui::Endpoint::OpenAi,
+                    if google {
+                        crate::tui::Endpoint::Google
+                    } else {
+                        crate::tui::Endpoint::OpenAi
+                    },
                     StatusCode::UNAUTHORIZED,
                     detail,
                 )
@@ -2174,18 +2212,35 @@ async fn client_auth(
             req.extensions_mut().insert(tenant);
             next.run(req).await
         }
-        Resolution::Suspended => auth_error(StatusCode::UNAUTHORIZED, "client key suspended"),
-        Resolution::Revoked => auth_error(StatusCode::UNAUTHORIZED, "client key revoked"),
-        Resolution::Denied => auth_error(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
+        Resolution::Suspended => refuse(StatusCode::UNAUTHORIZED, "client key suspended"),
+        Resolution::Revoked => refuse(StatusCode::UNAUTHORIZED, "client key revoked"),
+        Resolution::Denied => refuse(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
     }
 }
 
 /// Explicit malformed or conflicting credentials never become a keyless request.
-fn openai_client_key(headers: &http::HeaderMap) -> Result<Option<&str>, &'static str> {
+/// `google` also reads `x-goog-api-key` (the Gemini API's key header); every
+/// credential presented must name the same key.
+fn openai_client_key(
+    headers: &http::HeaderMap,
+    google: bool,
+) -> Result<Option<&str>, &'static str> {
     let api = headers
         .get("x-api-key")
         .map(|v| v.to_str().map_err(|_| "Invalid proxy API key"))
         .transpose()?;
+    let goog = if google {
+        headers
+            .get("x-goog-api-key")
+            .map(|v| v.to_str().map_err(|_| "Invalid proxy API key"))
+            .transpose()?
+    } else {
+        None
+    };
+    if api.is_some() && goog.is_some() && api != goog {
+        return Err("Conflicting proxy credentials");
+    }
+    let api = api.or(goog);
     let bearer = headers
         .get(http::header::AUTHORIZATION)
         .map(|v| {
@@ -2206,6 +2261,86 @@ fn openai_client_key(headers: &http::HeaderMap) -> Result<Option<&str>, &'static
         return Err("Conflicting proxy credentials");
     }
     Ok(bearer.or(api))
+}
+
+/// The model agy starts on: `agy.default_model`, else the live codex pin
+/// (`codex.default_model`, the model `run --codex` starts on).
+fn agy_default_model(state: &AppState) -> String {
+    state
+        .config
+        .agy
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| state.codex.model())
+}
+
+/// The Gemini API model list agy discovers (`GET /v1beta/models`), from the
+/// catalog ([`super::genai::discovery`]).
+fn genai_discovery(state: &AppState) -> Vec<serde_json::Value> {
+    let rows = crate::catalog::catalog(
+        &state.grok.model(),
+        &state.codex.model(),
+        state.openrouter.model(),
+    );
+    super::genai::discovery::models(&rows, &agy_default_model(state))
+}
+
+/// `GET /v1beta/models` — one `models.list` page (`pageSize`, `pageToken`).
+async fn genai_models_endpoint(State(state): State<AppState>, uri: http::Uri) -> Response {
+    let (size, token) = super::genai::discovery::page_params(uri.query());
+    match super::genai::discovery::page(&genai_discovery(&state), size.as_deref(), token.as_deref())
+    {
+        Ok(page) => axum::Json(page).into_response(),
+        Err((status, detail)) => super::genai::error(status, &detail),
+    }
+}
+
+/// `GET /v1beta/models/{model}` — one entry of the list, or a Google 404.
+async fn genai_model_endpoint(
+    State(state): State<AppState>,
+    axum::extract::Path(target): axum::extract::Path<String>,
+) -> Response {
+    let name = format!(
+        "models/{}",
+        target.strip_prefix("models/").unwrap_or(&target)
+    );
+    match genai_discovery(&state)
+        .into_iter()
+        .find(|model| model["name"] == name.as_str())
+    {
+        Some(model) => axum::Json(model).into_response(),
+        None => super::genai::error(StatusCode::NOT_FOUND, &format!("{name} is not served")),
+    }
+}
+
+/// Any other method on a Gemini API route: a Google-shaped 405.
+async fn genai_method_not_allowed(method: http::Method, uri: http::Uri) -> Response {
+    super::genai::error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &format!("{method} is not served at {}", uri.path()),
+    )
+}
+
+/// `POST /v1beta/models/{model}:{method}` — `countTokens` answered locally
+/// (no account, no upstream), the generate methods forwarded.
+async fn genai_post(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let counts = matches!(
+        super::genai::parse_target(req.uri().path()),
+        Ok((_, super::genai::Method::CountTokens))
+    );
+    if !counts {
+        return forward::forward(&state, req).await;
+    }
+    match axum::body::to_bytes(req.into_body(), state.config.proxy.max_request_bytes).await {
+        Ok(body) => super::genai::count_tokens(&body),
+        Err(_) => super::genai::error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body could not be read within the size limit",
+        ),
+    }
 }
 
 async fn openai_models_endpoint(State(state): State<AppState>) -> Response {

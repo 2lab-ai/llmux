@@ -1577,6 +1577,7 @@ mod tests {
         let mut json = doc_json();
         for (wire, expected) in [
             (Some("open_ai"), Endpoint::OpenAi),
+            (Some("google"), Endpoint::Google),
             (None, Endpoint::Anthropic),
         ] {
             {

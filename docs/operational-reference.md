@@ -510,6 +510,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 | Explicit Haiku 4.5 ids served by Haiku 5.5 on Claude Code / Agent SDK–shaped requests with default sampling and the bare `quota` probe (bare, custom-system or non-default-sampling requests still reach Haiku 4.5; row retired), Claude Code system block on the bare `quota` probe ([models](models.md#alias-semantics)) | no | yes | yes |
 | Subscription plan per account: `plan` / `rate_limit_tier` / `plan_type` in `/llmux/status`, `llmux status` lines (`max20 · 7d 66% left`), TUI detail pane ([Usage controls](#usage-controls-refresh--resets)) | no | yes | yes |
 | Personal vs team per account: `account_type` / `organization_type` / `plan_name` / `seat_tier` in `/llmux/status`, `max5 team` in `llmux status`, TUI `plan` + `type` columns, detail line and modal row, web 계정 `plan` + `type` columns ([Usage controls](#usage-controls-refresh--resets)) | no | no | yes |
+| `llmux run --agy` / `llmux env --agy` and the Gemini API ingress (`/v1beta/models/…`), `agy.default_model`, Google-origin activity tint ([Running the Antigravity CLI](#running-the-antigravity-cli-through-llmux)) | no | no | yes (after #316) |
 | Save mode: hold accounts whose weekly reset is after a cutoff (`POST /llmux/save-mode`, `scheduler.save_until`, `save_mode` in `/llmux/status`) ([schedulers](schedulers.md#save-mode)) | no | no | yes |
 
 Note on 0.2.24 local control (an older stable, before the columns above): the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
@@ -600,6 +601,29 @@ key. The command does not launch a client or daemon, fetch the model catalog,
 or write Codex configuration/login files; `llmux run --codex` handles startup
 and the model picker. Output contains the selected key: treat it as a secret.
 Plain `llmux env` continues to emit Claude Code exports.
+
+### Running the Antigravity CLI through llmux
+
+`llmux run --agy` launches the installed Antigravity CLI (`agy` ≥ 1.5.4) in its
+LLM-gateway mode against the daemon's Gemini API ingress (`/v1beta/models/…`, #316).
+For example:
+
+```sh
+llmux run --agy
+llmux run --agy -- -p 'Explain this repository' --model claude-opus-5-5
+```
+
+It sets `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, the endpoint's
+key (`AGY_LLM_GATEWAY_API_KEY`, only when it has one) and the subagent tiers (on the
+model the session starts on: your `--model`, else `agy.default_model`), removes
+the variables that select another agy backend (`GEMINI_API_KEY`, `CLOUD_CODE_URL`, …)
+or replace discovery (`AGY_LLM_GATEWAY_MODELS`), and passes `--model <agy.default_model>`
+unless the arguments name a model or a subcommand. agy reads its model picker from the
+daemon (`GET /v1beta/models`). No agy file or sign-in is touched. agy refuses plain
+http to a non-loopback host, so with `--remote` the launcher (and `env --agy`) fails
+early unless the remote is reached through a loopback tunnel. `llmux env --agy` prints
+the same exports, an `unset` line, and the `agy --model …` command. See the
+[agy frontend guide](agy-frontend/README.md).
 
 ## Multi-tenant client keys
 

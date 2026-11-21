@@ -10,12 +10,17 @@ use std::time::Duration;
 
 /// Client-facing protocol, independent of the selected backend/model.
 /// Missing persisted fields predate the OpenAI endpoint and are Anthropic.
+/// Wire names: `anthropic`, `open_ai`, `google`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Endpoint {
+    /// Anthropic Messages (`/v1/messages`, Claude Code).
     #[default]
     Anthropic,
+    /// OpenAI Responses (`/v1/responses`, Codex CLI).
     OpenAi,
+    /// Google Gemini API (`/v1beta/models/…`, the Antigravity CLI `agy`).
+    Google,
 }
 
 /// Input/output token counts for one completed request, when the upstream

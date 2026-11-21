@@ -425,55 +425,85 @@ impl GeminiProvider {
         anthropic_body: &[u8],
         credential: &AccountCredential,
     ) -> Result<(ProviderRequest, bool), ProviderError> {
-        let AccountCredential::Gemini {
-            access_token,
-            project_id,
-            ..
-        } = credential
-        else {
-            return Err(ProviderError::Auth(
-                "gemini provider requires a gemini credential".into(),
-            ));
-        };
-        if project_id.trim().is_empty() {
-            return Err(ProviderError::Auth(
-                "gemini credential has no project; resolve via loadCodeAssist first".into(),
-            ));
-        }
+        let (access_token, project_id) = credential_parts(credential)?;
         // Client-side fault → `InvalidRequest` (HTTP 400 locally).
         let body: Value = serde_json::from_slice(anthropic_body).map_err(|err| {
             ProviderError::InvalidRequest(format!("request body is not JSON: {err}"))
         })?;
         let shape = self.shape();
         let session_id = session_id_for(&body);
-        let (upstream_body, client_stream, _) = translate_request(
-            &body,
-            &shape,
-            project_id.trim(),
-            &session_id,
-            &self.signatures,
-        )?;
-
-        let mut headers = HeaderMap::new();
-        let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))
-            .map_err(|err| ProviderError::Auth(err.to_string()))?;
-        headers.insert(AUTHORIZATION, bearer);
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        let user_agent = HeaderValue::from_str(&shape.user_agent).map_err(|_| {
-            ProviderError::Convert("gemini user_agent is not a valid header value".into())
-        })?;
-        headers.insert(USER_AGENT, user_agent);
-
+        let (upstream_body, client_stream, _) =
+            translate_request(&body, &shape, project_id, &session_id, &self.signatures)?;
         Ok((
-            ProviderRequest {
-                method: Method::POST,
-                path: GEMINI_STREAM_PATH.to_string(),
-                headers,
-                body: Bytes::from(upstream_body.to_string()),
-            },
+            stream_request(access_token, &shape, &upstream_body)?,
             client_stream,
         ))
+    }
+
+    /// Build the upstream Antigravity request for a PUBLIC Gemini API body
+    /// (the agy ingress, #316): the body rides as the envelope's `request`
+    /// nearly as it came — `thoughtSignature`s, function-call ids and the
+    /// OpenAPI-subset tool schemas untouched — so Cloud Code sees its own
+    /// wire. What changes:
+    ///
+    /// - `model` resolves by the provider's rules ([`resolve_model`]: alias,
+    ///   `[1m]`, effort → level variant), `effort` being the body's
+    ///   `thinkingLevel` as an effort; the level therefore rides in the
+    ///   model id, and `generationConfig.thinkingConfig` becomes
+    ///   `{"includeThoughts": true}` (no `thinkingLevel` / `thinkingBudget`
+    ///   next to a level-suffixed id — the Messages path sends the same).
+    /// - `labels` (client metadata) and any `model` member are dropped.
+    /// - Every `functionDeclarations` entry is merged into ONE `tools` entry
+    ///   (agy sends one per tool; Cloud Code / Vertex have refused several
+    ///   function-declaration entries, and the Messages path's single merged
+    ///   entry is the proven shape); other tool kinds stay as they came.
+    /// - A model turn's first `functionCall` part without a signature gets
+    ///   [`SKIP_THOUGHT_SIGNATURE`] (a call another model made in a mixed
+    ///   session), like a replay the signature cache missed.
+    /// - `sessionId` is derived from the first user text (agy ≥ 1.5.4 sends
+    ///   none), the same hash [`session_id_for`] uses.
+    pub fn build_native_request(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+        genai_body: &Value,
+        credential: &AccountCredential,
+    ) -> Result<ProviderRequest, ProviderError> {
+        let (access_token, project_id) = credential_parts(credential)?;
+        let Some(body) = genai_body.as_object() else {
+            return Err(invalid("body", "expected a JSON object"));
+        };
+        let shape = self.shape();
+        let mut request = body.clone();
+        request.remove("labels");
+        request.remove("model");
+        if let Some(contents) = request.get_mut("contents").and_then(Value::as_array_mut) {
+            sign_unsigned_calls(contents);
+        }
+        if let Some(tools) = request.get_mut("tools") {
+            merge_function_declarations(tools);
+        }
+        let config = request
+            .entry("generationConfig")
+            .or_insert_with(|| json!({}));
+        if let Some(config) = config.as_object_mut() {
+            config.insert("thinkingConfig".into(), json!({"includeThoughts": true}));
+        }
+        let session_id = request
+            .get("contents")
+            .and_then(native_first_user_text)
+            .map(|text| format!("-{}", session_hash(&text)))
+            .unwrap_or_else(|| format!("-{}", session_hash(&responses::uuid_v4())));
+        request.insert("sessionId".into(), Value::String(session_id));
+        let envelope = json!({
+            "model": resolve_model(Some(model), effort, &shape.model),
+            "project": project_id,
+            "userAgent": "antigravity",
+            "requestType": "agent",
+            "requestId": format!("agent-{}", responses::uuid_v4()),
+            "request": Value::Object(request),
+        });
+        stream_request(access_token, &shape, &envelope)
     }
 
     /// What [`Self::build_request`] would leave out of `anthropic_body`,
@@ -505,6 +535,130 @@ impl GeminiProvider {
             .with_client_model(Some(stamp))
             .with_signatures(Arc::clone(&self.signatures), session_id)
     }
+}
+
+/// `(access token, project)` of a gemini credential that has a project.
+fn credential_parts(credential: &AccountCredential) -> Result<(&str, &str), ProviderError> {
+    let AccountCredential::Gemini {
+        access_token,
+        project_id,
+        ..
+    } = credential
+    else {
+        return Err(ProviderError::Auth(
+            "gemini provider requires a gemini credential".into(),
+        ));
+    };
+    if project_id.trim().is_empty() {
+        return Err(ProviderError::Auth(
+            "gemini credential has no project; resolve via loadCodeAssist first".into(),
+        ));
+    }
+    Ok((access_token, project_id.trim()))
+}
+
+/// The Cloud Code `streamGenerateContent` request carrying `envelope`.
+fn stream_request(
+    access_token: &str,
+    shape: &GeminiShape,
+    envelope: &Value,
+) -> Result<ProviderRequest, ProviderError> {
+    let mut headers = HeaderMap::new();
+    let bearer = HeaderValue::from_str(&format!("Bearer {access_token}"))
+        .map_err(|err| ProviderError::Auth(err.to_string()))?;
+    headers.insert(AUTHORIZATION, bearer);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    let user_agent = HeaderValue::from_str(&shape.user_agent).map_err(|_| {
+        ProviderError::Convert("gemini user_agent is not a valid header value".into())
+    })?;
+    headers.insert(USER_AGENT, user_agent);
+    Ok(ProviderRequest {
+        method: Method::POST,
+        path: GEMINI_STREAM_PATH.to_string(),
+        headers,
+        body: Bytes::from(envelope.to_string()),
+    })
+}
+
+/// Per model turn of a public-API `contents`, the FIRST `functionCall` part
+/// without a `thoughtSignature` gets [`SKIP_THOUGHT_SIGNATURE`] when no call
+/// before it in the turn is signed (Gemini signs the first call of a step;
+/// the rule [`apply_replayed_calls`] applies on the Messages path).
+fn sign_unsigned_calls(contents: &mut [Value]) {
+    for content in contents {
+        if content.get("role").and_then(Value::as_str) != Some("model") {
+            continue;
+        }
+        let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if let Some(first) = parts
+            .iter_mut()
+            .find(|part| part.get("functionCall").is_some())
+        {
+            if first
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                first["thoughtSignature"] = Value::String(SKIP_THOUGHT_SIGNATURE.to_string());
+            }
+        }
+    }
+}
+
+/// A public-API `tools` array with every `functionDeclarations` list merged
+/// into one leading entry, declarations in order; whatever else an entry
+/// carries (`googleSearch`, `codeExecution`, …) stays in an entry of its own.
+fn merge_function_declarations(tools: &mut Value) {
+    let Some(entries) = tools.as_array() else {
+        return;
+    };
+    let mut declarations = Vec::new();
+    let mut others = Vec::new();
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            others.push(entry.clone());
+            continue;
+        };
+        let mut rest = object.clone();
+        if let Some(Value::Array(list)) = rest.remove("functionDeclarations") {
+            declarations.extend(list);
+        }
+        if !rest.is_empty() {
+            others.push(Value::Object(rest));
+        }
+    }
+    let mut merged = Vec::with_capacity(others.len() + 1);
+    if !declarations.is_empty() {
+        merged.push(json!({"functionDeclarations": declarations}));
+    }
+    merged.extend(others);
+    *tools = Value::Array(merged);
+}
+
+/// The first user content's text parts (thoughts left out), joined by `\n`.
+fn native_first_user_text(contents: &Value) -> Option<String> {
+    contents.as_array()?.iter().find_map(|content| {
+        if content
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            != "user"
+        {
+            return None;
+        }
+        let text = content
+            .get("parts")?
+            .as_array()?
+            .iter()
+            .filter(|part| part.get("thought").and_then(Value::as_bool) != Some(true))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!text.is_empty()).then_some(text)
+    })
 }
 
 /// The `sessionId` sent upstream for `anthropic_body`: `-` + the low 63 bits
@@ -2433,6 +2587,121 @@ mod tests {
             &json!({"messages": [{"role": "user", "content": "ping"}]}),
         );
         assert!(!stream);
+    }
+
+    /// The agy ingress (#316): a public Gemini API body rides as the
+    /// envelope's `request` — signatures, ids and OpenAPI schemas untouched —
+    /// with the level in the model id, labels gone, an unsigned replayed call
+    /// signed with the dummy, and a session id from the first user text.
+    #[test]
+    fn native_genai_body_rides_in_the_envelope() {
+        let provider = GeminiProvider::new("https://cloudcode.example");
+        let body = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "first"}]},
+                {"role": "model", "parts": [
+                    {"text": "plan", "thought": true, "thoughtSignature": "T"},
+                    {"functionCall": {"name": "run_command", "args": {"CommandLine": "ls"}}},
+                    {"functionCall": {"name": "read_file", "args": {}}},
+                ]},
+                {"role": "user", "parts": [{"functionResponse": {"name": "run_command", "response": {"output": "ok"}}}]},
+                {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}, "thoughtSignature": "REAL"}]},
+            ],
+            "systemInstruction": {"role": "user", "parts": [{"text": "sys"}]},
+            "tools": [
+                {"functionDeclarations": [{"name": "run_command", "parameters": {"type": "OBJECT"}}]},
+                {"functionDeclarations": [{"name": "read_file", "parameters": {"type": "OBJECT", "properties": {"Path": {"type": "STRING"}}}}]},
+                {"googleSearch": {}},
+            ],
+            "generationConfig": {"maxOutputTokens": 65536, "thinkingConfig": {"includeThoughts": false, "thinkingBudget": 1024, "thinkingLevel": "LOW"}},
+            "labels": {"cascade_id": "c"},
+        });
+        let request = provider
+            .build_native_request(
+                "gemini-3.8-flash",
+                Some("low"),
+                &body,
+                &credential("proj-9"),
+            )
+            .unwrap();
+        assert_eq!(request.path, GEMINI_STREAM_PATH);
+        assert_eq!(request.headers[AUTHORIZATION], "Bearer ya29.token");
+        let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            envelope["model"], "gemini-3.8-flash-low",
+            "effort picks the variant"
+        );
+        assert_eq!(envelope["project"], "proj-9");
+        assert_eq!(envelope["requestType"], "agent");
+        let inner = &envelope["request"];
+        assert!(inner.get("labels").is_none());
+        assert_eq!(inner["systemInstruction"], body["systemInstruction"]);
+        assert_eq!(
+            inner["tools"],
+            json!([
+                {"functionDeclarations": [
+                    {"name": "run_command", "parameters": {"type": "OBJECT"}},
+                    {"name": "read_file", "parameters": {"type": "OBJECT", "properties": {"Path": {"type": "STRING"}}}},
+                ]},
+                {"googleSearch": {}},
+            ]),
+            "one merged declaration entry, OpenAPI schemas untouched"
+        );
+        assert_eq!(
+            inner["generationConfig"],
+            json!({"maxOutputTokens": 65536, "thinkingConfig": {"includeThoughts": true}})
+        );
+        let model_turn = &inner["contents"][1]["parts"];
+        assert_eq!(
+            model_turn[0]["thoughtSignature"], "T",
+            "thought signature kept"
+        );
+        assert_eq!(model_turn[1]["thoughtSignature"], SKIP_THOUGHT_SIGNATURE);
+        assert!(
+            model_turn[2].get("thoughtSignature").is_none(),
+            "first call only"
+        );
+        assert_eq!(inner["contents"][3]["parts"][0]["thoughtSignature"], "REAL");
+        assert_eq!(inner["contents"][2], body["contents"][2]);
+        assert_eq!(inner["sessionId"], format!("-{}", session_hash("first")));
+
+        // Gemini 4 families: agy sends the bare family id plus a
+        // `thinkingLevel` (live 2026-11-21); the family table picks the
+        // level id, capped at the family's top level.
+        for (model, effort, upstream) in [
+            ("gemini-4-neon", Some("low"), "gemini-4-neon-low"),
+            ("gemini-4-neon", Some("medium"), "gemini-4-neon-medium"),
+            ("gemini-4-neon", Some("high"), "gemini-4-neon-high"),
+            ("gemini-4-neon", Some("xhigh"), "gemini-4-neon-xhigh"),
+            ("gemini-4-hydrogen", Some("max"), "gemini-4-hydrogen-xhigh"),
+            ("gemini-4-argon", Some("xhigh"), "gemini-4-argon-high"),
+            ("gemini-4-carbon", Some("minimal"), "gemini-4-carbon-low"),
+            ("gemini-4-argon", None, "gemini-4-argon-high"),
+        ] {
+            let request = provider
+                .build_native_request(model, effort, &body, &credential("p"))
+                .unwrap();
+            let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(envelope["model"], upstream, "{model} {effort:?}");
+        }
+
+        // An id that already names its level passes verbatim.
+        let request = provider
+            .build_native_request(
+                "gemini-3.8-flash-high",
+                Some("low"),
+                &body,
+                &credential("p"),
+            )
+            .unwrap();
+        let envelope: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(envelope["model"], "gemini-3.8-flash-high");
+        assert!(provider
+            .build_native_request("gemini", None, &json!([]), &credential("p"))
+            .is_err());
+        assert!(provider
+            .build_native_request("gemini", None, &body, &credential(""))
+            .is_err());
     }
 
     #[test]

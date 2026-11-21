@@ -599,6 +599,24 @@ client catalog; a fetch failure warns and does not block launch. User `-m` and
 `-c` arguments override injected launch defaults. No persistent Codex settings
 file is edited. See [Codex frontend](codex-frontend/README.md) for supported controls.
 
+## Antigravity (agy) model picker
+
+`llmux run --agy` launches agy in gateway mode; agy reads its picker from the daemon's
+`GET /v1beta/models` (the llmux catalog as the Gemini model list — no client-side
+catalog file). One entry per model under its base id (`[1m]` twins merged; a
+`[1m]`-only row such as `claude-opus-4-8` is served as its `[1m]` row), at most 32
+entries (agy's limit for ids it does not know), the start model first.
+`outputTokenLimit` is a per-group default agy sends back as `maxOutputTokens`: claude
+64,000, codex 128,000, gemini 65,536, grok 32,768, openrouter 16,384. `thinking` is true
+for rows with an effort menu (agy refuses `--effort` otherwise; every Gemini 4 family row
+has one) and for level-named gemini ids, whose level agy moves into `thinkingLevel`; on
+the gemini group that level picks the family's level id (`gemini-4-neon` + `HIGH` →
+`gemini-4-neon-high`). agy 1.5.13 offers only `low` / `medium` / `high` there. The start
+model is `agy.default_model`, else `codex.default_model`; the 2026-11-21 catalog has 36
+candidates, of which `gpt-5.6-luna`, `or-dots-3-note`, `or-north-mini-code` and
+`or-gemma-4-31b` fall outside the 32. See
+[agy frontend](agy-frontend/README.md#discovery-and-limits).
+
 The following Claude Code sections describe that client’s picker and context
 display workarounds; Codex gets context metadata from its injected catalog.
 

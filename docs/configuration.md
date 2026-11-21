@@ -78,9 +78,15 @@ whatever `activity.jsonl` still holds); everything else keeps working.
 
 ## Frontend launch and SDK runtime
 
-`llmux run` selects Claude Code; `llmux run --codex` selects Codex CLI without a
-persistent frontend toggle. `codex.default_model` provides the Codex launcher
-default; explicit client `-m`/`-c` options override injected launch defaults.
+`llmux run` selects Claude Code; `llmux run --codex` selects Codex CLI and
+`llmux run --agy` the Antigravity CLI, without a persistent frontend toggle.
+`codex.default_model` provides the Codex launcher default; explicit client `-m`/`-c`
+options override injected launch defaults.
+
+| Key | Meaning |
+| --- | --- |
+| `agy.default_model` | The model `llmux run --agy` starts agy on (`--model`), listed first in `GET /v1beta/models`. A catalog id or alias. Unset (the default, omitted from the file) = `codex.default_model`. A user `--model` wins, and the `AGY_LLM_GATEWAY_TIER_*` subagent tiers follow the model the session starts on. See [agy frontend](agy-frontend/README.md). |
+
 Daemon-side routing and configured provider effort overrides still apply.
 `--no-model-picker` disables the selected client’s catalog injection.
 

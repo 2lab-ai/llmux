@@ -1,8 +1,9 @@
 # Provider compatibility
 
-Two client frontends share five backend groups. What survives depends on both the
+Three client frontends share five backend groups. What survives depends on both the
 incoming protocol and the selected backend. The detailed legacy matrix below
-describes **incoming Anthropic Messages**; Responses has its own transport and controls. This page is the readable difference matrix: what llmux forwards, what it drops (and
+describes **incoming Anthropic Messages**; Responses and the Gemini API have their own
+transport and controls. This page is the readable difference matrix: what llmux forwards, what it drops (and
 reports), and what it refuses outright, with the code line or dated receipt behind each row.
 
 Read it before you trust a request field on a non-Claude model. Deeper detail lives in the
@@ -12,19 +13,24 @@ user-facing contract) and the [responses compatibility spec](responses-compatibi
 
 ## Frontend transport matrix
 
-| Backend | Incoming Anthropic Messages | Incoming OpenAI Responses |
-| --- | --- | --- |
-| Claude | Native Messages with auth/model/thinking normalization | Official Claude Agent SDK; Responses converted to full Messages transcript and results converted back |
-| Codex | Messages → Responses → Messages | Native Responses history/tools/encrypted reasoning preserved |
-| Grok | Messages → Grok Responses → Messages | Responses → Messages → existing Grok adapter → Responses |
-| OpenRouter | Native Messages with model/thinking normalization | Responses → Messages → OpenRouter Messages → Responses |
-| Gemini | Messages → Cloud Code `streamGenerateContent` → Messages; Claude Code requests get a local 400 ([below](#gemini-no-cap-sent-thought-signatures-replayed)) | Responses → Messages → existing Gemini adapter → Responses; a Claude Code client gets the same local 400 in the OpenAI error shape |
+| Backend | Incoming Anthropic Messages (`run`) | Incoming OpenAI Responses (`run --codex`) | Incoming Gemini API (`run --agy`) |
+| --- | --- | --- | --- |
+| Claude | Native Messages with auth/model/thinking normalization | Official Claude Agent SDK; Responses converted to full Messages transcript and results converted back | Official Claude Agent SDK; genai → Messages (minted tool ids, sampling knobs and a forced tool choice dropped) → genai frames |
+| Codex | Messages → Responses → Messages | Native Responses history/tools/encrypted reasoning preserved | genai → Messages → Responses → Messages → genai frames; sampling knobs dropped, `maxOutputTokens` omitted upstream |
+| Grok | Messages → Grok Responses → Messages | Responses → Messages → existing Grok adapter → Responses | genai → Messages → Grok Responses → genai frames; sampling knobs dropped |
+| OpenRouter | Native Messages with model/thinking normalization | Responses → Messages → OpenRouter Messages → Responses | genai → Messages at `/v1/messages` → genai frames; sampling knobs carried |
+| Gemini | Messages → Cloud Code `streamGenerateContent` → Messages; Claude Code requests get a local 400 ([below](#gemini-no-cap-sent-thought-signatures-replayed)) | Responses → Messages → existing Gemini adapter → Responses; a Claude Code client gets the same local 400 in the OpenAI error shape | **Native**: the body in the Cloud Code envelope (signatures, call ids, schemas untouched; declarations merged into one `tools` entry; level from `thinkingLevel` into the model id via the family table; labels dropped; `maxOutputTokens` forwarded), frames unwrapped |
 
 Transport source checked 2026-10-07: [`src/proxy/forward.rs`](../src/proxy/forward.rs)
 (`run_taxonomy_loop`) and [`src/proxy/responses.rs`](../src/proxy/responses.rs)
 (`messages_request`); the Gemini row (2026-10-15) is [`gemini/spec.md`](gemini/spec.md)
 §R5 and `src/provider/gemini.rs`. This table describes implementation paths, not live parity
 proof for every backend; installed release smokes cover native Codex and Claude SDK.
+
+The Gemini API column (2026-11-21, #316) is [`src/proxy/genai/`](../src/proxy/genai/) and
+`GeminiProvider::build_native_request`; the [agy frontend guide](agy-frontend/README.md)
+owns its full mapping table, what is lost per group, and the live agy 1.5.13 receipts
+(e2e `agy_*` tests; a live agy run against mock upstreams, not real backends).
 
 The [Codex frontend guide](codex-frontend/README.md) owns Responses controls,
 structured output, tool replay and refusal/omission rules. In particular, Claude
