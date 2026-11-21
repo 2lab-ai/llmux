@@ -7,6 +7,7 @@ pub mod codex_trace;
 pub mod forward;
 pub(crate) mod gemini_project;
 pub mod idle_probe;
+pub(crate) mod ingress;
 pub mod internal_requests;
 pub mod keys;
 pub mod logging;
