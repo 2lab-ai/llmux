@@ -5,7 +5,7 @@
 Then let Claude, GPT and Grok work in the same Claude Code session.
 
 <p align="center">
-  <a href="#start-with-islands">islands</a> · <a href="#claude-implements-gpt-reviews--inside-the-same-claude-code">claude + gpt</a> · <a href="#see-what-was-actually-sent-to-the-model">raw traffic</a> · <a href="#install">install</a> · <a href="docs/README.md">docs</a>
+  <a href="#start-with-islands">islands</a> · <a href="#claude-implements-gpt-reviews--inside-the-same-claude-code">claude + gpt</a> · <a href="#antigravity-cli-every-account-from-agy">agy</a> · <a href="#see-what-was-actually-sent-to-the-model">raw traffic</a> · <a href="#install">install</a> · <a href="docs/README.md">docs</a>
 </p>
 
 ---
@@ -18,12 +18,12 @@ Then let Claude, GPT and Grok work in the same Claude Code session.
 
 <sub>Real app UI with demo data, built from the Islands get-started source (PR #196, preview channel). Captured 2026-10-08.</sub>
 
-llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 7-day window is left, and when it resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code and Codex CLI talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex session can also reach Gemini accounts (Claude Code cannot select gemini models).
+llmux Islands is a native macOS menu-bar and notch companion (with a KDE/Qt port). It shows every connected account, how much of its 7-day window is left, and when it resets. Underneath is llmux: a local proxy on `localhost:3456` that holds your accounts and routes each request by model name. Claude Code, Codex CLI and Google's Antigravity CLI (`agy`) talk to llmux instead of the provider, so one session can reach Claude, Codex (GPT), Grok and OpenRouter accounts; a Codex or agy session can also reach Gemini accounts (Claude Code cannot select gemini models).
 
 ## Start with Islands
 
 ```bash
-brew install --cask 2lab-ai/tap/llmux-islands   # installs the app and the llmux CLI (stable 0.2.25)
+brew install --cask 2lab-ai/tap/llmux-islands   # installs the app and the llmux CLI (stable 0.2.27)
 ```
 
 1. Open **llmux Islands**.
@@ -122,12 +122,35 @@ Ask Claude to send the same change to both reviewers and collect where they disa
 
 This is project configuration (two agent files and a prompt), not a bundled llmux command.
 
+## Antigravity CLI: every account from `agy`
+
+```bash
+brew install --cask antigravity-cli                    # Google's agy, 1.5.4 or later
+llmux run --agy                                        # starts/reuses the daemon, then launches agy against it
+llmux run --agy -- --model claude-opus-5-5
+llmux run --agy -- --model gemini-4-neon-xhigh         # a Google model's effort is part of its id
+llmux run --agy -- -p 'Explain this repository' --model gpt-6.2-sol
+```
+
+agy has an official gateway mode, and `llmux run --agy` switches it on for one session with environment variables alone. agy then needs no Google sign-in, sends the public Gemini API to llmux, and reads its model list from llmux. Each model goes to its own backend group: Claude through the Agent SDK, GPT and Grok translated, Gemini almost unchanged. agy's own tools (`run_command`, file edits, subagents) keep running inside agy. llmux edits none of agy's files; `llmux env --agy` prints the same variables for manual wiring.
+
+Tested on 2026-11-21 with agy 1.5.13 and real accounts: a text turn and a tool turn each on `claude-opus-5-5`, `gpt-6.2-sol`, `grok-4.7`, `gemini-3.8-flash-high` and Gemini 4 Neon (High). The Activity feed marks these rows with the Google origin.
+
+Limits:
+
+- agy lists at most 32 llmux models, one per model (no `[1m]` twins). With no `--model` it starts on `agy.default_model`, which follows `codex.default_model`.
+- For Google models the effort is part of the model id, as in Antigravity's own picker: `gemini-4-neon-high`, `-xhigh`, `-medium`, `-low`. For the others, `--effort` takes `low`, `medium` or `high`; agy itself refuses the rest.
+- agy sends plain HTTP only to loopback, so a remote daemon needs an ssh tunnel (`llmux run --agy` prints the command).
+- Remote Control, voice and credits need Google's own backend and do not work through llmux.
+
+Protocol, mapping and receipts: [agy frontend](docs/agy-frontend/README.md).
+
 ## What makes it work
 
 - **Account choice before reset.** Within one provider group, an account must pass eligibility gates first (auth, pause, 429 cooldown, 7d ≤ 0.99, fresh usage). The `default` mode then scores servable headroom × urgency (urgency rises up to 4× as the 7-day reset nears) and switches only when another account scores more than 25% higher, so it prefers quota that would otherwise expire unused. `round-robin` never switches proactively. [Schedulers](docs/schedulers.md).
 - **Keep your harness, change the model.** Claude Code keeps its own tools, permissions and project conventions. `/model fable`, `/model gpt-6-astra[1m]` or `/model grok-4.7` selects the backend. [Why llmux exists](docs/why-llmux.md).
 - **Codex CLI too.** `llmux run --codex` launches Codex against the same account pool and routing. Claude models on that path need Node.js 18+ and npm on the daemon host. llmux does not synchronize settings, hooks or skills between Claude Code and Codex. [Codex frontend](docs/codex-frontend/README.md).
-- **Antigravity CLI too (preview).** `llmux run --agy` launches Google's `agy` in its official gateway mode against llmux's Gemini API ingress: no Google sign-in, every backend group selectable, gemini served natively. [agy frontend](docs/agy-frontend/README.md).
+- **Antigravity CLI too.** `llmux run --agy` launches Google's `agy` in its official gateway mode against llmux's Gemini API ingress: no Google sign-in, every backend group selectable, gemini served natively ([above](#antigravity-cli-every-account-from-agy)). [agy frontend](docs/agy-frontend/README.md).
 - **One daemon for several computers (optional).** Manage accounts on one computer and connect other computers over a trusted overlay such as Tailscale or WireGuard. Issued per-computer keys attribute usage to each computer. The CLI uses plain HTTP; the Islands app requires HTTPS for non-loopback endpoints. [Remote daemon](docs/remote.md).
 
 ## See what was actually sent to the model
@@ -142,8 +165,8 @@ Guide: [the accidental AI debugger](docs/ai-debugger.md).
 
 | You want | Command | Channel |
 | --- | --- | --- |
-| Islands app + CLI | `brew install --cask 2lab-ai/tap/llmux-islands` | stable (0.2.25, 2026-10-08) |
-| CLI only | `brew install 2lab-ai/tap/llmux` | stable (0.2.25, 2026-10-08) |
+| Islands app + CLI | `brew install --cask 2lab-ai/tap/llmux-islands` | stable (0.2.27, 2026-11-21) |
+| CLI only | `brew install 2lab-ai/tap/llmux` | stable (0.2.27, 2026-11-21) |
 | Rolling preview (CLI, or `--cask 2lab-ai/tap/llmux-islands-preview` for the app) | `brew install 2lab-ai/tap/llmux-preview` | preview |
 | Build from source | `git clone https://github.com/2lab-ai/llmux && cd llmux && just build` | your checkout |
 
@@ -162,16 +185,17 @@ llmux import              # or import supported local credential stores
 
 llmux run                 # starts/reuses the daemon, then launches claude; args after -- pass through
 llmux run --codex         # same daemon, Codex CLI (install Codex on the client)
+llmux run --agy           # same daemon, Antigravity CLI (brew install --cask antigravity-cli)
 llmux server              # foreground TUI dashboard
 ```
 
-**Gemini terms of service.** Google states that using Antigravity through third-party tools or proxies violates the Antigravity Terms of Service, and it has suspended accounts for it ([gemini-cli discussion #20632](https://github.com/google-gemini/gemini-cli/discussions/20632); [report, 2026-09-03](https://enterprisedna.co/resources/ai-pulse/ai-pulse-2026-09-03-google-suspends-paying-antigravity-subscribers-for-using-thi/)). llmux is such a tool, and `llmux login --gemini` prints this warning before it starts. llmux does not ship Antigravity's Google OAuth client: set `gemini.client_id` and `gemini.client_secret` in `llmux.json` (or `LLMUX_GEMINI_CLIENT_ID` / `LLMUX_GEMINI_CLIENT_SECRET`) before logging in or refreshing; see [Gemini backend](docs/configuration.md#gemini-backend). `llmux import` also picks up an existing Antigravity CLI login. **Gemini 4** (`neon`, `carbon`, `hydrogen`, `argon` and their `gemini-4-*` ids) needs a paid Google AI Pro, Ultra or Enterprise plan (Carbon: Ultra or Enterprise); on Plus it returns 404, while Gemini 3.8 Flash works. Details: [Gemini accounts](docs/configuration.md#gemini-accounts).
+**Gemini terms of service.** Google states that using Antigravity through third-party tools or proxies violates the Antigravity Terms of Service, and it has suspended accounts for it ([gemini-cli discussion #20632](https://github.com/google-gemini/gemini-cli/discussions/20632); [report, 2026-09-03](https://enterprisedna.co/resources/ai-pulse/ai-pulse-2026-09-03-google-suspends-paying-antigravity-subscribers-for-using-thi/)). llmux is such a tool, and `llmux login --gemini` prints this warning before it starts. llmux does not ship Antigravity's Google OAuth client: set `gemini.client_id` and `gemini.client_secret` in `llmux.json` (or `LLMUX_GEMINI_CLIENT_ID` / `LLMUX_GEMINI_CLIENT_SECRET`) before logging in or refreshing; see [Gemini backend](docs/configuration.md#gemini-backend). `llmux import` also picks up an existing Antigravity CLI login. **Gemini 4** (`neon`, `carbon`, `hydrogen`, `argon` and their `gemini-4-*` ids) needs a paid Google AI Pro, Ultra or Enterprise plan (Carbon: Ultra or Enterprise); an account whose plan lacks the model gets a 404, while Gemini 3.8 Flash works on every plan. The agy frontend does not change this: agy itself needs no Google sign-in, but its gemini requests are served by these same Antigravity accounts. Details: [Gemini accounts](docs/configuration.md#gemini-accounts).
 
-In the dashboard, `n` opens a provider picker for the same five browser logins (the Gemini row prints the same terms-of-service note first). Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux).
+In the dashboard, `n` opens a provider picker for the same five browser logins (the Gemini row prints the same terms-of-service note first). Manual shell wiring also works: `eval "$(llmux env)"`, then `claude`. `llmux env --codex` prints OpenAI-compatible exports; see the [manual setup](docs/operational-reference.md#running-codex-through-llmux). `llmux env --agy` prints the agy gateway variables ([Running the Antigravity CLI](docs/operational-reference.md#running-the-antigravity-cli-through-llmux)).
 
 ## Switching models
 
-The incoming model name selects the backend in either client. For example, inside Claude Code:
+The incoming model name selects the backend in every client. For example, inside Claude Code:
 
 ```text
 /model fable
@@ -187,11 +211,11 @@ The incoming model name selects the backend in either client. For example, insid
 | `gpt-*` / `codex` / aliases (`sol`, `terra`, `luna`) | Codex accounts |
 | `grok` / `grok-*` | Grok accounts |
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
-| `gemini` / `gemini-*` / `argon` / `neon` / `carbon` / `hydrogen` | Gemini accounts (Codex only; Claude Code gets a local 400) |
+| `gemini` / `gemini-*` / `argon` / `neon` / `carbon` / `hydrogen` | Gemini accounts (Codex and agy; Claude Code gets a local 400) |
 
 Catalog on 2026-10-08 (`GET /models`): `claude-fable-5-1[1m]` (fable), `claude-opus-5-5[1m]` (opus), `claude-sonnet-5-5[1m]` (sonnet), `claude-haiku-5-5[1m]` (haiku, preview), `gpt-6.1-sol` (sol), `gpt-6-astra[1m]` (astra), `gpt-6-luna` (luna), `gpt-5.6-sol`, `gpt-5.6-terra` (terra), `gpt-5.5`, `grok-4.7` (grok), `grok-4.6`, `grok-4.5`, `or-ox-alpha` (or). Added 2026-10-15: `gemini-3.8-flash-high[1m]` (gemini), `gemini-3.8-flash-medium[1m]`, `gemini-3.8-flash-low[1m]` and `gemini-4-argon[1m]` (argon), each with its base row. Added 2026-11-10: `claude-fable-5-2[1m]`, which now owns `fable` (`claude-fable-5-1[1m]` keeps `fable-5-1`), and `gpt-6.1-terra` (terra, moved off `gpt-5.6-terra`) with its `[1m]` twin. Added 2026-11-18: `gpt-6.2-sol` (sol, moved off `gpt-6.1-sol`; also the bare `gpt-6.2`) and `gpt-6.2-astra[1m]` (astra, moved off `gpt-6-astra[1m]`), each with its twin; `or-ox-alpha` and three other dead OpenRouter rows were retired, and `or` now lands on `or-nemotron-3-ultra`. Removed 2026-11-19: `gpt-5.5` (the ChatGPT-account backend rejects it, [#309](https://github.com/2lab-ai/llmux/issues/309)). Added 2026-11-21 and reshaped the same day: the Gemini 4 rows are one row per thinking-level id, as in Antigravity's own picker — `gemini-4-neon-high` (neon, 512K) / `-xhigh` / `-medium` / `-low`, `gemini-4-hydrogen-high` (hydrogen) / `-xhigh` / `-medium` / `-low`, `gemini-4-argon-high` (argon) / `-medium` / `-low`, `gemini-4-carbon-high` (carbon) / `-medium` / `-low` — with no effort menu and no `[1m]` twins; `gemini-4-argon[1m]` and its base row were replaced.
 
-Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. Gemini rows are left out: Google's Antigravity backend refused Claude Code requests (2026-10-15), so llmux does not forward them and answers a Claude Code request for a gemini model with a local 400. Use gemini from Codex: `llmux run --codex -- -m gemini` ([details](docs/models.md#gemini)). The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
+Inside a `llmux run` session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. Gemini rows are left out: Google's Antigravity backend refused Claude Code requests (2026-10-15), so llmux does not forward them and answers a Claude Code request for a gemini model with a local 400. Use gemini from Codex (`llmux run --codex -- -m gemini`) or agy (`llmux run --agy -- --model gemini-4-neon-high`) ([details](docs/models.md#gemini)). The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
 
 `haiku` now selects Haiku 5.5 (published 1M context). Since 2026-10-23 the explicit Haiku 4.5 IDs (`claude-haiku-4-5`, dated `claude-haiku-4-5-YYYYMMDD`) that Claude Code and the Agent SDK send for their built-in Haiku tier are served by Haiku 5.5 too, and the 4.5 row is retired. Only Claude Code / Agent SDK–shaped requests with default sampling (and Claude Code's quota probe) float: a bare or custom-system request naming a 4.5 ID, or one that sets `temperature` other than 1, `top_p` or `top_k`, keeps reaching Haiku 4.5, because Haiku 5.5 refuses those on the subscription endpoint ([alias stability](docs/models.md#alias-semantics)). Usage recorded before the change keeps its Haiku 4.5 identity and pricing; a floated request is recorded as `claude-haiku-5-5`. Cost displays use reference rates and do not account for Haiku 5.5’s higher >100K-prompt tier or 1h cache writes ([model and pricing notes](docs/models.md#model-sweep-2026-10-08)).
 
@@ -202,7 +226,7 @@ Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [doc
 > - **`gpt-*` (Codex): no output-limit guarantee — your `max_tokens` is not sent upstream at all.** The gateway answered `400 Unsupported parameter: max_output_tokens` (live probe 2026-09-14), and no supported alternative cap field **was found** in the current official Codex client or its docs (read 2026-09-14), so llmux omits the cap rather than faking one. That is a search result, not an allowlist: other field names are untested, not proven absent.
 > - **`grok-*`: the cap is forwarded, but it is not the budget you asked for.** A `max_output_tokens: 1` probe (2026-09-14) came back `incomplete` with one visible token and 168 reported output tokens, 167 of them reasoning. What it bounds in general — and what it costs — is unmeasured.
 > - **Both:** non-null `temperature` / `top_p` / `top_k` and **non-empty** `stop_sequences` are refused with a local 400 (except [scoped monitor/title adapters](docs/provider-compatibility.md#claude-code-internal-tasks)), and Anthropic-signed `thinking` blocks are dropped. Each backend's own reasoning **is** carried across turns: when Claude Code asks for thinking, llmux returns it as a signed `thinking` block and replays it on the next request ([spec §R4](docs/responses-compatibility/spec.md#r4--prior-reasoning)).
-> - **`gemini*` / `argon` / `neon` / `carbon` / `hydrogen`: not available from Claude Code, and `max_tokens` is dropped too — the backend applies the model's own cap.** A Claude Code request for a gemini model gets a local 400 and nothing is forwarded; other Messages clients and Codex are served. Sampling and stop controls are forwarded, prior `thinking` blocks are dropped, and tool-call thought signatures are replayed across turns. The Gemini 4 models need a paid plan (404 on Plus). [Details](docs/provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
+> - **`gemini*` / `argon` / `neon` / `carbon` / `hydrogen`: not available from Claude Code, and `max_tokens` is dropped too — the backend applies the model's own cap.** A Claude Code request for a gemini model gets a local 400 and nothing is forwarded; other Messages clients, Codex and agy are served. Sampling and stop controls are forwarded, prior `thinking` blocks are dropped, and tool-call thought signatures are replayed across turns. The Gemini 4 models need a paid plan (404 without it). [Details](docs/provider-compatibility.md#gemini-no-cap-sent-thought-signatures-replayed).
 > - **Claude Code auto mode:** after an observed Codex or Grok main turn (or the session's startup warmup), the same session's safety monitor uses `luna` (Codex) or `grok` (Grok) with medium effort. Both severity stages are supported; unknown sessions keep normal routing. This changes the reviewer model, not the requested safety policy.
 > - **Claude Code internal models:** in Codex sessions, Claude Code's own Opus/Sonnet/Haiku requests (title, quota, status check, helpers) use configurable `terra`/`terra`/`luna` aliases; in Grok sessions they stay on `grok` at a lowered effort. Titles preserve their JSON schema; titles that start before the first main turn use the session's warmup or proven launch context. Quota checks Codex availability without inventing Claude quota percentages. Explicit main Claude switches remain authoritative. [Configuration](docs/configuration.md#claude-code-internal-models-claude_code).
 >
