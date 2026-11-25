@@ -2341,7 +2341,8 @@ async fn reset_outside_llmux_lifts_the_weekly_park_on_the_next_read() {
 
 /// A redemption through llmux is proof the limits were reset, even when the
 /// weekly gauge shows no fall (the park was for a shorter limit the gauge does
-/// not report, and the reset cleared it too).
+/// not report, and the reset cleared it too). The follow-up usage read FAILS
+/// here, so no fresh reading can lift the park — only the redemption can.
 #[tokio::test]
 async fn redeemed_reset_lifts_the_park_even_without_a_weekly_fall() {
     let mock = WhamMock::spawn().await;
@@ -2359,6 +2360,7 @@ async fn redeemed_reset_lifts_the_park_even_without_a_weekly_fall() {
     );
     park_like_a_weekly_429(&proxy.pool, "cx");
     assert!(parked(&dashboard_account(&proxy, "cx").await));
+    mock.push_usage(500, "upstream on fire");
 
     let (status, body) = post_admin(
         &proxy,
@@ -2368,8 +2370,17 @@ async fn redeemed_reset_lifts_the_park_even_without_a_weekly_fall() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["outcome"], "reset", "{body}");
+    assert!(
+        body["refresh_warning"].as_str().is_some(),
+        "the follow-up read failed, so nothing but the redemption lifted the park: {body}"
+    );
     let cx = dashboard_account(&proxy, "cx").await;
     assert!(!parked(&cx), "a redeemed reset lifts the park: {cx}");
+    assert_eq!(
+        seven_day_utilization(&cx),
+        Some(0.20),
+        "the gauge is the seeded one — no fresh reading landed: {cx}"
+    );
 }
 
 /// A redemption that spent nothing (`nothing_to_reset`) is no evidence: the

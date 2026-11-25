@@ -1471,14 +1471,20 @@ impl AccountPool {
         true
     }
 
-    /// Lift `account`'s account-wide 429 park, whatever its source: the caller
-    /// holds proof the limits behind it were reset (a reset redeemed through
-    /// llmux), which also covers a park the weekly gauge cannot explain.
-    /// Gated on the fingerprint the caller captured before its IO, checked
-    /// under the same write lock as [`Self::record_usage_if`], so a credential
-    /// replaced in flight keeps its own park. Returns whether a park was
-    /// lifted.
-    pub fn clear_cooldown_if(&self, account: &AccountId, expected: &AccountFingerprint) -> bool {
+    /// Lift `account`'s account-wide 429 park, whatever its source, when the
+    /// caller holds proof the limits behind it were reset (a reset redeemed
+    /// through llmux) — which also covers a park the weekly gauge cannot
+    /// explain. A reset only explains parks set no later than
+    /// `reset_started_at`; a park set after it stays. Gated on the
+    /// fingerprint the caller captured before its IO, checked under the same
+    /// write lock as [`Self::record_usage_if`], so a credential replaced in
+    /// flight keeps its own park. Returns whether a park was lifted.
+    pub fn clear_cooldown_if(
+        &self,
+        account: &AccountId,
+        expected: &AccountFingerprint,
+        reset_started_at: SystemTime,
+    ) -> bool {
         let mut state = self.write();
         if !state.matches_fingerprint(account, expected) {
             return false;
@@ -1486,9 +1492,14 @@ impl AccountPool {
         let Some(acct) = state.account_mut(account) else {
             return false;
         };
-        let parked = acct.cooldown_until.is_some();
+        let explained = acct
+            .cooldown_set_at
+            .is_some_and(|set_at| set_at <= reset_started_at);
+        if acct.cooldown_until.is_none() || !explained {
+            return false;
+        }
         acct.clear_cooldown();
-        parked
+        true
     }
 
     /// See [`PoolState::reset_usage`] — the `POST /llmux/reset-usage`
@@ -2442,18 +2453,28 @@ mod tests {
             pool.record_429(&id(name), Some(Duration::from_secs(7200)), now());
         }
         let fp = pool.fingerprint(&id("a")).expect("a exists");
-        assert!(pool.clear_cooldown_if(&id("a"), &fp));
+        let reset_at = at(NOW_SECS + 60);
+        assert!(pool.clear_cooldown_if(&id("a"), &fp, reset_at));
         let snap = pool.snapshot();
         assert!(snap.accounts[0].cooldown_until.is_none(), "a cleared");
         assert!(snap.accounts[1].cooldown_until.is_some(), "b untouched");
+        assert!(
+            !pool.clear_cooldown_if(&id("a"), &fp, reset_at),
+            "nothing left to lift"
+        );
+
+        // A park set AFTER the reset is not explained by it and stays (a
+        // retried redemption answering `already_redeemed`).
+        pool.record_429(&id("a"), Some(Duration::from_secs(7200)), at(NOW_SECS + 61));
+        assert!(!pool.clear_cooldown_if(&id("a"), &fp, reset_at));
+        assert!(pool.snapshot().accounts[0].cooldown_until.is_some());
 
         // A stale fingerprint (credential replaced in flight) changes nothing.
-        pool.record_429(&id("a"), Some(Duration::from_secs(7200)), now());
         let stale = AccountFingerprint {
             generation: fp.generation + 1_000,
             ..fp
         };
-        assert!(!pool.clear_cooldown_if(&id("a"), &stale));
+        assert!(!pool.clear_cooldown_if(&id("a"), &stale, at(NOW_SECS + 120)));
         assert!(pool.snapshot().accounts[0].cooldown_until.is_some());
     }
 
