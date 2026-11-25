@@ -22,7 +22,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `accounts reset ACCOUNT [--credit-id ID] [--request-id ID] [--yes]` | Redeem exactly ONE rate-limit reset. A TTY confirmation names the account and the reset; a non-TTY requires `--yes`. The request id is minted by the client, printed before the send, and must be REUSED (`--request-id`) to retry an uncertain attempt. |
 | `remove <name> [--yes]` | Remove an account by name. |
 | `key new --name L [--email E] [--admin]` | Issue a downstream client key (multi-tenant). The secret is printed once and never stored. |
-| `key list` | List issued client keys (id, name, email, kind, state, prefix). A key whose pre-rotation secret is still in use gets a second line saying how many requests sent it since the daemon started. |
+| `key list` | List issued client keys (id, name, email, kind, state, prefix). A key whose pre-rotation secret was sent since the daemon started gets a second line with the count and how long ago the last one came. |
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id; for 7 days the old secret is still metered to the key when a client on the daemon's own machine sends it to `/v1/messages`, and refused everywhere else (see [Multi-tenant client keys](#multi-tenant-client-keys)). |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 

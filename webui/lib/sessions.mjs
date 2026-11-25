@@ -29,6 +29,7 @@ export const AUX_RE = /SAFETY REVIEWER|Summarize this AI assistant response|<ses
 const MAIN_KINDS = new Set(['user', 'sdk', 'other', 'compact', 'recap']);
 const SOMA_CWD = /^\/(?:private\/)?tmp\/U[0-9A-Z]+\/session_/;
 const HOUR = 3600000;
+const RETIRED_ACTIVE_MS = 24 * HOUR;
 const KEEP_HOURS = 72;
 // The priced counters of an activity row, summed per bucket model (#278 adds the extended-TTL write
 // subset and the web-search count, so a history bucket prices like the daemon's rows).
@@ -104,9 +105,10 @@ export class SessionIndex {
     if (solved.size) this.rates = solved;
     for (const k of doc.client_keys || []) {
       this.setUser(k.id, { name: k.name, email: k.email, kind: k.kind, suspended: !!k.suspended, created_at_ms: k.created_at_ms });
-      // A client still sending the key's pre-rotation secret (loopback only; metered to this key).
-      // Set every poll, so it clears when the daemon stops reporting it.
-      this.users.get(k.id).retired = k.retired_secret || null;
+      // A client still sending the key's pre-rotation secret. The daemon counts since it started, so the
+      // flag shows only while the last such request is under 24 hours old: it clears once clients moved on.
+      const r = k.retired_secret;
+      this.users.get(k.id).retired = r && Date.now() - r.last_ms < RETIRED_ACTIVE_MS ? r : null;
     }
     for (const t of doc.tenant_usage || []) this.setUser(t.tenant, { name: t.name, email: t.email });
     for (const [uid, label] of Object.entries(doc.session_labels || {})) {

@@ -452,6 +452,23 @@ mod tests {
         }
     }
 
+    /// With several keys, each old secret resolves to its OWN key (the
+    /// retired map stores an index into the key list).
+    #[test]
+    fn each_retired_secret_resolves_to_its_own_key() {
+        let (mut a, a_old, _) = rotated(ClientKeyKind::Default);
+        a.id = "k-a".into();
+        let (mut b, b_old, _) = rotated(ClientKeyKind::Default);
+        b.id = "k-b".into();
+        let reg = KeyRegistry::from_config(&config_with(vec![a, b], None));
+        for (secret, id) in [(&a_old, "k-a"), (&b_old, "k-b")] {
+            assert!(matches!(
+                reg.resolve_at(Some(secret), true, ROTATED_AT),
+                Resolution::Allowed(t) if t.id == id && t.retired_secret
+            ));
+        }
+    }
+
     #[test]
     fn retired_secret_from_a_remote_peer_is_refused() {
         let (k, old, _) = rotated(ClientKeyKind::Default);

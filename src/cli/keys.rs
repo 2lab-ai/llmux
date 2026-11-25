@@ -75,15 +75,23 @@ pub async fn run(args: KeyArgs, remote: Option<String>) -> Result<(), CliError> 
                     state,
                     field(key, "key_prefix"),
                 );
-                if let Some(requests) = key
-                    .get("retired_secret")
-                    .and_then(|r| r.get("requests"))
-                    .and_then(serde_json::Value::as_u64)
-                {
+                let retired = key.get("retired_secret");
+                if let (Some(requests), Some(last_ms)) = (
+                    retired
+                        .and_then(|r| r.get("requests"))
+                        .and_then(serde_json::Value::as_u64),
+                    retired
+                        .and_then(|r| r.get("last_ms"))
+                        .and_then(serde_json::Value::as_u64),
+                ) {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let ago_min = now_ms.saturating_sub(last_ms) / 60_000;
                     println!(
-                        "      a local client still sends the pre-rotation secret \
-                         ({requests} requests since the daemon started, metered to this key) \
-                         — give it the new key"
+                        "      the pre-rotation secret was sent {requests} times since the daemon \
+                         started, last {ago_min} min ago — give that client the new key"
                     );
                 }
             }

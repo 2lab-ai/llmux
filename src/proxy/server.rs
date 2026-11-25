@@ -2500,8 +2500,7 @@ async fn keys_list_endpoint(State(state): State<AppState>) -> Response {
         .map(|key| {
             let mut json = client_key_json(key);
             if let Some(used) = state.keys.retired_use(&key.id) {
-                json["retired_secret"] =
-                    serde_json::json!({ "requests": used.requests, "last_ms": used.last_ms });
+                json["retired_secret"] = serde_json::json!(used);
             }
             json
         })
