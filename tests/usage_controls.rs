@@ -2287,6 +2287,123 @@ async fn post_consume_refresh_failure_is_a_warning_not_a_failed_redemption() {
 }
 
 // ---------------------------------------------------------------------------
+// Replenished quota lifts the 429 park (owner report 2026-11-25)
+// ---------------------------------------------------------------------------
+
+/// Park `name` the way a weekly-exhaustion 429 does: `retry-after` = the time
+/// to the weekly reset, here 30 hours.
+fn park_like_a_weekly_429(pool: &AccountPool, name: &str) {
+    pool.record_429(
+        &AccountId(name.to_string()),
+        Some(Duration::from_secs(30 * 3_600)),
+        SystemTime::now(),
+    );
+}
+
+fn parked(account: &serde_json::Value) -> bool {
+    !account["cooldown_until"].is_null()
+}
+
+/// The owner's case: a Claude account reads 100% used and carries the long
+/// retry-after park; the limit is then reset outside llmux (claude.ai, or
+/// usage bought), so the next read shows 0% used. The park must go with the
+/// spent quota — not linger for the remaining day and a half.
+#[tokio::test]
+async fn reset_outside_llmux_lifts_the_weekly_park_on_the_next_read() {
+    let mock = WhamMock::spawn().await;
+    let proxy = Proxy::spawn(&mock, vec![oauth_account("cl"), codex_account("cx")]).await;
+    for name in ["cl", "cx"] {
+        seed_exhausted(&proxy.pool, name);
+        park_like_a_weekly_429(&proxy.pool, name);
+        assert!(
+            parked(&dashboard_account(&proxy, name).await),
+            "{name} parked"
+        );
+    }
+
+    for name in ["cl", "cx"] {
+        let (status, body) = post_admin(
+            &proxy,
+            "/llmux/refresh-usage",
+            serde_json::json!({ "account": name }),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["results"][0]["ok"], true, "{body}");
+        let account = dashboard_account(&proxy, name).await;
+        assert!(
+            !parked(&account),
+            "{name}: the quota came back (100% -> {:?}), the park must clear: {account}",
+            seven_day_utilization(&account)
+        );
+    }
+}
+
+/// A redemption through llmux is proof the limits were reset, even when the
+/// weekly gauge shows no fall (the park was for a shorter limit the gauge does
+/// not report, and the reset cleared it too).
+#[tokio::test]
+async fn redeemed_reset_lifts_the_park_even_without_a_weekly_fall() {
+    let mock = WhamMock::spawn().await;
+    let proxy = Proxy::spawn(&mock, vec![codex_account("cx")]).await;
+    proxy.pool.record_usage(
+        &AccountId("cx".into()),
+        &UsageSnapshot {
+            seven_day: Some(WindowReading {
+                utilization: 0.20,
+                resets_at: SystemTime::now() + Duration::from_secs(3 * 86_400),
+            }),
+            scoped: Vec::new(),
+        },
+        SystemTime::now(),
+    );
+    park_like_a_weekly_429(&proxy.pool, "cx");
+    assert!(parked(&dashboard_account(&proxy, "cx").await));
+
+    let (status, body) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cx","redeem_request_id":"rid-park","confirm":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "reset", "{body}");
+    let cx = dashboard_account(&proxy, "cx").await;
+    assert!(!parked(&cx), "a redeemed reset lifts the park: {cx}");
+}
+
+/// A redemption that spent nothing (`nothing_to_reset`) is no evidence: the
+/// park stays.
+#[tokio::test]
+async fn unspent_redemption_leaves_the_park() {
+    let mock = WhamMock::spawn().await;
+    let proxy = Proxy::spawn(&mock, vec![codex_account("cx")]).await;
+    proxy.pool.record_usage(
+        &AccountId("cx".into()),
+        &UsageSnapshot {
+            seven_day: Some(WindowReading {
+                utilization: 0.20,
+                resets_at: SystemTime::now() + Duration::from_secs(3 * 86_400),
+            }),
+            scoped: Vec::new(),
+        },
+        SystemTime::now(),
+    );
+    park_like_a_weekly_429(&proxy.pool, "cx");
+    mock.push_consume(200, r#"{"code":"nothing_to_reset"}"#);
+
+    let (status, body) = post_admin(
+        &proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account":"cx","redeem_request_id":"rid-none","confirm":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "nothing_to_reset", "{body}");
+    assert!(parked(&dashboard_account(&proxy, "cx").await));
+}
+
+// ---------------------------------------------------------------------------
 // S3 — manual switch
 // ---------------------------------------------------------------------------
 
