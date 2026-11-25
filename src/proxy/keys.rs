@@ -86,7 +86,9 @@ pub enum Resolution {
     Suspended,
     /// A known key that has been revoked.
     Revoked,
-    /// A secret the key carried before a rotation, from a remote peer.
+    /// A secret the key carried before a rotation (still in its grace
+    /// window), presented where it cannot be attributed: a remote peer, or the
+    /// OpenAI / Gemini ingress, which refuse any unknown explicit key.
     Retired,
     /// No/unknown credential from a peer that required one.
     Denied,
@@ -102,8 +104,9 @@ struct Snapshot {
     keys: Vec<ClientKey>,
     /// digest → index into `keys`.
     by_digest: HashMap<String, usize>,
-    /// pre-rotation digest → index into `keys` (`ClientKey::retired_digests`).
-    retired_by_digest: HashMap<String, usize>,
+    /// pre-rotation digest → (index into `keys`, retired_at_ms)
+    /// (`ClientKey::retired_digests`).
+    retired_by_digest: HashMap<String, (usize, u64)>,
     /// The legacy shared proxy key digest, when configured.
     legacy_digest: Option<String>,
 }
@@ -115,8 +118,8 @@ impl Snapshot {
         let mut retired_by_digest = HashMap::new();
         for (i, key) in keys.iter().enumerate() {
             by_digest.insert(key.key_digest.clone(), i);
-            for digest in &key.retired_digests {
-                retired_by_digest.insert(digest.clone(), i);
+            for retired in &key.retired_digests {
+                retired_by_digest.insert(retired.digest.clone(), (i, retired.retired_at_ms));
             }
         }
         Self {
@@ -134,7 +137,7 @@ impl Snapshot {
 
 /// Requests that presented a key's pre-rotation secret since the daemon
 /// started: the sign that some client still holds the old secret.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RetiredUse {
     pub requests: u64,
     pub last_ms: u64,
@@ -177,16 +180,29 @@ impl KeyRegistry {
     /// - present + matches legacy `proxy.api_key` → `legacy` (admin).
     /// - present + matches an issued key digest → that key's tenant, unless
     ///   revoked/suspended.
-    /// - present + matches a key's pre-rotation digest → from loopback, that
+    /// - present + matches a key's pre-rotation digest retired less than
+    ///   [`crate::config::RETIRED_SECRET_GRACE_MS`] ago → from loopback, that
     ///   key's tenant with `retired_secret` set and no admin scope (unless
-    ///   revoked/suspended); from a remote peer, [`Resolution::Retired`].
-    ///   Loopback may send no key at all and still be served, so attributing
-    ///   the old secret there grants nothing new — it only keeps the request
-    ///   on its owner's bill instead of `local`.
+    ///   revoked/suspended); otherwise [`Resolution::Retired`]. Loopback may
+    ///   send no key at all and still be served, so attributing the old secret
+    ///   there grants no access — it keeps the request on its owner's bill
+    ///   instead of `local`. Past the grace window the digest is unknown again.
+    ///   (The OpenAI / Gemini ingress pass `loopback = false` for an explicit
+    ///   key, so there it is refused even locally; the gate also refuses it on
+    ///   the control plane.)
     /// - absent + loopback peer → `local` (data plane only).
     /// - anything else → denied. Keyless REMOTE is always denied, even when
     ///   no `proxy.api_key` is configured (keyless is loopback-only).
     pub fn resolve(&self, presented: Option<&str>, loopback: bool) -> Resolution {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.resolve_at(presented, loopback, now_ms)
+    }
+
+    /// [`Self::resolve`] at an explicit clock (the grace window's only input).
+    pub fn resolve_at(&self, presented: Option<&str>, loopback: bool, now_ms: u64) -> Resolution {
         let snap = self.snap();
         if let Some(presented) = presented {
             let digest = crate::config::client_key_digest(presented);
@@ -203,7 +219,9 @@ impl KeyRegistry {
                 }
                 return Resolution::Allowed(Tenant::from_key(key));
             }
-            if let Some(&i) = snap.retired_by_digest.get(&digest) {
+            if let Some(&(i, _)) = snap.retired_by_digest.get(&digest).filter(|(_, at)| {
+                now_ms.saturating_sub(*at) < crate::config::RETIRED_SECRET_GRACE_MS
+            }) {
                 let key = &snap.keys[i];
                 if key.revoked_at_ms.is_some() {
                     return Resolution::Revoked;
@@ -383,12 +401,36 @@ mod tests {
         assert_eq!(reg.resolve(Some(&secret), false), Resolution::Suspended);
     }
 
-    /// `key` rotated once: the old secret is a retired digest, a new one current.
+    /// Rotation time in these tests (epoch ms).
+    const ROTATED_AT: u64 = 1_000_000;
+
+    /// `key` rotated once at [`ROTATED_AT`]: the old secret is retired.
     fn rotated(kind: ClientKeyKind) -> (ClientKey, String, String) {
         let (mut k, old) = key(kind, false);
         let issued = generate_client_key();
-        k.retired_digests = vec![std::mem::replace(&mut k.key_digest, issued.digest)];
+        k.retire_digest(issued.digest, ROTATED_AT);
         (k, old, issued.secret)
+    }
+
+    #[test]
+    fn retired_secret_is_attributed_only_inside_the_grace_window() {
+        let (k, old, _) = rotated(ClientKeyKind::Default);
+        let id = k.id.clone();
+        let reg = KeyRegistry::from_config(&config_with(vec![k], None));
+        let grace = crate::config::RETIRED_SECRET_GRACE_MS;
+        assert!(matches!(
+            reg.resolve_at(Some(&old), true, ROTATED_AT + grace - 1),
+            Resolution::Allowed(t) if t.id == id && t.retired_secret
+        ));
+        assert_eq!(
+            reg.resolve_at(Some(&old), true, ROTATED_AT + grace),
+            Resolution::Allowed(Tenant::local()),
+            "past the window the old secret is unknown again"
+        );
+        assert_eq!(
+            reg.resolve_at(Some(&old), false, ROTATED_AT + grace),
+            Resolution::Denied
+        );
     }
 
     #[test]
@@ -396,7 +438,7 @@ mod tests {
         let (k, old, new) = rotated(ClientKeyKind::Admin);
         let id = k.id.clone();
         let reg = KeyRegistry::from_config(&config_with(vec![k], None));
-        match reg.resolve(Some(&old), true) {
+        match reg.resolve_at(Some(&old), true, ROTATED_AT) {
             Resolution::Allowed(t) => {
                 assert_eq!(t.id, id);
                 assert!(t.retired_secret);
@@ -404,7 +446,7 @@ mod tests {
             }
             other => panic!("expected Allowed, got {other:?}"),
         }
-        match reg.resolve(Some(&new), true) {
+        match reg.resolve_at(Some(&new), true, ROTATED_AT) {
             Resolution::Allowed(t) => assert!(t.admin && !t.retired_secret),
             other => panic!("expected Allowed, got {other:?}"),
         }
@@ -414,7 +456,10 @@ mod tests {
     fn retired_secret_from_a_remote_peer_is_refused() {
         let (k, old, _) = rotated(ClientKeyKind::Default);
         let reg = KeyRegistry::from_config(&config_with(vec![k], None));
-        assert_eq!(reg.resolve(Some(&old), false), Resolution::Retired);
+        assert_eq!(
+            reg.resolve_at(Some(&old), false, ROTATED_AT),
+            Resolution::Retired
+        );
     }
 
     #[test]
@@ -426,8 +471,14 @@ mod tests {
         revoked.id = "k-2".into();
         revoked.revoked_at_ms = Some(2);
         let reg = KeyRegistry::from_config(&config_with(vec![suspended, revoked], None));
-        assert_eq!(reg.resolve(Some(&s_old), true), Resolution::Suspended);
-        assert_eq!(reg.resolve(Some(&r_old), true), Resolution::Revoked);
+        assert_eq!(
+            reg.resolve_at(Some(&s_old), true, ROTATED_AT),
+            Resolution::Suspended
+        );
+        assert_eq!(
+            reg.resolve_at(Some(&r_old), true, ROTATED_AT),
+            Resolution::Revoked
+        );
     }
 
     #[test]

@@ -1981,6 +1981,76 @@ async fn rotated_out_secret_from_loopback_meters_to_its_key() {
     assert_eq!(row["retired_secret"]["requests"], 1, "{row}");
 }
 
+/// Where a rotated-out secret cannot be attributed it is refused with the
+/// "rotated" 401, even from loopback: on the OpenAI ingress (which refuses any
+/// unknown explicit key) and on the control plane (an old ADMIN secret gets the
+/// 401, not the generic 403, and is counted on the key row).
+#[tokio::test]
+async fn rotated_out_secret_is_refused_on_openai_ingress_and_control_plane() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let client = reqwest::Client::new();
+    let admin = |path: &str, body: serde_json::Value| {
+        client
+            .post(proxy.url(path))
+            .header("x-api-key", E2E_ADMIN_KEY)
+            .json(&body)
+            .send()
+    };
+    let issued: serde_json::Value = admin(
+        "/llmux/keys/new",
+        serde_json::json!({ "name": "ops", "kind": "admin" }),
+    )
+    .await
+    .expect("issue")
+    .json()
+    .await
+    .expect("issue json");
+    let id = issued["id"].as_str().expect("id").to_string();
+    let old = issued["key"].as_str().expect("secret").to_string();
+    let status = admin("/llmux/keys/rotate", serde_json::json!({ "id": id }))
+        .await
+        .expect("rotate")
+        .status();
+    assert_eq!(status, 200);
+
+    let responses = client
+        .post(proxy.url("/v1/responses"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {old}"))
+        .body(r#"{"model":"gpt-5.6-sol","input":"hi"}"#)
+        .send()
+        .await
+        .expect("proxy reachable");
+    assert_eq!(responses.status(), 401);
+    let body = responses.text().await.expect("body");
+    assert!(body.contains("rotated"), "{body}");
+
+    let control = client
+        .get(proxy.url("/llmux/keys"))
+        .header("x-api-key", &old)
+        .send()
+        .await
+        .expect("proxy reachable");
+    assert_eq!(control.status(), 401, "an old admin secret is not an admin");
+    let body = control.text().await.expect("body");
+    assert!(body.contains("rotated"), "{body}");
+
+    let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+        .await
+        .json()
+        .await
+        .expect("dashboard json");
+    let row = doc["client_keys"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|k| k["id"] == id.as_str()).cloned())
+        .unwrap_or_else(|| panic!("no key row for {id} in {doc}"));
+    assert_eq!(
+        row["retired_secret"]["requests"], 1,
+        "the control-plane attempt is counted, the refused OpenAI one is not: {row}"
+    );
+}
+
 /// #278: an Anthropic advisor sub-inference (`usage.iterations`, type
 /// `advisor_message`) is not in the top-level usage. It is booked under the
 /// advisor's own model on both relays (stream and JSON) without counting as

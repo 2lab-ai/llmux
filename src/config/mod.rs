@@ -12,8 +12,9 @@ pub use schema::{
     default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
     AccountLimits, AgyConfig, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner,
     GeminiConfig, GrokConfig, IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay,
-    RawIoConfig, RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert,
-    DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
+    RawIoConfig, RemoteConfig, RetiredDigest, RoutingConfig, SchedulerConfig, SchedulerMode,
+    TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT,
+    DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
@@ -410,6 +411,12 @@ pub const CLIENT_KEY_PREFIX: &str = "lmk-";
 /// (`ClientKey::retired_digests`); a rotation past this drops the oldest.
 pub const RETIRED_DIGESTS_MAX: usize = 8;
 
+/// How long after a rotation the old secret is still attributed to its key
+/// from loopback (7 days). Long enough for sessions started before the
+/// rotation to end; short enough that rotating a leaked secret soon stops it
+/// billing the owner.
+pub const RETIRED_SECRET_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// A freshly issued client-key secret plus the derived fields that get
 /// stored. The `secret` is shown to the caller exactly once and never
 /// persisted — only `prefix` + `digest` reach the config.
@@ -486,6 +493,49 @@ fn random_bytes_32() -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    /// A rotation retires the old digest, drops entries past the grace window
+    /// and keeps only the newest `RETIRED_DIGESTS_MAX`.
+    #[test]
+    fn retire_digest_bounds_the_list_by_age_and_count() {
+        let mut key = schema::ClientKey {
+            id: "k-1".into(),
+            name: "pc".into(),
+            email: None,
+            kind: schema::ClientKeyKind::Default,
+            key_prefix: "lmk-x".into(),
+            key_digest: "sha256:d0".into(),
+            retired_digests: Vec::new(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        };
+        key.retire_digest("sha256:d1".into(), 10);
+        assert_eq!(key.key_digest, "sha256:d1");
+        assert_eq!(
+            key.retired_digests,
+            vec![schema::RetiredDigest {
+                digest: "sha256:d0".into(),
+                retired_at_ms: 10
+            }]
+        );
+        // Past the grace window the first entry is dropped on the next rotation.
+        key.retire_digest("sha256:d2".into(), 10 + RETIRED_SECRET_GRACE_MS);
+        let digests: Vec<&str> = key
+            .retired_digests
+            .iter()
+            .map(|r| r.digest.as_str())
+            .collect();
+        assert_eq!(digests, vec!["sha256:d1"]);
+        for n in 3..20 {
+            key.retire_digest(format!("sha256:d{n}"), 20 + RETIRED_SECRET_GRACE_MS);
+        }
+        assert_eq!(key.retired_digests.len(), RETIRED_DIGESTS_MAX);
+        assert_eq!(
+            key.retired_digests.last().map(|r| r.digest.as_str()),
+            Some("sha256:d18")
+        );
+    }
+
     use super::*;
 
     /// Self-cleaning unique temp dir (no tempfile dev-dependency).

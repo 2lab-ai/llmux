@@ -23,7 +23,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `remove <name> [--yes]` | Remove an account by name. |
 | `key new --name L [--email E] [--admin]` | Issue a downstream client key (multi-tenant). The secret is printed once and never stored. |
 | `key list` | List issued client keys (id, name, email, kind, state, prefix). A key whose pre-rotation secret is still in use gets a second line saying how many requests sent it since the daemon started. |
-| `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id; the old secret is refused from other machines and still metered to the key from the daemon's own machine (see [Multi-tenant client keys](#multi-tenant-client-keys)). |
+| `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id; for 7 days the old secret is still metered to the key when a client on the daemon's own machine sends it to `/v1/messages`, and refused everywhere else (see [Multi-tenant client keys](#multi-tenant-client-keys)). |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
 In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes (after a confirmation card above the footer that names the account under the cursor — `↑↓` moves it, `1`/`y` removes, any other key cancels, `Enter` included), `R` reloads config, `d` toggles detail, `l` opens the logs tab, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `v` releases the mouse for the terminal's own selection ([Copy mode](#copy-mode)), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter → Gemini, and `V` (accounts overlay) switches between the table and the compact account list (see **Compact account list** under [Dashboard layout](#dashboard-layout-main)), and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. The context menu (right-click an accounts row on the dashboard) is titled with that account and opens on the row below the click — above it when there is no room below, so it never covers the row — with each item's switcher key: `switch now` (`⏎`), `pause`/`resume` (`p`), `set limit` (`L`) and `delete` (`r`, drawn destructive, behind the same confirmation card). `↑↓` move, `Enter` or a click runs the highlighted item, typing an item's key runs it, and any other key closes the menu. Items that cannot run are dim and skipped: `switch now` on a paused account (the scheduler refuses a paused target — resume it first), and every item once the account has left the pool. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
@@ -515,7 +515,7 @@ Stable is v0.2.27 (2026-11-21). Preview is rolling and carries whatever landed o
 | `llmux run --agy` / `llmux env --agy` and the Gemini API ingress (`/v1beta/models/…`), `agy.default_model`, Google-origin activity tint ([Running the Antigravity CLI](#running-the-antigravity-cli-through-llmux)) | no | no | yes | yes |
 | Save mode: hold accounts whose weekly reset is after a cutoff (`POST /llmux/save-mode`, `scheduler.save_until`, `save_mode` in `/llmux/status`) ([schedulers](schedulers.md#save-mode)) | no | no | yes | yes |
 | A `retry-after` 429 park lifts when the quota comes back (weekly reading falls 10+ points, or a reset is redeemed through llmux) ([Scheduling model](#scheduling-model)) | no | no | no | yes |
-| A rotated key's old secret stays metered to the key from the daemon's own machine and is refused with a "rotated" 401 from other machines; `retired_secret` on key rows, `이전 키 사용 중` on the web 사용자 tab ([Multi-tenant client keys](#multi-tenant-client-keys)) | no | no | no | yes |
+| A rotated key's old secret stays metered to the key for 7 days when a client on the daemon's machine sends it to `/v1/messages`, and gets a "rotated" 401 everywhere else; `retired_secret` on key rows, `이전 키 사용 중` on the web 사용자 tab ([Multi-tenant client keys](#multi-tenant-client-keys)) | no | no | no | yes |
 
 Note on 0.2.24 local control (an older stable, before the columns above): the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
@@ -649,18 +649,22 @@ usage is recorded per tenant (name + email) instead of one anonymous pool.
   metered as the `local` tenant; keyless remote is refused.
 - `suspend`/`remove`/`rotate` bite on the next request without a restart
   (the daemon keeps a live key registry; disk and memory update together).
-- After `rotate`, the old secret is refused from any other machine (401
-  `Invalid proxy API key: this client key was rotated — use the new key`).
-  From the daemon's own machine — where a request with no key is served
-  anyway — it is still metered to the same key instead of to `local`, so a
-  local client that still holds the old secret (a session started before the
-  rotation, a second process with its own copy) does not drop out of that
-  person's history. The key's last 8 old secrets are remembered (as digests,
-  in `client_keys[].retired_digests`). Such requests never carry admin scope.
+- After `rotate`, a client on the daemon's own machine that still sends the
+  old secret to the Anthropic endpoint (`/v1/messages`) keeps being metered
+  to the same key for 7 days, instead of to `local` — a request with no key
+  is served there anyway, so this grants no access; it keeps a session
+  started before the rotation, or a second process with its own copy of the
+  secret, in that person's history. Everywhere else the old secret gets 401
+  `Invalid proxy API key: this client key was rotated — use the new key`:
+  from any other machine, on the OpenAI and Gemini endpoints (which refuse
+  any unknown key, even locally), and on the `/llmux/*` control plane (an old
+  admin secret never keeps admin scope). After 7 days the old secret is an
+  unknown key again. The config keeps the digests of a key's last 8 old
+  secrets with their rotation time (`client_keys[].retired_digests`).
   `llmux key list`, `GET /llmux/keys` and the dashboard document
   (`client_keys[].retired_secret` = `{requests, last_ms}`, counted since the
-  daemon started) report them, and the daemon logs a warning on the first one;
-  give that client the new key.
+  daemon started) report requests that sent an old secret, and the daemon
+  logs a warning on the first one; give that client the new key.
   The last active admin credential can never be suspended or revoked —
   recovery from a lost admin key is editing the config on the server host.
 - HTTP surface (admin): `GET /llmux/keys`, `POST /llmux/keys/new`,

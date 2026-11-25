@@ -943,7 +943,7 @@ impl AppState {
     /// Rotate an issued key: a NEW secret under the SAME attribution id, so
     /// usage continuity is a property of the API, not a promise. The old
     /// secret's digest moves to `retired_digests`: refused from remote peers,
-    /// still attributed to this key from loopback (see
+    /// still attributed to this key from loopback for a grace window (see
     /// [`crate::proxy::keys::KeyRegistry::resolve`]). Returns the updated row
     /// plus the new plaintext (shown once).
     pub fn rotate_client_key(
@@ -961,13 +961,7 @@ impl AppState {
                 .position(|k| k.id == id && k.revoked_at_ms.is_none())
                 .ok_or(KeyAdminError::NotFound)?;
             let key = &mut c.client_keys[i];
-            let old = std::mem::replace(&mut key.key_digest, digest);
-            key.retired_digests.push(old);
-            let excess = key
-                .retired_digests
-                .len()
-                .saturating_sub(crate::config::RETIRED_DIGESTS_MAX);
-            key.retired_digests.drain(..excess);
+            key.retire_digest(digest, now_epoch_ms());
             key.key_prefix = prefix;
             Ok(key.clone())
         })?;
@@ -2214,12 +2208,7 @@ async fn client_auth(
         .resolve(presented, loopback && (!openai || presented.is_none()))
     {
         Resolution::Allowed(tenant) => {
-            if is_control_plane(req.uri().path()) && !tenant.admin {
-                return auth_error(
-                    StatusCode::FORBIDDEN,
-                    "admin credential required for llmux control endpoints",
-                );
-            }
+            let control = is_control_plane(req.uri().path());
             if tenant.retired_secret {
                 let tally = state.keys.note_retired_use(&tenant.id, now_epoch_ms());
                 if tally.requests == 1 {
@@ -2227,22 +2216,35 @@ async fn client_auth(
                         id = %tenant.id,
                         name = %tenant.name,
                         "a local client still presents this key's pre-rotation secret; \
-                         metered to the key — give that client the new secret"
+                         give that client the new secret"
                     );
                 }
+                // A retired secret never reaches the control plane; say why
+                // instead of the generic "admin credential required".
+                if control {
+                    return refuse(StatusCode::UNAUTHORIZED, RETIRED_KEY_MESSAGE);
+                }
+            }
+            if control && !tenant.admin {
+                return auth_error(
+                    StatusCode::FORBIDDEN,
+                    "admin credential required for llmux control endpoints",
+                );
             }
             req.extensions_mut().insert(tenant);
             next.run(req).await
         }
         Resolution::Suspended => refuse(StatusCode::UNAUTHORIZED, "client key suspended"),
         Resolution::Revoked => refuse(StatusCode::UNAUTHORIZED, "client key revoked"),
-        Resolution::Retired => refuse(
-            StatusCode::UNAUTHORIZED,
-            "Invalid proxy API key: this client key was rotated — use the new key",
-        ),
+        Resolution::Retired => refuse(StatusCode::UNAUTHORIZED, RETIRED_KEY_MESSAGE),
         Resolution::Denied => refuse(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
     }
 }
+
+/// The 401 a rotated-out client key gets wherever it is refused. Starts with
+/// the generic message clients already match on.
+const RETIRED_KEY_MESSAGE: &str =
+    "Invalid proxy API key: this client key was rotated — use the new key";
 
 /// Explicit malformed or conflicting credentials never become a keyless request.
 /// `google` also reads `x-goog-api-key` (the Gemini API's key header); every
@@ -5922,10 +5924,12 @@ mod tests {
         assert_eq!(state.keys.resolve(Some(&old), false), Resolution::Retired);
         // The retired digest is persisted, so a restart still knows it.
         let reloaded = crate::config::load_path(&path).expect("reload");
-        assert_eq!(
-            reloaded.client_keys[0].retired_digests,
-            vec![crate::config::client_key_digest(&old)]
-        );
+        let retired: Vec<&str> = reloaded.client_keys[0]
+            .retired_digests
+            .iter()
+            .map(|r| r.digest.as_str())
+            .collect();
+        assert_eq!(retired, vec![crate::config::client_key_digest(&old)]);
         let fresh = crate::proxy::keys::KeyRegistry::from_config(&reloaded);
         assert!(matches!(
             fresh.resolve(Some(&old), true),
@@ -5989,7 +5993,7 @@ mod tests {
         let docs = doc.client_keys;
         assert_eq!(
             docs[0].retired_secret,
-            Some(crate::dashboard::RetiredSecretDoc {
+            Some(crate::proxy::keys::RetiredUse {
                 requests: 2,
                 last_ms: 2_000
             })
