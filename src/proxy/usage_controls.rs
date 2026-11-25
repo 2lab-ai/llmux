@@ -1671,19 +1671,24 @@ impl AppState {
             // the weekly gauge does not show. Lift it here rather than leave it
             // to the follow-up read. `already_redeemed` answers a retry: its
             // reset happened during the FIRST attempt, so only parks older
-            // than that attempt's receipt are explained by it; a park set
-            // since then stays. (If the follow-up read fails, a stale weekly
-            // gauge still gates the account until the next read lands.)
+            // than that attempt's held receipt are explained by it (the
+            // receipt's millisecond stamp is rounded UP so a park set just
+            // before it still counts); a park set since then stays. A replay
+            // with no held receipt carries no reset time at all, so it lifts
+            // nothing. (If the follow-up read fails, a stale weekly gauge
+            // still gates the account until the next read lands.)
             let reset_started_at = match (result.outcome, &pending) {
-                (codex_usage::ResetOutcome::AlreadyRedeemed, Some(receipt)) => {
-                    UNIX_EPOCH + std::time::Duration::from_millis(receipt.started_at_ms)
-                }
-                _ => sent_at,
+                (codex_usage::ResetOutcome::AlreadyRedeemed, Some(receipt)) => Some(
+                    UNIX_EPOCH
+                        + std::time::Duration::from_millis(receipt.started_at_ms.saturating_add(1)),
+                ),
+                (codex_usage::ResetOutcome::AlreadyRedeemed, None) => None,
+                _ => Some(sent_at),
             };
-            if self
-                .pool
-                .clear_cooldown_if(&target.id, &target.fingerprint, reset_started_at)
-            {
+            if reset_started_at.is_some_and(|reset_started_at| {
+                self.pool
+                    .clear_cooldown_if(&target.id, &target.fingerprint, reset_started_at)
+            }) {
                 tracing::info!(
                     account = %target.id,
                     "reset redeemed; lifting the account's 429 park"

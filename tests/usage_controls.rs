@@ -2347,17 +2347,7 @@ async fn reset_outside_llmux_lifts_the_weekly_park_on_the_next_read() {
 async fn redeemed_reset_lifts_the_park_even_without_a_weekly_fall() {
     let mock = WhamMock::spawn().await;
     let proxy = Proxy::spawn(&mock, vec![codex_account("cx")]).await;
-    proxy.pool.record_usage(
-        &AccountId("cx".into()),
-        &UsageSnapshot {
-            seven_day: Some(WindowReading {
-                utilization: 0.20,
-                resets_at: SystemTime::now() + Duration::from_secs(3 * 86_400),
-            }),
-            scoped: Vec::new(),
-        },
-        SystemTime::now(),
-    );
+    seed_twenty_percent(&proxy.pool, "cx");
     park_like_a_weekly_429(&proxy.pool, "cx");
     assert!(parked(&dashboard_account(&proxy, "cx").await));
     mock.push_usage(500, "upstream on fire");
@@ -2383,14 +2373,11 @@ async fn redeemed_reset_lifts_the_park_even_without_a_weekly_fall() {
     );
 }
 
-/// A redemption that spent nothing (`nothing_to_reset`) is no evidence: the
-/// park stays.
-#[tokio::test]
-async fn unspent_redemption_leaves_the_park() {
-    let mock = WhamMock::spawn().await;
-    let proxy = Proxy::spawn(&mock, vec![codex_account("cx")]).await;
-    proxy.pool.record_usage(
-        &AccountId("cx".into()),
+/// Seed `name` with a weekly reading of 20% used (no fall can follow from it
+/// once the follow-up read is failed).
+fn seed_twenty_percent(pool: &AccountPool, name: &str) {
+    pool.record_usage(
+        &AccountId(name.to_string()),
         &UsageSnapshot {
             seven_day: Some(WindowReading {
                 utilization: 0.20,
@@ -2400,6 +2387,76 @@ async fn unspent_redemption_leaves_the_park() {
         },
         SystemTime::now(),
     );
+}
+
+async fn consume(proxy: &Proxy, account: &str, request_id: &str) -> (u16, serde_json::Value) {
+    post_admin(
+        proxy,
+        "/llmux/reset-credits/consume",
+        serde_json::json!({"account": account, "redeem_request_id": request_id, "confirm": true}),
+    )
+    .await
+}
+
+/// `already_redeemed` answers a retry of an uncertain redemption, so its reset
+/// happened during the FIRST attempt: a park older than that attempt lifts, a
+/// park set after it stays — and a replay with no held receipt (the id was
+/// already resolved) carries no reset time and lifts nothing. Every follow-up
+/// usage read fails here, so only the redemption path can act.
+#[tokio::test]
+async fn already_redeemed_lifts_only_parks_older_than_the_first_attempt() {
+    let mock = WhamMock::spawn().await;
+    let proxy = Proxy::spawn(&mock, vec![codex_account("cx"), codex_account("cy")]).await;
+
+    // cx: parked BEFORE the first (uncertain) attempt -> the retry lifts it.
+    seed_twenty_percent(&proxy.pool, "cx");
+    park_like_a_weekly_429(&proxy.pool, "cx");
+    mock.push_consume(200, r#"{"code":"teleported"}"#);
+    let (status, body) = consume(&proxy, "cx", "rid-old").await;
+    assert_eq!(status, 502, "first attempt is uncertain: {body}");
+    mock.push_consume(200, r#"{"code":"already_redeemed","windows_reset":2}"#);
+    mock.push_usage(500, "upstream on fire");
+    let (status, body) = consume(&proxy, "cx", "rid-old").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "already_redeemed", "{body}");
+    let cx = dashboard_account(&proxy, "cx").await;
+    assert!(!parked(&cx), "a park older than the reset lifts: {cx}");
+
+    // cy: parked AFTER the first attempt -> the retry leaves it.
+    seed_twenty_percent(&proxy.pool, "cy");
+    mock.push_consume(200, r#"{"code":"teleported"}"#);
+    let (status, body) = consume(&proxy, "cy", "rid-new").await;
+    assert_eq!(status, 502, "first attempt is uncertain: {body}");
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    park_like_a_weekly_429(&proxy.pool, "cy");
+    mock.push_consume(200, r#"{"code":"already_redeemed","windows_reset":2}"#);
+    mock.push_usage(500, "upstream on fire");
+    let (status, body) = consume(&proxy, "cy", "rid-new").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "already_redeemed", "{body}");
+    let cy = dashboard_account(&proxy, "cy").await;
+    assert!(parked(&cy), "a park set after the reset stays: {cy}");
+
+    // The id is resolved now (no held receipt): replaying it lifts nothing.
+    mock.push_consume(200, r#"{"code":"already_redeemed","windows_reset":0}"#);
+    mock.push_usage(500, "upstream on fire");
+    let (status, body) = consume(&proxy, "cy", "rid-new").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "already_redeemed", "{body}");
+    let cy = dashboard_account(&proxy, "cy").await;
+    assert!(
+        parked(&cy),
+        "a receipt-less replay carries no reset time: {cy}"
+    );
+}
+
+/// A redemption that spent nothing (`nothing_to_reset`) is no evidence: the
+/// park stays.
+#[tokio::test]
+async fn unspent_redemption_leaves_the_park() {
+    let mock = WhamMock::spawn().await;
+    let proxy = Proxy::spawn(&mock, vec![codex_account("cx")]).await;
+    seed_twenty_percent(&proxy.pool, "cx");
     park_like_a_weekly_429(&proxy.pool, "cx");
     mock.push_consume(200, r#"{"code":"nothing_to_reset"}"#);
 
