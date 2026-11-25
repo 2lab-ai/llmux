@@ -1561,6 +1561,9 @@ impl AppState {
         // and the retry path: never spend a credit with a credential the pool
         // has already replaced.
         self.still_current(&target)?;
+        // The reset this call may perform lands no earlier than now: a 429
+        // park set after this instant is not explained by it.
+        let sent_at = SystemTime::now();
         let result = match &target.credential {
             AccountCredential::Codex {
                 access_token,
@@ -1663,6 +1666,34 @@ impl AppState {
         // a SUCCESSFUL redemption — never a retryable redemption failure, and
         // never silence.
         if result.outcome.spent() {
+            // The provider reset this account's limits, so a 429 park set
+            // before that reset was for quota that is back — including limits
+            // the weekly gauge does not show. Lift it here rather than leave it
+            // to the follow-up read. `already_redeemed` answers a retry: its
+            // reset happened during the FIRST attempt, so only parks older
+            // than that attempt's held receipt are explained by it (the
+            // receipt's millisecond stamp is rounded UP so a park set just
+            // before it still counts); a park set since then stays. A replay
+            // with no held receipt carries no reset time at all, so it lifts
+            // nothing. (If the follow-up read fails, a stale weekly gauge
+            // still gates the account until the next read lands.)
+            let reset_started_at = match (result.outcome, &pending) {
+                (codex_usage::ResetOutcome::AlreadyRedeemed, Some(receipt)) => Some(
+                    UNIX_EPOCH
+                        + std::time::Duration::from_millis(receipt.started_at_ms.saturating_add(1)),
+                ),
+                (codex_usage::ResetOutcome::AlreadyRedeemed, None) => None,
+                _ => Some(sent_at),
+            };
+            if reset_started_at.is_some_and(|reset_started_at| {
+                self.pool
+                    .clear_cooldown_if(&target.id, &target.fingerprint, reset_started_at)
+            }) {
+                tracing::info!(
+                    account = %target.id,
+                    "reset redeemed; lifting the account's 429 park"
+                );
+            }
             let provider = provider_of(&target.credential).unwrap_or("codex");
             let usage = self.read_usage(&target).await;
             let applied = self.commit_refresh(account, provider, &target, usage).await;

@@ -132,7 +132,9 @@ Selection algorithm (pure over a snapshot; re-evaluated on ineligibility and a 6
    overflow pool.
 5. On 429: honor `retry-after`; persistent failure → cooldown + switch.
 6. All accounts exhausted → respond 429 with the soonest reset as `retry-after`.
-7. Cooldowns self-heal when fresh usage data shows capacity.
+7. Cooldowns self-heal: a retry-after-less park when fresh usage data shows capacity; a
+   `retry-after` park when fresh usage data shows the quota was replenished (the weekly reading
+   fell at least 10 points and has room) or a reset was redeemed through llmux.
 8. Never switch accounts mid-stream; in-flight requests pin their account.
 
 ### FR4 — Providers
