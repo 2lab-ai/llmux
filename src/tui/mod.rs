@@ -9328,6 +9328,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         }];
         let doc = crate::key_usage::KeysUsageDoc {
             window: "all".into(),

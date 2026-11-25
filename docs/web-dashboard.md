@@ -73,6 +73,10 @@ sessions.
 - It also shows what the person has running or waiting now, where today's sessions ran, and an estimated
   24-hour spend curve.
 - Open a row to see that person's live and recent sessions, models and the accounts they used.
+- `이전 키 사용 중` on a row means a client on the daemon's machine still sends the secret the key had before its
+  last rotation. Those requests are already counted in this row; hover (or open the row) for how many and when the
+  last one came, then give that client the new key. It clears when the daemon stops reporting it (it counts since the
+  daemon started).
 - `키 없음 · 이 머신` is traffic sent from the daemon's own machine without a key: local consoles and soma-work's own
   automation.
 

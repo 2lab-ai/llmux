@@ -1415,6 +1415,28 @@ pub struct KeyRowDoc {
     pub created_at_ms: u64,
     #[serde(default)]
     pub revoked_at_ms: Option<u64>,
+    /// Requests that presented this key's pre-rotation secret since the daemon
+    /// started — a client that still holds the old secret. Loopback only (a
+    /// remote one is refused); metered to this key. Additive: absent when
+    /// none, and in docs from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_secret: Option<RetiredSecretDoc>,
+}
+
+/// See [`KeyRowDoc::retired_secret`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredSecretDoc {
+    pub requests: u64,
+    pub last_ms: u64,
+}
+
+impl From<crate::proxy::keys::RetiredUse> for RetiredSecretDoc {
+    fn from(u: crate::proxy::keys::RetiredUse) -> Self {
+        Self {
+            requests: u.requests,
+            last_ms: u.last_ms,
+        }
+    }
 }
 
 /// One trailing-window slice of the per-account/per-model heatmap (issue #23):
@@ -2416,6 +2438,7 @@ pub fn key_row_docs(state: &AppState) -> Vec<KeyRowDoc> {
             suspended: k.suspended,
             created_at_ms: k.created_at_ms,
             revoked_at_ms: k.revoked_at_ms,
+            retired_secret: state.keys.retired_use(&k.id).map(Into::into),
         })
         .collect()
 }
@@ -2951,6 +2974,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         });
         let pool = AccountPool::new(&[oauth_account("a")]);
         let doc = dashboard_doc(
@@ -3042,6 +3066,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         });
         let pool = AccountPool::new(&[oauth_account("a")]);
         let doc = dashboard_doc(
@@ -3110,6 +3135,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         });
         let pool = AccountPool::new(&[oauth_account("a")]);
         let doc = dashboard_doc(

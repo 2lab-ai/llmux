@@ -406,6 +406,10 @@ pub fn generate_api_key() -> String {
 /// `proxy::logging::mask_credentials`.
 pub const CLIENT_KEY_PREFIX: &str = "lmk-";
 
+/// How many pre-rotation secret digests a client key remembers
+/// (`ClientKey::retired_digests`); a rotation past this drops the oldest.
+pub const RETIRED_DIGESTS_MAX: usize = 8;
+
 /// A freshly issued client-key secret plus the derived fields that get
 /// stored. The `secret` is shown to the caller exactly once and never
 /// persisted — only `prefix` + `digest` reach the config.
@@ -1089,6 +1093,7 @@ mod tests {
             kind: schema::ClientKeyKind::Admin,
             key_prefix: "lmk-x".into(),
             key_digest: "sha256:00".into(),
+            retired_digests: Vec::new(),
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,

@@ -245,6 +245,18 @@ test('sessions are owned by the key that sent their requests; side calls fold', 
   assert.deepEqual(auxBy, { local: 1 });
 });
 
+test('a key whose pre-rotation secret is still in use says so on the users view, and clears', () => {
+  const ix = new SessionIndex();
+  const key = { id: 'k-1', name: 'alex (U000TEST01)', email: 'c@x' };
+  ix.ingest({ client_keys: [{ ...key, retired_secret: { requests: 3, last_ms: 1000 } }], usage_stats: [], model_usage: [] });
+  const ku = { tenants: [{ tenant: 'k-1', requests: 5, cost_usd: 1 }] };
+  const user = (v) => v.find(u => u.tenant === 'k-1');
+  assert.deepEqual(user(ix.usersView(ku, [])).retired, { requests: 3, last_ms: 1000 });
+  assert.equal(user(ix.usersView(ku, [])).usage.requests, 5, 'usage still from the daemon');
+  ix.ingest({ client_keys: [key], usage_stats: [], model_usage: [] });
+  assert.equal(user(ix.usersView(ku, [])).retired, null, 'cleared when the daemon stops reporting it');
+});
+
 test('tool inputs kept for the Claude Code screen are clipped and never the whole payload', async () => {
   const { slimInput } = await import('../lib/transcript.mjs');
   const big = 'x'.repeat(10000);

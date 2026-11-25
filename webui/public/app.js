@@ -698,7 +698,7 @@ function paintUsers() {
     const origins = Object.entries(u.origins || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
     return `<button type="button" class="urow${st.selUser === u.tenant ? ' on' : ''}" data-tenant="${E(u.tenant)}">
       <span class="ui-avatar av" data-hue="${u.hue == null ? 7 : u.hue}">${E((u.short || '?').slice(0, 1).toUpperCase())}</span>
-      <span class="u-id"><strong>${E(u.short)}</strong><small>${E(u.email || (u.system ? '이 머신에서 키 없이 보낸 요청 (콘솔·soma-work 자동 작업)' : u.tenant))}${u.suspended ? ' · <b class="bad">정지됨</b>' : ''}</small></span>
+      <span class="u-id"><strong>${E(u.short)}</strong><small>${E(u.email || (u.system ? '이 머신에서 키 없이 보낸 요청 (콘솔·soma-work 자동 작업)' : u.tenant))}${u.suspended ? ' · <b class="bad">정지됨</b>' : ''}${u.retired ? ` · <b class="warn" title="${E(retiredText(u.retired))}">이전 키 사용 중</b>` : ''}</small></span>
       <span class="u-live">${u.live.running ? `<span class="ui-status is-pill" data-tone="run">실행 ${u.live.running}</span>` : ''}${u.live.waiting + u.live.stalled ? `<span class="ui-status is-pill" data-tone="wait">대기 ${u.live.waiting + u.live.stalled}</span>` : ''}${u.live.flagged ? `<span class="ui-status is-pill" data-tone="fail">주의 ${u.live.flagged}</span>` : ''}<small>${E(origins || '오늘 세션 없음')}</small></span>
       <span class="u-num"><b>${usd(us.cost_usd)}</b><i class="bar"><i style="width:${Math.round(100 * (us.cost_usd || 0) / max)}%"></i></i></span>
       <span class="u-num"><b>${X.n(us.requests)}</b><small>요청${us.errors ? ` · <span class="bad">오류 ${us.errors}</span>` : ''}</small></span>
@@ -712,6 +712,11 @@ function paintUsers() {
 }
 $('u-stats').addEventListener('ui-period', (e) => { st.window = e.detail.value; loadUsers(); });
 $('u-list').addEventListener('click', (e) => { const b = e.target.closest('[data-tenant]'); if (b) openUser(b.dataset.tenant); });
+
+// A client of this user still sends the secret the key had before its last rotation.
+function retiredText(r) {
+  return `로테이션 전 키로 들어온 요청 ${X.n(r.requests)}건 (마지막 ${ago(r.last_ms)}, 데몬 시작 이후). 이 사용자 기록에 포함됐습니다 — 그 클라이언트에 새 키를 넣으세요.`;
+}
 
 function openUser(tenant) {
   st.selUser = tenant; st.sel = null; st.detail = null;
@@ -731,6 +736,7 @@ function paintUserDetail() {
   const srow = (c) => `<button type="button" class="srow" data-open="${c.sid}"><span class="ui-status is-pill" data-tone="${c.status === 'running' ? 'run' : c.status === 'waiting' || c.status === 'stalled' ? 'wait' : 'done'}">${{ running: '실행 중', waiting: '입력 대기', stalled: '도구 대기', idle: '쉬는 중', past: '지난' }[c.status]}</span><span class="s-t"><strong>${E(c.title)}</strong><small>${E(placeText(c))}${c.project ? ' · ' + E(c.project) : ''} · ${ago(c.last_ms)} · ${usd(c.costEst)}${(c.flags || []).length ? ` · <b class="warn">${E(c.flags.map(f => f.text).join(' · '))}</b>` : ''}</small></span></button>`;
   $('ubody').innerHTML = `<ui-stat-strip id="ud-stats" lang="ko"></ui-stat-strip>
     <ui-bar-chart id="ud-chart" lang="ko"></ui-bar-chart>
+    ${u.retired ? `<p class="hint warn">${E(retiredText(u.retired))}</p>` : ''}
     <h4 class="ui-section-head">지금 <span class="ui-count">${active.length}</span></h4><div class="slist">${active.map(srow).join('') || '<div class="ui-empty">진행 중인 세션이 없습니다</div>'}</div>
     <h4 class="ui-section-head">최근 세션</h4><div class="slist">${recent.map(srow).join('') || '<div class="ui-empty">최근 세션이 없습니다</div>'}</div>
     <div class="ov-grid2">

@@ -75,6 +75,17 @@ pub async fn run(args: KeyArgs, remote: Option<String>) -> Result<(), CliError> 
                     state,
                     field(key, "key_prefix"),
                 );
+                if let Some(requests) = key
+                    .get("retired_secret")
+                    .and_then(|r| r.get("requests"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    println!(
+                        "      a local client still sends the pre-rotation secret \
+                         ({requests} requests since the daemon started, metered to this key) \
+                         — give it the new key"
+                    );
+                }
             }
             Ok(())
         }

@@ -331,6 +331,14 @@ pub struct ClientKey {
     /// `sha256:<hex>` of the full issued secret; the auth gate compares
     /// digests, never plaintext.
     pub key_digest: String,
+    /// Digests of the secrets this key carried before each rotation, oldest
+    /// first, at most [`crate::config::RETIRED_DIGESTS_MAX`]. A retired secret
+    /// never authenticates from a remote peer. From loopback, where a keyless
+    /// request is allowed anyway, it is attributed to this key, so a client
+    /// still holding the old secret keeps metering as its owner instead of
+    /// vanishing into `local`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_digests: Vec<String>,
     /// Operator pause: a suspended key authenticates to 401 until resumed.
     #[serde(default)]
     pub suspended: bool,
