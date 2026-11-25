@@ -1663,6 +1663,16 @@ impl AppState {
         // a SUCCESSFUL redemption — never a retryable redemption failure, and
         // never silence.
         if result.outcome.spent() {
+            // The provider just reset this account's limits, so any 429 park
+            // it carries was for quota that is back. Lift it BEFORE the
+            // follow-up read: a failed read must not leave the account benched,
+            // and the reset also clears limits the weekly gauge does not show.
+            if self.pool.clear_cooldown_if(&target.id, &target.fingerprint) {
+                tracing::info!(
+                    account = %target.id,
+                    "reset redeemed; lifting the account's 429 park"
+                );
+            }
             let provider = provider_of(&target.credential).unwrap_or("codex");
             let usage = self.read_usage(&target).await;
             let applied = self.commit_refresh(account, provider, &target, usage).await;

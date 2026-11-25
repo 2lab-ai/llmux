@@ -52,6 +52,14 @@ pub const DEFAULT_HEURISTIC_COOLDOWN: Duration = Duration::from_secs(8);
 /// bar the W0 design fixed for Fable avoidance.
 pub const CRITICAL_UTILIZATION: f64 = 0.95;
 
+/// Smallest fall in the weekly utilization, from one reading to the next, that
+/// counts as quota handed back — a limit reset on the provider's site, bought
+/// usage, a redeemed reset credit. Inside one window the utilization only
+/// climbs, so a fall this large is a replenishment, not the rounding gap
+/// between the header and usage-poll scales. It is what lets a `retry-after`
+/// 429 park lift before its time (`AccountState::maybe_self_heal`).
+pub const REPLENISH_MIN_DROP: f64 = 0.10;
+
 /// Stable account identifier — the config `name`. Newtype so ids don't get
 /// mixed up with credentials or display strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -280,26 +288,60 @@ impl AccountState {
         true
     }
 
-    /// Cooldown self-healing: fresh data (strictly newer than the cooldown)
-    /// showing capacity (a weekly window under 100%) clears a `Heuristic`
-    /// cooldown. `RetryAfter` parks are explicit upstream instructions and
-    /// are never cleared early.
-    fn maybe_self_heal(&mut self, now: SystemTime) {
-        if self.cooldown_source != Some(CooldownSource::Heuristic) {
+    /// Cooldown self-healing on fresh data (strictly newer than the
+    /// cooldown). A `Heuristic` park clears when the weekly window shows
+    /// capacity (under 100%). A `RetryAfter` park is an explicit upstream
+    /// instruction, so capacity alone never clears it — the park may be for a
+    /// limit the weekly gauge does not show. It clears only when the quota was
+    /// REPLENISHED ([`Self::quota_replenished`]): a reset or bought usage took
+    /// away the reason for the park. `prior` is the weekly reading this fresh
+    /// one replaced.
+    fn maybe_self_heal(&mut self, prior: Option<QuotaWindow>, now: SystemTime) {
+        let Some(source) = self.cooldown_source else {
             return;
-        }
+        };
         let newer_than_cooldown = self.cooldown_set_at.is_none_or(|set_at| now > set_at);
         if !newer_than_cooldown {
             return;
         }
-        let shows_capacity = self
-            .seven_day
-            .is_some_and(|w| w.effective_utilization(now) < 1.0);
-        if shows_capacity {
-            self.cooldown_until = None;
-            self.cooldown_source = None;
-            self.cooldown_set_at = None;
+        let heals = match source {
+            CooldownSource::Heuristic => self
+                .seven_day
+                .is_some_and(|w| w.effective_utilization(now) < 1.0),
+            CooldownSource::RetryAfter => self.quota_replenished(prior, now),
+        };
+        if heals {
+            if source == CooldownSource::RetryAfter {
+                tracing::info!(
+                    account = %self.id,
+                    before = prior.map(|w| w.effective_utilization(now)),
+                    after = self.seven_day.map(|w| w.effective_utilization(now)),
+                    "weekly quota replenished; lifting the retry-after 429 park"
+                );
+            }
+            self.clear_cooldown();
         }
+    }
+
+    /// Whether the weekly window just got quota back: the current reading sits
+    /// at least [`REPLENISH_MIN_DROP`] below `prior` and under 100%. Both read
+    /// reset-aware, so a prior window that already expired reads 0% and never
+    /// counts as a fall. The 1e-9 slack keeps an exact minimum fall (1.0 → 0.9)
+    /// from being lost to float steps.
+    fn quota_replenished(&self, prior: Option<QuotaWindow>, now: SystemTime) -> bool {
+        let (Some(prior), Some(fresh)) = (prior, self.seven_day) else {
+            return false;
+        };
+        let before = prior.effective_utilization(now);
+        let after = fresh.effective_utilization(now);
+        after < 1.0 && before - after >= REPLENISH_MIN_DROP - 1e-9
+    }
+
+    /// Drop the account-wide park, whatever its source.
+    fn clear_cooldown(&mut self) {
+        self.cooldown_until = None;
+        self.cooldown_source = None;
+        self.cooldown_set_at = None;
     }
 
     /// Set (or refresh, keyed by scope label) one model-scoped cooldown
@@ -529,6 +571,7 @@ impl PoolState {
         let Some(acct) = self.account_mut(account) else {
             return;
         };
+        let prior = acct.seven_day;
         let mut recorded = false;
         if let Some(reading) = parsed.seven_day {
             recorded |= AccountState::merge_window(
@@ -565,19 +608,21 @@ impl PoolState {
             );
         }
         if recorded {
-            acct.maybe_self_heal(now);
+            acct.maybe_self_heal(prior, now);
         }
     }
 
     /// Record a `/api/oauth/usage` poll result. Same freshness merge as
-    /// headers; fresh data showing capacity clears `Heuristic` cooldowns.
-    /// Scoped (`limits[]`) readings merge into the account's scoped list but
-    /// deliberately do NOT feed the self-heal gate: cooldown behavior stays
-    /// keyed to the account-wide windows only (scope-aware cooldown is W2).
+    /// headers; fresh data showing capacity clears `Heuristic` cooldowns, and
+    /// a weekly reading that fell (replenished quota) clears a `RetryAfter`
+    /// park too. Scoped (`limits[]`) readings merge into the account's scoped
+    /// list but deliberately do NOT feed the self-heal gate: cooldown behavior
+    /// stays keyed to the account-wide windows only (scope-aware cooldown is W2).
     pub fn record_usage(&mut self, account: &AccountId, usage: &UsageSnapshot, now: SystemTime) {
         let Some(acct) = self.account_mut(account) else {
             return;
         };
+        let prior = acct.seven_day;
         let mut recorded = false;
         if let Some(reading) = usage.seven_day {
             recorded |= AccountState::merge_window(
@@ -596,7 +641,7 @@ impl PoolState {
             );
         }
         if recorded {
-            acct.maybe_self_heal(now);
+            acct.maybe_self_heal(prior, now);
         }
     }
 
@@ -1426,6 +1471,26 @@ impl AccountPool {
         true
     }
 
+    /// Lift `account`'s account-wide 429 park, whatever its source: the caller
+    /// holds proof the limits behind it were reset (a reset redeemed through
+    /// llmux), which also covers a park the weekly gauge cannot explain.
+    /// Gated on the fingerprint the caller captured before its IO, checked
+    /// under the same write lock as [`Self::record_usage_if`], so a credential
+    /// replaced in flight keeps its own park. Returns whether a park was
+    /// lifted.
+    pub fn clear_cooldown_if(&self, account: &AccountId, expected: &AccountFingerprint) -> bool {
+        let mut state = self.write();
+        if !state.matches_fingerprint(account, expected) {
+            return false;
+        }
+        let Some(acct) = state.account_mut(account) else {
+            return false;
+        };
+        let parked = acct.cooldown_until.is_some();
+        acct.clear_cooldown();
+        parked
+    }
+
     /// See [`PoolState::reset_usage`] — the `POST /llmux/reset-usage`
     /// operator command (issue #115).
     pub fn reset_usage(&self) -> usize {
@@ -2220,7 +2285,11 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_park_is_never_healed_by_data() {
+    fn retry_after_park_is_not_healed_by_capacity_alone() {
+        // A cold account (no earlier reading) gets a retry-after park, then a
+        // poll shows room. Room alone is no proof the quota came back — the
+        // park may be for a limit the weekly gauge does not show — so the
+        // explicit park runs its course.
         let mut state = PoolState::from_accounts(&[oauth_account("a")]);
         state.record_429(&id("a"), Some(Duration::from_secs(600)), now());
         state.record_usage(
@@ -2230,8 +2299,162 @@ mod tests {
         );
         assert!(
             state.accounts[0].cooldown_until.is_some(),
-            "explicit retry-after park must run its full course"
+            "no earlier reading, no replenishment: the park stands"
         );
+    }
+
+    /// The weekly-exhaustion park the owner hit (2026-11-25): the account
+    /// reads 100% used, Anthropic 429s with `retry-after` = the time to the
+    /// weekly reset (~1d6h), then the operator resets the limit (or buys
+    /// usage) and the next poll reads 0% used. The park must go with it.
+    #[test]
+    fn retry_after_park_clears_when_the_weekly_quota_is_replenished() {
+        let resets = NOW_SECS + 30 * 3600;
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        state.record_usage(&id("a"), &usage(Some(reading(1.0, resets))), now());
+        state.record_429(
+            &id("a"),
+            Some(Duration::from_secs(30 * 3600)),
+            at(NOW_SECS + 1),
+        );
+        // Still exhausted on the next poll: the park holds.
+        state.record_usage(
+            &id("a"),
+            &usage(Some(reading(1.0, resets))),
+            at(NOW_SECS + 60),
+        );
+        assert!(state.accounts[0].cooldown_until.is_some(), "still spent");
+        // The reset / purchase lands: 100% used -> 0% used.
+        state.record_usage(
+            &id("a"),
+            &usage(Some(reading(0.0, resets))),
+            at(NOW_SECS + 120),
+        );
+        let acct = &state.accounts[0];
+        assert!(
+            acct.cooldown_until.is_none(),
+            "quota came back: the retry-after park is cleared"
+        );
+        assert!(acct.cooldown_source.is_none());
+        assert!(acct.cooldown_set_at.is_none());
+    }
+
+    /// Same replenishment seen through response headers instead of a usage
+    /// poll, on a reset that also opens a NEW weekly window (later
+    /// `resets_at`).
+    #[test]
+    fn retry_after_park_clears_on_a_replenishing_header_reading() {
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        let spent = ParsedRateLimitHeaders {
+            seven_day: Some(reading(0.97, NOW_SECS + 3600)),
+            ..Default::default()
+        };
+        state.record_headers(&id("a"), &spent, now());
+        state.record_429(&id("a"), Some(Duration::from_secs(3600)), now());
+        let fresh = ParsedRateLimitHeaders {
+            seven_day: Some(reading(0.05, NOW_SECS + 7 * 86_400)),
+            ..Default::default()
+        };
+        state.record_headers(&id("a"), &fresh, at(NOW_SECS + 30));
+        assert!(state.accounts[0].cooldown_until.is_none());
+    }
+
+    /// A retry-after park the weekly gauge does not explain (here: weekly at
+    /// 20%, parked for hours — a shorter upstream limit) must NOT be cleared
+    /// by polls that keep reading the same 20%, nor by a small wobble.
+    #[test]
+    fn retry_after_park_holds_while_the_weekly_reading_does_not_fall() {
+        let resets = NOW_SECS + 3 * 86_400;
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        state.record_usage(&id("a"), &usage(Some(reading(0.20, resets))), now());
+        state.record_429(&id("a"), Some(Duration::from_secs(7200)), now());
+        for (step, util) in [(60, 0.20), (120, 0.21), (180, 0.15)] {
+            state.record_usage(
+                &id("a"),
+                &usage(Some(reading(util, resets))),
+                at(NOW_SECS + step),
+            );
+            assert!(
+                state.accounts[0].cooldown_until.is_some(),
+                "{util}: no replenishment, the park holds"
+            );
+        }
+    }
+
+    /// Exactly the minimum fall counts (float steps must not swallow it), and
+    /// a fall that leaves the window full does not.
+    #[test]
+    fn replenishment_threshold_edges() {
+        let resets = NOW_SECS + 86_400;
+        let parked_at = |util: f64| {
+            let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+            state.record_usage(&id("a"), &usage(Some(reading(util, resets))), now());
+            state.record_429(&id("a"), Some(Duration::from_secs(3600)), now());
+            state
+        };
+        let mut state = parked_at(1.0);
+        state.record_usage(
+            &id("a"),
+            &usage(Some(reading(1.0 - REPLENISH_MIN_DROP, resets))),
+            at(NOW_SECS + 60),
+        );
+        assert!(
+            state.accounts[0].cooldown_until.is_none(),
+            "a fall of exactly REPLENISH_MIN_DROP clears"
+        );
+        let mut state = parked_at(1.2);
+        state.record_usage(
+            &id("a"),
+            &usage(Some(reading(1.0, resets))),
+            at(NOW_SECS + 60),
+        );
+        assert!(
+            state.accounts[0].cooldown_until.is_some(),
+            "still at 100%: nothing to serve, the park holds"
+        );
+    }
+
+    /// The 429's own response cannot clear the park it sets: replenishing data
+    /// stamped at the park's instant is ignored.
+    #[test]
+    fn replenishment_must_be_newer_than_the_park() {
+        let resets = NOW_SECS + 86_400;
+        let mut state = PoolState::from_accounts(&[oauth_account("a")]);
+        state.record_usage(&id("a"), &usage(Some(reading(1.0, resets))), now());
+        state.record_429(&id("a"), Some(Duration::from_secs(3600)), at(NOW_SECS + 10));
+        state.record_usage(
+            &id("a"),
+            &usage(Some(reading(0.0, resets))),
+            at(NOW_SECS + 10),
+        );
+        assert!(state.accounts[0].cooldown_until.is_some());
+    }
+
+    /// An operator-confirmed reset (llmux redeemed it) clears the park outright,
+    /// even when the weekly gauge shows no fall — the reset also clears the
+    /// shorter limits the gauge does not show. Guarded by the fingerprint.
+    #[test]
+    fn clear_cooldown_if_clears_only_the_matching_account() {
+        let resets = NOW_SECS + 86_400;
+        let pool = AccountPool::new(&[oauth_account("a"), oauth_account("b")]);
+        for name in ["a", "b"] {
+            pool.record_usage(&id(name), &usage(Some(reading(0.20, resets))), now());
+            pool.record_429(&id(name), Some(Duration::from_secs(7200)), now());
+        }
+        let fp = pool.fingerprint(&id("a")).expect("a exists");
+        assert!(pool.clear_cooldown_if(&id("a"), &fp));
+        let snap = pool.snapshot();
+        assert!(snap.accounts[0].cooldown_until.is_none(), "a cleared");
+        assert!(snap.accounts[1].cooldown_until.is_some(), "b untouched");
+
+        // A stale fingerprint (credential replaced in flight) changes nothing.
+        pool.record_429(&id("a"), Some(Duration::from_secs(7200)), now());
+        let stale = AccountFingerprint {
+            generation: fp.generation + 1_000,
+            ..fp
+        };
+        assert!(!pool.clear_cooldown_if(&id("a"), &stale));
+        assert!(pool.snapshot().accounts[0].cooldown_until.is_some());
     }
 
     /// Construct a `QuotaWindow` directly for `maybe_self_heal` unit tests.
@@ -2260,24 +2483,62 @@ mod tests {
     fn maybe_self_heal_clears_heuristic_when_all_windows_have_capacity() {
         let mut acct = heuristic_parked(now());
         acct.seven_day = Some(window(0.99, NOW_SECS + 86_400, NOW_SECS + 1));
-        acct.maybe_self_heal(at(NOW_SECS + 1));
+        acct.maybe_self_heal(None, at(NOW_SECS + 1));
         assert!(acct.cooldown_until.is_none());
         assert!(acct.cooldown_source.is_none());
         assert!(acct.cooldown_set_at.is_none());
     }
 
-    // SCHED-15(b): a RetryAfter park is an explicit upstream instruction and is
-    // never cleared by fresh capacity.
+    // SCHED-15(b): a RetryAfter park is an explicit upstream instruction:
+    // fresh capacity alone never clears it — only a replenishment (the weekly
+    // reading FELL since the last one) does.
     #[test]
-    fn maybe_self_heal_never_clears_retry_after_cooldown() {
-        let mut acct = AccountState::fresh(&oauth_account("a"));
-        acct.cooldown_until = Some(at(NOW_SECS + 600));
-        acct.cooldown_source = Some(CooldownSource::RetryAfter);
-        acct.cooldown_set_at = Some(now());
-        acct.seven_day = Some(window(0.0, NOW_SECS + 3600, NOW_SECS + 1));
-        acct.maybe_self_heal(at(NOW_SECS + 1));
+    fn maybe_self_heal_keeps_retry_after_without_a_replenishment() {
+        let parked = || {
+            let mut acct = AccountState::fresh(&oauth_account("a"));
+            acct.cooldown_until = Some(at(NOW_SECS + 600));
+            acct.cooldown_source = Some(CooldownSource::RetryAfter);
+            acct.cooldown_set_at = Some(now());
+            acct.seven_day = Some(window(0.0, NOW_SECS + 3600, NOW_SECS + 1));
+            acct
+        };
+        // No earlier reading.
+        let mut acct = parked();
+        acct.maybe_self_heal(None, at(NOW_SECS + 1));
         assert_eq!(acct.cooldown_until, Some(at(NOW_SECS + 600)));
         assert_eq!(acct.cooldown_source, Some(CooldownSource::RetryAfter));
+        // Earlier reading already as low.
+        let mut acct = parked();
+        acct.maybe_self_heal(
+            Some(window(0.0, NOW_SECS + 3600, NOW_SECS)),
+            at(NOW_SECS + 1),
+        );
+        assert_eq!(acct.cooldown_until, Some(at(NOW_SECS + 600)));
+        // Earlier reading whose window already expired reads 0%: no fall.
+        let mut acct = parked();
+        acct.maybe_self_heal(
+            Some(window(1.0, NOW_SECS - 1, NOW_SECS - 10)),
+            at(NOW_SECS + 1),
+        );
+        assert_eq!(acct.cooldown_until, Some(at(NOW_SECS + 600)));
+    }
+
+    // SCHED-15(d): a RetryAfter park clears when the weekly reading falls by
+    // at least REPLENISH_MIN_DROP and leaves room (reset or purchased quota).
+    #[test]
+    fn maybe_self_heal_clears_retry_after_on_replenishment() {
+        let mut acct = AccountState::fresh(&oauth_account("a"));
+        acct.cooldown_until = Some(at(NOW_SECS + 30 * 3600));
+        acct.cooldown_source = Some(CooldownSource::RetryAfter);
+        acct.cooldown_set_at = Some(now());
+        acct.seven_day = Some(window(0.0, NOW_SECS + 30 * 3600, NOW_SECS + 60));
+        acct.maybe_self_heal(
+            Some(window(1.0, NOW_SECS + 30 * 3600, NOW_SECS)),
+            at(NOW_SECS + 60),
+        );
+        assert!(acct.cooldown_until.is_none());
+        assert!(acct.cooldown_source.is_none());
+        assert!(acct.cooldown_set_at.is_none());
     }
 
     // SCHED-15(c): strict-newer guard — data with `fetched_at == cooldown_set_at`
@@ -2288,7 +2549,7 @@ mod tests {
         let mut acct = heuristic_parked(now());
         acct.seven_day = Some(window(0.10, NOW_SECS + 3600, NOW_SECS));
         // now == cooldown_set_at -> not strictly newer.
-        acct.maybe_self_heal(now());
+        acct.maybe_self_heal(None, now());
         assert!(acct.cooldown_until.is_some());
         assert_eq!(acct.cooldown_source, Some(CooldownSource::Heuristic));
     }
