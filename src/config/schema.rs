@@ -331,6 +331,16 @@ pub struct ClientKey {
     /// `sha256:<hex>` of the full issued secret; the auth gate compares
     /// digests, never plaintext.
     pub key_digest: String,
+    /// The secrets this key carried before each rotation, oldest first: at
+    /// most [`crate::config::RETIRED_DIGESTS_MAX`], none older than
+    /// [`crate::config::RETIRED_SECRET_GRACE_MS`] (both enforced by
+    /// [`ClientKey::retire_digest`]). A retired secret never authenticates from
+    /// a remote peer. On the Anthropic data plane from loopback, where a keyless
+    /// request is allowed anyway, it is attributed to this key during the grace
+    /// window, so a client still holding the old secret keeps metering as its
+    /// owner instead of vanishing into `local`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_digests: Vec<RetiredDigest>,
     /// Operator pause: a suspended key authenticates to 401 until resumed.
     #[serde(default)]
     pub suspended: bool,
@@ -340,6 +350,37 @@ pub struct ClientKey {
     /// authenticates but the row is preserved for attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at_ms: Option<u64>,
+}
+
+/// One pre-rotation secret of a [`ClientKey`]: its digest and when it was
+/// replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredDigest {
+    /// `sha256:<hex>` of the replaced secret.
+    pub digest: String,
+    /// When the rotation replaced it (epoch ms).
+    pub retired_at_ms: u64,
+}
+
+impl ClientKey {
+    /// Replace the current secret digest with `digest` (a rotation): the old
+    /// one joins `retired_digests`, entries past the grace window are dropped,
+    /// and only the newest [`crate::config::RETIRED_DIGESTS_MAX`] are kept.
+    pub fn retire_digest(&mut self, digest: String, now_ms: u64) {
+        let old = std::mem::replace(&mut self.key_digest, digest);
+        self.retired_digests.push(RetiredDigest {
+            digest: old,
+            retired_at_ms: now_ms,
+        });
+        self.retired_digests.retain(|r| {
+            now_ms.saturating_sub(r.retired_at_ms) < crate::config::RETIRED_SECRET_GRACE_MS
+        });
+        let excess = self
+            .retired_digests
+            .len()
+            .saturating_sub(crate::config::RETIRED_DIGESTS_MAX);
+        self.retired_digests.drain(..excess);
+    }
 }
 
 /// One dashboard event banner (an element of config `events`). Display-only:

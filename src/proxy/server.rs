@@ -877,6 +877,7 @@ impl AppState {
                 kind,
                 key_prefix: prefix,
                 key_digest: digest,
+                retired_digests: Vec::new(),
                 suspended: false,
                 created_at_ms: now_epoch_ms(),
                 revoked_at_ms: None,
@@ -940,8 +941,11 @@ impl AppState {
     }
 
     /// Rotate an issued key: a NEW secret under the SAME attribution id, so
-    /// usage continuity is a property of the API, not a promise. Returns the
-    /// updated row plus the new plaintext (shown once).
+    /// usage continuity is a property of the API, not a promise. The old
+    /// secret's digest moves to `retired_digests`: refused from remote peers,
+    /// still attributed to this key from loopback for a grace window (see
+    /// [`crate::proxy::keys::KeyRegistry::resolve`]). Returns the updated row
+    /// plus the new plaintext (shown once).
     pub fn rotate_client_key(
         &self,
         id: &str,
@@ -956,9 +960,10 @@ impl AppState {
                 .iter()
                 .position(|k| k.id == id && k.revoked_at_ms.is_none())
                 .ok_or(KeyAdminError::NotFound)?;
-            c.client_keys[i].key_prefix = prefix;
-            c.client_keys[i].key_digest = digest;
-            Ok(c.client_keys[i].clone())
+            let key = &mut c.client_keys[i];
+            key.retire_digest(digest, now_epoch_ms());
+            key.key_prefix = prefix;
+            Ok(key.clone())
         })?;
         tracing::info!(id = %key.id, name = %key.name, "client key rotated");
         Ok((key, issued.secret))
@@ -2203,7 +2208,24 @@ async fn client_auth(
         .resolve(presented, loopback && (!openai || presented.is_none()))
     {
         Resolution::Allowed(tenant) => {
-            if is_control_plane(req.uri().path()) && !tenant.admin {
+            let control = is_control_plane(req.uri().path());
+            if tenant.retired_secret {
+                let tally = state.keys.note_retired_use(&tenant.id, now_epoch_ms());
+                if tally.requests == 1 {
+                    tracing::warn!(
+                        id = %tenant.id,
+                        name = %tenant.name,
+                        "a local client still presents this key's pre-rotation secret; \
+                         give that client the new secret"
+                    );
+                }
+                // A retired secret never reaches the control plane; say why
+                // instead of the generic "admin credential required".
+                if control {
+                    return refuse(StatusCode::UNAUTHORIZED, RETIRED_KEY_MESSAGE);
+                }
+            }
+            if control && !tenant.admin {
                 return auth_error(
                     StatusCode::FORBIDDEN,
                     "admin credential required for llmux control endpoints",
@@ -2214,9 +2236,15 @@ async fn client_auth(
         }
         Resolution::Suspended => refuse(StatusCode::UNAUTHORIZED, "client key suspended"),
         Resolution::Revoked => refuse(StatusCode::UNAUTHORIZED, "client key revoked"),
+        Resolution::Retired => refuse(StatusCode::UNAUTHORIZED, RETIRED_KEY_MESSAGE),
         Resolution::Denied => refuse(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
     }
 }
+
+/// The 401 a rotated-out client key gets wherever it is refused. Starts with
+/// the generic message clients already match on.
+const RETIRED_KEY_MESSAGE: &str =
+    "Invalid proxy API key: this client key was rotated — use the new key";
 
 /// Explicit malformed or conflicting credentials never become a keyless request.
 /// `google` also reads `x-goog-api-key` (the Gemini API's key header); every
@@ -2465,7 +2493,18 @@ async fn keys_new_endpoint(
 /// `GET /llmux/keys` — list issued keys (metadata only; secrets are neither
 /// stored nor returned). Usage summaries join in P2 via the dashboard doc.
 async fn keys_list_endpoint(State(state): State<AppState>) -> Response {
-    let keys: Vec<serde_json::Value> = state.keys.list().iter().map(client_key_json).collect();
+    let keys: Vec<serde_json::Value> = state
+        .keys
+        .list()
+        .iter()
+        .map(|key| {
+            let mut json = client_key_json(key);
+            if let Some(used) = state.keys.retired_use(&key.id) {
+                json["retired_secret"] = serde_json::json!(used);
+            }
+            json
+        })
+        .collect();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -5850,7 +5889,114 @@ mod tests {
             state.keys.resolve(Some(&rotated), false),
             Resolution::Allowed(_)
         ));
-        assert_eq!(state.keys.resolve(Some(&secret), false), Resolution::Denied);
+        assert_eq!(
+            state.keys.resolve(Some(&secret), false),
+            Resolution::Retired,
+            "a remote peer presenting the old secret is refused"
+        );
+    }
+
+    /// Rotation keeps the attribution id, so a request that still carries the
+    /// pre-rotation secret from loopback (a session started before the rotate,
+    /// a second process holding the old secret) meters as that key instead of
+    /// vanishing into `local` — the rotated user's history went empty.
+    #[tokio::test]
+    async fn rotated_out_secret_from_loopback_keeps_its_tenant() {
+        use crate::proxy::keys::Resolution;
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        let (row, old) = state
+            .issue_client_key("pc-a", None, crate::config::ClientKeyKind::Default)
+            .expect("issue");
+        let (rotated, new) = state.rotate_client_key(&row.id).expect("rotate");
+        assert_eq!(rotated.id, row.id, "rotation keeps the attribution id");
+        for (label, secret, retired) in [("new", &new, false), ("old", &old, true)] {
+            match state.keys.resolve(Some(secret), true) {
+                Resolution::Allowed(t) => {
+                    assert_eq!(t.id, row.id, "{label} secret");
+                    assert_eq!(t.retired_secret, retired, "{label} secret");
+                }
+                other => panic!("{label} secret: expected the key's tenant, got {other:?}"),
+            }
+        }
+        assert_eq!(state.keys.resolve(Some(&old), false), Resolution::Retired);
+        // The retired digest is persisted, so a restart still knows it.
+        let reloaded = crate::config::load_path(&path).expect("reload");
+        let retired: Vec<&str> = reloaded.client_keys[0]
+            .retired_digests
+            .iter()
+            .map(|r| r.digest.as_str())
+            .collect();
+        assert_eq!(retired, vec![crate::config::client_key_digest(&old)]);
+        let fresh = crate::proxy::keys::KeyRegistry::from_config(&reloaded);
+        assert!(matches!(
+            fresh.resolve(Some(&old), true),
+            Resolution::Allowed(t) if t.id == row.id && t.retired_secret
+        ));
+    }
+
+    /// Each rotation retires the secret it replaces; the list keeps the newest
+    /// `RETIRED_DIGESTS_MAX`, so the oldest secret falls back to `local`.
+    #[tokio::test]
+    async fn rotation_keeps_a_bounded_list_of_retired_secrets() {
+        use crate::proxy::keys::Resolution;
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        let (row, first) = state
+            .issue_client_key("pc-a", None, crate::config::ClientKeyKind::Default)
+            .expect("issue");
+        let mut secrets = vec![first];
+        for _ in 0..=crate::config::RETIRED_DIGESTS_MAX {
+            secrets.push(state.rotate_client_key(&row.id).expect("rotate").1);
+        }
+        let key = &state.keys.list()[0];
+        assert_eq!(
+            key.retired_digests.len(),
+            crate::config::RETIRED_DIGESTS_MAX
+        );
+        assert_eq!(
+            state.keys.resolve(Some(&secrets[0]), true),
+            Resolution::Allowed(crate::proxy::keys::Tenant::local()),
+            "the oldest secret dropped off the list"
+        );
+        assert!(matches!(
+            state.keys.resolve(Some(&secrets[1]), true),
+            Resolution::Allowed(t) if t.id == row.id && t.retired_secret
+        ));
+    }
+
+    /// The key list and the dashboard document report a client that still
+    /// presents the pre-rotation secret; a key with no such use carries nothing.
+    #[tokio::test]
+    async fn key_rows_report_retired_secret_use() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, Vec::new());
+        let (row, _) = state
+            .issue_client_key("pc-a", None, crate::config::ClientKeyKind::Default)
+            .expect("issue");
+        let body = response_json(keys_list_endpoint(State(state.clone())).await).await;
+        assert!(body["keys"][0].get("retired_secret").is_none(), "{body}");
+        state.keys.note_retired_use(&row.id, 1_000);
+        let used = state.keys.note_retired_use(&row.id, 2_000);
+        assert_eq!(used.requests, 2);
+        let body = response_json(keys_list_endpoint(State(state.clone())).await).await;
+        assert_eq!(body["keys"][0]["retired_secret"]["requests"], 2, "{body}");
+        assert_eq!(
+            body["keys"][0]["retired_secret"]["last_ms"], 2_000,
+            "{body}"
+        );
+        let doc = crate::dashboard::build_doc(&state, SystemTime::now());
+        let docs = doc.client_keys;
+        assert_eq!(
+            docs[0].retired_secret,
+            Some(crate::proxy::keys::RetiredUse {
+                requests: 2,
+                last_ms: 2_000
+            })
+        );
     }
 
     /// Last-active-admin guard: with no legacy key configured, the final

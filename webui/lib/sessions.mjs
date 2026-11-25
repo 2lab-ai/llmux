@@ -29,6 +29,7 @@ export const AUX_RE = /SAFETY REVIEWER|Summarize this AI assistant response|<ses
 const MAIN_KINDS = new Set(['user', 'sdk', 'other', 'compact', 'recap']);
 const SOMA_CWD = /^\/(?:private\/)?tmp\/U[0-9A-Z]+\/session_/;
 const HOUR = 3600000;
+const RETIRED_ACTIVE_MS = 24 * HOUR;
 const KEEP_HOURS = 72;
 // The priced counters of an activity row, summed per bucket model (#278 adds the extended-TTL write
 // subset and the web-search count, so a history bucket prices like the daemon's rows).
@@ -102,7 +103,13 @@ export class SessionIndex {
     this.avg = avgPerRequest(doc.model_usage);
     const solved = solveRates(doc.usage_stats);
     if (solved.size) this.rates = solved;
-    for (const k of doc.client_keys || []) this.setUser(k.id, { name: k.name, email: k.email, kind: k.kind, suspended: !!k.suspended, created_at_ms: k.created_at_ms });
+    for (const k of doc.client_keys || []) {
+      this.setUser(k.id, { name: k.name, email: k.email, kind: k.kind, suspended: !!k.suspended, created_at_ms: k.created_at_ms });
+      // A client still sending the key's pre-rotation secret. The daemon counts since it started, so the
+      // flag shows only while the last such request is under 24 hours old: it clears once clients moved on.
+      const r = k.retired_secret;
+      this.users.get(k.id).retired = r && Date.now() - r.last_ms < RETIRED_ACTIVE_MS ? r : null;
+    }
     for (const t of doc.tenant_usage || []) this.setUser(t.tenant, { name: t.name, email: t.email });
     for (const [uid, label] of Object.entries(doc.session_labels || {})) {
       const p = parseUid(uid); if (!p) continue;
@@ -462,7 +469,7 @@ export class SessionIndex {
       }
       const usage = byTenant.get(tenant) || null;
       out.push({
-        ...u, kind: full.kind || null, suspended: !!full.suspended, created_at_ms: full.created_at_ms || null,
+        ...u, kind: full.kind || null, suspended: !!full.suspended, created_at_ms: full.created_at_ms || null, retired: full.retired || null,
         usage: usage ? { requests: usage.requests, ok: usage.ok, errors: usage.errors, tokens_in: usage.tokens_in, tokens_out: usage.tokens_out, cost_usd: usage.cost_usd, first_ms: usage.first_ms, last_ms: usage.last_ms, models: (usage.models || []).map(m => ({ model: m.model, group: m.group, requests: m.requests, cost_usd: m.cost_usd })) } : null,
         live, origins, devices: devices.size,
         active: mine.filter(c => c.status === 'running' || c.status === 'waiting' || c.status === 'stalled').slice(0, 6).map(c => ({ sid: c.sid, title: c.title, status: c.status, client: c.client, project: c.project })),

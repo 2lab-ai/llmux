@@ -837,6 +837,7 @@ impl Proxy {
                 kind: ClientKeyKind::Default,
                 key_prefix: "lmk-aaaa".into(),
                 key_digest: format!("sha256:{}", "0".repeat(64)),
+                retired_digests: Vec::new(),
                 suspended: false,
                 created_at_ms: 1,
                 revoked_at_ms: None,

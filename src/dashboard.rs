@@ -1415,6 +1415,12 @@ pub struct KeyRowDoc {
     pub created_at_ms: u64,
     #[serde(default)]
     pub revoked_at_ms: Option<u64>,
+    /// Requests that presented this key's pre-rotation secret since the daemon
+    /// started — a client that still holds the old secret: metered to this key
+    /// on the Anthropic data plane from loopback, refused on the control plane.
+    /// Additive: absent when none, and in docs from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_secret: Option<crate::proxy::keys::RetiredUse>,
 }
 
 /// One trailing-window slice of the per-account/per-model heatmap (issue #23):
@@ -2416,6 +2422,7 @@ pub fn key_row_docs(state: &AppState) -> Vec<KeyRowDoc> {
             suspended: k.suspended,
             created_at_ms: k.created_at_ms,
             revoked_at_ms: k.revoked_at_ms,
+            retired_secret: state.keys.retired_use(&k.id),
         })
         .collect()
 }
@@ -2951,6 +2958,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         });
         let pool = AccountPool::new(&[oauth_account("a")]);
         let doc = dashboard_doc(
@@ -3042,6 +3050,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         });
         let pool = AccountPool::new(&[oauth_account("a")]);
         let doc = dashboard_doc(
@@ -3110,6 +3119,7 @@ mod tests {
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         });
         let pool = AccountPool::new(&[oauth_account("a")]);
         let doc = dashboard_doc(

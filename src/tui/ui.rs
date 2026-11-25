@@ -13178,6 +13178,7 @@ mod tests {
             suspended: true,
             created_at_ms: 1,
             revoked_at_ms: None,
+            retired_secret: None,
         }];
         view
     }
@@ -20439,6 +20440,10 @@ mod tests {
             kind: crate::config::ClientKeyKind::Default,
             key_prefix: "lmk-test".into(),
             key_digest: "sha256:00".into(),
+            retired_digests: vec![crate::config::RetiredDigest {
+                digest: "sha256:01".into(),
+                retired_at_ms: 1,
+            }],
             suspended: false,
             created_at_ms: 1,
             revoked_at_ms: Some(2),
