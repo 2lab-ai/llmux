@@ -103,3 +103,43 @@ struct LoginStatusResponse: Decodable {
         case userCode = "user_code"
     }
 }
+
+/// The short reason the island shows when a daemon-run login fails.
+///
+/// The daemon's `error` text is free text, so it never reaches the UI as is:
+/// it is matched against the failures llmux knows and mapped to a fixed
+/// sentence that says what to do. Anything else stays the generic
+/// "login failed" with a pointer to the server log, where the daemon now
+/// writes the full reason.
+enum LoginFailureMessage {
+    static let generic = "login failed — see the llmux server log"
+
+    static func from(daemonError: String?) -> String {
+        guard let raw = daemonError?.lowercased(), !raw.isEmpty else { return generic }
+        if raw.contains("address already in use") || raw.contains("os error 48")
+            || raw.contains("os error 98") {
+            return "login failed: the sign-in callback port is in use by another app or an "
+                + "earlier login — close it or run `llmux restart`, then retry"
+        }
+        if raw.contains("timed out") {
+            return "login timed out — finish the sign-in in the browser within 2 minutes"
+        }
+        if raw == "cancelled" { return "login cancelled" }
+        if raw.contains("state mismatch") {
+            return "login failed: the browser returned an old sign-in page — retry"
+        }
+        if raw.contains("oauth error: access_denied") {
+            return "login failed: sign-in was declined in the browser"
+        }
+        if raw.contains("missing refresh_token") {
+            return "login failed: offline access was not granted — retry and allow every permission"
+        }
+        if raw.contains("oauth client not configured") {
+            return "login failed: this llmux has no Google sign-in client configured"
+        }
+        if raw.contains("network error") || raw.contains("oauth http error") {
+            return "login failed: network error — check the connection and retry"
+        }
+        return generic
+    }
+}

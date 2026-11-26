@@ -220,15 +220,18 @@ pub(crate) async fn run_callback_server(
             expected_state: state.map(str::to_string),
             code_tx: Arc::new(StdMutex::new(Some(code_tx))),
         });
-    let server = tokio::spawn(async move {
-        // The task is aborted once a code is obtained; serve errors at that
-        // point are expected and irrelevant.
+    // The server owns the listener. A JoinSet aborts its tasks when dropped,
+    // so the server stops when this future finishes OR is dropped: the
+    // daemon cancels a GUI login by aborting the login task, and a plain
+    // JoinHandle would leave this server (and the fixed callback port) alive
+    // for the rest of the process. Serve errors after the abort are expected
+    // and irrelevant.
+    let mut server = tokio::task::JoinSet::new();
+    server.spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
 
-    let code = wait_for_code(code_rx, state).await;
-    server.abort();
-    code
+    wait_for_code(code_rx, state).await
 }
 
 /// Race the callback server against manual paste on stdin (TTY only,
@@ -1166,5 +1169,56 @@ mod tests {
         .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(tokens.expires_at_ms, 1_800_000_000_000);
+    }
+
+    /// A cancelled login (the daemon aborts the login task) must release the
+    /// callback port. The callback server runs in its own spawned task; when
+    /// only the outer login task was aborted, that server kept the listener
+    /// for the rest of the process, and every later login on the same fixed
+    /// port (Gemini: 51121) failed at once with "Address already in use".
+    #[tokio::test]
+    async fn aborting_the_login_releases_the_callback_port() {
+        let (listener, port) = bind_callback_listener(&[0]).await.unwrap();
+        let login = tokio::spawn(async move {
+            let _ = run_callback_server(listener, "/callback", Some("st")).await;
+        });
+        // Cancel only once the callback server answers HTTP: before that the
+        // listener may still sit in the login future, and dropping it would
+        // pass even with a leaking server task.
+        // Each probe is bounded, so a listener that accepts but never
+        // answers fails the assertion below instead of hanging the test.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let mut serving = false;
+        for _ in 0..80 {
+            if client
+                .get(format!("http://127.0.0.1:{port}/ready"))
+                .send()
+                .await
+                .is_ok()
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(serving, "callback server never answered on port {port}");
+        login.abort();
+        let _ = login.await;
+
+        let mut rebound = None;
+        for _ in 0..40 {
+            if let Ok(found) = bind_callback_listener(&[port]).await {
+                rebound = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            rebound.is_some(),
+            "port {port} is still held after the login task was aborted"
+        );
     }
 }

@@ -266,6 +266,49 @@ enum CompactUsageGauges {
     }
 }
 
+/// The usage tile's 7d row with the Fable weekly limit folded into it
+/// (owner 2026-11-26: one bar, one text, e.g. `60% (40%)`).
+///
+/// Fable is a limit INSIDE the weekly one — Fable traffic draws on both — so
+/// the two values are drawn as a bullet graph (Few, Bullet Graph Design
+/// Specification, 2013), not as stacked parts of one whole: the 7d remaining
+/// fills the full-height segments as before, and Fable's remaining is a thin
+/// inset stripe on the same 0–100 scale. A stacked or colour-mixed bar would
+/// read as "parts of 7d" and cannot show Fable having MORE left than 7d; the
+/// inset stays readable in both directions because it runs over empty track
+/// as well as over the fill. The text keeps the 7d value first and puts
+/// Fable in brackets in the stripe's colour, so the colour is the legend.
+enum SevenDayReadout {
+    static let segmentCount = 10
+
+    /// Remaining share 0…1 of a window reported as used percent 0–100.
+    static func remaining(usedPercent: Double?) -> Double? {
+        guard let usedPercent, usedPercent.isFinite else { return nil }
+        let used = max(0, min(100, usedPercent))
+        return (100 - used) / 100
+    }
+
+    /// Segments to light for a remaining share, rounded to the nearest
+    /// segment (the bar's existing rule).
+    static func litSegments(_ remaining: Double?, count: Int = segmentCount) -> Int {
+        guard let remaining, remaining.isFinite else { return 0 }
+        let clamped = max(0, min(1, remaining))
+        return max(0, min(count, Int((clamped * Double(count)).rounded(.toNearestOrAwayFromZero))))
+    }
+
+    /// `60%` for the 7d value, `--` when it is not reported.
+    static func percentText(_ remaining: Double?) -> String {
+        guard let remaining else { return "--" }
+        return "\(Int((max(0, min(1, remaining)) * 100).rounded()))%"
+    }
+
+    /// ` (40%)` after the 7d value; empty when Fable is not shown.
+    static func fableSuffix(_ fableRemaining: Double?) -> String {
+        guard let fableRemaining else { return "" }
+        return " (\(percentText(fableRemaining)))"
+    }
+}
+
 extension LlmuxDashboardAccount {
     /// The account health row's quota text: `7d 31% · Fab 82%`, used
     /// percentages of the reported windows. nil (cold
