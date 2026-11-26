@@ -220,26 +220,18 @@ pub(crate) async fn run_callback_server(
             expected_state: state.map(str::to_string),
             code_tx: Arc::new(StdMutex::new(Some(code_tx))),
         });
-    // The server owns the listener. It is aborted when this future finishes
-    // OR is dropped: the daemon cancels a GUI login by aborting the login
-    // task, and a plain JoinHandle would leave this server (and the fixed
-    // callback port) alive for the rest of the process. Serve errors after
-    // the abort are expected and irrelevant.
-    let _server = AbortOnDrop(tokio::spawn(async move {
+    // The server owns the listener. A JoinSet aborts its tasks when dropped,
+    // so the server stops when this future finishes OR is dropped: the
+    // daemon cancels a GUI login by aborting the login task, and a plain
+    // JoinHandle would leave this server (and the fixed callback port) alive
+    // for the rest of the process. Serve errors after the abort are expected
+    // and irrelevant.
+    let mut server = tokio::task::JoinSet::new();
+    server.spawn(async move {
         let _ = axum::serve(listener, app).await;
-    }));
+    });
 
     wait_for_code(code_rx, state).await
-}
-
-/// Aborts the wrapped task when dropped, so a spawned helper never outlives
-/// the future that started it.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// Race the callback server against manual paste on stdin (TTY only,
@@ -1190,8 +1182,24 @@ mod tests {
         let login = tokio::spawn(async move {
             let _ = run_callback_server(listener, "/callback", Some("st")).await;
         });
-        // Let the callback server start listening, then cancel the login.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Cancel only once the callback server answers HTTP: before that the
+        // listener may still sit in the login future, and dropping it would
+        // pass even with a leaking server task.
+        let client = reqwest::Client::new();
+        let mut serving = false;
+        for _ in 0..80 {
+            if client
+                .get(format!("http://127.0.0.1:{port}/ready"))
+                .send()
+                .await
+                .is_ok()
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(serving, "callback server never answered on port {port}");
         login.abort();
         let _ = login.await;
 

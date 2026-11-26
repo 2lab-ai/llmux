@@ -44,7 +44,7 @@ final class AttentionTriageTests: XCTestCase {
             record("b", status: "auth_failed"),
             record("c", sevenDay: 1.0),
         ])
-        triage.observe(second)
+        triage.observe(second, online: true)
         XCTAssertEqual(triage.split(second).top.map(\.account), ["c"])
         XCTAssertEqual(triage.split(second).bottom.map(\.account), ["b", "a"])
     }
@@ -76,16 +76,27 @@ final class AttentionTriageTests: XCTestCase {
 
         // Missing from a few polls (an account cold after a daemon restart),
         // then back: still dismissed, and the absence count starts over.
-        for _ in 0..<10 { triage.observe([]) }
-        triage.observe(current)
+        for _ in 0..<10 { triage.observe([], online: true) }
+        triage.observe(current, online: true)
         XCTAssertTrue(triage.split(current).top.isEmpty)
 
         // Missing from every poll for the whole grace period: forgotten, so it
         // is new the next time it appears.
-        for _ in 0..<(AttentionTriage.forgetAfterAbsentPolls - 1) { triage.observe([]) }
+        for _ in 0..<(AttentionTriage.forgetAfterAbsentPolls - 1) { triage.observe([], online: true) }
         XCTAssertTrue(triage.split(current).top.isEmpty, "one poll short of the grace period")
-        XCTAssertTrue(triage.observe([]))
+        XCTAssertTrue(triage.observe([], online: true))
         XCTAssertEqual(triage.split(current).top.count, 2)
+    }
+
+    func testOfflinePollsNeverUndoADismissal() {
+        var triage = AttentionTriage()
+        let current = rows([record("a", sevenDay: 1.0)])
+        triage.dismiss(current)
+        // A long daemon outage: every poll is offline with no rows.
+        for _ in 0..<(AttentionTriage.forgetAfterAbsentPolls * 2) {
+            XCTAssertFalse(triage.observe([], online: false))
+        }
+        XCTAssertTrue(triage.split(current).top.isEmpty, "still dismissed after reconnecting")
     }
 
     func testMaskedNamesDoNotShareATriageEntry() {

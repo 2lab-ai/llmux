@@ -59,12 +59,13 @@ struct AttentionTriage: Codable, Equatable {
         place(items, .dismissed)
     }
 
-    /// Record one online poll's rows. Call only for an online poll — an
-    /// offline poll has no rows and would look like "all cleared".
-    /// Returns whether anything changed, so the caller saves only then (an
-    /// empty triage — the usual case — never writes).
+    /// Record one poll's rows. An offline poll changes nothing: it has no
+    /// rows, and counting it would let a daemon outage undo the owner's
+    /// choices. Returns whether anything changed, so the caller saves only
+    /// then (an empty triage — the usual case — never writes).
     @discardableResult
-    mutating func observe(_ items: [GlanceAttention]) -> Bool {
+    mutating func observe(_ items: [GlanceAttention], online: Bool) -> Bool {
+        guard online else { return false }
         let present = Set(items.map(Self.digest))
         var changed = false
         for (key, entry) in entries {

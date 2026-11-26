@@ -513,9 +513,8 @@ final class IslandUsageModel: ObservableObject {
         )
         glance = output.signal
         attention = output.attention
-        // Only an online poll can say a condition cleared; an offline one has
-        // no rows at all.
-        if !offline, attentionTriage.observe(output.attention) {
+        // Only an online poll can say a condition cleared (AttentionTriage).
+        if attentionTriage.observe(output.attention, online: !offline) {
             attentionTriage.save()
         }
     }
