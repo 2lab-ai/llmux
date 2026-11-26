@@ -3860,10 +3860,20 @@ async fn login_start_endpoint(
     // the terminal phase against this `state`.
     let app = state.clone();
     let task_state = state_id.clone();
+    tracing::info!(provider = provider.as_str(), "login started");
     let handle = tokio::spawn(async move {
+        // The outcome goes to the server log too: the GUI shows only a short
+        // reason, and the log is where an operator looks first. The message
+        // is token-free (see `run_login`).
         let phase = match run_login(&app, provider, &task_state).await {
-            Ok(account) => super::login::LoginPhase::Done { account },
-            Err(message) => super::login::LoginPhase::Error { message },
+            Ok(account) => {
+                tracing::info!(provider = provider.as_str(), %account, "login finished");
+                super::login::LoginPhase::Done { account }
+            }
+            Err(message) => {
+                tracing::warn!(provider = provider.as_str(), error = %message, "login failed");
+                super::login::LoginPhase::Error { message }
+            }
         };
         app.logins.finish(&task_state, phase);
     });

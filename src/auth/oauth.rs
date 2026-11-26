@@ -220,15 +220,26 @@ pub(crate) async fn run_callback_server(
             expected_state: state.map(str::to_string),
             code_tx: Arc::new(StdMutex::new(Some(code_tx))),
         });
-    let server = tokio::spawn(async move {
-        // The task is aborted once a code is obtained; serve errors at that
-        // point are expected and irrelevant.
+    // The server owns the listener. It is aborted when this future finishes
+    // OR is dropped: the daemon cancels a GUI login by aborting the login
+    // task, and a plain JoinHandle would leave this server (and the fixed
+    // callback port) alive for the rest of the process. Serve errors after
+    // the abort are expected and irrelevant.
+    let _server = AbortOnDrop(tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
-    });
+    }));
 
-    let code = wait_for_code(code_rx, state).await;
-    server.abort();
-    code
+    wait_for_code(code_rx, state).await
+}
+
+/// Aborts the wrapped task when dropped, so a spawned helper never outlives
+/// the future that started it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Race the callback server against manual paste on stdin (TTY only,
@@ -1166,5 +1177,35 @@ mod tests {
         .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(tokens.expires_at_ms, 1_800_000_000_000);
+    }
+
+    /// A cancelled login (the daemon aborts the login task) must release the
+    /// callback port. The callback server runs in its own spawned task; when
+    /// only the outer login task was aborted, that server kept the listener
+    /// for the rest of the process, and every later login on the same fixed
+    /// port (Gemini: 51121) failed at once with "Address already in use".
+    #[tokio::test]
+    async fn aborting_the_login_releases_the_callback_port() {
+        let (listener, port) = bind_callback_listener(&[0]).await.unwrap();
+        let login = tokio::spawn(async move {
+            let _ = run_callback_server(listener, "/callback", Some("st")).await;
+        });
+        // Let the callback server start listening, then cancel the login.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        login.abort();
+        let _ = login.await;
+
+        let mut rebound = None;
+        for _ in 0..40 {
+            if let Ok(found) = bind_callback_listener(&[port]).await {
+                rebound = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            rebound.is_some(),
+            "port {port} is still held after the login task was aborted"
+        );
     }
 }
