@@ -4034,6 +4034,10 @@ async fn login_cancel_endpoint(
     body: axum::extract::Json<LoginCancelRequest>,
 ) -> Response {
     let cancelled = state.logins.cancel(&body.state);
+    // The cancelled task is aborted before it can log its own outcome.
+    if cancelled {
+        tracing::info!("login cancelled");
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],

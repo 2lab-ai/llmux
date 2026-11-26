@@ -260,8 +260,8 @@ The panel now names the reason. **"the sign-in callback port is in use"** means 
 login is still holding the browser callback port (Gemini uses 51121, the same port as the
 Antigravity CLI). Before 2026-11-26 a cancelled login could keep that port until the daemon
 restarted; a daemon on an older build needs `llmux restart` once. The daemon log
-(`~/.local/state/llmux/server.log`) records every GUI login as `login started`,
-`login finished` or `login failed` with the full reason.
+(`~/.local/state/llmux/server.log`) records every GUI login as `login started`, then
+`login finished`, `login failed` with the full reason, or `login cancelled`.
 
 A Google account that Google has suspended for Antigravity use can still sign in, but its
 requests keep failing with 403 — the log says `Google suspended Antigravity access`.
