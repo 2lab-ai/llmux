@@ -20,6 +20,7 @@ struct NotchMenuView: View {
     @State private var launchAtLogin: Bool = false
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
     @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
+    @AppStorage(AppSettings.showTokenExpiryKey) private var showTokenExpiry = false
 
     static var appVersion: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0"
@@ -73,6 +74,17 @@ struct NotchMenuView: View {
                 isOn: showFableWeekly
             ) {
                 Task { await IslandUsageModel.shared.setShowFableWeekly(!showFableWeekly) }
+            }
+
+            // The key-icon row on each tile (access-token time left). Off by
+            // default; a local view preference, so it flips the @AppStorage
+            // key directly — no daemon or shared-core round-trip.
+            MenuToggleRow(
+                icon: "key",
+                label: "Show token expiry",
+                isOn: showTokenExpiry
+            ) {
+                showTokenExpiry.toggle()
             }
 
             LlmuxConnectionSection(expanded: $viewModel.connectionSettingsExpanded)

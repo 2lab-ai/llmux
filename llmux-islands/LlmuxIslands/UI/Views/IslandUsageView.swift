@@ -114,12 +114,19 @@ struct IslandUsageView: View {
             }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
                 .background(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.055)))
         } else {
+            // Rows the owner has not acted on sit on top; rows sent down with
+            // `_` stay under the tiles; dismissed rows are gone (AttentionTriage).
+            let attention = model.attentionTriage.split(model.attention)
             ScrollView(.vertical, showsIndicators: false) {
                 StartCodingView(isOnline: model.connection == .online, fixtureProject: snapshotProject)
                     .padding(.bottom, 12)
-                if !model.attention.isEmpty {
-                    NeedsAttentionSection(items: model.attention)
-                        .padding(.bottom, 8)
+                if !attention.top.isEmpty {
+                    NeedsAttentionSection(
+                        items: attention.top,
+                        onMinimize: { model.minimizeAttention(attention.top) },
+                        onDismiss: { model.dismissAttention(attention.top) }
+                    )
+                    .padding(.bottom, 8)
                 }
                 UsageAccountTileGrid(
                     tiles: model.tiles,
@@ -129,6 +136,15 @@ struct IslandUsageView: View {
                     onSetPaused: { name, paused in Task { await model.setPaused(name, paused: paused) } }
                 )
                 .padding(.bottom, 4)
+                if !attention.bottom.isEmpty {
+                    NeedsAttentionSection(
+                        items: attention.bottom,
+                        onMinimize: nil,
+                        onDismiss: { model.dismissAttention(attention.bottom) }
+                    )
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+                }
             }
             .scrollBounceBehavior(.basedOnSize)
         }
@@ -168,14 +184,28 @@ struct IslandUsageView: View {
 /// so what you glanced is what you get. Healthy state renders nothing (no
 /// section, no divider) and the tile grid below keeps full legibility (no
 /// dim — comparing healthy accounts' quota is a real workflow).
+///
+/// Top-right controls: `_` sends the rows to the bottom of the panel (passed
+/// as nil once they are there), `x` dismisses the rows of this group.
 private struct NeedsAttentionSection: View {
     let items: [GlanceAttention]
+    let onMinimize: (() -> Void)?
+    let onDismiss: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("NEEDS ATTENTION")
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundColor(Color(red: 1.0, green: 0.72, blue: 0.28))
+            HStack(spacing: 6) {
+                Text("NEEDS ATTENTION")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundColor(Color(red: 1.0, green: 0.72, blue: 0.28))
+                Spacer(minLength: 0)
+                if let onMinimize {
+                    controlButton("minus", help: "Move to the bottom — new problems still show here", action: onMinimize)
+                        .accessibilityLabel("Move needs-attention to the bottom")
+                }
+                controlButton("xmark", help: "Dismiss these \(items.count) — they return only if the problem clears and comes back", action: onDismiss)
+                    .accessibilityLabel("Dismiss needs-attention rows")
+            }
             ForEach(items) { item in
                 HStack(spacing: 8) {
                     EmailPixelized(
@@ -204,6 +234,19 @@ private struct NeedsAttentionSection: View {
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+    }
+
+    private func controlButton(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.white.opacity(0.55))
+                .frame(width: 20, height: 20)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.07)))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 

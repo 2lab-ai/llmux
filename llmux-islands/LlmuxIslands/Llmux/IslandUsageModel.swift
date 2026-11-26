@@ -52,6 +52,9 @@ final class IslandUsageModel: ObservableObject {
     /// [`GlanceResolver`] run, so the two surfaces can never disagree.
     @Published var glance: GlanceSignal = .none
     @Published var attention: [GlanceAttention] = []
+    /// The owner's `_` / `x` choices on the NEEDS ATTENTION rows. Panel-only:
+    /// the closed chip still reports the worst exception.
+    @Published private(set) var attentionTriage = AttentionTriage.load()
     /// Consecutive polls with an explicit degraded account (closed-chip
     /// debounce; resets to 0 the moment no account reports degraded).
     private var degradedStreak = 0
@@ -478,13 +481,22 @@ final class IslandUsageModel: ObservableObject {
 
     private func updateGlance(from state: SharedUiState) {
         let records = state.dashboardProjection.accounts.map(\.statusRecord)
-        updateGlance(records: records, offline: false)
+        // The projection keeps `usage.accounts` order, so index i is the same
+        // account in both; its id is unique even when names are masked.
+        let ids = state.usage.accounts.map(\.id)
+        updateGlance(records: records, offline: false, identity: { index, name in
+            ids.indices.contains(index) ? ids[index] : name
+        })
     }
 
     /// Run the beacon resolver over one Rust-accepted poll or an offline
     /// failure. Demo mode maps account names onto the same stable fakes the
     /// tiles use, so an attention row never leaks a real email into a recording.
-    private func updateGlance(records: [LlmuxAccountRecord], offline: Bool) {
+    private func updateGlance(
+        records: [LlmuxAccountRecord],
+        offline: Bool,
+        identity: @escaping (Int, String) -> String = { _, name in name }
+    ) {
         if !offline, records.contains(where: { $0.status == "degraded" }) {
             degradedStreak += 1
         } else {
@@ -496,10 +508,35 @@ final class IslandUsageModel: ObservableObject {
             degradedStreak: degradedStreak,
             displayName: { index, name in
                 DemoMode.isActive ? DemoMode.fakeEmail(index: index) : name
-            }
+            },
+            identity: identity
         )
         glance = output.signal
         attention = output.attention
+        // Only an online poll can say a condition cleared; an offline one has
+        // no rows at all.
+        if !offline, attentionTriage.observe(output.attention) {
+            attentionTriage.save()
+        }
+    }
+
+    /// NEEDS ATTENTION `_`: move these rows to the bottom of the panel for
+    /// good; a row that appears later shows on top again.
+    func minimizeAttention(_ rows: [GlanceAttention]) {
+        attentionTriage.minimize(rows)
+        attentionTriage.save()
+    }
+
+    /// Snapshot mode only: show a fixed triage without touching the saved one.
+    func replaceAttentionTriageForSnapshot(_ triage: AttentionTriage) {
+        attentionTriage = triage
+    }
+
+    /// NEEDS ATTENTION `x`: hide these rows until their condition clears and
+    /// comes back.
+    func dismissAttention(_ rows: [GlanceAttention]) {
+        attentionTriage.dismiss(rows)
+        attentionTriage.save()
     }
 
     /// Fold the daemon's `email_anonymous` (if it reports one) into local
@@ -1192,7 +1229,12 @@ final class IslandUsageModel: ObservableObject {
                 if let account = response.account { succeeded["target_display"] = account }
                 status = succeeded
             case "error":
-                status = ["phase": "failed", "message": "login failed"]
+                // A fixed sentence per known failure, never the daemon's raw
+                // text (LoginFailureMessage).
+                status = [
+                    "phase": "failed",
+                    "message": LoginFailureMessage.from(daemonError: response.error),
+                ]
             default:
                 status = ["phase": "failed", "message": "login status was invalid"]
             }

@@ -228,12 +228,37 @@ enum SnapshotMode {
         model.connection = .online
         model.dashboard = nil
 
+        // NEEDS ATTENTION fixture rows. The live triage (the owner's saved
+        // `_` / `x` choices) is never read or written here.
+        let attention = [
+            GlanceAttention(account: DemoMode.fakeEmail(index: 3), reason: "7d 4% left",
+                            detail: "resets in 3d 5h", kind: "low:7d"),
+            GlanceAttention(account: DemoMode.fakeEmail(index: 4), reason: "7d limit exhausted",
+                            detail: "resets in 1d 2h", kind: "limit:7d"),
+        ]
+        model.attention = attention
+        model.replaceAttentionTriageForSnapshot(AttentionTriage())
+
         let viewModel = makeViewModel()
         viewModel.contentType = .usage
         let anonOn = AppSettings.emailAnonymousEnabled
         let url = dir.appendingPathComponent(anonOn ? "usage-anon-on.png" : "usage-anon-off.png")
         try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: viewModel.openedSize, to: url)
-        return [url.path]
+
+        // After `_`: the two rows sit under the tiles; a row that appears
+        // later is the only one on top.
+        var minimized = AttentionTriage()
+        minimized.minimize(attention)
+        model.replaceAttentionTriageForSnapshot(minimized)
+        model.attention = [
+            GlanceAttention(account: DemoMode.fakeEmail(index: 5), reason: "authentication required — re-login",
+                            detail: nil, kind: "auth"),
+        ] + attention
+        let minimizedURL = dir.appendingPathComponent("usage-attention-minimized.png")
+        let tall = CGSize(width: viewModel.openedSize.width, height: viewModel.openedSize.height + 260)
+        try writeHosted(view: IslandUsageView(model: model, viewModel: viewModel), size: tall, to: minimizedURL)
+        model.attention = []
+        return [url.path, minimizedURL.path]
     }
 
     /// Production views, deterministic state, no live settings or executors.
@@ -525,7 +550,7 @@ enum SnapshotMode {
     private static func fixtureTiles() -> [UsageAccountTile] {
         let now = Date()
 
-        func info(name: String, sevenDay: Double) -> CLIUsageInfo {
+        func info(name: String, sevenDay: Double, fable: Double?, fableLimiting: Bool) -> CLIUsageInfo {
             CLIUsageInfo(
                 name: name,
                 available: true,
@@ -534,11 +559,17 @@ enum SnapshotMode {
                 sevenDayReset: now.addingTimeInterval(3 * 24 * 3600 + 5 * 3600),
                 model: nil,
                 plan: nil,
-                buckets: nil
+                buckets: nil,
+                fableWeeklyPercent: fable,
+                fableWeeklyReset: fable.map { _ in now.addingTimeInterval(2 * 24 * 3600 + 3 * 3600) },
+                fableWeeklyConstraining: fable.map { _ in fableLimiting }
             )
         }
 
-        func tile(index: Int, provider: UsageProvider, tier: String?, sevenDay: Double) -> UsageAccountTile {
+        func tile(
+            index: Int, provider: UsageProvider, tier: String?, sevenDay: Double,
+            fable: Double? = nil, fableLimiting: Bool = false
+        ) -> UsageAccountTile {
             let email = DemoMode.fakeEmail(index: index)
             return UsageAccountTile(
                 id: email,
@@ -552,18 +583,21 @@ enum SnapshotMode {
                     expiresAt: now.addingTimeInterval(5 * 3600),
                     lifetimeSeconds: 8 * 3600
                 ),
-                info: info(name: email, sevenDay: sevenDay),
+                info: info(name: email, sevenDay: sevenDay, fable: fable, fableLimiting: fableLimiting),
                 errorMessage: nil,
                 issue: nil
             )
         }
 
         return [
-            tile(index: 0, provider: .claude, tier: "max20", sevenDay: 61),
-            tile(index: 1, provider: .claude, tier: "max5", sevenDay: 42),
+            // Fable folded into the 7d row: less Fable left than 7d …
+            tile(index: 0, provider: .claude, tier: "max20", sevenDay: 40, fable: 60),
+            // … more Fable left than 7d (the stripe runs past the fill) …
+            tile(index: 1, provider: .claude, tier: "max5", sevenDay: 42, fable: 10),
             tile(index: 2, provider: .codex, tier: nil, sevenDay: 27),
-            // 7d ≥ 90% — exercises the compact rows' warning color (#68).
-            tile(index: 3, provider: .claude, tier: "pro", sevenDay: 96),
+            // … and a limiting Fable (red stripe and bracket). 7d ≥ 90% also
+            // exercises the compact rows' warning color (#68).
+            tile(index: 3, provider: .claude, tier: "pro", sevenDay: 96, fable: 99, fableLimiting: true),
         ]
     }
 }

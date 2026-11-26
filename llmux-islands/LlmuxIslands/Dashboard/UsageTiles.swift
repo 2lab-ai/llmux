@@ -19,14 +19,10 @@ enum UsageProvider: Hashable {
 
 enum UsageWindow: CaseIterable {
     case sevenDay
-    case fableWeekly
 
     var label: String {
         switch self {
         case .sevenDay: "7d"
-        // Fable weekly is a 7-day window scoped to the Fable model — stack the
-        // duration over the scope so the row reads "7d / Fab" (two lines).
-        case .fableWeekly: "7d\nFab"
         }
     }
 }
@@ -300,12 +296,16 @@ private struct UsageProviderColumn: View {
 
     @AppStorage(AppSettings.emailAnonymousEnabledKey) private var emailAnonymousEnabled = false
     @AppStorage(AppSettings.showFableWeeklyKey) private var showFableWeekly = true
+    @AppStorage(AppSettings.showTokenExpiryKey) private var showTokenExpiry = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
 
-            UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
+            // Key-icon row: off by default, ☰ → "Show token expiry".
+            if showTokenExpiry {
+                UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
+            }
 
             usageRows
         }
@@ -498,7 +498,7 @@ private struct UsageProviderColumn: View {
                     percentUsed: percentUsed(for: window),
                     resetAt: resetAt(for: window),
                     now: now,
-                    emphasizeCritical: emphasizeCritical(for: window)
+                    fable: fableReading
                 )
             }
         }
@@ -510,21 +510,29 @@ private struct UsageProviderColumn: View {
             // Only the 7d row: no provider has a 5h window any more (owner
             // 2026-11-04 and 2026-11-10). Grok reports no quota windows (docs/grok/spec.md §R3) — the row
             // renders its placeholder until a parked reset appears.
-            var windows: [UsageWindow] = [.sevenDay]
-            // The Fable weekly row is opt-out (default on) and only appears when
-            // the daemon actually reports a Fable weekly window for this account.
-            if showFableWeekly, info?.fableWeeklyPercent != nil {
-                windows.append(.fableWeekly)
-            }
-            return windows
+            // Fable weekly is not a row of its own any more: it rides the 7d
+            // row's bar and text (`fableReading`, SevenDayReadout).
+            return [.sevenDay]
         }
+    }
+
+    /// Fable weekly folded into the 7d row — only when the toggle is on and
+    /// the daemon reports the window for this account.
+    private var fableReading: UsageWindowRow.FableReading? {
+        guard showFableWeekly, let info, info.available, !info.error,
+              let used = info.fableWeeklyPercent
+        else { return nil }
+        return UsageWindowRow.FableReading(
+            percentUsed: used,
+            resetAt: info.fableWeeklyReset,
+            constraining: info.fableWeeklyConstraining == true
+        )
     }
 
     private func percentUsed(for window: UsageWindow) -> Double? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
         case .sevenDay: return info.sevenDayPercent
-        case .fableWeekly: return info.fableWeeklyPercent
         }
     }
 
@@ -532,22 +540,7 @@ private struct UsageProviderColumn: View {
         guard let info, info.available, !info.error else { return nil }
         switch window {
         case .sevenDay: return info.sevenDayReset
-        case .fableWeekly: return info.fableWeeklyReset
         }
-    }
-
-    /// The Fable weekly row is emphasized (red) only when the daemon's
-    /// reset-aware `constraining` bool is true. This keys off `constraining`
-    /// (from `ScopedQuotaWindow::is_constraining`), NOT the raw `severity`
-    /// string: `severity` is not reset-aware, so a just-reset window can still
-    /// carry a stale `critical` while its utilization is 0 — keying red off it
-    /// would flash `F 0%!` right after a weekly reset. `is_active` is likewise
-    /// NOT a trigger: it marks the representative/governing limit, NOT an
-    /// exhausted one (a 76%/warning row is `is_active: true` with ~24%
-    /// headroom). `constraining` folds both concerns in on the daemon side.
-    private func emphasizeCritical(for window: UsageWindow) -> Bool {
-        guard window == .fableWeekly, let info else { return false }
-        return info.fableWeeklyConstraining == true
     }
 
     private func normalizeCodexTier(_ plan: String?) -> String? {
@@ -691,22 +684,34 @@ private struct UsageTokenRefreshRow: View {
 }
 
 private struct UsageWindowRow: View {
+    /// Fable weekly, drawn inside this row (SevenDayReadout).
+    struct FableReading: Equatable {
+        let percentUsed: Double
+        let resetAt: Date?
+        /// The daemon's reset-aware `constraining` (from
+        /// `ScopedQuotaWindow::is_constraining`) turns the Fable stripe and
+        /// its bracket red. Not the raw `severity` (a just-reset window can
+        /// keep a stale `critical` at 0%), not `is_active` (it marks the
+        /// governing limit, not an exhausted one).
+        let constraining: Bool
+    }
+
     let window: UsageWindow
     let percentUsed: Double?
     let resetAt: Date?
     let now: Date
-    /// When true (Fable weekly at `severity == critical`), the usage bar +
-    /// percent are forced red regardless of the usage-fraction hue ramp.
-    /// `is_active` alone does NOT set this — it marks the representative limit,
-    /// not an exhausted one, so a 76%/warning/is_active row keeps its normal hue.
-    var emphasizeCritical: Bool = false
+    var fable: FableReading? = nil
+
+    /// Lavender: outside the 7d bar's red→green ramp and the blue reset bar,
+    /// so the stripe and the bracketed number read as one series.
+    static let fableColor = Color(red: 0.78, green: 0.64, blue: 1.0)
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Text(window.label)
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundColor(labelColor)
-                .lineLimit(2)
+                .foregroundColor(.white.opacity(0.45))
+                .lineLimit(1)
                 .minimumScaleFactor(0.8)
                 .frame(width: 26, alignment: .leading)
                 .padding(.top, 2)
@@ -716,15 +721,15 @@ private struct UsageWindowRow: View {
                 MiniSegmentBar(
                     fraction: usageRemainingFraction,
                     fillColor: usageFillColor,
-                    emptyColor: Color.white.opacity(0.08)
+                    emptyColor: Color.white.opacity(0.08),
+                    insetFraction: fableRemainingFraction,
+                    insetColor: fableTint
                 )
                 .frame(height: 10)
 
-                Text(remainingPercentString)
-                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                    .foregroundColor(usageTextColor)
+                remainingText
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                    .minimumScaleFactor(0.6)
             }
             .frame(maxWidth: .infinity)
 
@@ -743,27 +748,33 @@ private struct UsageWindowRow: View {
             }
             .frame(maxWidth: .infinity)
         }
+        .help(helpText)
     }
 
     private var usageRemainingFraction: Double {
-        guard let percentUsed else { return 0 }
-        let used = max(0, min(100, percentUsed))
-        return max(0, min(1, (100 - used) / 100))
+        SevenDayReadout.remaining(usedPercent: percentUsed) ?? 0
     }
 
-    private var remainingPercentString: String {
-        guard let percentUsed else { return "--" }
-        let used = max(0, min(100, percentUsed))
-        let remaining = max(0, min(100, 100 - used))
-        return "\(Int(remaining.rounded()))%"
+    private var fableRemainingFraction: Double? {
+        fable.flatMap { SevenDayReadout.remaining(usedPercent: $0.percentUsed) }
     }
 
-    private var labelColor: Color {
-        emphasizeCritical ? TerminalColors.red : .white.opacity(0.45)
+    private var fableTint: Color {
+        fable?.constraining == true ? TerminalColors.red : Self.fableColor
+    }
+
+    /// `60%` in the 7d colour, then ` (40%)` smaller in the Fable colour.
+    private var remainingText: Text {
+        let seven = Text(SevenDayReadout.percentText(SevenDayReadout.remaining(usedPercent: percentUsed)))
+            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+            .foregroundColor(usageTextColor)
+        guard let fableRemainingFraction else { return seven }
+        return seven + Text(SevenDayReadout.fableSuffix(fableRemainingFraction))
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundColor(fableTint)
     }
 
     private var usageFillColor: Color {
-        if emphasizeCritical { return TerminalColors.red }
         let fraction = max(0, min(1, usageRemainingFraction))
         let hue = 0.33 * fraction
         return Color(hue: hue, saturation: 0.85, brightness: 0.95)
@@ -771,8 +782,21 @@ private struct UsageWindowRow: View {
 
     private var usageTextColor: Color {
         guard percentUsed != nil else { return TerminalColors.dim }
-        if emphasizeCritical { return TerminalColors.red }
         return usageFillColor.opacity(0.9)
+    }
+
+    /// Hover: both values with their own resets (Fable can reset on a
+    /// different day than the 7d window shown in the right column).
+    private var helpText: String {
+        var lines = ["7d: \(SevenDayReadout.percentText(SevenDayReadout.remaining(usedPercent: percentUsed))) left"
+            + (resetAt.map { " · resets in \(GlanceResolver.duration(Int($0.timeIntervalSince(now))))" } ?? "")]
+        if let fable {
+            lines.append("Fable 7d (bracket, thin stripe): "
+                + "\(SevenDayReadout.percentText(fableRemainingFraction)) left"
+                + (fable.resetAt.map { " · resets in \(GlanceResolver.duration(Int($0.timeIntervalSince(now))))" } ?? "")
+                + (fable.constraining ? " · limiting" : ""))
+        }
+        return lines.joined(separator: "\n")
     }
 
     private var resetRemainingFraction: Double {
@@ -792,7 +816,7 @@ private struct UsageWindowRow: View {
 
     private var windowDurationSeconds: TimeInterval? {
         switch window {
-        case .sevenDay, .fableWeekly:
+        case .sevenDay:
             return 7 * 24 * 60 * 60
         }
     }
@@ -937,19 +961,42 @@ private struct MiniSegmentBar: View {
     let fraction: Double
     let fillColor: Color
     let emptyColor: Color
+    /// Optional second value on the same scale, drawn as a thin stripe
+    /// through the middle of the segments (bullet-graph inset). It runs over
+    /// lit and empty segments alike, so it shows whether it is shorter or
+    /// longer than the main fill.
+    var insetFraction: Double? = nil
+    var insetColor: Color = .clear
 
     var body: some View {
         GeometryReader { geo in
-            let segmentCount = 10
+            let segmentCount = SevenDayReadout.segmentCount
             let spacing: CGFloat = 1
             let totalSpacing = spacing * CGFloat(segmentCount - 1)
             let segmentWidth = max(1, (geo.size.width - totalSpacing) / CGFloat(segmentCount))
-            let filledSegments = max(0, min(segmentCount, Int((fraction * Double(segmentCount)).rounded(.toNearestOrAwayFromZero))))
+            let filledSegments = SevenDayReadout.litSegments(fraction, count: segmentCount)
+            let insetSegments = SevenDayReadout.litSegments(insetFraction, count: segmentCount)
+            // ~40% of the bar height: thin enough to leave the main fill
+            // readable above and below it, thick enough to read at a glance.
+            let insetHeight = max(2, (geo.size.height * 0.4).rounded())
 
             HStack(spacing: spacing) {
                 ForEach(0..<segmentCount, id: \.self) { index in
                     RoundedRectangle(cornerRadius: 2)
                         .fill(index < filledSegments ? fillColor : emptyColor)
+                        .overlay {
+                            if insetFraction != nil, index < insetSegments {
+                                RoundedRectangle(cornerRadius: 1)
+                                    .fill(insetColor)
+                                    // A dark hairline keeps the stripe apart
+                                    // from a fill of similar brightness.
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 1)
+                                            .stroke(Color.black.opacity(0.45), lineWidth: 0.5)
+                                    )
+                                    .frame(height: insetHeight)
+                            }
+                        }
                         .frame(width: segmentWidth)
                 }
             }

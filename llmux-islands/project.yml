@@ -60,6 +60,8 @@ targets:
       # exception-beacon: pure resolver (signal priority, thresholds,
       # tie-breaks, debounce) — Foundation-only by design.
       - path: LlmuxIslands/Llmux/GlanceSignal.swift
+      # NEEDS ATTENTION minimize/dismiss bookkeeping (Foundation + CryptoKit).
+      - path: LlmuxIslands/Llmux/AttentionTriage.swift
       - path: LlmuxIslands/Llmux/LegacyStatusDashboardAdapter.swift
       - path: LlmuxIslands/Llmux/LlmuxDashboard.swift
       # Foundation-only `llmux` CLI output parsing (CLIParse / ReleaseChannel /

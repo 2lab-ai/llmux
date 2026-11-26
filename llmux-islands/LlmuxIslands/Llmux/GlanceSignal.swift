@@ -53,7 +53,18 @@ struct GlanceAttention: Equatable, Identifiable {
     let reason: String
     /// "resets in 1h 42m" when the window carries a reset. nil otherwise.
     let detail: String?
+    /// The condition, without the numbers that move between polls:
+    /// "auth", "limit:7d", "low:7d", "degraded". With `identity` it names the
+    /// row across polls, so a row the owner minimized or dismissed stays put
+    /// while its percent or countdown changes (`AttentionTriage`).
+    var kind: String = ""
+    /// The account's id, unique even when the display name is masked
+    /// (email anonymity can give two accounts the same `account` text).
+    /// Empty = fall back to `account`.
+    var identity: String = ""
     var id: String { account + "·" + reason }
+    /// Stable across polls (see `kind`).
+    var conditionKey: String { (identity.isEmpty ? account : identity) + "\u{1F}" + kind }
 }
 
 enum GlanceResolver {
@@ -79,7 +90,8 @@ enum GlanceResolver {
         records: [LlmuxAccountRecord],
         offline: Bool,
         degradedStreak: Int,
-        displayName: (Int, String) -> String = { _, name in name }
+        displayName: (Int, String) -> String = { _, name in name },
+        identity: (Int, String) -> String = { _, name in name }
     ) -> Output {
         if offline {
             return Output(signal: .offline, attention: [])
@@ -95,7 +107,9 @@ enum GlanceResolver {
                 GlanceAttention(
                     account: displayName(index, record.name),
                     reason: "authentication required — re-login",
-                    detail: nil
+                    detail: nil,
+                    kind: "auth",
+                    identity: identity(index, record.name)
                 )
             )
         }
@@ -131,7 +145,9 @@ enum GlanceResolver {
                     // The action is always present: wait for the named reset,
                     // or rotate now when the daemon reports no reset time.
                     detail: state.resetsInSecs.map { "resets in \(Self.duration($0))" }
-                        ?? "reset unknown — rotate accounts"
+                        ?? "reset unknown — rotate accounts",
+                    kind: "limit:\(state.window)",
+                    identity: identity(state.index, state.name)
                 )
             )
         }
@@ -147,7 +163,9 @@ enum GlanceResolver {
                     account: displayName(state.index, state.name),
                     reason: "\(state.window) \(remainingPct(state.utilization))% left",
                     detail: state.resetsInSecs.map { "resets in \(Self.duration($0))" }
-                        ?? "reset unknown — plan a switch"
+                        ?? "reset unknown — plan a switch",
+                    kind: "low:\(state.window)",
+                    identity: identity(state.index, state.name)
                 )
             )
         }
@@ -161,7 +179,9 @@ enum GlanceResolver {
                 GlanceAttention(
                     account: displayName(index, record.name),
                     reason: "degraded",
-                    detail: "reported by daemon — check llmux logs"
+                    detail: "reported by daemon — check llmux logs",
+                    kind: "degraded",
+                    identity: identity(index, record.name)
                 )
             )
         }

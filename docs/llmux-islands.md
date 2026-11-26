@@ -14,7 +14,20 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
 
 - Per-account Claude / Codex / Grok / Gemini / API-key usage from the llmux daemon.
 - The 7-day quota window with reset timing (no provider reports a 5-hour window since 2026-11).
-- Token/auth health and degraded accounts.
+  When the daemon reports a **Fable weekly** limit for a Claude account, it rides the same
+  7d row (2026-11-26): the text reads `60% (40%)` — 7d left, then Fable left in brackets —
+  and Fable is a thin lavender stripe inside the 7d bar, on the same 0–100% scale. The stripe
+  runs past the 7d fill when Fable has more left than the week, and turns red while the
+  daemon marks Fable as the limiting window. Hover the row for both values and both resets.
+  ☰ → **Show Fable weekly (7d)** turns the stripe and the bracket off.
+- Token/auth health and degraded accounts. The key-icon row (time left on each account's
+  access token) is hidden by default since 2026-11-26; turn it on with ☰ → **Show token expiry**.
+- A **NEEDS ATTENTION** box at the top of the panel when an account needs re-login, has run
+  out of its 7d quota, is close to it, or is degraded. Its top-right buttons:
+  **–** moves the box under the account tiles and keeps it there — a problem that appears
+  later shows on top again, alone; **×** dismisses the rows in that box until their problem
+  clears and comes back (a row is forgotten 15 minutes after its problem is gone). The closed
+  island's chip still shows the worst problem. These choices are kept on this Mac only.
 - A **Start coding** row (preview channel) that opens Claude Code or Codex in a chosen project folder through llmux.
 - A closed floating island label:
 
@@ -240,6 +253,19 @@ For manual diagnosis:
 llmux restart
 llmux status
 ```
+
+### Adding an account says "login failed"
+
+The panel now names the reason. **"the sign-in callback port is in use"** means another
+login is still holding the browser callback port (Gemini uses 51121, the same port as the
+Antigravity CLI). Before 2026-11-26 a cancelled login could keep that port until the daemon
+restarted; a daemon on an older build needs `llmux restart` once. The daemon log
+(`~/.local/state/llmux/server.log`) records every GUI login as `login started`,
+`login finished` or `login failed` with the full reason.
+
+A Google account that Google has suspended for Antigravity use can still sign in, but its
+requests keep failing with 403 — the log says `Google suspended Antigravity access`.
+Re-adding the account does not lift a suspension.
 
 ### The app build cannot find an Xcode project
 

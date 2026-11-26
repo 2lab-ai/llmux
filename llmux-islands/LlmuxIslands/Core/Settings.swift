@@ -41,6 +41,7 @@ enum AppSettings {
         static let usageResetAlertsEnabled = "usageResetAlertsEnabled"
         static let emailAnonymousEnabled = "emailAnonymousEnabled"
         static let showFableWeekly = "showFableWeekly"
+        static let showTokenExpiry = "showTokenExpiry"
     }
 
     // MARK: - Notification Sound
@@ -111,5 +112,20 @@ enum AppSettings {
         set {
             defaults.set(newValue, forKey: Keys.showFableWeekly)
         }
+    }
+
+    // MARK: - Token expiry row (key icon)
+
+    /// UserDefaults key for the "show token expiry" setting, exposed so
+    /// SwiftUI views can observe it live via `@AppStorage`.
+    static let showTokenExpiryKey = Keys.showTokenExpiry
+
+    /// Whether each usage tile shows the key-icon row (time left on the
+    /// account's access token). Defaults to OFF (owner 2026-11-26): llmux
+    /// refreshes tokens itself, so the row is detail most owners never act
+    /// on. A view preference of this Mac only — nothing reaches the daemon.
+    static var showTokenExpiry: Bool {
+        get { defaults.bool(forKey: Keys.showTokenExpiry) }
+        set { defaults.set(newValue, forKey: Keys.showTokenExpiry) }
     }
 }
