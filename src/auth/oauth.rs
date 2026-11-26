@@ -1185,7 +1185,12 @@ mod tests {
         // Cancel only once the callback server answers HTTP: before that the
         // listener may still sit in the login future, and dropping it would
         // pass even with a leaking server task.
-        let client = reqwest::Client::new();
+        // Each probe is bounded, so a listener that accepts but never
+        // answers fails the assertion below instead of hanging the test.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
         let mut serving = false;
         for _ in 0..80 {
             if client

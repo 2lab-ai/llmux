@@ -112,6 +112,33 @@ final class AttentionTriageTests: XCTestCase {
         XCTAssertEqual(triage.split([first, second]).top, [second])
     }
 
+    func testMaskedQuotaRowsStayApartThroughTheResolver() {
+        // Two accounts that email anonymity shows with the same text, for
+        // both quota conditions: acting on one must not touch the other.
+        let masked: (Int, String) -> String = { _, _ in "a***@example.com" }
+        let ids: (Int, String) -> String = { index, _ in "id-\(index)" }
+        for usage in [0.95, 1.0] {
+            let rows = GlanceResolver.resolve(
+                records: [record("first", sevenDay: usage), record("second", sevenDay: usage)],
+                offline: false,
+                degradedStreak: 0,
+                displayName: masked,
+                identity: ids
+            ).attention
+            XCTAssertEqual(rows.count, 2)
+            XCTAssertEqual(Set(rows.map(\.account)).count, 1, "names collide on purpose")
+
+            var minimized = AttentionTriage()
+            minimized.minimize([rows[0]])
+            XCTAssertEqual(minimized.split(rows).top, [rows[1]], "usage \(usage)")
+            XCTAssertEqual(minimized.split(rows).bottom, [rows[0]], "usage \(usage)")
+
+            var dismissed = AttentionTriage()
+            dismissed.dismiss([rows[1]])
+            XCTAssertEqual(dismissed.split(rows).top, [rows[0]], "usage \(usage)")
+        }
+    }
+
     func testResolverCarriesTheAccountIdentity() {
         let output = GlanceResolver.resolve(
             records: [record("shown", status: "auth_failed")],

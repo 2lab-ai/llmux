@@ -37,16 +37,8 @@ struct AttentionTriage: Codable, Equatable {
     /// on yet, `bottom` what was minimized. Dismissed rows are in neither.
     /// Each side keeps the resolver's order (worst first).
     func split(_ items: [GlanceAttention]) -> (top: [GlanceAttention], bottom: [GlanceAttention]) {
-        var top: [GlanceAttention] = []
-        var bottom: [GlanceAttention] = []
-        for item in items {
-            switch entries[Self.digest(item)]?.placement {
-            case .dismissed?: continue
-            case .bottom?: bottom.append(item)
-            case nil: top.append(item)
-            }
-        }
-        return (top, bottom)
+        let grouped = Dictionary(grouping: items) { entries[Self.digest($0)]?.placement }
+        return (grouped[nil] ?? [], grouped[.bottom] ?? [])
     }
 
     /// `_`: these rows move to the bottom and stay there.
