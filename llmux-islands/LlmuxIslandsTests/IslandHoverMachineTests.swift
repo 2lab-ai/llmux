@@ -89,6 +89,15 @@ final class IslandHoverMachineTests: XCTestCase {
         }
     }
 
+    func testThePickerAtTheDwellDeadlineCancelsTheOpen() {
+        var busy = closed
+        busy.busy = true
+        var machine = IslandHoverMachine()
+        machine.pointer(hovering: true, island: closed, now: at(0))
+        XCTAssertNil(machine.due(island: busy, now: at(0.3)))
+        XCTAssertNil(machine.deadline, "cancelled, not deferred")
+    }
+
     func testTheOpenIsDroppedIfTheIslandOpenedMeanwhile() {
         // A click opened the island during the dwell: no second open.
         var machine = IslandHoverMachine()
