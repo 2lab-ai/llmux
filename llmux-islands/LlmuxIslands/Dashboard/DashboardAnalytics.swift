@@ -302,12 +302,11 @@ enum SevenDayReadout {
     /// Where Fable's bracket ends on a bar `width` points wide: the right
     /// edge of the last segment `litSegments` would light, so the bracket's
     /// end tick lines up with a segment edge. 0 when no segment is lit.
-    static func bracketEnd(_ remaining: Double?, width: CGFloat,
-                           count: Int = segmentCount, spacing: CGFloat = segmentSpacing) -> CGFloat {
-        let lit = litSegments(remaining, count: count)
-        guard lit > 0, count > 0 else { return 0 }
-        let segment = max(1, (width - spacing * CGFloat(count - 1)) / CGFloat(count))
-        return min(width, segment * CGFloat(lit) + spacing * CGFloat(lit - 1))
+    static func bracketEnd(_ remaining: Double?, width: CGFloat) -> CGFloat {
+        let lit = litSegments(remaining)
+        guard lit > 0 else { return 0 }
+        let segment = max(1, (width - segmentSpacing * CGFloat(segmentCount - 1)) / CGFloat(segmentCount))
+        return min(width, segment * CGFloat(lit) + segmentSpacing * CGFloat(lit - 1))
     }
 
     /// `60%` for the 7d value, `--` when it is not reported.
