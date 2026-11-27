@@ -16,3 +16,6 @@ dist/*.backup.app/
 /bridge/node_modules/
 scripts/dbms/pgdata/
 __pycache__/
+
+# Written by the cxx-qt build for the QML language server; machine-specific.
+llmux-islands-linux/.qmlls.ini
