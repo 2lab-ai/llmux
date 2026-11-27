@@ -159,6 +159,12 @@ class NotchViewModel: ObservableObject {
 
     // MARK: - Initialization
 
+    deinit {
+        // A display change replaces the view model; its app-wide key monitor
+        // must go with it.
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    }
+
     init(deviceNotchRect: CGRect, screenRect: CGRect, windowHeight: CGFloat, hasPhysicalNotch: Bool) {
         self.geometry = NotchGeometry(
             deviceNotchRect: deviceNotchRect,
@@ -293,17 +299,18 @@ class NotchViewModel: ObservableObject {
         // A click in another window of this app (the folder picker, a sheet)
         // is not a click outside the island.
         if let window = event.window, !(window is NotchPanel) { return }
+        // A click inside the island pins a hover-opened island: it then stays
+        // open until a click outside, a notch click or Esc. Checked before
+        // the busy guard: this handler is queued, so the click that opened
+        // the folder picker may arrive while the picker is already modal.
+        if status == .opened, event.window is NotchPanel {
+            openReason = .click
+        }
         guard !islandIsBusy else { return }
         let location = NSEvent.mouseLocation
 
         switch status {
         case .opened:
-            if !geometry.isPointOutsidePanel(location, size: openedSize),
-               !geometry.notchScreenRect.contains(location) {
-                // Clicking inside pins a hover-opened island: it now stays
-                // open until a click outside, a notch click or Esc.
-                openReason = .click
-            }
             if geometry.isPointOutsidePanel(location, size: openedSize) {
                 notchClose()
                 // Re-post the click so it reaches the window/app behind us

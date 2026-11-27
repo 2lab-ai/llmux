@@ -263,12 +263,7 @@ struct NotchView: View {
     // MARK: - Event Handlers
 
     private func handleStatusChange(from oldStatus: NotchStatus, to newStatus: NotchStatus) {
-        switch newStatus {
-        case .opened, .popping:
-            isVisible = true
-        case .closed:
-            // Stays visible: see `.onAppear`.
-            isVisible = true
-        }
+        // Visible in every state, closed included: see `.onAppear`.
+        isVisible = true
     }
 }
