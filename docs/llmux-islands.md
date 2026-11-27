@@ -32,6 +32,8 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
   choices are kept on this Mac only. Since 2026-11-27 the closed island shows no warning chip
   (`AUTH 3`, `LIMIT 2`, `7d 8%`); warnings are here, in NEEDS ATTENTION.
 - A **Start coding** row (preview channel) that opens Claude Code or Codex in a chosen project folder through llmux.
+  **Choose project folder** opens the folder picker above the island and without blocking it
+  (2026-11-27): the island keeps responding and stays open while the picker is up.
 - A closed floating island label:
 
 ```text

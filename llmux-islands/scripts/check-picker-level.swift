@@ -36,7 +36,16 @@ enum CheckPickerLevel {
         var islandLayer: Int?
         var responsive = false
         var done = false
+        // Watchdog in the common modes, which also run inside a modal
+        // session: if the picker opens modally, beginAboveIsland never
+        // returns, so fail from here.
+        let watchdog = Timer(timeInterval: 5, repeats: false) { _ in
+            print("FAIL: the picker opened in a modal session (beginAboveIsland did not return)")
+            exit(1)
+        }
+        RunLoop.main.add(watchdog, forMode: .common)
         NotchPanel.beginAboveIsland(panel) { _ in done = true }
+        watchdog.invalidate()
         // A default-mode timer: it never fires inside a modal session.
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
             MainActor.assumeIsolated {
@@ -52,6 +61,10 @@ enum CheckPickerLevel {
         }
 
         print("picker layer \(picker.map(String.init) ?? "?"), island layer \(islandLayer.map(String.init) ?? "?"), app responsive while picker up: \(responsive)")
+        guard done else {
+            print("FAIL: the picker's completion never ran (the chosen folder would be lost)")
+            exit(1)
+        }
         guard responsive else {
             print("FAIL: the app froze while the picker was up (modal session)")
             exit(1)
