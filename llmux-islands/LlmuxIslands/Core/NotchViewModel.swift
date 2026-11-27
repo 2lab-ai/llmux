@@ -228,7 +228,7 @@ class NotchViewModel: ObservableObject {
         // Esc closes the open island (the panel is key while open).
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.keyCode == 53, self.status == .opened,
-                  NSApp.modalWindow == nil, event.window is NotchPanel
+                  !self.islandIsBusy, event.window is NotchPanel
             else { return event }
             self.notchClose()
             return nil
@@ -238,7 +238,7 @@ class NotchViewModel: ObservableObject {
     /// While a window the island opened is up (the folder picker), the island
     /// neither opens nor closes by itself: its clicks and pointer moves are not
     /// "outside the island".
-    private var islandIsBusy: Bool { NSApp.modalWindow != nil }
+    private var islandIsBusy: Bool { NSApp.modalWindow != nil || NotchPanel.openPanels > 0 }
 
     /// Typing in a field of the island (an API key, a connection setting)
     /// also keeps a hover-opened island from closing when the pointer leaves.
