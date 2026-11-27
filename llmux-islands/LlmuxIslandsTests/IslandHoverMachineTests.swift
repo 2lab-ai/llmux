@@ -3,8 +3,8 @@ import XCTest
 /// Hover open and leave-close timing of the island (docs/llmux-islands.md,
 /// "When the island opens and closes", rules 1 and 4), on a fake clock.
 final class IslandHoverMachineTests: XCTestCase {
-    private let t0 = Date(timeIntervalSinceReferenceDate: 1_000_000)
-    private func at(_ seconds: TimeInterval) -> Date { t0.addingTimeInterval(seconds) }
+    private let t0: TimeInterval = 1_000
+    private func at(_ seconds: TimeInterval) -> TimeInterval { t0 + seconds }
 
     private let closed = IslandHoverMachine.Island(isOpen: false, openedByHover: false)
     private let hoverOpened = IslandHoverMachine.Island(isOpen: true, openedByHover: true)
@@ -15,7 +15,9 @@ final class IslandHoverMachineTests: XCTestCase {
         machine.pointer(hovering: true, island: closed, now: at(0))
         XCTAssertEqual(machine.deadline, at(IslandHoverMachine.hoverOpenDelay))
         XCTAssertNil(machine.due(island: closed, now: at(0.1)), "not before the dwell")
+        XCTAssertEqual(machine.deadline, at(0.3), "still armed after an early call")
         XCTAssertEqual(machine.due(island: closed, now: at(0.3)), .open)
+        XCTAssertNil(machine.deadline)
     }
 
     func testAQuickPassOverTheNotchDoesNotOpen() {

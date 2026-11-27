@@ -257,7 +257,7 @@ class NotchViewModel: ObservableObject {
         guard newHovering != isHovering else { return }
 
         isHovering = newHovering
-        hover.pointer(hovering: newHovering, island: hoverIsland, now: Date())
+        hover.pointer(hovering: newHovering, island: hoverIsland, now: ProcessInfo.processInfo.systemUptime)
         scheduleHoverDeadline()
     }
 
@@ -276,14 +276,17 @@ class NotchViewModel: ObservableObject {
         guard let deadline = hover.deadline else { return }
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            switch self.hover.due(island: self.hoverIsland, now: Date()) {
+            switch self.hover.due(island: self.hoverIsland, now: ProcessInfo.processInfo.systemUptime) {
             case .open: self.notchOpen(reason: .hover)
             case .close: self.notchClose()
-            case nil: break
+            case nil:
+                // Fired a hair before the deadline: still pending, wait again.
+                if self.hover.deadline != nil { self.scheduleHoverDeadline() }
             }
         }
         hoverDeadline = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline.timeIntervalSinceNow), execute: workItem)
+        let delay = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     /// Keep an opened island open until a click outside, a notch click or

@@ -15,7 +15,10 @@ import Foundation
 ///   (pinned, busy or typing in a field: no close).
 ///
 /// NotchViewModel feeds it pointer changes and calls `due` at `deadline`.
-/// Foundation-only: the logic test target exercises it directly.
+/// Times are seconds on a monotonic clock (`ProcessInfo.systemUptime`, the
+/// clock `DispatchQueue.asyncAfter` runs on), so a wall-clock change cannot
+/// make a deadline look early. Foundation-only: the logic test target
+/// exercises it directly.
 struct IslandHoverMachine: Equatable {
     /// Pointer dwell on the notch before the island opens by itself
     /// (boring.notch / Atoll use 0.3 s; Claude Island used 1 s).
@@ -43,10 +46,10 @@ struct IslandHoverMachine: Equatable {
 
     private(set) var hovering = false
     private(set) var pending: Action?
-    private(set) var deadline: Date?
+    private(set) var deadline: TimeInterval?
 
     /// The pointer entered or left the notch or the opened island.
-    mutating func pointer(hovering newValue: Bool, island: Island, now: Date) {
+    mutating func pointer(hovering newValue: Bool, island: Island, now: TimeInterval) {
         guard newValue != hovering else { return }
         hovering = newValue
         pending = nil
@@ -60,8 +63,9 @@ struct IslandHoverMachine: Equatable {
     }
 
     /// Called at `deadline`: what to do, checked against the island as it is
-    /// now. nil when nothing is due or the reason for it has gone.
-    mutating func due(island: Island, now: Date) -> Action? {
+    /// now. nil when nothing is due or the reason for it has gone; before the
+    /// deadline nothing changes (`deadline` stays set, so the caller re-arms).
+    mutating func due(island: Island, now: TimeInterval) -> Action? {
         guard let pending, let deadline, now >= deadline else { return nil }
         self.pending = nil
         self.deadline = nil
@@ -74,8 +78,8 @@ struct IslandHoverMachine: Equatable {
         }
     }
 
-    private mutating func schedule(_ action: Action, after delay: TimeInterval, now: Date) {
+    private mutating func schedule(_ action: Action, after delay: TimeInterval, now: TimeInterval) {
         pending = action
-        deadline = now.addingTimeInterval(delay)
+        deadline = now + delay
     }
 }
