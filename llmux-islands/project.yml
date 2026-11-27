@@ -86,6 +86,8 @@ targets:
       # Foundation-only analytics logic (issue #62 S4): formatting, the
       # health-warning rule, data-quality fallbacks, (group, model) keying.
       - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift
+      # Foundation-only hover open / leave close timing (fake clock in tests).
+      - path: LlmuxIslands/Core/IslandHoverMachine.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslandsTests
