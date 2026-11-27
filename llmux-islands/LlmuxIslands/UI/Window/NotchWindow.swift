@@ -17,18 +17,30 @@ class NotchPanel: NSPanel {
     /// or it opens behind the open panel and cannot be used.
     static let modalAboveIslandLevel = NSWindow.Level(rawValue: islandLevel.rawValue + 1)
 
-    /// Runs `panel` modally above the island. `runModal()` puts a panel back
-    /// at the modal-panel level (8) when its session starts, under the
-    /// island (27), so a level set beforehand is lost (measured with
-    /// CGWindowListCopyWindowInfo on macOS 26). The level is raised from
-    /// inside the modal session instead.
+    /// Panels the island opened that are still up (the folder picker).
+    /// While one is, the island neither opens nor closes by itself.
+    @MainActor static private(set) var openPanels = 0
+
+    /// Shows `panel` above the island WITHOUT a modal session, then calls
+    /// `completion` with the result. A modal session (`runModal()`) blocks
+    /// every other window of the app while the picker is up — the island
+    /// looked frozen, worst when the picker did not come to the front (owner
+    /// 2026-11-27). Non-modal, the island keeps responding, and the level is
+    /// set after the panel is ordered in, where it sticks (measured with
+    /// CGWindowListCopyWindowInfo: picker 28, island 27).
     @MainActor
-    static func runModalAboveIsland(_ panel: NSSavePanel) -> NSApplication.ModalResponse {
-        RunLoop.main.perform(inModes: [.modalPanel]) { [weak panel] in
-            MainActor.assumeIsolated { panel?.level = modalAboveIslandLevel }
+    static func beginAboveIsland(_ panel: NSSavePanel,
+                                 completion: @escaping @MainActor (NSApplication.ModalResponse) -> Void) {
+        openPanels += 1
+        panel.begin { response in
+            MainActor.assumeIsolated {
+                openPanels -= 1
+                completion(response)
+            }
         }
-        NSApp.activate(ignoringOtherApps: true)
-        return panel.runModal()
+        panel.level = modalAboveIslandLevel
+        NSApp.activate()
+        panel.makeKeyAndOrderFront(nil)
     }
 
     override init(

@@ -78,10 +78,11 @@ struct StartCodingView: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose project"
         panel.message = "Choose the folder Claude Code or Codex should work in."
-        // The island floats above the menu bar (NotchPanel.islandLevel); a
-        // panel at its default modal level opened BEHIND it and could not be
-        // used.
-        if NotchPanel.runModalAboveIsland(panel) == .OK { project = panel.url; message = nil }
+        // Above the island (NotchPanel.islandLevel) and not modal, so the
+        // island keeps responding while the picker is up.
+        NotchPanel.beginAboveIsland(panel) { response in
+            if response == .OK { project = panel.url; message = nil }
+        }
     }
     private func plan() throws -> CodingLaunchPlan { try CodingLaunchPlan(client: client, project: selectedProject, isRemote: remote) }
     private func copyCommand() {
