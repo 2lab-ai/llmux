@@ -592,10 +592,10 @@ enum SnapshotMode {
         return [
             // Fable folded into the 7d row: less Fable left than 7d …
             tile(index: 0, provider: .claude, tier: "max20", sevenDay: 40, fable: 60),
-            // … more Fable left than 7d (the stripe runs past the fill) …
+            // … more Fable left than 7d (the bracket runs past the fill) …
             tile(index: 1, provider: .claude, tier: "max5", sevenDay: 42, fable: 10),
             tile(index: 2, provider: .codex, tier: nil, sevenDay: 27),
-            // … and a limiting Fable (red stripe and bracket). 7d ≥ 90% also
+            // … and a limiting Fable (red bracket and number). 7d ≥ 90% also
             // exercises the compact rows' warning color (#68).
             tile(index: 3, provider: .claude, tier: "pro", sevenDay: 96, fable: 99, fableLimiting: true),
         ]

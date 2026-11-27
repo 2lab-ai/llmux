@@ -270,16 +270,19 @@ enum CompactUsageGauges {
 /// (owner 2026-11-26: one bar, one text, e.g. `60% (40%)`).
 ///
 /// Fable is a limit INSIDE the weekly one — Fable traffic draws on both — so
-/// the two values are drawn as a bullet graph (Few, Bullet Graph Design
-/// Specification, 2013), not as stacked parts of one whole: the 7d remaining
-/// fills the full-height segments as before, and Fable's remaining is a thin
-/// inset stripe on the same 0–100 scale. A stacked or colour-mixed bar would
-/// read as "parts of 7d" and cannot show Fable having MORE left than 7d; the
-/// inset stays readable in both directions because it runs over empty track
-/// as well as over the fill. The text keeps the 7d value first and puts
-/// Fable in brackets in the stripe's colour, so the colour is the legend.
+/// the two values share one scale but are not stacked parts of one whole:
+/// the 7d remaining fills the segments exactly as before, and Fable's
+/// remaining is a square bracket UNDER the bar, from the start of the track
+/// to the end of the last segment Fable would light (owner 2026-11-27: the
+/// earlier stripe through the segments covered the 7d fill). A stacked or
+/// colour-mixed bar would read as "parts of 7d" and cannot show Fable having
+/// MORE left than 7d; the bracket reads in both directions because it spans
+/// empty track as well as fill. The text keeps the 7d value first and puts
+/// Fable in brackets in the bracket's colour, so the colour is the legend.
 enum SevenDayReadout {
     static let segmentCount = 10
+    /// Gap between two segments of the bar, in points.
+    static let segmentSpacing: CGFloat = 1
 
     /// Remaining share 0…1 of a window reported as used percent 0–100.
     static func remaining(usedPercent: Double?) -> Double? {
@@ -294,6 +297,17 @@ enum SevenDayReadout {
         guard let remaining, remaining.isFinite else { return 0 }
         let clamped = max(0, min(1, remaining))
         return max(0, min(count, Int((clamped * Double(count)).rounded(.toNearestOrAwayFromZero))))
+    }
+
+    /// Where Fable's bracket ends on a bar `width` points wide: the right
+    /// edge of the last segment `litSegments` would light, so the bracket's
+    /// end tick lines up with a segment edge. 0 when no segment is lit.
+    static func bracketEnd(_ remaining: Double?, width: CGFloat,
+                           count: Int = segmentCount, spacing: CGFloat = segmentSpacing) -> CGFloat {
+        let lit = litSegments(remaining, count: count)
+        guard lit > 0, count > 0 else { return 0 }
+        let segment = max(1, (width - spacing * CGFloat(count - 1)) / CGFloat(count))
+        return min(width, segment * CGFloat(lit) + spacing * CGFloat(lit - 1))
     }
 
     /// `60%` for the 7d value, `--` when it is not reported.
