@@ -689,8 +689,8 @@ private struct UsageWindowRow: View {
         let percentUsed: Double
         let resetAt: Date?
         /// The daemon's reset-aware `constraining` (from
-        /// `ScopedQuotaWindow::is_constraining`) turns the Fable stripe and
-        /// its bracket red. Not the raw `severity` (a just-reset window can
+        /// `ScopedQuotaWindow::is_constraining`) turns the Fable bracket and
+        /// its bracketed number red. Not the raw `severity` (a just-reset window can
         /// keep a stale `critical` at 0%), not `is_active` (it marks the
         /// governing limit, not an exhausted one).
         let constraining: Bool
@@ -703,7 +703,8 @@ private struct UsageWindowRow: View {
     var fable: FableReading? = nil
 
     /// Lavender: outside the 7d bar's red→green ramp and the blue reset bar,
-    /// so the stripe and the bracketed number read as one series.
+    /// so the bracket under the bar and the bracketed number read as one
+    /// series.
     static let fableColor = Color(red: 0.78, green: 0.64, blue: 1.0)
 
     var body: some View {
@@ -721,11 +722,20 @@ private struct UsageWindowRow: View {
                 MiniSegmentBar(
                     fraction: usageRemainingFraction,
                     fillColor: usageFillColor,
-                    emptyColor: Color.white.opacity(0.08),
-                    insetFraction: fableRemainingFraction,
-                    insetColor: fableTint
+                    emptyColor: Color.white.opacity(0.08)
                 )
                 .frame(height: 10)
+                // Fable sits under the bar, never on it: a bracket from the
+                // start of the track to Fable's remaining. Drawn in the gap
+                // above the text, so the row keeps its height and the two
+                // columns stay aligned.
+                .overlay(alignment: .topLeading) {
+                    if let fableRemainingFraction {
+                        FableBracket(remaining: fableRemainingFraction, color: fableTint)
+                            .frame(height: FableBracket.height)
+                            .offset(y: 10 + FableBracket.gap)
+                    }
+                }
 
                 remainingText
                     .lineLimit(1)
@@ -791,7 +801,7 @@ private struct UsageWindowRow: View {
         var lines = ["7d: \(SevenDayReadout.percentText(SevenDayReadout.remaining(usedPercent: percentUsed))) left"
             + (resetAt.map { " · resets in \(GlanceResolver.duration(Int($0.timeIntervalSince(now))))" } ?? "")]
         if let fable {
-            lines.append("Fable 7d (bracket, thin stripe): "
+            lines.append("Fable 7d (bracket under the bar): "
                 + "\(SevenDayReadout.percentText(fableRemainingFraction)) left"
                 + (fable.resetAt.map { " · resets in \(GlanceResolver.duration(Int($0.timeIntervalSince(now))))" } ?? "")
                 + (fable.constraining ? " · limiting" : ""))
@@ -961,46 +971,59 @@ private struct MiniSegmentBar: View {
     let fraction: Double
     let fillColor: Color
     let emptyColor: Color
-    /// Optional second value on the same scale, drawn as a thin stripe
-    /// through the middle of the segments (bullet-graph inset). It runs over
-    /// lit and empty segments alike, so it shows whether it is shorter or
-    /// longer than the main fill.
-    var insetFraction: Double? = nil
-    var insetColor: Color = .clear
 
     var body: some View {
         GeometryReader { geo in
             let segmentCount = SevenDayReadout.segmentCount
-            let spacing: CGFloat = 1
+            let spacing = SevenDayReadout.segmentSpacing
             let totalSpacing = spacing * CGFloat(segmentCount - 1)
             let segmentWidth = max(1, (geo.size.width - totalSpacing) / CGFloat(segmentCount))
             let filledSegments = SevenDayReadout.litSegments(fraction, count: segmentCount)
-            let insetSegments = SevenDayReadout.litSegments(insetFraction, count: segmentCount)
-            // ~40% of the bar height: thin enough to leave the main fill
-            // readable above and below it, thick enough to read at a glance.
-            let insetHeight = max(2, (geo.size.height * 0.4).rounded())
 
             HStack(spacing: spacing) {
                 ForEach(0..<segmentCount, id: \.self) { index in
                     RoundedRectangle(cornerRadius: 2)
                         .fill(index < filledSegments ? fillColor : emptyColor)
-                        .overlay {
-                            if insetFraction != nil, index < insetSegments {
-                                RoundedRectangle(cornerRadius: 1)
-                                    .fill(insetColor)
-                                    // A dark hairline keeps the stripe apart
-                                    // from a fill of similar brightness.
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 1)
-                                            .stroke(Color.black.opacity(0.45), lineWidth: 0.5)
-                                    )
-                                    .frame(height: insetHeight)
-                            }
-                        }
                         .frame(width: segmentWidth)
                 }
             }
         }
+    }
+}
+
+/// Fable's remaining under the 7d bar, as a square bracket on the same
+/// scale: `└────┘` from the start of the track to the end of the last
+/// segment Fable would light. A range annotation (the square bracket of
+/// d3-annotation, a dimension line in a technical drawing), so it marks a
+/// span without covering a single segment of the 7d fill, and it reads in
+/// both directions — shorter or longer than the fill. No Fable left draws
+/// only the start tick.
+private struct FableBracket: View {
+    let remaining: Double
+    let color: Color
+
+    /// Space between the bar and the bracket's ticks.
+    static let gap: CGFloat = 2
+    /// Tick length; the bracket's whole height.
+    static let height: CGFloat = 3.5
+    static let lineWidth: CGFloat = 1
+
+    var body: some View {
+        GeometryReader { geo in
+            let end = SevenDayReadout.bracketEnd(remaining, width: geo.size.width)
+            Path { path in
+                let inset = Self.lineWidth / 2
+                let bottom = geo.size.height - inset
+                path.move(to: CGPoint(x: inset, y: 0))
+                path.addLine(to: CGPoint(x: inset, y: bottom))
+                if end > Self.lineWidth {
+                    path.addLine(to: CGPoint(x: end - inset, y: bottom))
+                    path.addLine(to: CGPoint(x: end - inset, y: 0))
+                }
+            }
+            .stroke(color.opacity(0.9), style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: .round, lineJoin: .round))
+        }
+        .accessibilityHidden(true)
     }
 }
 

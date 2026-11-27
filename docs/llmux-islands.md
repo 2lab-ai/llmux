@@ -16,10 +16,11 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
 - The 7-day quota window with reset timing (no provider reports a 5-hour window since 2026-11).
   When the daemon reports a **Fable weekly** limit for a Claude account, it rides the same
   7d row (2026-11-26): the text reads `60% (40%)` — 7d left, then Fable left in brackets —
-  and Fable is a thin lavender stripe inside the 7d bar, on the same 0–100% scale. The stripe
-  runs past the 7d fill when Fable has more left than the week, and turns red while the
-  daemon marks Fable as the limiting window. Hover the row for both values and both resets.
-  ☰ → **Show Fable weekly (7d)** turns the stripe and the bracket off.
+  and Fable is a thin lavender bracket `└──┘` under the 7d bar, on the same 0–100% scale,
+  from the start of the bar to the segment Fable reaches (2026-11-27; it never covers the 7d
+  fill). The bracket runs past the 7d fill when Fable has more left than the week, and turns
+  red while the daemon marks Fable as the limiting window. Hover the row for both values and
+  both resets. ☰ → **Show Fable weekly (7d)** turns the bracket and the `(40%)` off.
 - Token/auth health and degraded accounts. The key-icon row (time left on each account's
   access token) is hidden by default since 2026-11-26; turn it on with ☰ → **Show token expiry**.
 - A **NEEDS ATTENTION** box at the top of the panel when an account needs re-login, has run
