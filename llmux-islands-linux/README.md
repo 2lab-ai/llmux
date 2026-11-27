@@ -75,6 +75,32 @@ maintenance receipt instead gives the exact package-manager instruction.
 The clean-container CI runs this PKGBUILD as an unprivileged `makepkg` user,
 installs the resulting package, and smoke-launches the installed binary.
 
+## See it from a Mac (preview container)
+
+In short: `dev/kde-preview.sh` builds and renders this shell inside an Arch Linux
+container, so you can look at it from a Mac (or any Docker host) without a Linux
+machine. The first build takes about 7 minutes on Apple silicon (amd64 under
+Rosetta); after that a change renders in about 35 seconds.
+
+```sh
+llmux-islands-linux/dev/kde-preview.sh snapshot   # fixture PNGs of every surface -> target/kde-preview/
+llmux-islands-linux/dev/kde-preview.sh wayland    # the live shell on a headless Wayland desktop -> target/kde-preview/screen.png
+llmux-islands-linux/dev/kde-preview.sh shell      # a shell in the container
+```
+
+- The image (`dev/Dockerfile.preview`) carries the same Qt 6, Kirigami and
+  LayerShellQt packages as the Arch/CachyOS target, Noto and Inter fonts, a headless
+  wlroots compositor (sway, pixman renderer, no GPU) and `grim`, `wf-recorder`,
+  `ffmpeg`, ImageMagick for captures.
+- The container (`llmux-kde`) mounts this checkout at `/src` and keeps cargo caches in
+  the `llmux-kde-target` and `llmux-kde-cargo` volumes. Moving the checkout recreates
+  the container.
+- `wayland` starts the shell without a daemon, so it shows the offline state; use
+  `snapshot` for populated surfaces.
+- Limits: software rendering differs from a GPU-composited Plasma session in
+  anti-aliasing, and KWin's own effects are absent (the island draws no blur). Text
+  cannot match macOS pixel for pixel: the macOS system font does not ship on Linux.
+
 ## KDE platform mapping
 
 - The tray uses `Qt.labs.platform.SystemTrayIcon`, backed by Qt's

@@ -1,0 +1,20 @@
+# Arch Linux dev image for SEEING llmux Islands for Linux from a Mac (or any
+# Docker host): Qt 6 / Kirigami / LayerShellQt like the CachyOS/KDE target,
+# plus a headless wlroots compositor (sway) and capture tools (grim,
+# wf-recorder, ffmpeg) so the shell can be rendered and filmed without a
+# display. Used by dev/kde-preview.sh; not a release artifact.
+FROM --platform=linux/amd64 archlinux:latest
+
+RUN sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf \
+    && pacman -Syu --noconfirm --needed \
+        base-devel clang git rust \
+        gtk3 kirigami layer-shell-qt libcanberra libnotify mesa \
+        qqc2-desktop-style qt6-base qt6-declarative qt6-svg qt6-tools qt6-wayland \
+        noto-fonts inter-font \
+        sway grim wf-recorder ffmpeg imagemagick \
+    && pacman -Scc --noconfirm
+
+ENV QMAKE=/usr/bin/qmake6 \
+    CARGO_TARGET_DIR=/target \
+    XDG_RUNTIME_DIR=/tmp/xdg
+WORKDIR /src/llmux-islands-linux
