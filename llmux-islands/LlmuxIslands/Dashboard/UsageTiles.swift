@@ -725,10 +725,14 @@ private struct UsageWindowRow: View {
                 )
                 .frame(height: 10)
                 // Fable is the same bar one layer down: behind the 7d bar,
-                // shifted down so only its lower edge shows.
-                .background(alignment: .top) {
+                // shifted down and to the right, so its lower and right
+                // edges show like a card stacked behind.
+                .background(alignment: .topLeading) {
                     if let fableRemainingFraction {
-                        FableBackBar(remaining: fableRemainingFraction, color: fableTint, barHeight: 10)
+                        GeometryReader { geo in
+                            FableBackBar(remaining: fableRemainingFraction, color: fableTint,
+                                         barSize: geo.size)
+                        }
                     }
                 }
                 .padding(.bottom, fablePeek)
@@ -767,7 +771,7 @@ private struct UsageWindowRow: View {
         fable.flatMap { SevenDayReadout.remaining(usedPercent: $0.percentUsed) }
     }
 
-    /// Room under both bars for the Fable layer's visible edge.
+    /// Room under both bars for the Fable layer's visible lower edge.
     private var fablePeek: CGFloat {
         fableRemainingFraction == nil ? 0 : FableBackBar.peek
     }
@@ -995,30 +999,43 @@ private struct MiniSegmentBar: View {
 }
 
 /// Fable weekly as the same segmented bar as the 7d one, one layer down:
-/// drawn behind the 7d bar and shifted down by `peek`, so only its lower
-/// edge shows under it (owner 2026-11-27). Lit segments are filled in the
-/// Fable colour; segments Fable has used up are dashed outlines, so the
-/// whole track still reads as one bar. It never covers the 7d fill, and it
-/// shows Fable longer or shorter than 7d alike.
+/// drawn behind the 7d bar and offset down and to the right by `offset`, so
+/// its lower and right edges show like a card stacked behind it (owner
+/// 2026-11-27). Lit segments are filled in the Fable colour; segments Fable
+/// has used up are dashed outlines, so the whole track still reads as one
+/// bar. Nothing is drawn where the 7d segments are, so it never covers the
+/// 7d fill; it shows Fable longer or shorter than 7d alike.
 private struct FableBackBar: View {
     let remaining: Double
     let color: Color
-    let barHeight: CGFloat
+    /// The 7d bar's size; this view draws past it by `offset` on both axes.
+    let barSize: CGSize
 
-    /// How much of the bar behind shows under the 7d bar.
-    static let peek: CGFloat = 4
+    /// How far the bar behind is shifted, down and to the right.
+    static let offset = CGSize(width: 3, height: 3)
+    /// Room the row keeps under the bars for the shifted bar.
+    static var peek: CGFloat { offset.height }
 
     var body: some View {
-        Canvas { context, size in
+        Canvas { context, _ in
             let count = SevenDayReadout.segmentCount
             let spacing = SevenDayReadout.segmentSpacing
-            let width = max(1, (size.width - spacing * CGFloat(count - 1)) / CGFloat(count))
+            let width = max(1, (barSize.width - spacing * CGFloat(count - 1)) / CGFloat(count))
             let lit = SevenDayReadout.litSegments(remaining, count: count)
-            // Behind the 7d bar: only the strip below it is visible.
-            context.clip(to: Path(CGRect(x: 0, y: barHeight, width: size.width, height: Self.peek)))
+            func segment(_ index: Int, dx: CGFloat = 0, dy: CGFloat = 0) -> CGRect {
+                CGRect(x: CGFloat(index) * (width + spacing) + dx, y: dy, width: width, height: barSize.height)
+            }
+            // Behind the 7d bar: everything except its segments is visible
+            // (even-odd: the canvas minus the front segments).
+            var visible = Path(CGRect(x: 0, y: 0,
+                                      width: barSize.width + Self.offset.width,
+                                      height: barSize.height + Self.offset.height))
             for index in 0..<count {
-                let rect = CGRect(x: CGFloat(index) * (width + spacing), y: Self.peek,
-                                  width: width, height: barHeight)
+                visible.addRoundedRect(in: segment(index), cornerSize: CGSize(width: 2, height: 2))
+            }
+            context.clip(to: visible, style: FillStyle(eoFill: true))
+            for index in 0..<count {
+                let rect = segment(index, dx: Self.offset.width, dy: Self.offset.height)
                 if index < lit {
                     context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(color))
                 } else {
@@ -1030,7 +1047,7 @@ private struct FableBackBar: View {
                 }
             }
         }
-        .frame(height: barHeight + Self.peek)
+        .frame(width: barSize.width + Self.offset.width, height: barSize.height + Self.offset.height)
         .accessibilityHidden(true)
     }
 }

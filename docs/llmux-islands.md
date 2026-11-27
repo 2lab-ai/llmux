@@ -17,7 +17,7 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
   When the daemon reports a **Fable weekly** limit for a Claude account, it rides the same
   7d row (2026-11-26): the text reads `60% (40%)` — 7d left, then Fable left in brackets —
   and Fable is the same segmented bar in lavender, one layer down: behind the 7d bar and shifted
-  down so only its lower edge shows, with the segments Fable has used up drawn as dashed outlines
+  down and to the right, so its lower and right edges show like a card stacked behind it, with the segments Fable has used up drawn as dashed outlines
   (2026-11-27; it never covers the 7d fill). It runs past the 7d fill when Fable has more left
   than the week, and turns red while the daemon marks Fable as the limiting window. Hover the row
   for both values and both resets. ☰ → **Show Fable weekly (7d)** turns the Fable bar and the
