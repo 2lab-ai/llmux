@@ -127,7 +127,7 @@ first launch with no accounts. (Rules as of 2026-11-26.)
 
 **Opens**
 
-- Rest the pointer on the notch for 0.5 seconds (hover-open).
+- Rest the pointer on the notch for 0.3 seconds (hover-open).
 - Click the notch.
 - First launch only: a short open-and-close at start-up, and setup when the
   workspace has no accounts. A display change (a remote screen resized, a display
@@ -136,7 +136,8 @@ first launch with no accounts. (Rules as of 2026-11-26.)
 
 **Closes**
 
-- A hover-opened island closes 0.8 seconds after the pointer leaves it.
+- A hover-opened island closes 0.5 seconds after the pointer leaves it, unless you
+  are typing in one of its fields.
 - Clicking inside pins it: it then stays open until one of the next three.
 - A click outside the island.
 - A click on the notch.
@@ -144,6 +145,11 @@ first launch with no accounts. (Rules as of 2026-11-26.)
 
 While a window the island opened is up — the project-folder picker — the island
 neither opens nor closes by itself. That picker now opens above the island.
+
+These rules follow what the common open-source notch apps do (checked 2026-11-27):
+boring.notch and Atoll open on a 0.3-second hover and close shortly after the pointer
+leaves; NotchDrop and Claude Island close only on an outside click; none of them
+replays its intro animation when a display changes.
 
 **Closed island on a display with a camera notch.** The label splits around the
 notch: the mascot sits left of it, per-provider activity and the warning chip right

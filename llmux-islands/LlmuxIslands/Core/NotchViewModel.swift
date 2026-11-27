@@ -145,10 +145,13 @@ class NotchViewModel: ObservableObject {
     private var leaveTimer: DispatchWorkItem?
     private var keyMonitor: Any?
 
-    /// Pointer dwell on the notch before the island opens by itself.
-    static let hoverOpenDelay: TimeInterval = 0.5
-    /// Grace period after the pointer leaves a hover-opened island.
-    static let leaveCloseDelay: TimeInterval = 0.8
+    /// Pointer dwell on the notch before the island opens by itself
+    /// (boring.notch / Atoll use 0.3 s; Claude Island used 1 s).
+    static let hoverOpenDelay: TimeInterval = 0.3
+    /// Grace period after the pointer leaves a hover-opened island
+    /// (boring.notch / Atoll 0.1 s; a little longer here so a big panel does
+    /// not close when the pointer slips off an edge).
+    static let leaveCloseDelay: TimeInterval = 0.5
 
     // MARK: - Navigation State
 
@@ -238,6 +241,13 @@ class NotchViewModel: ObservableObject {
     /// "outside the island".
     private var islandIsBusy: Bool { NSApp.modalWindow != nil }
 
+    /// Typing in a field of the island (an API key, a connection setting)
+    /// also keeps a hover-opened island from closing when the pointer leaves.
+    private var isEditingText: Bool {
+        guard let window = NSApp.keyWindow, window is NotchPanel else { return false }
+        return window.firstResponder is NSTextView
+    }
+
     private func handleMouseMove(_ location: CGPoint) {
         let inNotch = geometry.isPointInNotch(location)
         let inOpened = status == .opened && geometry.isPointInOpenedPanel(location, size: openedSize)
@@ -271,7 +281,7 @@ class NotchViewModel: ObservableObject {
         if !isHovering && status == .opened && openReason == .hover {
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self, !self.isHovering, self.status == .opened,
-                      self.openReason == .hover, !self.islandIsBusy else { return }
+                      self.openReason == .hover, !self.islandIsBusy, !self.isEditingText else { return }
                 self.notchClose()
             }
             leaveTimer = workItem
