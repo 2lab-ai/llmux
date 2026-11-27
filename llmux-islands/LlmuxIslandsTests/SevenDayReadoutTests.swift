@@ -11,7 +11,7 @@ final class SevenDayReadoutTests: XCTestCase {
     }
 
     func testFableWithMoreLeftThanSevenDayStillShows() {
-        // The bracket runs past the 7d fill, under empty track.
+        // Fable's bar behind runs past the 7d fill.
         let seven = SevenDayReadout.remaining(usedPercent: 80)
         let fable = SevenDayReadout.remaining(usedPercent: 10)
         XCTAssertEqual(SevenDayReadout.litSegments(seven), 2)
@@ -22,21 +22,6 @@ final class SevenDayReadoutTests: XCTestCase {
     func testNoFableMeansNoBracket() {
         XCTAssertEqual(SevenDayReadout.fableSuffix(nil), "")
         XCTAssertEqual(SevenDayReadout.litSegments(nil), 0)
-    }
-
-    func testBracketEndsOnTheEdgeOfFablesLastSegment() {
-        // 10 segments with 1-point gaps on a 109-point bar: 10 points each.
-        let fable = SevenDayReadout.remaining(usedPercent: 40) // 60% left
-        XCTAssertEqual(SevenDayReadout.bracketEnd(fable, width: 109), 65) // 6 × 10 + 5 gaps
-        XCTAssertEqual(SevenDayReadout.bracketEnd(1, width: 109), 109, "full Fable spans the bar")
-        XCTAssertEqual(SevenDayReadout.bracketEnd(0.04, width: 109), 0, "nothing lit: start tick only")
-        XCTAssertEqual(SevenDayReadout.bracketEnd(nil, width: 109), 0)
-    }
-
-    func testBracketEndDoesNotDependOnTheSevenDayFill() {
-        // Same Fable value, any 7d value: the bracket is its own series.
-        let fable = SevenDayReadout.remaining(usedPercent: 10) // 90% left
-        XCTAssertEqual(SevenDayReadout.bracketEnd(fable, width: 109), 98)
     }
 
     func testUnreportedAndOutOfRangeValues() {

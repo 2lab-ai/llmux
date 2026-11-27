@@ -271,14 +271,14 @@ enum CompactUsageGauges {
 ///
 /// Fable is a limit INSIDE the weekly one — Fable traffic draws on both — so
 /// the two values share one scale but are not stacked parts of one whole:
-/// the 7d remaining fills the segments exactly as before, and Fable's
-/// remaining is a square bracket UNDER the bar, from the start of the track
-/// to the end of the last segment Fable would light (owner 2026-11-27: the
-/// earlier stripe through the segments covered the 7d fill). A stacked or
-/// colour-mixed bar would read as "parts of 7d" and cannot show Fable having
-/// MORE left than 7d; the bracket reads in both directions because it spans
-/// empty track as well as fill. The text keeps the 7d value first and puts
-/// Fable in brackets in the bracket's colour, so the colour is the legend.
+/// the 7d remaining fills the segments exactly as before, and Fable is the
+/// same segmented bar one layer down — behind the 7d bar, shifted down so
+/// only its lower edge shows, used-up segments as dashed outlines (owner
+/// 2026-11-27: the earlier stripe through the segments covered the 7d fill).
+/// A stacked or colour-mixed bar would read as "parts of 7d" and cannot show
+/// Fable having MORE left than 7d; the bar behind shows both. The text keeps
+/// the 7d value first and puts Fable in brackets in the Fable colour, so the
+/// colour is the legend.
 enum SevenDayReadout {
     static let segmentCount = 10
     /// Gap between two segments of the bar, in points.
@@ -297,16 +297,6 @@ enum SevenDayReadout {
         guard let remaining, remaining.isFinite else { return 0 }
         let clamped = max(0, min(1, remaining))
         return max(0, min(count, Int((clamped * Double(count)).rounded(.toNearestOrAwayFromZero))))
-    }
-
-    /// Where Fable's bracket ends on a bar `width` points wide: the right
-    /// edge of the last segment `litSegments` would light, so the bracket's
-    /// end tick lines up with a segment edge. 0 when no segment is lit.
-    static func bracketEnd(_ remaining: Double?, width: CGFloat) -> CGFloat {
-        let lit = litSegments(remaining)
-        guard lit > 0 else { return 0 }
-        let segment = max(1, (width - segmentSpacing * CGFloat(segmentCount - 1)) / CGFloat(segmentCount))
-        return min(width, segment * CGFloat(lit) + segmentSpacing * CGFloat(lit - 1))
     }
 
     /// `60%` for the 7d value, `--` when it is not reported.

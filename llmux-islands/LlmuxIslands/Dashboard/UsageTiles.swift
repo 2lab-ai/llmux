@@ -689,8 +689,8 @@ private struct UsageWindowRow: View {
         let percentUsed: Double
         let resetAt: Date?
         /// The daemon's reset-aware `constraining` (from
-        /// `ScopedQuotaWindow::is_constraining`) turns the Fable bracket and
-        /// its bracketed number red. Not the raw `severity` (a just-reset window can
+        /// `ScopedQuotaWindow::is_constraining`) turns the Fable bar and its
+        /// bracketed number red. Not the raw `severity` (a just-reset window can
         /// keep a stale `critical` at 0%), not `is_active` (it marks the
         /// governing limit, not an exhausted one).
         let constraining: Bool
@@ -703,8 +703,7 @@ private struct UsageWindowRow: View {
     var fable: FableReading? = nil
 
     /// Lavender: outside the 7d bar's red→green ramp and the blue reset bar,
-    /// so the bracket under the bar and the bracketed number read as one
-    /// series.
+    /// so the Fable bar behind and the bracketed number read as one series.
     static let fableColor = Color(red: 0.78, green: 0.64, blue: 1.0)
 
     var body: some View {
@@ -725,17 +724,14 @@ private struct UsageWindowRow: View {
                     emptyColor: Color.white.opacity(0.08)
                 )
                 .frame(height: 10)
-                // Fable sits under the bar, never on it: a bracket from the
-                // start of the track to Fable's remaining. Drawn in the gap
-                // above the text, so the row keeps its height and the two
-                // columns stay aligned.
-                .overlay(alignment: .topLeading) {
+                // Fable is the same bar one layer down: behind the 7d bar,
+                // shifted down so only its lower edge shows.
+                .background(alignment: .top) {
                     if let fableRemainingFraction {
-                        FableBracket(remaining: fableRemainingFraction, color: fableTint)
-                            .frame(height: FableBracket.height)
-                            .offset(y: 10 + FableBracket.gap)
+                        FableBackBar(remaining: fableRemainingFraction, color: fableTint, barHeight: 10)
                     }
                 }
+                .padding(.bottom, fablePeek)
 
                 remainingText
                     .lineLimit(1)
@@ -751,6 +747,8 @@ private struct UsageWindowRow: View {
                     emptyColor: Color.white.opacity(0.08)
                 )
                 .frame(height: 10)
+                // Same height as the usage column, so both texts line up.
+                .padding(.bottom, fablePeek)
 
                 timeRemainingText
                     .lineLimit(1)
@@ -767,6 +765,11 @@ private struct UsageWindowRow: View {
 
     private var fableRemainingFraction: Double? {
         fable.flatMap { SevenDayReadout.remaining(usedPercent: $0.percentUsed) }
+    }
+
+    /// Room under both bars for the Fable layer's visible edge.
+    private var fablePeek: CGFloat {
+        fableRemainingFraction == nil ? 0 : FableBackBar.peek
     }
 
     private var fableTint: Color {
@@ -801,7 +804,7 @@ private struct UsageWindowRow: View {
         var lines = ["7d: \(SevenDayReadout.percentText(SevenDayReadout.remaining(usedPercent: percentUsed))) left"
             + (resetAt.map { " · resets in \(GlanceResolver.duration(Int($0.timeIntervalSince(now))))" } ?? "")]
         if let fable {
-            lines.append("Fable 7d (bracket under the bar): "
+            lines.append("Fable 7d (the bar behind): "
                 + "\(SevenDayReadout.percentText(fableRemainingFraction)) left"
                 + (fable.resetAt.map { " · resets in \(GlanceResolver.duration(Int($0.timeIntervalSince(now))))" } ?? "")
                 + (fable.constraining ? " · limiting" : ""))
@@ -991,38 +994,43 @@ private struct MiniSegmentBar: View {
     }
 }
 
-/// Fable's remaining under the 7d bar, as a square bracket on the same
-/// scale: `└────┘` from the start of the track to the end of the last
-/// segment Fable would light. A range annotation (the square bracket of
-/// d3-annotation, a dimension line in a technical drawing), so it marks a
-/// span without covering a single segment of the 7d fill, and it reads in
-/// both directions — shorter or longer than the fill. No Fable left draws
-/// only the start tick.
-private struct FableBracket: View {
+/// Fable weekly as the same segmented bar as the 7d one, one layer down:
+/// drawn behind the 7d bar and shifted down by `peek`, so only its lower
+/// edge shows under it (owner 2026-11-27). Lit segments are filled in the
+/// Fable colour; segments Fable has used up are dashed outlines, so the
+/// whole track still reads as one bar. It never covers the 7d fill, and it
+/// shows Fable longer or shorter than 7d alike.
+private struct FableBackBar: View {
     let remaining: Double
     let color: Color
+    let barHeight: CGFloat
 
-    /// Space between the bar and the bracket's ticks.
-    static let gap: CGFloat = 2
-    /// Tick length; the bracket's whole height.
-    static let height: CGFloat = 3.5
-    static let lineWidth: CGFloat = 1
+    /// How much of the bar behind shows under the 7d bar.
+    static let peek: CGFloat = 4
 
     var body: some View {
-        GeometryReader { geo in
-            let end = SevenDayReadout.bracketEnd(remaining, width: geo.size.width)
-            Path { path in
-                let inset = Self.lineWidth / 2
-                let bottom = geo.size.height - inset
-                path.move(to: CGPoint(x: inset, y: 0))
-                path.addLine(to: CGPoint(x: inset, y: bottom))
-                if end > Self.lineWidth {
-                    path.addLine(to: CGPoint(x: end - inset, y: bottom))
-                    path.addLine(to: CGPoint(x: end - inset, y: 0))
+        Canvas { context, size in
+            let count = SevenDayReadout.segmentCount
+            let spacing = SevenDayReadout.segmentSpacing
+            let width = max(1, (size.width - spacing * CGFloat(count - 1)) / CGFloat(count))
+            let lit = SevenDayReadout.litSegments(remaining, count: count)
+            // Behind the 7d bar: only the strip below it is visible.
+            context.clip(to: Path(CGRect(x: 0, y: barHeight, width: size.width, height: Self.peek)))
+            for index in 0..<count {
+                let rect = CGRect(x: CGFloat(index) * (width + spacing), y: Self.peek,
+                                  width: width, height: barHeight)
+                if index < lit {
+                    context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(color))
+                } else {
+                    context.stroke(
+                        Path(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), cornerRadius: 2),
+                        with: .color(color.opacity(0.55)),
+                        style: StrokeStyle(lineWidth: 1, dash: [1.5, 1.5])
+                    )
                 }
             }
-            .stroke(color.opacity(0.9), style: StrokeStyle(lineWidth: Self.lineWidth, lineCap: .round, lineJoin: .round))
         }
+        .frame(height: barHeight + Self.peek)
         .accessibilityHidden(true)
     }
 }
