@@ -136,9 +136,6 @@ struct NotchView: View {
             // closed label — activity, exception chip — invisible.
             isVisible = true
         }
-        .onChange(of: viewModel.status) { oldStatus, newStatus in
-            handleStatusChange(from: oldStatus, to: newStatus)
-        }
     }
 
     private var isProcessing: Bool {
@@ -258,12 +255,5 @@ struct NotchView: View {
             }
         }
         .frame(width: notchSize.width - 24)
-    }
-
-    // MARK: - Event Handlers
-
-    private func handleStatusChange(from oldStatus: NotchStatus, to newStatus: NotchStatus) {
-        // Visible in every state, closed included: see `.onAppear`.
-        isVisible = true
     }
 }

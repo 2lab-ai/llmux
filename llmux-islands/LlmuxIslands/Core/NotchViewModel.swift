@@ -295,6 +295,13 @@ class NotchViewModel: ObservableObject {
         }
     }
 
+    /// Keep an opened island open until a click outside, a notch click or
+    /// Esc: a click inside it, or opening the folder picker (by mouse or by
+    /// keyboard), means the owner is working in it.
+    func pin() {
+        if status == .opened { openReason = .click }
+    }
+
     private func handleMouseDown(_ event: NSEvent) {
         // A click in another window of this app (the folder picker, a sheet)
         // is not a click outside the island.
@@ -303,9 +310,7 @@ class NotchViewModel: ObservableObject {
         // open until a click outside, a notch click or Esc. Checked before
         // the busy guard: this handler is queued, so the click that opened
         // the folder picker may arrive while the picker is already modal.
-        if status == .opened, event.window is NotchPanel {
-            openReason = .click
-        }
+        if event.window is NotchPanel { pin() }
         guard !islandIsBusy else { return }
         let location = NSEvent.mouseLocation
 

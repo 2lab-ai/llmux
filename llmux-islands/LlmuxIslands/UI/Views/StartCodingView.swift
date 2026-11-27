@@ -6,6 +6,9 @@ import SwiftUI
 struct StartCodingView: View {
     var isOnline: Bool
     var fixtureProject: URL? = nil
+    /// Called before the folder picker opens, so the island it sits in stays
+    /// open after the picker closes (NotchViewModel.pin).
+    var onChooseProject: () -> Void = {}
     @State private var client: CodingClient = .claude
     @State private var project: URL?
     @State private var message: String?
@@ -68,6 +71,7 @@ struct StartCodingView: View {
     }
     private func chooseProject() {
         guard !SnapshotMode.isActive else { return }
+        onChooseProject()
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
