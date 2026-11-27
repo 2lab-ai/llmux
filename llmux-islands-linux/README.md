@@ -63,7 +63,11 @@ QMAKE=/usr/bin/qmake6 cargo run --locked -- \
 ```
 
 This explicit mode forces Qt's offscreen software renderer and writes
-`usage.png`, `statistics.png`, and `menu.png`. Directory creation, fixture
+`usage.png`, `statistics.png`, and `menu.png`, plus the closed island at 2x in
+four states (`label-c0x0-p0.png`, `label-c3x2-p0.png`, `label-notch-c0x0-p0.png`,
+`label-notch-c3x2-p0.png`: idle and 3 Claude + 2 Codex sessions, without and
+beside a physical notch), the same states the macOS app renders with
+`LLMUX_ISLANDS_SNAPSHOT_KIND=label`, for side-by-side comparison. Directory creation, fixture
 hydration, capture, and file-save failures return a nonzero process status.
 Normal startup never loads the fixture: it starts empty, briefly opens the
 boot island, and closes it after one second only when a tray is available.
@@ -148,6 +152,7 @@ cargo test --no-default-features --locked
 The Arch container additionally compiles the CXX-Qt GUI, validates the desktop
 and AppStream files, lints all four QML surfaces, runs the Linux tests, executes
 the bounded offscreen smoke receipt, builds and installs the real Arch package,
-and verifies that the snapshot CLI writes three distinct 960x760 PNGs from the
-statically embedded QML module. CI uploads those images and their `SHA256SUMS`
+and verifies that the snapshot CLI writes three distinct 960x760 PNGs and the four
+closed-island PNGs from the statically embedded QML module. CI uploads those
+images and their `SHA256SUMS`
 manifest as `llmux-islands-kde-snapshots`.
