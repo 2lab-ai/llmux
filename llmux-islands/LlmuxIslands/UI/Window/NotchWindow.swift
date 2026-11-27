@@ -24,10 +24,9 @@ class NotchPanel: NSPanel {
     /// inside the modal session instead.
     @MainActor
     static func runModalAboveIsland(_ panel: NSSavePanel) -> NSApplication.ModalResponse {
-        let raise = Timer(timeInterval: 0, repeats: false) { [weak panel] _ in
+        RunLoop.main.perform(inModes: [.modalPanel]) { [weak panel] in
             MainActor.assumeIsolated { panel?.level = modalAboveIslandLevel }
         }
-        RunLoop.main.add(raise, forMode: .modalPanel)
         NSApp.activate(ignoringOtherApps: true)
         return panel.runModal()
     }
