@@ -140,18 +140,11 @@ class NotchViewModel: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
     private let events = EventMonitors.shared
-    private var hoverTimer: DispatchWorkItem?
-    /// Pending close after the pointer left an island that hover opened.
-    private var leaveTimer: DispatchWorkItem?
+    /// Hover open / leave close timing (rules 1 and 4); see IslandHoverMachine.
+    private var hover = IslandHoverMachine()
+    /// Fires `hover.due` at `hover.deadline`.
+    private var hoverDeadline: DispatchWorkItem?
     private var keyMonitor: Any?
-
-    /// Pointer dwell on the notch before the island opens by itself
-    /// (boring.notch / Atoll use 0.3 s; Claude Island used 1 s).
-    static let hoverOpenDelay: TimeInterval = 0.3
-    /// Grace period after the pointer leaves a hover-opened island
-    /// (boring.notch / Atoll 0.1 s; a little longer here so a big panel does
-    /// not close when the pointer slips off an edge).
-    static let leaveCloseDelay: TimeInterval = 0.5
 
     // MARK: - Navigation State
 
@@ -264,35 +257,33 @@ class NotchViewModel: ObservableObject {
         guard newHovering != isHovering else { return }
 
         isHovering = newHovering
+        hover.pointer(hovering: newHovering, island: hoverIsland, now: Date())
+        scheduleHoverDeadline()
+    }
 
-        // Cancel any pending hover / leave timer
-        hoverTimer?.cancel()
-        hoverTimer = nil
-        leaveTimer?.cancel()
-        leaveTimer = nil
-        guard !islandIsBusy else { return }
+    private var hoverIsland: IslandHoverMachine.Island {
+        IslandHoverMachine.Island(
+            isOpen: status == .opened,
+            openedByHover: openReason == .hover,
+            busy: islandIsBusy,
+            editing: isEditingText
+        )
+    }
 
-        // Rule 1: resting the pointer on the notch opens the island.
-        if isHovering && (status == .closed || status == .popping) {
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self, self.isHovering, !self.islandIsBusy else { return }
-                self.notchOpen(reason: .hover)
+    private func scheduleHoverDeadline() {
+        hoverDeadline?.cancel()
+        hoverDeadline = nil
+        guard let deadline = hover.deadline else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            switch self.hover.due(island: self.hoverIsland, now: Date()) {
+            case .open: self.notchOpen(reason: .hover)
+            case .close: self.notchClose()
+            case nil: break
             }
-            hoverTimer = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.hoverOpenDelay, execute: workItem)
         }
-
-        // Rule 4: an island that hover opened (and was not clicked inside)
-        // closes once the pointer has been away from it for a moment.
-        if !isHovering && status == .opened && openReason == .hover {
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self, !self.isHovering, self.status == .opened,
-                      self.openReason == .hover, !self.islandIsBusy, !self.isEditingText else { return }
-                self.notchClose()
-            }
-            leaveTimer = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.leaveCloseDelay, execute: workItem)
-        }
+        hoverDeadline = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline.timeIntervalSinceNow), execute: workItem)
     }
 
     /// Keep an opened island open until a click outside, a notch click or
