@@ -84,12 +84,22 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     && test "$(od -An -tx1 -N8 "$receipt" | tr -d ' \n')" = "89504e470d0a1a0a" \
     && receipt_hash="$(sha256sum "$receipt" | cut -d ' ' -f 1)" \
     && case " $hashes " in *" $receipt_hash "*) exit 1;; esac \
-    && test "$(find /tmp/llmux-islands-snapshots -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 7 \
+    && for label in label-c0x0-p0 label-c3x2-p0 label-notch-c0x0-p0 label-notch-c3x2-p0; do \
+         file="/tmp/llmux-islands-snapshots/$label.png"; \
+         test -s "$file"; \
+         test "$(od -An -tx1 -N8 "$file" | tr -d ' \n')" = "89504e470d0a1a0a"; \
+         hash="$(sha256sum "$file" | cut -d ' ' -f 1)"; \
+         case " $hashes " in *" $hash "*) exit 1;; esac; \
+         hashes="$hashes $hash"; \
+       done \
+    && test "$(find /tmp/llmux-islands-snapshots -maxdepth 1 -type f -name '*.png' | wc -l)" -eq 11 \
     && cd /tmp/llmux-islands-snapshots \
     && sha256sum \
          usage.png usage-advanced.png \
          statistics.png statistics-advanced.png \
          receipts.png menu.png menu-advanced.png \
+         label-c0x0-p0.png label-c3x2-p0.png \
+         label-notch-c0x0-p0.png label-notch-c3x2-p0.png \
          > SHA256SUMS
 
 # Exercise the real PKGBUILD against this exact checkout. makepkg refuses to

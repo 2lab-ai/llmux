@@ -20,10 +20,12 @@ Kirigami.ApplicationWindow {
         && trayLoader.item.available === true
     readonly property bool semanticOpen: windowState.open === true
     readonly property int preferredWindowWidth: semanticOpen
-        ? (controller.snapshotMode ? 960 : expandedPreferredWidth()) : 260
+        ? (controller.snapshotMode ? 960 : expandedPreferredWidth())
+        : Math.ceil(compactIsland.implicitWidth)
     readonly property int preferredWindowContentHeight: semanticOpen
         ? (controller.snapshotMode ? snapshotPreferredContentHeight()
-                                   : expandedPreferredContentHeight()) : 44
+                                   : expandedPreferredContentHeight())
+        : Math.ceil(compactIsland.implicitHeight)
     readonly property var snapshotSurfaces: ["usage", "usage-advanced", "statistics", "statistics-advanced", "receipts", "menu", "menu-advanced"]
     property bool surfaceConfigured: false
     property bool noTrayFallback: false
@@ -225,6 +227,14 @@ Kirigami.ApplicationWindow {
             root.x = Number(target.virtualX) + (Number(target.width) - root.width) / 2
             root.y = Number(target.virtualY) + 8
         }
+    }
+
+    function providerCount(provider) {
+        var counts = windowState.provider_in_flight
+        if (counts === null || typeof counts !== "object")
+            return 0
+        var count = Number(counts[provider])
+        return isFinite(count) && count > 0 ? Math.floor(count) : 0
     }
 
     function inFlightTotal(counts) {
@@ -431,14 +441,45 @@ Kirigami.ApplicationWindow {
             snapshotIndex += 1
             snapshotCaptureAttempts = 0
             if (snapshotIndex >= snapshotSurfaces.length) {
-                root.quitRequested = true
-                controller.exitHeadless(0)
+                root.captureClosedSnapshot(0)
                 return
             }
             selectSnapshotSurface(snapshotSurfaces[snapshotIndex])
             snapshotCaptureTimer.restart()
         }
         snapshotTarget.grabToImage(saveResult, Qt.size(960, height))
+    }
+
+    // Closed-island captures named like the macOS label snapshots
+    // (label-c{claude}x{codex}-p0, colour loop at phase 0), at 2x, for a
+    // display without a notch and with a 185-point notch.
+    readonly property var closedSnapshots: [
+        { "name": "label-c0x0-p0", "item": snapshotClosedIdle },
+        { "name": "label-c3x2-p0", "item": snapshotClosedActive },
+        { "name": "label-notch-c0x0-p0", "item": snapshotClosedNotchIdle },
+        { "name": "label-notch-c3x2-p0", "item": snapshotClosedNotchActive }
+    ]
+
+    function captureClosedSnapshot(index) {
+        if (index >= closedSnapshots.length) {
+            root.quitRequested = true
+            controller.exitHeadless(0)
+            return
+        }
+        var entry = closedSnapshots[index]
+        var item = entry.item
+        var outputPath = controller.snapshotDir + "/" + entry.name + ".png"
+        // grabToImage() returns false without calling back when it cannot
+        // grab (a hidden window), which would stall the snapshot run.
+        var accepted = item.grabToImage(function(result) {
+            if (result === null || !result.saveToFile(outputPath)) {
+                root.failSnapshot(qsTr("Failed to save %1 snapshot").arg(entry.name))
+                return
+            }
+            root.captureClosedSnapshot(index + 1)
+        }, Qt.size(item.width * 2, item.height * 2))
+        if (!accepted)
+            root.failSnapshot(qsTr("Could not capture %1 snapshot").arg(entry.name))
     }
 
     function automaticPollAllowed() {
@@ -577,6 +618,28 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // Snapshot-only closed islands (never visible in a live session).
+    Column {
+        visible: controller.snapshotMode
+        x: 0
+        y: 0
+        z: -1
+        spacing: 4
+        // Each on a neutral backdrop: an item grab is opaque, and the island's
+        // concave top corners and round bottom only show against a colour.
+        component Backdrop: Rectangle {
+            default property alias island: holder.data
+            color: "#3a3a3a"
+            width: holder.childrenRect.width
+            height: holder.childrenRect.height
+            Item { id: holder; anchors.fill: parent }
+        }
+        Backdrop { id: snapshotClosedIdle; ClosedIsland { active: false } }
+        Backdrop { id: snapshotClosedActive; ClosedIsland { active: false; claudeCount: 3; codexCount: 2 } }
+        Backdrop { id: snapshotClosedNotchIdle; ClosedIsland { active: false; notchGap: 185 } }
+        Backdrop { id: snapshotClosedNotchActive; ClosedIsland { active: false; notchGap: 185; claudeCount: 3; codexCount: 2 } }
+    }
+
     Item {
         id: snapshotTarget
         anchors.fill: parent
@@ -676,46 +739,22 @@ Kirigami.ApplicationWindow {
                     : root.selectedSurface === "menu" ? menuComponent : usageComponent
             }
 
-            Rectangle {
+            // The closed island: the macOS closed label (ClosedIsland.qml),
+            // flush with the top edge (layer-shell anchors it there).
+            ClosedIsland {
                 id: compactIsland
                 objectName: "compact-closed-island"
-                anchors.fill: parent
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.top: parent.top
                 visible: !root.semanticOpen
-                radius: height / 2
-                color: IslandTheme.panel
-                border.color: IslandTheme.borderStrong
-                border.width: 1
-
-                RowLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: Kirigami.Units.largeSpacing
-                    anchors.rightMargin: Kirigami.Units.largeSpacing
-                    spacing: Kirigami.Units.smallSpacing
-
-                    Kirigami.Icon {
-                        source: "io.twolab.LlmuxIslands"
-                        implicitWidth: Kirigami.Units.iconSizes.small
-                        implicitHeight: implicitWidth
-                    }
-
-                    Label {
-                        Layout.fillWidth: true
-                        text: root.compactProviderSummary()
-                        color: IslandTheme.primaryText
-                        font.bold: root.totalInFlight > 0
-                        font.family: IslandTheme.monoFamily
-                        font.pixelSize: 11
-                        elide: Text.ElideRight
-                        horizontalAlignment: Text.AlignHCenter
-                    }
-
-                    Label {
-                        text: root.uiState.lifecycle === "ready" ? "●" : "○"
-                        color: root.uiState.lifecycle === "ready"
-                            ? IslandTheme.primaryText
-                            : IslandTheme.red
-                    }
-                }
+                active: visible
+                claudeCount: root.providerCount("claude")
+                codexCount: root.providerCount("codex")
+                grokCount: root.providerCount("grok")
+                geminiCount: root.providerCount("gemini")
+                offline: root.uiState.lifecycle === "offline" || root.uiState.lifecycle === "fatal"
+                chipText: root.trayNeedsAttention ? qsTr("attention") : ""
+                chipColor: Qt.rgba(1.0, 0.72, 0.28, 1)
 
                 MouseArea {
                     id: compactMouseArea
