@@ -56,6 +56,7 @@ final class IslandHoverMachineTests: XCTestCase {
         // The click pins the island (NotchViewModel.pin) before the deadline
         // fires; the deadline sees a pinned island and does not close it.
         XCTAssertNil(machine.due(island: pinned, now: at(2.5)))
+        XCTAssertNil(machine.deadline, "cancelled, not deferred")
     }
 
     func testAPinnedIslandNeverSchedulesAClose() {
@@ -84,6 +85,7 @@ final class IslandHoverMachineTests: XCTestCase {
             var later = hoverOpened
             later[keyPath: change] = true
             XCTAssertNil(machine.due(island: later, now: at(1.5)), "\(change)")
+            XCTAssertNil(machine.deadline, "cancelled, not deferred: \(change)")
         }
     }
 
@@ -92,5 +94,6 @@ final class IslandHoverMachineTests: XCTestCase {
         var machine = IslandHoverMachine()
         machine.pointer(hovering: true, island: closed, now: at(0))
         XCTAssertNil(machine.due(island: pinned, now: at(0.3)))
+        XCTAssertNil(machine.deadline)
     }
 }
