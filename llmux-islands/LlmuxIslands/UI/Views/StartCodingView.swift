@@ -6,6 +6,9 @@ import SwiftUI
 struct StartCodingView: View {
     var isOnline: Bool
     var fixtureProject: URL? = nil
+    /// Called before the folder picker opens, so the island it sits in stays
+    /// open after the picker closes (NotchViewModel.pin).
+    var onChooseProject: () -> Void = {}
     @State private var client: CodingClient = .claude
     @State private var project: URL?
     @State private var message: String?
@@ -68,12 +71,18 @@ struct StartCodingView: View {
     }
     private func chooseProject() {
         guard !SnapshotMode.isActive else { return }
+        onChooseProject()
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose project"
         panel.message = "Choose the folder Claude Code or Codex should work in."
+        // The island floats above the menu bar (NotchPanel.islandLevel); a
+        // panel at its default modal level opened BEHIND it and could not be
+        // used. Put it one level above the island and make it key.
+        panel.level = NotchPanel.modalAboveIslandLevel
+        NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK { project = panel.url; message = nil }
     }
     private func plan() throws -> CodingLaunchPlan { try CodingLaunchPlan(client: client, project: selectedProject, isRemote: remote) }

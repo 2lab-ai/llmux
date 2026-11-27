@@ -118,7 +118,8 @@ struct IslandUsageView: View {
             // `_` stay under the tiles; dismissed rows are gone (AttentionTriage).
             let attention = model.attentionTriage.split(model.attention)
             ScrollView(.vertical, showsIndicators: false) {
-                StartCodingView(isOnline: model.connection == .online, fixtureProject: snapshotProject)
+                StartCodingView(isOnline: model.connection == .online, fixtureProject: snapshotProject,
+                                onChooseProject: viewModel.pin)
                     .padding(.bottom, 12)
                 if !attention.top.isEmpty {
                     NeedsAttentionSection(

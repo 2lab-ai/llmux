@@ -11,6 +11,12 @@ import AppKit
 
 // Use NSPanel subclass for non-activating behavior
 class NotchPanel: NSPanel {
+    /// The island sits above the menu bar.
+    static let islandLevel = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
+    /// A window the island opens (folder picker) must sit above the island,
+    /// or it opens behind the open panel and cannot be used.
+    static let modalAboveIslandLevel = NSWindow.Level(rawValue: islandLevel.rawValue + 1)
+
     override init(
         contentRect: NSRect,
         styleMask style: NSWindow.StyleMask,
@@ -47,7 +53,7 @@ class NotchPanel: NSPanel {
         ]
 
         // Above the menu bar
-        level = .mainMenu + 3
+        level = Self.islandLevel
 
         // Enable tooltips even when app is inactive (needed for panel windows)
         allowsToolTipsWhenApplicationIsInactive = true

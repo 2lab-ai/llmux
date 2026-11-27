@@ -626,6 +626,9 @@ struct ClosedIslandSnapshotView: View {
     /// Non-notch fallback island size (Ext+NSScreen.notchSize fallback).
     private static let closedNotchSize = CGSize(width: 224, height: 38)
 
+    private static let physicalNotchWidth: CGFloat? = ProcessInfo.processInfo
+        .environment["LLMUX_ISLANDS_SNAPSHOT_NOTCH"].flatMap(Double.init).map { CGFloat($0) }
+
     private func hue(seed: Double) -> Double {
         switch clock {
         case .phase(let phase):
@@ -646,7 +649,10 @@ struct ClosedIslandSnapshotView: View {
             claudeHue: hue(seed: NotchClosedLabelView.claudeHueSeed),
             codexHue: hue(seed: NotchClosedLabelView.codexHueSeed),
             grokHue: hue(seed: NotchClosedLabelView.grokHueSeed),
-            geminiHue: hue(seed: NotchClosedLabelView.geminiHueSeed)
+            geminiHue: hue(seed: NotchClosedLabelView.geminiHueSeed),
+            // `LLMUX_ISLANDS_SNAPSHOT_NOTCH=<points>` renders the split label
+            // of a display with a physical notch of that width.
+            notchGap: Self.physicalNotchWidth
         )
         .frame(minWidth: Self.closedNotchSize.width - 20)
         .frame(height: max(24, Self.closedNotchSize.height))

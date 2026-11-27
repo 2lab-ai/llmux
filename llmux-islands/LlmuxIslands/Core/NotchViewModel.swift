@@ -141,12 +141,29 @@ class NotchViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let events = EventMonitors.shared
     private var hoverTimer: DispatchWorkItem?
+    /// Pending close after the pointer left an island that hover opened.
+    private var leaveTimer: DispatchWorkItem?
+    private var keyMonitor: Any?
+
+    /// Pointer dwell on the notch before the island opens by itself
+    /// (boring.notch / Atoll use 0.3 s; Claude Island used 1 s).
+    static let hoverOpenDelay: TimeInterval = 0.3
+    /// Grace period after the pointer leaves a hover-opened island
+    /// (boring.notch / Atoll 0.1 s; a little longer here so a big panel does
+    /// not close when the pointer slips off an edge).
+    static let leaveCloseDelay: TimeInterval = 0.5
 
     // MARK: - Navigation State
 
     private var lastNonMenuContentType: NotchContentType = .usage
 
     // MARK: - Initialization
+
+    deinit {
+        // A display change replaces the view model; its app-wide key monitor
+        // must go with it.
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    }
 
     init(deviceNotchRect: CGRect, screenRect: CGRect, windowHeight: CGFloat, hasPhysicalNotch: Bool) {
         self.geometry = NotchGeometry(
@@ -210,10 +227,31 @@ class NotchViewModel: ObservableObject {
 
         events.mouseDown
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleMouseDown()
+            .sink { [weak self] event in
+                self?.handleMouseDown(event)
             }
             .store(in: &cancellables)
+
+        // Esc closes the open island (the panel is key while open).
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53, self.status == .opened,
+                  NSApp.modalWindow == nil, event.window is NotchPanel
+            else { return event }
+            self.notchClose()
+            return nil
+        }
+    }
+
+    /// While a window the island opened is up (the folder picker), the island
+    /// neither opens nor closes by itself: its clicks and pointer moves are not
+    /// "outside the island".
+    private var islandIsBusy: Bool { NSApp.modalWindow != nil }
+
+    /// Typing in a field of the island (an API key, a connection setting)
+    /// also keeps a hover-opened island from closing when the pointer leaves.
+    private var isEditingText: Bool {
+        guard let window = NSApp.keyWindow, window is NotchPanel else { return false }
+        return window.firstResponder is NSTextView
     }
 
     private func handleMouseMove(_ location: CGPoint) {
@@ -227,22 +265,53 @@ class NotchViewModel: ObservableObject {
 
         isHovering = newHovering
 
-        // Cancel any pending hover timer
+        // Cancel any pending hover / leave timer
         hoverTimer?.cancel()
         hoverTimer = nil
+        leaveTimer?.cancel()
+        leaveTimer = nil
+        guard !islandIsBusy else { return }
 
-        // Start hover timer to auto-expand after 1 second
+        // Rule 1: resting the pointer on the notch opens the island.
         if isHovering && (status == .closed || status == .popping) {
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self, self.isHovering else { return }
+                guard let self = self, self.isHovering, !self.islandIsBusy else { return }
                 self.notchOpen(reason: .hover)
             }
             hoverTimer = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.hoverOpenDelay, execute: workItem)
+        }
+
+        // Rule 4: an island that hover opened (and was not clicked inside)
+        // closes once the pointer has been away from it for a moment.
+        if !isHovering && status == .opened && openReason == .hover {
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self, !self.isHovering, self.status == .opened,
+                      self.openReason == .hover, !self.islandIsBusy, !self.isEditingText else { return }
+                self.notchClose()
+            }
+            leaveTimer = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.leaveCloseDelay, execute: workItem)
         }
     }
 
-    private func handleMouseDown() {
+    /// Keep an opened island open until a click outside, a notch click or
+    /// Esc: a click inside it, or opening the folder picker (by mouse or by
+    /// keyboard), means the owner is working in it.
+    func pin() {
+        if status == .opened { openReason = .click }
+    }
+
+    private func handleMouseDown(_ event: NSEvent) {
+        // A click in another window of this app (the folder picker, a sheet)
+        // is not a click outside the island.
+        if let window = event.window, !(window is NotchPanel) { return }
+        // A click inside the island pins a hover-opened island: it then stays
+        // open until a click outside, a notch click or Esc. Checked before
+        // the busy guard: this handler is queued, so the click that opened
+        // the folder picker may arrive while the picker is already modal.
+        if event.window is NotchPanel { pin() }
+        guard !islandIsBusy else { return }
         let location = NSEvent.mouseLocation
 
         switch status {

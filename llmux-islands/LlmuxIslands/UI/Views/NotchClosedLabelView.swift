@@ -33,10 +33,11 @@ struct NotchClosedLabelView: View {
     /// label pixel-identical. The chip is STATIC (decoupled from the rainbow
     /// loop) so a warning never reads as decoration.
     var signal: GlanceSignal = .none
-    /// Whether the island is actually on screen (NotchView's `isVisible`). On
-    /// notched Macs the closed pill sits at opacity 0 until hovered — keep the
-    /// 30fps timeline paused then instead of animating an invisible view.
+    /// Whether the island is actually on screen (NotchView's `isVisible`);
+    /// the 30fps timeline stays paused while it is not.
     let active: Bool
+    /// See `NotchClosedLabelContent.notchGap`.
+    var notchGap: CGFloat? = nil
 
     /// Full rainbow revolution takes this long.
     private static let rainbowLoopSeconds: Double = 3.0
@@ -70,7 +71,8 @@ struct NotchClosedLabelView: View {
                 codexHue: Self.rainbowHue(time: time, seed: Self.codexHueSeed),
                 grokHue: Self.rainbowHue(time: time, seed: Self.grokHueSeed),
                 geminiHue: Self.rainbowHue(time: time, seed: Self.geminiHueSeed),
-                signal: signal
+                signal: signal,
+                notchGap: notchGap
             )
         }
     }
@@ -136,28 +138,67 @@ struct NotchClosedLabelContent: View {
     /// exception-beacon chip; `.none` renders today's label pixel-identical
     /// (no reserved slot, no spacer).
     var signal: GlanceSignal = .none
+    /// Width of a physical notch the label must not draw under, or nil on a
+    /// display without one. With a notch the label splits into two wings —
+    /// the mascot left of the notch, activity and the exception chip right of
+    /// it — so nothing hides behind the hardware.
+    var notchGap: CGFloat? = nil
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Prefix text. If space ever gets tight, shrink/truncate this
-            // (never the counts) — see minimumScaleFactor + tail truncation.
-            Text("Llmux Islands")
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundColor(.white.opacity(0.85))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .minimumScaleFactor(0.6)
+        if let notchGap {
+            // Equal wings keep the notch centred in the pill.
+            NotchSplitLayout(gap: notchGap + 16) {
+                leftWing
+                rightWing
+            }
+        } else {
+            HStack(spacing: 8) {
+                leftWing
+                rightWing
+            }
+        }
+    }
 
-            if case .offline = signal {
-                // Observation failure ≠ zero activity: hide the (stale)
-                // session groups, dim the mascot, and SAY offline.
+    private var isOffline: Bool {
+        if case .offline = signal { return true }
+        return false
+    }
+
+    /// Title + mascot. Beside a physical notch the title is left out: the
+    /// wings cover menu bar space, so they stay as narrow as their content.
+    @ViewBuilder
+    private var leftWing: some View {
+        HStack(spacing: 8) {
+            if notchGap == nil {
+                Text("Llmux Islands")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white.opacity(0.85))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.6)
+            }
+
+            if isOffline {
+                // Observation failure ≠ zero activity: dim the mascot.
                 ClaudeCrabIcon(size: 14, animateLegs: false)
                     .opacity(0.35)
-                chip("offline", color: Color.white.opacity(0.45))
             } else {
                 ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
                     .offset(y: jumpOffset)
+            }
+        }
+    }
 
+    /// Per-provider activity + the one exception chip. With no activity and
+    /// no exception it is empty (the notch-split layout then shows a quiet dot
+    /// so the right wing never collapses to nothing).
+    @ViewBuilder
+    private var rightWing: some View {
+        HStack(spacing: 8) {
+            if isOffline {
+                // Hide the (stale) session groups and SAY offline.
+                chip("offline", color: Color.white.opacity(0.45))
+            } else {
                 if claudeCount > 0 {
                     providerGroup(.claude, count: claudeCount, hue: claudeHue)
                 }
@@ -170,9 +211,12 @@ struct NotchClosedLabelContent: View {
                 if geminiCount > 0 {
                     providerGroup(.gemini, count: geminiCount, hue: geminiHue)
                 }
-
                 if let text = signal.chipText {
                     chip(text, color: chipColor)
+                } else if notchGap != nil, claudeCount + codexCount + grokCount + geminiCount == 0 {
+                    Circle()
+                        .fill(Color.white.opacity(0.35))
+                        .frame(width: 5, height: 5)
                 }
             }
         }
@@ -213,5 +257,38 @@ struct NotchClosedLabelContent: View {
                 .monospacedDigit()
                 .foregroundStyle(Color(hue: hue, saturation: 0.85, brightness: 1.0))
         }
+    }
+}
+
+/// Two wings around a gap of fixed width (a physical notch): both wings take
+/// the wider wing's natural width so the gap stays centred; the left wing's
+/// content hugs the gap from the left, the right wing's from the right.
+/// A Layout rather than measured @State, so the first frame (and a one-shot
+/// snapshot render) is already correct.
+struct NotchSplitLayout: Layout {
+    let gap: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
+        let wing = sizes.map(\.width).max() ?? 0
+        let height = sizes.map(\.height).max() ?? 0
+        return CGSize(width: wing * 2 + gap, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let left = subviews[0].sizeThatFits(.unspecified)
+        let right = subviews[1].sizeThatFits(.unspecified)
+        let wing = max(left.width, right.width)
+        subviews[0].place(
+            at: CGPoint(x: bounds.minX + wing - left.width, y: bounds.midY),
+            anchor: .leading,
+            proposal: ProposedViewSize(left)
+        )
+        subviews[1].place(
+            at: CGPoint(x: bounds.minX + wing + gap, y: bounds.midY),
+            anchor: .leading,
+            proposal: ProposedViewSize(right)
+        )
     }
 }

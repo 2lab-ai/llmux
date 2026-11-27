@@ -119,6 +119,43 @@ admin credential on `/llmux/*` even from loopback (confirmed from source, not
 reproduced in a running app). Upgrade with `llmux update`.
 Per-release status: [Release availability](operational-reference.md#release-availability).
 
+## When the island opens and closes
+
+In short: it opens when you point at the notch or click it, and closes when you
+leave it, click elsewhere, or press Esc. Nothing else opens it, except setup on a
+first launch with no accounts. (Rules as of 2026-11-26.)
+
+**Opens**
+
+- Rest the pointer on the notch for 0.3 seconds (hover-open).
+- Click the notch.
+- First launch only: a short open-and-close at start-up, and setup when the
+  workspace has no accounts. A display change (a remote screen resized, a display
+  waking, a monitor added) no longer replays the start-up animation, and keeps the
+  window when the screen geometry did not change.
+
+**Closes**
+
+- A hover-opened island closes 0.5 seconds after the pointer leaves it, unless you
+  are typing in one of its fields.
+- Clicking inside pins it: it then stays open until one of the next three.
+- A click outside the island.
+- A click on the notch.
+- Esc.
+
+While a window the island opened is up — the project-folder picker — the island
+neither opens nor closes by itself. That picker now opens above the island.
+
+These rules follow what the common open-source notch apps do (checked 2026-11-27):
+boring.notch and Atoll open on a 0.3-second hover and close shortly after the pointer
+leaves; NotchDrop and Claude Island close only on an outside click; none of them
+replays its intro animation when a display changes.
+
+**Closed island on a display with a camera notch.** The label splits around the
+notch: the mascot sits left of it, per-provider activity and the warning chip right
+of it, and a small dot stands in when there is nothing to show. Before 2026-11-26
+the closed island was hidden on these displays, so the label never showed.
+
 ## First launch
 
 Open the floating notch at the top of your screen by clicking or hovering over it.
