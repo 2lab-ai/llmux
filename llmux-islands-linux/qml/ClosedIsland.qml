@@ -201,12 +201,6 @@ Item {
         id: rw
         property var isl
         spacing: 8
-        Chip {
-            isl: rw.isl
-            visible: rw.isl.offline
-            label: "offline"
-            anchors.verticalCenter: parent.verticalCenter
-        }
         ProviderGroup {
             isl: rw.isl
             visible: !rw.isl.offline && count > 0
@@ -231,10 +225,13 @@ Item {
             iconSource: "qrc:/providers/gemini.png"; count: rw.isl.geminiCount; seed: 0.525
             anchors.verticalCenter: parent.verticalCenter
         }
+        // One chip: offline hides the (stale) provider groups and says so;
+        // otherwise the exception text, if any.
         Chip {
             isl: rw.isl
-            visible: !rw.isl.offline && rw.isl.chipText !== ""
-            label: rw.isl.chipText; tint: rw.isl.chipColor
+            visible: rw.isl.offline || rw.isl.chipText !== ""
+            label: rw.isl.offline ? "offline" : rw.isl.chipText
+            tint: rw.isl.offline ? Qt.rgba(1, 1, 1, 0.45) : rw.isl.chipColor
             anchors.verticalCenter: parent.verticalCenter
         }
         Rectangle {

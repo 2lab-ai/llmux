@@ -469,13 +469,17 @@ Kirigami.ApplicationWindow {
         var entry = closedSnapshots[index]
         var item = entry.item
         var outputPath = controller.snapshotDir + "/" + entry.name + ".png"
-        item.grabToImage(function(result) {
+        // grabToImage() returns false without calling back when it cannot
+        // grab (a hidden window), which would stall the snapshot run.
+        var accepted = item.grabToImage(function(result) {
             if (result === null || !result.saveToFile(outputPath)) {
                 root.failSnapshot(qsTr("Failed to save %1 snapshot").arg(entry.name))
                 return
             }
             root.captureClosedSnapshot(index + 1)
         }, Qt.size(item.width * 2, item.height * 2))
+        if (!accepted)
+            root.failSnapshot(qsTr("Could not capture %1 snapshot").arg(entry.name))
     }
 
     function automaticPollAllowed() {

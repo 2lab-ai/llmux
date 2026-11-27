@@ -80,6 +80,18 @@ Privacy masking, actions, and receipts come from the shared Rust UI state on
 both platforms. Opening Linux Advanced does not dispatch an action, touch the
 daemon, or persist state.
 
+The closed island is the one surface both shells draw alike (2026-11-27, the
+start of pixel parity for the Linux port): the notch-shaped black pill with
+`Llmux Islands`, the pixel crab (it walks and hops while Claude sessions run),
+one icon and rainbow count per provider with sessions in flight, and one chip —
+`offline` (the provider counts are then hidden, the crab dimmed) or the
+exception text (`attention` on KDE). Beside a physical notch the label splits
+into two wings, crab left, activity right. Sizes, spacing and timing are the
+macOS values; text uses Inter spaced to the SF Pro Rounded widths. Both shells
+render the same four closed states in snapshot mode for side-by-side
+comparison (KDE: `--snapshot-dir`; macOS: `LLMUX_ISLANDS_SNAPSHOT_KIND=label`),
+and `llmux-islands-linux/dev/kde-preview.sh` shows the KDE shell from a Mac.
+
 ## Requirements
 
 - macOS 14 or later and llmux installed on the same computer.
