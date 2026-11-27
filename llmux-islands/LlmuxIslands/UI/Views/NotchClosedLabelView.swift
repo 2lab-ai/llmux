@@ -208,32 +208,30 @@ struct NotchClosedLabelContent: View {
     /// can put each on either side of the notch.
     @ViewBuilder
     private var activityItems: some View {
-        Group {
-            if isOffline {
-                // Hide the (stale) session groups and SAY offline.
-                chip("offline", color: Color.white.opacity(0.45))
-            } else {
-                if claudeCount > 0 {
-                    providerGroup(.claude, count: claudeCount, hue: claudeHue)
-                }
-                if codexCount > 0 {
-                    providerGroup(.codex, count: codexCount, hue: codexHue)
-                }
-                if grokCount > 0 {
-                    providerGroup(.grok, count: grokCount, hue: grokHue)
-                }
-                if geminiCount > 0 {
-                    providerGroup(.gemini, count: geminiCount, hue: geminiHue)
-                }
-                // No warning chip (AUTH 3, LIMIT 2, 7d 8%, degraded) on the
-                // closed island: it made the label long, and the warnings
-                // are in NEEDS ATTENTION when the island opens (owner
-                // 2026-11-27). Only offline, above, replaces the counts.
-                if notchGap != nil, claudeCount + codexCount + grokCount + geminiCount == 0 {
-                    Circle()
-                        .fill(Color.white.opacity(0.35))
-                        .frame(width: 5, height: 5)
-                }
+        if isOffline {
+            // Hide the (stale) session groups and SAY offline.
+            chip("offline", color: Color.white.opacity(0.45))
+        } else {
+            if claudeCount > 0 {
+                providerGroup(.claude, count: claudeCount, hue: claudeHue)
+            }
+            if codexCount > 0 {
+                providerGroup(.codex, count: codexCount, hue: codexHue)
+            }
+            if grokCount > 0 {
+                providerGroup(.grok, count: grokCount, hue: grokHue)
+            }
+            if geminiCount > 0 {
+                providerGroup(.gemini, count: geminiCount, hue: geminiHue)
+            }
+            // No warning chip (AUTH 3, LIMIT 2, 7d 8%, degraded) on the
+            // closed island: it made the label long, and the warnings
+            // are in NEEDS ATTENTION when the island opens (owner
+            // 2026-11-27). Only offline, above, replaces the counts.
+            if notchGap != nil, claudeCount + codexCount + grokCount + geminiCount == 0 {
+                Circle()
+                    .fill(Color.white.opacity(0.35))
+                    .frame(width: 5, height: 5)
             }
         }
     }

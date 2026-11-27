@@ -39,6 +39,19 @@ final class NotchSplitTests: XCTestCase {
         XCTAssertEqual(NotchSplit.width([mascot], spacing: 8), mascot)
     }
 
+    func testWidthsCountTheSpacingBetweenItems() {
+        XCTAssertEqual(NotchSplit.width([10, 20], spacing: 8), 38)
+        XCTAssertEqual(NotchSplit.width([10, 20, 30], spacing: 8), 76)
+    }
+
+    func testSpacingDecidesACloseSplit() {
+        // [30, 12, 12, 12] without spacing: 30 | 12 12 12 → 36 beats
+        // 30 12 | 12 12 → 42. With 10 points between items: 30 | … → 56,
+        // 30 12 | 12 12 → 52, so the spacing moves an item left.
+        XCTAssertEqual(NotchSplit.best(widths: [30, 12, 12, 12], spacing: 0), 1)
+        XCTAssertEqual(NotchSplit.best(widths: [30, 12, 12, 12], spacing: 10), 2)
+    }
+
     func testASingleItemGoesLeft() {
         XCTAssertEqual(NotchSplit.best(widths: [mascot], spacing: 8), 1)
         XCTAssertEqual(NotchSplit.best(widths: [], spacing: 8), 0)
