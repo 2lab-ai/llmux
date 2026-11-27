@@ -28,7 +28,10 @@ fn main() {
             .qml_file("qml/IslandTextField.qml")
             .qml_file("qml/Usage.qml")
             .qml_file("qml/Statistics.qml")
-            .qml_file("qml/Menu.qml"),
+            .qml_file("qml/Menu.qml")
+            .qml_file("qml/NotchShape.qml")
+            .qml_file("qml/CrabIcon.qml")
+            .qml_file("qml/ClosedIsland.qml"),
     )
     .qt_module("Network")
     .qt_module("Widgets")

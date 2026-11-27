@@ -3,4 +3,9 @@
   <qresource prefix="/icons">
     <file alias="io.twolab.LlmuxIslands.svg">icons/io.twolab.LlmuxIslands.svg</file>
   </qresource>
+  <qresource prefix="/providers">
+    <file alias="claude.svg">providers/claude.svg</file>
+    <file alias="codex.svg">providers/codex.svg</file>
+    <file alias="gemini.png">providers/gemini.png</file>
+  </qresource>
 </RCC>
