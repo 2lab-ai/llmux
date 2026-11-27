@@ -88,6 +88,8 @@ targets:
       - path: LlmuxIslands/Dashboard/DashboardAnalytics.swift
       # Foundation-only hover open / leave close timing (fake clock in tests).
       - path: LlmuxIslands/Core/IslandHoverMachine.swift
+      # Foundation-only: which closed-label items go left/right of the notch.
+      - path: LlmuxIslands/Core/NotchSplit.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.2lab.LlmuxIslandsTests
