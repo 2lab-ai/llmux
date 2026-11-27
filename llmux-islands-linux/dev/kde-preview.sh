@@ -45,22 +45,8 @@ case "$mode" in
         docker cp "$name:/target/snap/." "$out/"
         ;;
     wayland)
-        # Headless wlroots desktop (no GPU): pixman renderer, one 1512x982 output.
-        run 'mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
-             pkill -x sway-nocap || true; pkill -x llmux-islands-l || true  # comm is cut to 15 chars; -f would match this shell
-             printf "output HEADLESS-1 resolution 1512x982 bg #202124 solid_color\n" > /tmp/sway.conf
-             # Arch ships sway with a file capability (cap_sys_nice) that a
-             # container may not grant; a plain copy runs without it.
-             cp /usr/sbin/sway /tmp/sway-nocap
-             WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
-                 /tmp/sway-nocap --unsupported-gpu -c /tmp/sway.conf >/tmp/sway.log 2>&1 &
-             for i in $(seq 1 50); do ls "$XDG_RUNTIME_DIR"/wayland-* >/dev/null 2>&1 && break; sleep 0.2; done
-             export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-* | grep -v lock | head -1)")
-             cargo build --locked
-             QT_QPA_PLATFORM=wayland XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
-                 /target/debug/llmux-islands-linux >/tmp/islands.log 2>&1 &
-             sleep "${LLMUX_KDE_SETTLE:-6}"
-             grim /target/screen.png'
+        docker exec -w /src/llmux-islands-linux -e LLMUX_KDE_SETTLE="${LLMUX_KDE_SETTLE:-6}" "$name" \
+            dbus-run-session -- bash dev/wayland-capture.sh
         docker cp "$name:/target/screen.png" "$out/screen.png"
         ;;
     shell)
