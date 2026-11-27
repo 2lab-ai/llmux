@@ -272,8 +272,8 @@ enum CompactUsageGauges {
 /// Fable is a limit INSIDE the weekly one — Fable traffic draws on both — so
 /// the two values share one scale but are not stacked parts of one whole:
 /// the 7d remaining fills the segments exactly as before, and Fable is the
-/// same segmented bar one layer down — behind the 7d bar, shifted down so
-/// only its lower edge shows, used-up segments as dashed outlines (owner
+/// same segmented bar one layer down — behind the 7d bar, shifted down and
+/// to the right like a stacked card, used-up segments as dashed outlines (owner
 /// 2026-11-27: the earlier stripe through the segments covered the 7d fill).
 /// A stacked or colour-mixed bar would read as "parts of 7d" and cannot show
 /// Fable having MORE left than 7d; the bar behind shows both. The text keeps
