@@ -17,6 +17,20 @@ class NotchPanel: NSPanel {
     /// or it opens behind the open panel and cannot be used.
     static let modalAboveIslandLevel = NSWindow.Level(rawValue: islandLevel.rawValue + 1)
 
+    /// Runs `panel` modally above the island. `runModal()` puts a panel back
+    /// at the modal-panel level (8) when its session starts, under the
+    /// island (27), so a level set beforehand is lost (measured with
+    /// CGWindowListCopyWindowInfo on macOS 26). The level is raised from
+    /// inside the modal session instead.
+    @MainActor
+    static func runModalAboveIsland(_ panel: NSSavePanel) -> NSApplication.ModalResponse {
+        RunLoop.main.perform(inModes: [.modalPanel]) { [weak panel] in
+            MainActor.assumeIsolated { panel?.level = modalAboveIslandLevel }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        return panel.runModal()
+    }
+
     override init(
         contentRect: NSRect,
         styleMask style: NSWindow.StyleMask,
