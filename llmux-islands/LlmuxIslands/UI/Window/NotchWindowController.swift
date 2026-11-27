@@ -15,8 +15,21 @@ class NotchWindowController: NSWindowController {
     private let screen: NSScreen
     private var cancellables = Set<AnyCancellable>()
 
-    init(screen: NSScreen) {
+    /// The geometry this window was built for; a screen-parameter change
+    /// that leaves it equal needs no new window.
+    let builtFor: ScreenSignature
+
+    struct ScreenSignature: Equatable {
+        let frame: CGRect
+        let notchSize: CGSize
+        let hasPhysicalNotch: Bool
+    }
+
+    init(screen: NSScreen, playBootAnimation: Bool) {
         self.screen = screen
+        self.builtFor = ScreenSignature(
+            frame: screen.frame, notchSize: screen.notchSize, hasPhysicalNotch: screen.hasPhysicalNotch
+        )
 
         let screenFrame = screen.frame
         let notchSize = screen.notchSize
@@ -89,11 +102,13 @@ class NotchWindowController: NSWindowController {
 
         // In demo/recording mode, open the island and hold it open so a screen
         // recorder can capture the usage panel without a human hovering the notch.
-        // Otherwise perform the usual brief boot animation.
+        // Otherwise the brief boot animation plays at app launch only — never
+        // when a display change rebuilds the window (it made the island pop
+        // open by itself on every remote-screen resize or display wake).
         DispatchQueue.main.asyncAfter(deadline: .now() + (DemoMode.isActive ? 0.4 : 0.3)) { [weak self] in
             if DemoMode.isActive {
                 self?.viewModel.enterDemoHold()
-            } else {
+            } else if playBootAnimation {
                 self?.viewModel.performBootAnimation()
             }
         }

@@ -141,6 +141,14 @@ class NotchViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let events = EventMonitors.shared
     private var hoverTimer: DispatchWorkItem?
+    /// Pending close after the pointer left an island that hover opened.
+    private var leaveTimer: DispatchWorkItem?
+    private var keyMonitor: Any?
+
+    /// Pointer dwell on the notch before the island opens by itself.
+    static let hoverOpenDelay: TimeInterval = 0.5
+    /// Grace period after the pointer leaves a hover-opened island.
+    static let leaveCloseDelay: TimeInterval = 0.8
 
     // MARK: - Navigation State
 
@@ -210,11 +218,25 @@ class NotchViewModel: ObservableObject {
 
         events.mouseDown
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleMouseDown()
+            .sink { [weak self] event in
+                self?.handleMouseDown(event)
             }
             .store(in: &cancellables)
+
+        // Esc closes the open island (the panel is key while open).
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53, self.status == .opened,
+                  NSApp.modalWindow == nil, event.window is NotchPanel
+            else { return event }
+            self.notchClose()
+            return nil
+        }
     }
+
+    /// While a window the island opened is up (the folder picker), the island
+    /// neither opens nor closes by itself: its clicks and pointer moves are not
+    /// "outside the island".
+    private var islandIsBusy: Bool { NSApp.modalWindow != nil }
 
     private func handleMouseMove(_ location: CGPoint) {
         let inNotch = geometry.isPointInNotch(location)
@@ -227,26 +249,51 @@ class NotchViewModel: ObservableObject {
 
         isHovering = newHovering
 
-        // Cancel any pending hover timer
+        // Cancel any pending hover / leave timer
         hoverTimer?.cancel()
         hoverTimer = nil
+        leaveTimer?.cancel()
+        leaveTimer = nil
+        guard !islandIsBusy else { return }
 
-        // Start hover timer to auto-expand after 1 second
+        // Rule 1: resting the pointer on the notch opens the island.
         if isHovering && (status == .closed || status == .popping) {
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self, self.isHovering else { return }
+                guard let self = self, self.isHovering, !self.islandIsBusy else { return }
                 self.notchOpen(reason: .hover)
             }
             hoverTimer = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.hoverOpenDelay, execute: workItem)
+        }
+
+        // Rule 4: an island that hover opened (and was not clicked inside)
+        // closes once the pointer has been away from it for a moment.
+        if !isHovering && status == .opened && openReason == .hover {
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self, !self.isHovering, self.status == .opened,
+                      self.openReason == .hover, !self.islandIsBusy else { return }
+                self.notchClose()
+            }
+            leaveTimer = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.leaveCloseDelay, execute: workItem)
         }
     }
 
-    private func handleMouseDown() {
+    private func handleMouseDown(_ event: NSEvent) {
+        // A click in another window of this app (the folder picker, a sheet)
+        // is not a click outside the island.
+        if let window = event.window, !(window is NotchPanel) { return }
+        guard !islandIsBusy else { return }
         let location = NSEvent.mouseLocation
 
         switch status {
         case .opened:
+            if !geometry.isPointOutsidePanel(location, size: openedSize),
+               !geometry.notchScreenRect.contains(location) {
+                // Clicking inside pins a hover-opened island: it now stays
+                // open until a click outside, a notch click or Esc.
+                openReason = .click
+            }
             if geometry.isPointOutsidePanel(location, size: openedSize) {
                 notchClose()
                 // Re-post the click so it reaches the window/app behind us

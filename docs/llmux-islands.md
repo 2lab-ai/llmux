@@ -119,6 +119,37 @@ admin credential on `/llmux/*` even from loopback (confirmed from source, not
 reproduced in a running app). Upgrade with `llmux update`.
 Per-release status: [Release availability](operational-reference.md#release-availability).
 
+## When the island opens and closes
+
+In short: it opens when you point at the notch or click it, and closes when you
+leave it, click elsewhere, or press Esc. Nothing else opens it, except setup on a
+first launch with no accounts. (Rules as of 2026-11-26.)
+
+**Opens**
+
+- Rest the pointer on the notch for 0.5 seconds (hover-open).
+- Click the notch.
+- First launch only: a short open-and-close at start-up, and setup when the
+  workspace has no accounts. A display change (a remote screen resized, a display
+  waking, a monitor added) no longer replays the start-up animation, and keeps the
+  window when the screen geometry did not change.
+
+**Closes**
+
+- A hover-opened island closes 0.8 seconds after the pointer leaves it.
+- Clicking inside pins it: it then stays open until one of the next three.
+- A click outside the island.
+- A click on the notch.
+- Esc.
+
+While a window the island opened is up — the project-folder picker — the island
+neither opens nor closes by itself. That picker now opens above the island.
+
+**Closed island on a display with a camera notch.** The label splits around the
+notch: the mascot sits left of it, per-provider activity and the warning chip right
+of it, and a small dot stands in when there is nothing to show. Before 2026-11-26
+the closed island was hidden on these displays, so the label never showed.
+
 ## First launch
 
 Open the floating notch at the top of your screen by clicking or hovering over it.

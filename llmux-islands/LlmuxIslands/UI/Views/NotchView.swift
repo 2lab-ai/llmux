@@ -130,11 +130,11 @@ struct NotchView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .preferredColorScheme(.dark)
         .onAppear {
-            // On non-notched displays keep the island visible so there's an
-            // interaction target; on a real notch it stays hidden until hovered.
-            if !viewModel.hasPhysicalNotch {
-                isVisible = true
-            }
+            // The closed island is always visible. On a display with a
+            // physical notch its label splits into wings beside the notch
+            // (NotchClosedLabelContent.notchGap); hiding it there made the
+            // closed label — activity, exception chip — invisible.
+            isVisible = true
         }
         .onChange(of: viewModel.status) { oldStatus, newStatus in
             handleStatusChange(from: oldStatus, to: newStatus)
@@ -196,7 +196,8 @@ struct NotchView: View {
                     grokCount: usageModel.grokInFlight,
                     geminiCount: usageModel.geminiInFlight,
                     signal: usageModel.glance,
-                    active: isVisible
+                    active: isVisible,
+                    notchGap: viewModel.hasPhysicalNotch ? closedNotchSize.width : nil
                 )
                 .frame(minWidth: closedNotchSize.width - 20)
             } else {
@@ -266,12 +267,8 @@ struct NotchView: View {
         case .opened, .popping:
             isVisible = true
         case .closed:
-            guard viewModel.hasPhysicalNotch else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                if viewModel.status == .closed && !activityCoordinator.expandingActivity.show {
-                    isVisible = false
-                }
-            }
+            // Stays visible: see `.onAppear`.
+            isVisible = true
         }
     }
 }
