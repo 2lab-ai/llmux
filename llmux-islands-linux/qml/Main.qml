@@ -753,8 +753,6 @@ Kirigami.ApplicationWindow {
                 grokCount: root.providerCount("grok")
                 geminiCount: root.providerCount("gemini")
                 offline: root.uiState.lifecycle === "offline" || root.uiState.lifecycle === "fatal"
-                chipText: root.trayNeedsAttention ? qsTr("attention") : ""
-                chipColor: Qt.rgba(1.0, 0.72, 0.28, 1)
 
                 MouseArea {
                     id: compactMouseArea

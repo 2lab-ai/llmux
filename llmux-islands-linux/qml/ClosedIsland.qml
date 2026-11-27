@@ -14,8 +14,6 @@ Item {
     property int codexCount: 0
     property int grokCount: 0
     property int geminiCount: 0
-    property string chipText: ""
-    property color chipColor: Qt.rgba(1, 1, 1, 0.45)
     property bool offline: false
     property real notchGap: -1
     /// 0..1 position in the 3 s colour loop; animated while there is activity.
@@ -225,19 +223,13 @@ Item {
             iconSource: "qrc:/providers/gemini.png"; count: rw.isl.geminiCount; seed: 0.525
             anchors.verticalCenter: parent.verticalCenter
         }
-        // One chip: offline hides the (stale) provider groups and says so;
-        // otherwise the exception text, if any.
+        // Offline hides the (stale) provider groups and says so. No warning
+        // chip on the closed island (macOS 2026-11-27): warnings live in the
+        // opened panel.
         Chip {
             isl: rw.isl
-            visible: rw.isl.offline || rw.isl.chipText !== ""
-            label: rw.isl.offline ? "offline" : rw.isl.chipText
-            tint: rw.isl.offline ? Qt.rgba(1, 1, 1, 0.45) : rw.isl.chipColor
-            anchors.verticalCenter: parent.verticalCenter
-        }
-        Rectangle {
-            visible: rw.isl.hasNotch && !rw.isl.offline && rw.isl.chipText === "" && rw.isl.totalCount === 0
-            width: 5; height: 5; radius: 2.5
-            color: Qt.rgba(1, 1, 1, 0.35)
+            visible: rw.isl.offline
+            label: "offline"
             anchors.verticalCenter: parent.verticalCenter
         }
     }
@@ -252,28 +244,116 @@ Item {
         RightWing { isl: island; anchors.verticalCenter: parent.verticalCenter }
     }
 
-    // Display with a notch: equal wings around the gap.
+    // Display with a notch: the items (crab, provider groups, offline chip
+    // or a quiet dot) split around the gap where the two wings come out
+    // closest in width, each at the OUTER end of its wing, so spare width
+    // sits next to the notch (NotchSplitLayout / NotchSplit on macOS).
     Item {
         id: split
         visible: island.hasNotch
-        readonly property real wing: Math.max(left.implicitWidth, right.implicitWidth)
         readonly property real gap: island.notchGap + 16
+        readonly property real spacing: 8
+        readonly property var items: [notchCrab, notchClaude, notchCodex, notchGrok, notchGemini,
+                                      notchOffline, notchDot].filter(item => item.visible)
+        readonly property var widths: items.map(item => item.implicitWidth)
+        readonly property int leftCount: bestSplit(widths)
+        readonly property real rightWidth: runWidth(widths.slice(leftCount))
+        readonly property real wing: Math.max(runWidth(widths.slice(0, leftCount)), rightWidth)
+
+        function runWidth(list) {
+            return list.length === 0 ? 0 : list.reduce((a, b) => a + b, 0) + spacing * (list.length - 1)
+        }
+        // How many leading items go left: at least the crab, at most all but
+        // one; the split whose wider wing is narrowest.
+        function bestSplit(list) {
+            if (list.length < 2)
+                return list.length
+            var best = 1, bestWing = Infinity
+            for (var left = 1; left < list.length; ++left) {
+                var w = Math.max(runWidth(list.slice(0, left)), runWidth(list.slice(left)))
+                if (w < bestWing - 0.001) { bestWing = w; best = left }
+            }
+            return best
+        }
+        function xOf(item) {
+            var index = items.indexOf(item)
+            if (index < 0)
+                return 0
+            if (index < leftCount)
+                return runWidth(widths.slice(0, index)) + (index > 0 ? spacing : 0)
+            var start = 2 * wing + gap - rightWidth
+            var before = widths.slice(leftCount, index)
+            return start + runWidth(before) + (before.length > 0 ? spacing : 0)
+        }
+
         implicitWidth: wing * 2 + gap
         implicitHeight: island.closedHeight
         anchors.centerIn: parent
         width: implicitWidth
         height: implicitHeight
-        LeftWing {
-            id: left
+
+        Item {
+            id: notchCrab
+            implicitWidth: notchCrabIcon.implicitWidth
+            implicitHeight: notchCrabIcon.implicitHeight
+            x: split.xOf(notchCrab)
+            anchors.verticalCenter: parent.verticalCenter
+            CrabIcon {
+                id: notchCrabIcon
+                size: 14
+                y: island.offline ? 0 : island.jumpOffset
+                opacity: island.offline ? 0.35 : 1
+                animateLegs: !island.offline && island.claudeCount > 0
+                frozen: !island.active
+            }
+        }
+        ProviderGroup {
+            id: notchClaude
             isl: island
-            withTitle: false
-            x: split.wing - implicitWidth
+            visible: !island.offline && count > 0
+            iconSource: "qrc:/providers/claude.svg"; count: island.claudeCount; seed: 0
+            x: split.xOf(notchClaude)
             anchors.verticalCenter: parent.verticalCenter
         }
-        RightWing {
-            id: right
+        ProviderGroup {
+            id: notchCodex
             isl: island
-            x: split.wing + split.gap
+            visible: !island.offline && count > 0
+            iconSource: "qrc:/providers/codex.svg"; count: island.codexCount; seed: 0.35
+            x: split.xOf(notchCodex)
+            anchors.verticalCenter: parent.verticalCenter
+        }
+        ProviderGroup {
+            id: notchGrok
+            isl: island
+            visible: !island.offline && count > 0
+            letter: "G"; count: island.grokCount; seed: 0.7
+            x: split.xOf(notchGrok)
+            anchors.verticalCenter: parent.verticalCenter
+        }
+        ProviderGroup {
+            id: notchGemini
+            isl: island
+            visible: !island.offline && count > 0
+            iconSource: "qrc:/providers/gemini.png"; count: island.geminiCount; seed: 0.525
+            x: split.xOf(notchGemini)
+            anchors.verticalCenter: parent.verticalCenter
+        }
+        Chip {
+            id: notchOffline
+            isl: island
+            visible: island.offline
+            label: "offline"
+            x: split.xOf(notchOffline)
+            anchors.verticalCenter: parent.verticalCenter
+        }
+        Rectangle {
+            id: notchDot
+            visible: !island.offline && island.totalCount === 0
+            implicitWidth: 5; implicitHeight: 5
+            width: 5; height: 5; radius: 2.5
+            color: Qt.rgba(1, 1, 1, 0.35)
+            x: split.xOf(notchDot)
             anchors.verticalCenter: parent.verticalCenter
         }
     }
