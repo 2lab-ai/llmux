@@ -28,8 +28,9 @@ Older recording (2026-07-02, previous UI): [GIF](../screenshots/llmux-islands-de
   out of its 7d quota, is close to it, or is degraded. Its top-right buttons:
   **–** moves the box under the account tiles and keeps it there — a problem that appears
   later shows on top again, alone; **×** dismisses the rows in that box until their problem
-  clears and comes back (a row is forgotten 15 minutes after its problem is gone). The closed
-  island's chip still shows the worst problem. These choices are kept on this Mac only.
+  clears and comes back (a row is forgotten 15 minutes after its problem is gone). These
+  choices are kept on this Mac only. Since 2026-11-27 the closed island shows no warning chip
+  (`AUTH 3`, `LIMIT 2`, `7d 8%`); warnings are here, in NEEDS ATTENTION.
 - A **Start coding** row (preview channel) that opens Claude Code or Codex in a chosen project folder through llmux.
 - A closed floating island label:
 
@@ -85,10 +86,10 @@ daemon, or persist state.
 The closed island is the one surface both shells draw alike (2026-11-27, the
 start of pixel parity for the Linux port): the notch-shaped black pill with
 `Llmux Islands`, the pixel crab (it walks and hops while Claude sessions run),
-one icon and rainbow count per provider with sessions in flight, and one chip —
-`offline` (the provider counts are then hidden, the crab dimmed) or the
-exception text (`attention` on KDE). Beside a physical notch the label splits
-into two wings, crab left, activity right. Sizes, spacing and timing are the
+one icon and rainbow count per provider with sessions in flight, and an
+`offline` chip when the daemon is unreachable (the provider counts are then
+hidden, the crab dimmed). Beside a physical notch the label splits around it
+(see below). Sizes, spacing and timing are the
 macOS values; text uses Inter spaced to the SF Pro Rounded widths. Both shells
 render the same four closed states in snapshot mode for side-by-side
 comparison (KDE: `--snapshot-dir`; macOS: `LLMUX_ISLANDS_SNAPSHOT_KIND=label`),
@@ -165,9 +166,12 @@ boring.notch and Atoll open on a 0.3-second hover and close shortly after the po
 leaves; NotchDrop and Claude Island close only on an outside click; none of them
 replays its intro animation when a display changes.
 
-**Closed island on a display with a camera notch.** The label splits around the
-notch: the mascot sits left of it, per-provider activity and the warning chip right
-of it, and a small dot stands in when there is nothing to show. Before 2026-11-26
+**Closed island on a display with a camera notch.** The label's items — the
+mascot, then one icon and count per provider — split around the notch where the
+two wings come out closest in width (`crab ✳4 | ◎1 G1`), each item at the outer
+end of its wing like the iPhone Dynamic Island, so spare width sits next to the
+notch and reads as notch. A small dot stands in when there is nothing to show.
+There is no warning chip (2026-11-27). Before 2026-11-26
 the closed island was hidden on these displays, so the label never showed.
 
 ## First launch

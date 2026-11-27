@@ -162,6 +162,8 @@ enum SnapshotMode {
     private static func renderLabelFrames(into dir: URL) throws -> [String] {
         let claude = DemoMode.forcedInFlight?.claude ?? 0
         let codex = DemoMode.forcedInFlight?.codex ?? 0
+        let grok = DemoMode.forcedInFlight?.grok ?? 0
+        let gemini = DemoMode.forcedInFlight?.gemini ?? 0
 
         if let raw = ProcessInfo.processInfo.environment["LLMUX_ISLANDS_SNAPSHOT_T"], !raw.isEmpty {
             guard let t = TimeInterval(raw), t >= 0, t.isFinite else {
@@ -170,7 +172,7 @@ enum SnapshotMode {
             let name = String(format: "t%03d-c%d.png", Int((t * 100).rounded()), claude)
             let url = dir.appendingPathComponent(name)
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, grokCount: 0, geminiCount: 0, clock: .wallClock(t)
+                claudeCount: claude, codexCount: codex, grokCount: grok, geminiCount: gemini, clock: .wallClock(t)
             )
             try renderLabel(view, to: url)
             return [url.path]
@@ -180,7 +182,7 @@ enum SnapshotMode {
         for (index, phase) in phases.enumerated() {
             let url = dir.appendingPathComponent("label-c\(claude)x\(codex)-p\(index).png")
             let view = ClosedIslandSnapshotView(
-                claudeCount: claude, codexCount: codex, grokCount: 0, geminiCount: 0, clock: .phase(phase)
+                claudeCount: claude, codexCount: codex, grokCount: grok, geminiCount: gemini, clock: .phase(phase)
             )
             try renderLabel(view, to: url)
             written.append(url.path)
@@ -629,6 +631,21 @@ struct ClosedIslandSnapshotView: View {
     private static let physicalNotchWidth: CGFloat? = ProcessInfo.processInfo
         .environment["LLMUX_ISLANDS_SNAPSHOT_NOTCH"].flatMap(Double.init).map { CGFloat($0) }
 
+    /// `LLMUX_ISLANDS_SNAPSHOT_SIGNAL=auth:3|limit:2|offline|degraded|low:7d:8`
+    /// renders the label with that exception chip.
+    static let signal: GlanceSignal = {
+        let raw = ProcessInfo.processInfo.environment["LLMUX_ISLANDS_SNAPSHOT_SIGNAL"] ?? ""
+        let parts = raw.split(separator: ":").map(String.init)
+        switch parts.first {
+        case "offline": return .offline
+        case "degraded": return .degraded
+        case "auth": return .auth(count: Int(parts.dropFirst().first ?? "") ?? 1)
+        case "limit": return .limit(count: Int(parts.dropFirst().first ?? "") ?? 1)
+        case "low" where parts.count == 3: return .lowQuota(window: parts[1], remainingPct: Int(parts[2]) ?? 0, account: "")
+        default: return .none
+        }
+    }()
+
     private func hue(seed: Double) -> Double {
         switch clock {
         case .phase(let phase):
@@ -650,6 +667,7 @@ struct ClosedIslandSnapshotView: View {
             codexHue: hue(seed: NotchClosedLabelView.codexHueSeed),
             grokHue: hue(seed: NotchClosedLabelView.grokHueSeed),
             geminiHue: hue(seed: NotchClosedLabelView.geminiHueSeed),
+            signal: Self.signal,
             // `LLMUX_ISLANDS_SNAPSHOT_NOTCH=<points>` renders the split label
             // of a display with a physical notch of that width.
             notchGap: Self.physicalNotchWidth

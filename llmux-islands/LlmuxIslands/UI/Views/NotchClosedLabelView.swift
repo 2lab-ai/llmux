@@ -29,9 +29,8 @@ struct NotchClosedLabelView: View {
     let grokCount: Int
     /// Σ in-flight sessions over Gemini accounts — drives `{g}`.
     let geminiCount: Int
-    /// exception-beacon: the worst live exception, or `.none` for today's
-    /// label pixel-identical. The chip is STATIC (decoupled from the rainbow
-    /// loop) so a warning never reads as decoration.
+    /// The worst live exception. Only `.offline` shows on the closed label
+    /// (warnings live in NEEDS ATTENTION since 2026-11-27).
     var signal: GlanceSignal = .none
     /// Whether the island is actually on screen (NotchView's `isVisible`);
     /// the 30fps timeline stays paused while it is not.
@@ -135,21 +134,23 @@ struct NotchClosedLabelContent: View {
     let grokHue: Double
     /// 0..<1 rainbow hue for the gemini `[icon]{g}` group.
     let geminiHue: Double
-    /// exception-beacon chip; `.none` renders today's label pixel-identical
-    /// (no reserved slot, no spacer).
+    /// Only `.offline` changes the label: an `offline` chip replaces the
+    /// counts and the mascot dims. Warnings are not shown here.
     var signal: GlanceSignal = .none
     /// Width of a physical notch the label must not draw under, or nil on a
-    /// display without one. With a notch the label splits into two wings —
-    /// the mascot left of the notch, activity and the exception chip right of
-    /// it — so nothing hides behind the hardware.
+    /// display without one. With a notch the label's items split around it
+    /// (NotchSplitLayout), so nothing hides behind the hardware.
     var notchGap: CGFloat? = nil
 
     var body: some View {
         if let notchGap {
-            // Equal wings keep the notch centred in the pill.
-            NotchSplitLayout(gap: notchGap + 16) {
-                leftWing
-                rightWing
+            // Mascot, activity and chip in one row that the layout splits
+            // around the notch so both wings come out about the same width
+            // (a wide right wing next to a lone mascot left the left wing an
+            // empty black bar). Equal wings keep the notch centred.
+            NotchSplitLayout(gap: notchGap + 16, spacing: 8) {
+                mascot
+                activityItems
             }
         } else {
             HStack(spacing: 8) {
@@ -178,23 +179,36 @@ struct NotchClosedLabelContent: View {
                     .minimumScaleFactor(0.6)
             }
 
-            if isOffline {
-                // Observation failure ≠ zero activity: dim the mascot.
-                ClaudeCrabIcon(size: 14, animateLegs: false)
-                    .opacity(0.35)
-            } else {
-                ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
-                    .offset(y: jumpOffset)
-            }
+            mascot
         }
     }
 
-    /// Per-provider activity + the one exception chip. With no activity and
-    /// no exception it is empty (the notch-split layout then shows a quiet dot
-    /// so the right wing never collapses to nothing).
+    @ViewBuilder
+    private var mascot: some View {
+        if isOffline {
+            // Observation failure ≠ zero activity: dim the mascot.
+            ClaudeCrabIcon(size: 14, animateLegs: false)
+                .opacity(0.35)
+        } else {
+            ClaudeCrabIcon(size: 14, animateLegs: claudeCount > 0)
+                .offset(y: jumpOffset)
+        }
+    }
+
+    /// Per-provider activity, or the offline chip. Beside a notch with no
+    /// activity a quiet dot stands in so the right wing never collapses.
     @ViewBuilder
     private var rightWing: some View {
         HStack(spacing: 8) {
+            activityItems
+        }
+    }
+
+    /// Provider groups and the chip as separate views, so the notch layout
+    /// can put each on either side of the notch.
+    @ViewBuilder
+    private var activityItems: some View {
+        Group {
             if isOffline {
                 // Hide the (stale) session groups and SAY offline.
                 chip("offline", color: Color.white.opacity(0.45))
@@ -211,9 +225,11 @@ struct NotchClosedLabelContent: View {
                 if geminiCount > 0 {
                     providerGroup(.gemini, count: geminiCount, hue: geminiHue)
                 }
-                if let text = signal.chipText {
-                    chip(text, color: chipColor)
-                } else if notchGap != nil, claudeCount + codexCount + grokCount + geminiCount == 0 {
+                // No warning chip (AUTH 3, LIMIT 2, 7d 8%, degraded) on the
+                // closed island: it made the label long, and the warnings
+                // are in NEEDS ATTENTION when the island opens (owner
+                // 2026-11-27). Only offline, above, replaces the counts.
+                if notchGap != nil, claudeCount + codexCount + grokCount + geminiCount == 0 {
                     Circle()
                         .fill(Color.white.opacity(0.35))
                         .frame(width: 5, height: 5)
@@ -222,17 +238,7 @@ struct NotchClosedLabelContent: View {
         }
     }
 
-    /// Severity color — reinforcement only; the TEXT carries the meaning.
-    private var chipColor: Color {
-        switch signal {
-        case .auth, .limit: return Color(red: 1.0, green: 0.42, blue: 0.36)
-        case .lowQuota: return Color(red: 1.0, green: 0.72, blue: 0.28)
-        case .degraded: return Color(red: 0.95, green: 0.62, blue: 0.45)
-        case .offline, .none: return Color.white.opacity(0.45)
-        }
-    }
-
-    /// The one static exception chip: a hairline divider + short text token.
+    /// The offline chip: a hairline divider + short text token.
     @ViewBuilder
     private func chip(_ text: String, color: Color) -> some View {
         HStack(spacing: 6) {
@@ -260,35 +266,41 @@ struct NotchClosedLabelContent: View {
     }
 }
 
-/// Two wings around a gap of fixed width (a physical notch): both wings take
-/// the wider wing's natural width so the gap stays centred; the left wing's
-/// content hugs the gap from the left, the right wing's from the right.
-/// A Layout rather than measured @State, so the first frame (and a one-shot
-/// snapshot render) is already correct.
+/// The label's items (mascot, provider groups, chip) in order, split around
+/// a gap of fixed width (a physical notch): the first items go left of the
+/// gap, the rest right of it, at the split that makes the two wings closest
+/// in width (`NotchSplit.best`). Both wings take the wider wing's width so
+/// the gap stays centred. The items sit at the OUTER ends of their wings
+/// (like the leading/trailing views of the iPhone Dynamic Island), so any
+/// spare width lies next to the notch, where it reads as more notch, not as
+/// an empty bar at the edge of the pill. A Layout rather than measured
+/// @State, so the first frame (and a one-shot snapshot render) is already
+/// correct.
 struct NotchSplitLayout: Layout {
     let gap: CGFloat
+    var spacing: CGFloat = 8
+
+    private func split(_ subviews: Subviews) -> (widths: [CGFloat], left: Int, wing: CGFloat) {
+        let widths = subviews.map { $0.sizeThatFits(.unspecified).width }
+        let left = NotchSplit.best(widths: widths, spacing: spacing)
+        let wing = max(NotchSplit.width(widths[..<left], spacing: spacing),
+                       NotchSplit.width(widths[left...], spacing: spacing))
+        return (widths, left, wing)
+    }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let sizes = subviews.map { $0.sizeThatFits(.unspecified) }
-        let wing = sizes.map(\.width).max() ?? 0
-        let height = sizes.map(\.height).max() ?? 0
-        return CGSize(width: wing * 2 + gap, height: height)
+        let height = subviews.map { $0.sizeThatFits(.unspecified).height }.max() ?? 0
+        return CGSize(width: split(subviews).wing * 2 + gap, height: height)
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        guard subviews.count == 2 else { return }
-        let left = subviews[0].sizeThatFits(.unspecified)
-        let right = subviews[1].sizeThatFits(.unspecified)
-        let wing = max(left.width, right.width)
-        subviews[0].place(
-            at: CGPoint(x: bounds.minX + wing - left.width, y: bounds.midY),
-            anchor: .leading,
-            proposal: ProposedViewSize(left)
-        )
-        subviews[1].place(
-            at: CGPoint(x: bounds.minX + wing + gap, y: bounds.midY),
-            anchor: .leading,
-            proposal: ProposedViewSize(right)
-        )
+        let (widths, left, _) = split(subviews)
+        var x = bounds.minX
+        for index in subviews.indices {
+            if index == left { x = bounds.maxX - NotchSplit.width(widths[left...], spacing: spacing) }
+            let size = subviews[index].sizeThatFits(.unspecified)
+            subviews[index].place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(size))
+            x += widths[index] + spacing
+        }
     }
 }
