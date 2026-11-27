@@ -9,6 +9,11 @@ mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 # comm is cut to 15 characters; `pkill -f` would match this script itself.
 pkill -x sway-nocap || true
 pkill -x llmux-islands-l || true
+# Wait for the previous run to exit before overwriting its executable.
+for _ in $(seq 1 50); do
+    pgrep -x sway-nocap >/dev/null || pgrep -x llmux-islands-l >/dev/null || break
+    sleep 0.1
+done
 printf 'output HEADLESS-1 resolution 1512x982 bg #202124 solid_color\nbar {\n position bottom\n tray_output *\n}\n' > /tmp/sway.conf
 # Arch ships sway with a file capability (cap_sys_nice) a container may not
 # grant; a plain copy runs without it.
@@ -24,5 +29,12 @@ export WAYLAND_DISPLAY
 cargo build --locked
 QT_QPA_PLATFORM=wayland XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
     /target/debug/llmux-islands-linux >/tmp/islands.log 2>&1 &
+shell=$!
 sleep "${LLMUX_KDE_SETTLE:-6}"
-grim /target/screen.png
+# A shell that died during startup would leave an empty desktop to capture.
+if ! kill -0 "$shell" 2>/dev/null; then
+    echo "llmux-islands-linux exited during startup:" >&2
+    cat /tmp/islands.log >&2
+    exit 1
+fi
+grim "${LLMUX_KDE_SCREEN:-/target/screen.png}"
